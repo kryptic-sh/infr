@@ -70,6 +70,10 @@ impl ChatModel for CpuDenseChat {
             .generate_cpu(prompt, max_new, req, |p| on_piece(p))
     }
 
+    fn supports_constraint(&self) -> bool {
+        !self.metal
+    }
+
     /// The constrained span runs on the plain CPU forward, never MTP: as on Vulkan, the grammar
     /// steps one token at a time and has nothing to verify a draft against. The reference-Metal
     /// mode has no constrained path and refuses, like the trait default.

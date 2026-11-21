@@ -342,6 +342,12 @@ knobs! {
     // Same "`0` is a VALUE, not a bad one" grammar as the deadline above: `0` disables the periodic
     // throughput line, so the env layer must not filter it out.
     "INFR_SERVE_STATS_SECS" => "serve.stats_interval_secs", Int, Ignored, "10", migrated;
+    // `*` disables the Host check; an empty value leaves the default policy, as `--set` does.
+    // See `ServeCfg::allowed_hosts`.
+    "INFR_SERVE_ALLOWED_HOSTS" => "serve.allowed_hosts", Text, Ignored, "llm.example.com", migrated;
+    // `0` turns the keep-alive off, so the env layer keeps it.
+    "INFR_SERVE_SSE_KEEPALIVE_SECS" => "serve.sse_keepalive_secs", Int, Ignored, "30", migrated;
+    "INFR_SERVE_MAX_BODY_BYTES" => "serve.max_body_bytes", Int, Ignored, "8388608", migrated;
 
     // ── hub ──────────────────────────────────────────────────────────────────
     // Same "`0` is a VALUE" grammar as the two `serve` knobs above: `0` means "one connection",

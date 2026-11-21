@@ -339,24 +339,6 @@ window between the weight upload and the KV allocation, against
    the interaction between a shrunk window and `vulkan_slot_ctx`'s divide-by-N
    is reasoned, not measured.
 
-### B10a — the serve arrival line reports prompt CHARS, not prompt tokens
-
-**Tag:** raised 2026-08-02 · **Blocked on:** a `ChatGenerator` trait change
-
-B10's request/throughput logging landed, with one part of its spec unmet: the
-`request start` line carries `prompt_chars`, not prompt tokens. The tokenizer
-lives behind `ChatGenerator`, so at arrival the server genuinely cannot know the
-token count — it only learns it from `ChatOutcome` when the generation ends,
-which is where the real `prompt_tokens` is logged (`request done`).
-
-Fixing it means a new `ChatGenerator` method
-(`count_prompt_tokens(&[ChatMessage])` or similar) implemented by `infr-cli`'s
-`SeamGenerator` / `ParallelGenerator`, which then have to render the chat
-template a second time — the template render, not just the tokenization, is what
-determines the count. Out of scope for the logging slice: it is a trait change
-plus duplicated render work on every request, for a number the completion line
-already reports accurately a moment later.
-
 ### B11 — an explicit `INFR_CACHE=<pct>` still resolves against raw free VRAM
 
 **Tag:** narrowed 2026-08-02 · **Blocked on:** a decision about what the
@@ -3152,13 +3134,6 @@ model lock after a panic, cancel on client hang-up,
 415 for body rejections, `stream_options.include_usage`, the bearer check before
 the body, `-1` for `seed` / `max_tokens`, and the 401 body. Left:
 
-- **A streamed over-long prompt still answers 200.** The headers and role chunk
-  go out before `engine.chat` runs, so the client gets a typed error frame, not
-  a 400. Returning 400 means tokenizing before the stream opens, as llama.cpp's
-  server does; that is the `count_prompt_tokens` method B10a describes, and it
-  would also let an over-long prompt be refused before it takes a slot.
-- **No body-size key.** The axum default (2 MiB) still applies, undocumented;
-  there is no `serve.*` setting for it.
 - **`ctx_full` and `natural_stop` are set only on the dense seam paths.** The
   MTP, diffusion and Metal speculative paths report `false` for both, so a
   context-cut reply there still says `stop` and an end token on the last allowed
@@ -3171,11 +3146,6 @@ the body, `-1` for `seed` / `max_tokens`, and the 401 body. Left:
   it keep failing. `DiffusionGemmaChat::reset_kv` drops its whole session and
   has no test (it needs a real GGUF). A non-streaming 500 body still includes
   the panic message.
-- **DiffusionGemma under `serve` has no cap on the session it opens.** The
-  untyped overflow in `diffusion_generate` is reachable only from `bench`;
-  `DiffusionGemmaChat::ensure_sess` always sizes the session to at least
-  prompt + blocks × canvas + 64, so an over-long prompt opens an arbitrarily
-  large session instead of being refused. Needs a decision on the cap.
 - `infr-cpu/src/pool.rs` still sets a process-wide panic hook in two tests.
 - The hang-up tests use real sockets with 2 s bounds; a loaded Windows or macOS
   runner could fail them. A failure would be an assertion, not a hang.
@@ -3923,27 +3893,76 @@ first. What is left:
   attention `deq` closure) were left: they read buffers the backend allocates,
   not the GGUF mapping.
 
-### B137 — `infr serve`: three decisions for the owner (2026-11-12)
+### B137 — `infr serve`: what JSON mode, the Host check and prepare-once left (2026-11-21)
 
-- **`response_format` is accepted and ignored.** A client that asks for JSON
-  output gets unconstrained text with a 200. Options: reject `json_object` /
-  `json_schema` with a 400 (safe, but clients that get 200 today break);
-  implement JSON mode on the existing llguidance grammar path (correct,
-  feature-sized); keep ignoring it (silently off-contract).
-- **No `Host` / `Origin` validation on the default keyless loopback server.** A
-  web page that rebinds its hostname to `127.0.0.1` becomes same-origin and
-  could drive completions and read `/status` and `/metrics`. Reported from
-  reading `build_router`; the attack was not tried. Options: validate `Host`
-  against a loopback allow-list (blocks rebinding, breaks custom hostnames and
-  reverse proxies); validate only when a browser `Origin` header is present;
-  document it and leave it. Distinct from B5.
-- **No SSE keep-alive.** Nothing is sent during a long prefill or a forced tool
-  call, so an idle-timeout proxy may cut the stream. axum's `KeepAlive` sends
-  comment lines at a 15 s default, which conforming SSE parsers ignore. Options:
-  add it at the default; make the interval a `serve.*` key; leave it out.
+`response_format`, the `Host` check, SSE keep-alive, `serve.max_body_bytes` and
+preparing a request before it takes a slot have shipped. Left, all read in code
+unless marked:
+
+- **JSON mode narrows numbers.** A number the schema leaves unbounded is limited
+  (`NUMBER_LIMIT`, `NUMBER_STEP` in `infr-llama/src/grammar/caps.rs`) and
+  exponent form is never produced, so `6.02e23` cannot be written. The fraction
+  limit is coarser than llama.cpp's because llguidance's `multipleOf` matcher
+  does its arithmetic in 32 bits. Strings, array lengths and nesting are not
+  bounded, as in llama.cpp, so a reply can still run to `max_tokens` inside a
+  string.
+- **Numbers in intersected subschemas keep only the schema's own bounds**
+  (`allOf`, applicators beside sibling keywords, a property matching a pattern
+  property, definitions referenced from those places): adding bounds or the
+  any-value definition there makes llguidance refuse valid schemas. A digit run
+  there can still reach `max_tokens`.
+- **The schema guard over-refuses by design** (`grammar/shape.rs`,
+  `grammar/caps.rs`). It exists because llguidance compiles recursively and a
+  stack overflow aborts the process: a flat `$ref` chain killed the server
+  before it. Refused although some could compile: any `$ref` that is not a plain
+  local pointer; `$id`, `$anchor` and the dynamic/recursive keywords even where
+  inert; a draft-04 `$schema`; a 2019-09+ keyword under a draft-06/07 `$schema`
+  even as an annotation; two `multipleOf` steps that would combine badly but
+  never meet; a `multipleOf` coefficient above `MAX_STEP_COEFFICIENT`, which
+  llguidance compiles slowly or fails on at the first mask. Fractional steps
+  that llguidance's own float conversion mangles (`0.0007`) are its 400, not
+  infr's.
+- **The stack measurements behind `MAX_COMPILE_LEVELS` are debug-build ones**;
+  intersection-heavy chains were not re-measured in release, where frames are
+  smaller. `the_keyword_lists_match_the_installed_llguidance` notices an
+  llguidance upgrade that refuses or implements a listed keyword, not one that
+  starts implementing a keyword infr treats as an annotation. A grammar built
+  through the public `Constraint::new` gets the compile stack but not the shape
+  check.
+- **A mask-time grammar error** is a 500, or a `server_error` frame after the
+  200 on a stream; the session stays usable (read, not run).
+- **Thinking is off under `response_format`.** llama.cpp lets the model reason
+  first and constrains only the content, through a per-template reasoning parser
+  infr does not have.
+- **The prompt is still tokenized twice** — once to count it, once inside the
+  backend, which takes text. Removing that needs a token-input path on every
+  backend. The render and the grammar compile happen once.
+- **CPU and MTP sessions report no context limit before generation**, so an
+  over-long prompt there is still refused by the runner, as a typed error frame
+  on a stream.
+- **A keyless server bound to `0.0.0.0` is not Host-checked** unless
+  `serve.allowed_hosts` is set, though it is reachable through `127.0.0.1` and
+  so open to the same rebinding. A resolver that forwards `*.localhost` names to
+  DNS (plain glibc without nss-myhostname) weakens that allowance.
+- **Not compiled or run here:** the macOS-only `supports_constraint` and
+  `max_prompt_tokens` overrides in `chat/metal.rs`; JSON mode on Metal; the
+  DiffusionGemma reply trim on a real model (its sizing is tested as a pure
+  function); the arrival log line's `prompt_tokens`, checked by eye only.
+- **`crates/infr-cli/src/main.rs` keeps growing**: the serve adapter and its
+  tests belong in their own module.
 - **`max_tokens: -1` means the server default (`sampling.max_new`)**, chosen on
   2026-11-12; llama.cpp reads `n_predict: -1` as "until the context is full".
   Recorded so the difference is a decision and not an accident.
+
+### B225 — `cargo deny` fails on RUSTSEC-2026-0543 (2026-11-21)
+
+`chrono` is flagged unmaintained and is a direct dependency of `infr-chat`
+(`cargo tree -i chrono`); what uses it there was not read. `cargo deny check` is
+red on `main` at `9151fbd` and the weekly `cron.yml` job will report it.
+Options: replace `chrono` in `infr-chat` with a maintained crate or the standard
+library, if its use is small; or add the advisory to `deny.toml`'s `ignore` list
+with the reason, as the existing unmaintained entries are. A dependency
+decision, so not made here.
 
 ### B138 — smaller infr-core findings (2026-11-11)
 
@@ -6362,8 +6381,8 @@ shader bodies.
   id with any mass. `top_k` is still typed `Option<i64>`, so `"top_k": 40.0` or
   a string is a body-parse 400 that names no parameter, where `n` and
   `top_logprobs` now name theirs. The `SpecMetalChat` refusal compiles only on
-  macOS and has not been built or run. B137 records `response_format`, still
-  accepted and ignored.
+  macOS and has not been built or run. B137 records what JSON mode
+  (`response_format`) left.
 - **MTP's `residual_dist` is quadratic in the support.** `dist_prob` is a linear
   search and `residual_dist` (`seam/model.rs`) calls it per entry, so two
   distributions spanning the vocabulary cost about the square of its size per

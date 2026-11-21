@@ -435,6 +435,18 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     // Ditto: `0` means "no periodic throughput line", a value the operator may need to set OVER a
     // config file that enabled it, so it must survive this layer rather than be filtered as junk.
     p.serve.stats_interval_secs = num::<u64>(get, "INFR_SERVE_STATS_SECS");
+    // The `--set` list grammar; a value with no names in it (``, ` `, `,`, `none`) is "unset",
+    // the default policy, as the server reads an empty list from any layer.
+    p.serve.allowed_hosts = get("INFR_SERVE_ALLOWED_HOSTS").map(|v| {
+        <Option<Vec<String>> as super::partial::ConfigValue>::parse_set(&v)
+            .ok()
+            .flatten()
+            .filter(|list| !list.is_empty())
+    });
+    // `0` is a VALUE here too: it turns the keep-alive off.
+    p.serve.sse_keepalive_secs = num::<u64>(get, "INFR_SERVE_SSE_KEEPALIVE_SECS");
+    // A zero body limit would refuse every request, so it is junk, like a zero token cap.
+    p.serve.max_body_bytes = num::<u64>(get, "INFR_SERVE_MAX_BODY_BYTES").filter(|&v| v > 0);
 
     // ── hub ──────────────────────────────────────────────────────────────────
     // NO `> 0` filter: `0` is a MEANINGFUL value ("fetch strictly one file at a time"), so it must

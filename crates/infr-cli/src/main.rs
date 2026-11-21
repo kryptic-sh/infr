@@ -1816,8 +1816,9 @@ fn metal_chat_model(
 /// (`infr_chat::render_chat_oai`, model-independent), generates through the SAME `ChatModel`
 /// primitive `infr run`/`bench` drive (persistent session ⇒ per-request suffix-only prefill), and
 /// streams through the same `ChatStream` splitter (reasoning/content/auto-parsed tool calls).
-/// Grammar-FORCED tool_choice builds an llguidance constraint and generates through
-/// `generate_constrained` (llama.cpp-parity reliability); auto/none stream through the parser.
+/// Grammar-FORCED tool_choice and `response_format` build an llguidance constraint and generate
+/// through `generate_constrained` (llama.cpp-parity reliability); auto/none stream through the
+/// parser.
 /// SERIALISED: the backend is a `&mut`-only `ChatModel` with a single KV session, so concurrent
 /// requests take turns behind a `Mutex`. Used for CPU / Metal / diffusion-gemma, which have no
 /// multi-slot engine — `cmd_serve` pins those to `--parallel 1` so the queueing is explicit rather
@@ -1832,6 +1833,14 @@ struct SeamGenerator {
     /// The model's logits row length (`Config::vocab`), read once at construction for the same
     /// reason: the server's `logit_bias` id check asks for it on the request path.
     vocab: usize,
+    /// [`infr_llama::chat::ChatModel::supports_constraint`], read at construction for the same
+    /// reason.
+    constrains: bool,
+    /// [`infr_llama::chat::ChatModel::max_prompt_tokens`], `0` while unknown: read at
+    /// construction, after every generation, and whenever a request is prepared while no
+    /// generation holds the model (a lazily opened session only knows its size once open), so a
+    /// request can be measured against it without waiting on the model's lock.
+    max_prompt: std::sync::atomic::AtomicUsize,
 }
 
 impl SeamGenerator {
@@ -1847,6 +1856,8 @@ impl SeamGenerator {
         Ok(Self {
             backend,
             vocab: model.render_model().config().vocab,
+            constrains: model.supports_constraint(),
+            max_prompt: model.max_prompt_tokens().unwrap_or(0).into(),
             model: std::sync::Mutex::new(model),
             renderer: infr_llama::chat::OaiRenderer::open_with_tokenizer(gguf_path, tok, cfg)?,
             watch: infr_llama::WeightWatch::open_model(gguf_path)?,
@@ -1892,11 +1903,11 @@ trait GenBackend: Send + Sync {
     /// nonsense, so a served reply is worth one `fstat`.
     fn weights(&self) -> &infr_llama::WeightWatch;
 
-    /// The reply budget for a request that names none: `sampling.max_new` (`INFR_MAX_NEW`,
-    /// default 2048) off the config this backend's renderer was opened with. A trait method
-    /// rather than a free function because the config is per-backend state — and the default
-    /// body serves both generators, since both hold the same renderer (`run_chat` used to
-    /// read the `INFR_MAX_NEW` variable from the process environment here).
+    /// The reply budget for a request that names none: `sampling.max_new` (`INFR_MAX_NEW`; the
+    /// default is `SamplingCfg`'s) off the config this backend's renderer was opened with. A
+    /// trait method rather than a free function because the config is per-backend state — and
+    /// the default body serves both generators, since both hold the same renderer (`run_chat`
+    /// used to read the `INFR_MAX_NEW` variable from the process environment here).
     fn max_new_default(&self) -> usize {
         self.renderer().engine_cfg().sampling.max_new
     }
@@ -1907,6 +1918,13 @@ trait GenBackend: Send + Sync {
         &self,
         sampling: infr_llama::sampling::RequestSampling,
     ) -> infr_llama::sampling::RequestCtx;
+
+    /// Whether `generate` honours a constraint here; a request that needs one is refused up front
+    /// on a backend that would only fail it mid-generation.
+    fn can_constrain(&self) -> bool;
+
+    /// The longest prompt `generate` accepts, if known without waiting on a generation.
+    fn max_prompt_tokens(&self) -> Option<usize>;
 
     fn generate(
         &self,
@@ -1936,6 +1954,25 @@ impl GenBackend for SeamGenerator {
         infr_llama::sampling::RequestCtx::new(sampling)
     }
 
+    fn can_constrain(&self) -> bool {
+        self.constrains
+    }
+
+    fn max_prompt_tokens(&self) -> Option<usize> {
+        // Refresh from the model when no generation holds it — never wait for one: a session
+        // opened since the last read (by a warmup, or a generation that failed) is seen here.
+        if let Ok(model) = self.model.try_lock() {
+            self.max_prompt.store(
+                model.max_prompt_tokens().unwrap_or(0),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+        match self.max_prompt.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => None,
+            n => Some(n),
+        }
+    }
+
     fn generate(
         &self,
         prompt: &str,
@@ -1945,10 +1982,15 @@ impl GenBackend for SeamGenerator {
         on_piece: &mut dyn FnMut(&str),
     ) -> anyhow::Result<infr_llama::GenStats> {
         let mut model = lock_recovered(&self.model);
-        match constraint {
+        let out = match constraint {
             Some(c) => model.generate_constrained(prompt, max_new, c, Some(req), on_piece),
             None => model.generate(prompt, max_new, Some(req), on_piece),
-        }
+        };
+        self.max_prompt.store(
+            model.max_prompt_tokens().unwrap_or(0),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        out
     }
 }
 
@@ -1988,6 +2030,15 @@ impl GenBackend for ParallelGenerator {
         sampling: infr_llama::sampling::RequestSampling,
     ) -> infr_llama::sampling::RequestCtx {
         self.engine.request_ctx(sampling)
+    }
+
+    fn can_constrain(&self) -> bool {
+        true
+    }
+
+    /// The runner keeps one row of a slot for the first reply token (see `reply_budget`).
+    fn max_prompt_tokens(&self) -> Option<usize> {
+        Some(self.engine.max_ctx().saturating_sub(1))
     }
 
     fn generate(
@@ -2048,6 +2099,32 @@ impl infr_server::ChatGenerator for SeamGenerator {
     ) -> anyhow::Result<infr_server::ChatOutcome> {
         run_chat(self, messages, tools, tool_choice, params, cancel, on_delta)
     }
+
+    fn prepare(
+        &self,
+        messages: &[infr_engine::ChatMessage],
+        tools: Option<&serde_json::Value>,
+        tool_choice: Option<&str>,
+        params: &infr_server::GenParams,
+    ) -> anyhow::Result<Option<infr_server::PreparedRequest>> {
+        prepare_for_server(self, messages, tools, tool_choice, params).map(Some)
+    }
+
+    fn chat_prepared(
+        &self,
+        prepared: infr_server::PreparedRequest,
+        messages: &[infr_engine::ChatMessage],
+        tools: Option<&serde_json::Value>,
+        tool_choice: Option<&str>,
+        params: &infr_server::GenParams,
+        cancel: &Arc<std::sync::atomic::AtomicBool>,
+        on_delta: &mut dyn FnMut(infr_engine::Delta),
+    ) -> anyhow::Result<infr_server::ChatOutcome> {
+        match prepared.into_state::<Prepared>() {
+            Some(p) => run_prepared(self, p, params, cancel, on_delta),
+            None => run_chat(self, messages, tools, tool_choice, params, cancel, on_delta),
+        }
+    }
 }
 
 impl infr_server::ChatGenerator for ParallelGenerator {
@@ -2081,6 +2158,32 @@ impl infr_server::ChatGenerator for ParallelGenerator {
     ) -> anyhow::Result<infr_server::ChatOutcome> {
         run_chat(self, messages, tools, tool_choice, params, cancel, on_delta)
     }
+
+    fn prepare(
+        &self,
+        messages: &[infr_engine::ChatMessage],
+        tools: Option<&serde_json::Value>,
+        tool_choice: Option<&str>,
+        params: &infr_server::GenParams,
+    ) -> anyhow::Result<Option<infr_server::PreparedRequest>> {
+        prepare_for_server(self, messages, tools, tool_choice, params).map(Some)
+    }
+
+    fn chat_prepared(
+        &self,
+        prepared: infr_server::PreparedRequest,
+        messages: &[infr_engine::ChatMessage],
+        tools: Option<&serde_json::Value>,
+        tool_choice: Option<&str>,
+        params: &infr_server::GenParams,
+        cancel: &Arc<std::sync::atomic::AtomicBool>,
+        on_delta: &mut dyn FnMut(infr_engine::Delta),
+    ) -> anyhow::Result<infr_server::ChatOutcome> {
+        match prepared.into_state::<Prepared>() {
+            Some(p) => run_prepared(self, p, params, cancel, on_delta),
+            None => run_chat(self, messages, tools, tool_choice, params, cancel, on_delta),
+        }
+    }
 }
 
 /// Tool-call parsing is enabled only when the request offers at least one tool and has not
@@ -2106,15 +2209,136 @@ fn forced_tool_call(body: &str) -> Option<(String, String)> {
     Some((name, serde_json::to_string(&arguments).ok()?))
 }
 
-/// The OpenAI chat body, shared by every serve backend: render the conversation through the model's
-/// own template, honour a FORCED tool_choice with an llguidance constraint, then stream the reply
-/// through the reasoning/content/tool-call splitter with stop sequences applied to the raw text.
+/// How one request's reply is generated, decided from the request before anything runs.
+enum Plan {
+    /// A forced `tool_choice`: the prompt is primed with the `<tool_call>` opener and the call body
+    /// is grammar-constrained. Wins over `response_format` — the reply is a call, not content.
+    ForcedTool(infr_llama::grammar::Constraint),
+    /// `response_format`: the whole reply is grammar-constrained JSON — or tool calls, when `tools`
+    /// are offered and callable (`calls`), as OpenAI allows under `tool_choice: "auto"`.
+    Json {
+        constraint: infr_llama::grammar::Constraint,
+        calls: bool,
+    },
+    /// Free text through the reasoning/content/tool-call splitter, parsing tool calls when
+    /// `tools` are offered and callable.
+    Free { tools: bool },
+}
+
+/// A request ready to generate: its prompt, exactly as generation will see it, and how its reply
+/// is generated. Built once per request — by [`prepare_for_server`] before the request queues, or
+/// by [`run_chat`] for a caller that did not prepare — and consumed by [`run_prepared`].
+struct Prepared {
+    prompt: String,
+    plan: Plan,
+}
+
+/// Render the request's prompt and build the constraint it needs.
 ///
-/// Backend-agnostic by construction — all the per-sequence state (sampling, RNG seed, penalties,
-/// stop matcher, abort latch) is created HERE, per call, and handed to the backend explicitly. Two
-/// concurrent calls therefore share nothing: that is what makes request A's `temperature` unable to
-/// leak into request B (the old thread-local could not offer that guarantee once one thread stepped
-/// several sequences).
+/// A request the backend cannot constrain, or whose schema the grammar engine rejects, fails with
+/// a [`infr_server::ParamError`] — a `400` naming the field at fault — never an unconstrained
+/// reply.
+///
+/// `response_format` renders with thinking OFF: its grammar constrains the whole reply to JSON,
+/// and the reasoning markers are the model's own special tokens, which that grammar does not
+/// model. llama.cpp's server instead lets the model reason first and constrains only what
+/// follows, through a per-template reasoning parser this crate does not have.
+fn prepare(
+    be: &dyn GenBackend,
+    messages: &[infr_engine::ChatMessage],
+    tools: Option<&serde_json::Value>,
+    tool_choice: Option<&str>,
+    params: &infr_server::GenParams,
+) -> anyhow::Result<Prepared> {
+    let need_constraint = |param: &'static str| -> anyhow::Result<()> {
+        if be.can_constrain() {
+            return Ok(());
+        }
+        Err(infr_server::ParamError {
+            param,
+            message: format!(
+                "{param} needs grammar-constrained generation, which this model's backend does \
+                 not support"
+            ),
+        }
+        .into())
+    };
+    // Each constraint is checked for first and compiled second: a backend that cannot apply one
+    // is refused before any grammar is built for it.
+    if infr_llama::grammar::forces_tool_call(tools, tool_choice) {
+        need_constraint("tool_choice")?;
+    }
+    if let Some(constraint) = be
+        .renderer()
+        .tool_constraint(tools, tool_choice)
+        .map_err(|e| grammar_rejected(e, "tools"))?
+    {
+        let prompt = be.renderer().render(messages, tools)?;
+        return Ok(Prepared {
+            prompt: format!("{prompt}<tool_call>\n"),
+            plan: Plan::ForcedTool(constraint),
+        });
+    }
+    let calls = tool_parsing_allowed(tools, tool_choice);
+    let Some(format) = &params.response_format else {
+        return Ok(Prepared {
+            prompt: be.renderer().render(messages, tools)?,
+            plan: Plan::Free { tools: calls },
+        });
+    };
+    need_constraint("response_format")?;
+    let constraint = be
+        .renderer()
+        .response_constraint(&format.schema(), tools.filter(|_| calls))
+        .map_err(|e| grammar_rejected(e, "response_format"))?;
+    Ok(Prepared {
+        prompt: be.renderer().render_no_think(messages, tools)?,
+        plan: Plan::Json { constraint, calls },
+    })
+}
+
+/// A grammar the engine refused, as the [`infr_server::ParamError`] naming the request field at
+/// fault — `tools` when a tool's schema is, else `param`; any other error as is.
+fn grammar_rejected(e: anyhow::Error, param: &'static str) -> anyhow::Error {
+    match e.downcast_ref::<infr_llama::grammar::GrammarRejected>() {
+        Some(r) => {
+            let param = if r.in_tools { "tools" } else { param };
+            infr_server::ParamError {
+                param,
+                message: format!("{param} cannot be enforced: {r}"),
+            }
+            .into()
+        }
+        None => e,
+    }
+}
+
+/// [`infr_server::ChatGenerator::prepare`] for every serve backend: the request [`prepare`]d once,
+/// its prompt counted against the backend's limit, carried to
+/// [`infr_server::ChatGenerator::chat_prepared`] so generation renders and builds nothing again.
+///
+/// The prompt is still tokenized twice — here to count it, and inside the backend, whose
+/// `generate` takes text. Handing the ids through would take a token-input path on every backend
+/// behind `GenBackend::generate`; a request that is not prepared tokenizes once.
+fn prepare_for_server(
+    be: &dyn GenBackend,
+    messages: &[infr_engine::ChatMessage],
+    tools: Option<&serde_json::Value>,
+    tool_choice: Option<&str>,
+    params: &infr_server::GenParams,
+) -> anyhow::Result<infr_server::PreparedRequest> {
+    let prepared = prepare(be, messages, tools, tool_choice, params)?;
+    let n = be.renderer().count_tokens(&prepared.prompt)?;
+    let saturate = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+    Ok(infr_server::PreparedRequest::new(
+        saturate(n),
+        be.max_prompt_tokens().map(saturate),
+        prepared,
+    ))
+}
+
+/// The OpenAI chat body for a caller that did not prepare the request: [`prepare`] it, then
+/// [`run_prepared`].
 fn run_chat(
     be: &dyn GenBackend,
     messages: &[infr_engine::ChatMessage],
@@ -2124,47 +2348,77 @@ fn run_chat(
     cancel: &Arc<std::sync::atomic::AtomicBool>,
     on_delta: &mut dyn FnMut(infr_engine::Delta),
 ) -> anyhow::Result<infr_server::ChatOutcome> {
-    {
-        // Refuse before generating, not after: once the weight file has been overwritten under the
-        // mapping this process cannot produce a trustworthy reply, and a served answer carries no
-        // sign that anything was wrong. One `fstat` per request, on the request thread. See
-        // `infr_gguf::watch` for what this can and cannot see.
-        be.weights().check()?;
-        // `tools` arrives already parsed (a borrowed Value) — no Value→string→Value round-trip.
-        let prompt = be.renderer().render(messages, tools)?;
-        // The request's `max_tokens`/`max_completion_tokens` wins; `sampling.max_new`
-        // (INFR_MAX_NEW, default 2048) is the server-side default for requests that don't set one.
-        let max_new = params
-            .max_tokens
-            .map(|v| v as usize)
-            .unwrap_or_else(|| be.max_new_default());
-        // THIS sequence's own sampling (temperature/top_p/top_k/seed/penalties) + abort latch + GPU
-        // turn. Owned by this call — not installed anywhere ambient — so it cannot be observed by,
-        // or leak into, any other in-flight request. The server's `cancel` (client disconnect or
-        // deadline) is linked in rather than copied from a piece callback, so it also stops a
-        // prefill that has not produced a piece yet.
-        let req = be
-            .request_ctx(request_sampling(params))
-            .with_cancel(cancel.clone());
-        // Forced tool_choice ("required"/named): grammar-constrain the call body (the same
+    let prepared = prepare(be, messages, tools, tool_choice, params)?;
+    run_prepared(be, prepared, params, cancel, on_delta)
+}
+
+/// Generate a [`Prepared`] request, shared by every serve backend: honour a FORCED tool_choice or
+/// a `response_format` with the constraint it carries, then stream the reply — through the
+/// reasoning/content/tool-call splitter, or for constrained JSON through [`ConstrainedReply`] —
+/// with stop sequences applied to the raw text.
+///
+/// The request's `logit_bias`, `min_p` and penalties shape a constrained reply too: they reach the
+/// constrained decode through the same per-request sampling as a free one, and act within what the
+/// grammar allows (a bias cannot force a token the grammar forbids).
+///
+/// Backend-agnostic by construction — all the per-sequence state (sampling, RNG seed, penalties,
+/// stop matcher, abort latch) is created HERE, per call, and handed to the backend explicitly. Two
+/// concurrent calls therefore share nothing: that is what makes request A's `temperature` unable to
+/// leak into request B (the old thread-local could not offer that guarantee once one thread stepped
+/// several sequences).
+fn run_prepared(
+    be: &dyn GenBackend,
+    prepared: Prepared,
+    params: &infr_server::GenParams,
+    cancel: &Arc<std::sync::atomic::AtomicBool>,
+    on_delta: &mut dyn FnMut(infr_engine::Delta),
+) -> anyhow::Result<infr_server::ChatOutcome> {
+    // Refuse before generating, not after: once the weight file has been overwritten under the
+    // mapping this process cannot produce a trustworthy reply, and a served answer carries no
+    // sign that anything was wrong. One `fstat` per request, on the request thread. See
+    // `infr_gguf::watch` for what this can and cannot see.
+    be.weights().check()?;
+    let Prepared { prompt, plan } = prepared;
+    // The request's `max_tokens`/`max_completion_tokens` wins; `sampling.max_new` is the
+    // server-side default for requests that don't set one (see `GenBackend::max_new_default`).
+    let max_new = params
+        .max_tokens
+        .map(|v| v as usize)
+        .unwrap_or_else(|| be.max_new_default());
+    // THIS sequence's own sampling (temperature/top_p/top_k/seed/penalties) + abort latch + GPU
+    // turn. Owned by this call — not installed anywhere ambient — so it cannot be observed by,
+    // or leak into, any other in-flight request. The server's `cancel` (client disconnect or
+    // deadline) is linked in rather than copied from a piece callback, so it also stops a
+    // prefill that has not produced a piece yet.
+    let req = be
+        .request_ctx(request_sampling(params))
+        .with_cancel(cancel.clone());
+    // A failure that is the request's fault, as the typed error serve answers `400`; `param` is
+    // the field whose constraint a backend without grammar support could not apply, `None` for an
+    // unconstrained reply.
+    let refusal = |e: &anyhow::Error, param: Option<&'static str>| {
+        context_length_exceeded(e, params.max_tokens.is_some())
+            .or_else(|| unsupported_sampling(e))
+            .or_else(|| unsupported_constraint(e, param?))
+    };
+    match plan {
+        // Forced tool_choice ("required"/named): the grammar-constrained call body (the same
         // llguidance machinery as the bespoke path — grammar::constrained_step runs inside the
-        // seam decode). Prime the assistant turn with the <tool_call> opener and parse the
-        // constrained JSON. A forced choice is a contract: the reply carries the requested call or
-        // the request fails, never ordinary text in its place.
-        if let Some(mut constraint) = be.renderer().tool_constraint(tools, tool_choice)? {
-            let primed = format!("{prompt}<tool_call>\n");
+        // seam decode), parsed from the primed `<tool_call>` opener on. A forced choice is a
+        // contract: the reply carries the requested call or the request fails, never ordinary
+        // text in its place.
+        Plan::ForcedTool(mut constraint) => {
             let mut body = String::new();
             let gstats = be
                 .generate(
-                    &primed,
+                    &prompt,
                     max_new,
                     Some(&mut constraint),
                     &req,
                     &mut |p: &str| body.push_str(p),
                 )
                 .map_err(|e| {
-                    context_length_exceeded(&e, params.max_tokens.is_some())
-                        .or_else(|| unsupported_sampling(&e))
+                    refusal(&e, Some("tool_choice"))
                         .unwrap_or_else(|| anyhow::anyhow!("forced tool call failed: {e}"))
                 })?;
             let (name, arguments) = forced_tool_call(&body).ok_or_else(|| {
@@ -2177,53 +2431,171 @@ fn run_chat(
                 }
             })?;
             on_delta(infr_engine::Delta::ToolCall { name, arguments });
-            return Ok(chat_outcome(infr_server::Finish::ToolCalls, &gstats));
+            Ok(chat_outcome(infr_server::Finish::ToolCalls, &gstats))
         }
-        let mut stream = infr_engine::ChatStream::new(tool_parsing_allowed(tools, tool_choice));
-        // Stop sequences run on the RAW decoded text, BEFORE the reasoning/tool splitter — so a
-        // stop string that spans two tokens still fires, and a partial stop prefix is held back
-        // instead of being streamed out (see `StopMatcher`). A hit latches an abort on THIS
-        // sequence's own `RequestCtx`, which its decode loop polls after the current token. The
-        // matcher and the latch are both per-call locals, so N concurrent requests each stop on
-        // their OWN stop strings and nobody else's.
-        let mut stops = infr_server::StopMatcher::new(params.stop.clone());
-        let stats = {
-            let od = &mut *on_delta;
-            // Template-prefilled thinking (the PROMPT ends with the `<think>` opener): inject a
-            // synthetic opener so the splitter emits the head as Reasoning deltas, mirroring
-            // `Chat::turn` — run and serve expose thinking identically.
-            if infr_engine::prompt_prefills_think(&prompt) {
-                stream.push("<think>", &mut *od);
-            }
+        // `response_format`: the constrained reply streams as content as it is decided, or —
+        // when the model took the grammar's tool-call branch — fires as calls at the end. A
+        // reply cut short (`max_tokens`, a stop sequence) keeps what it produced and says why.
+        Plan::Json {
+            mut constraint,
+            calls,
+        } => {
+            let mut stops = infr_server::StopMatcher::new(params.stop.clone());
+            let mut reply = ConstrainedReply::new(calls);
             let stats = be
-                .generate(&prompt, max_new, None, &req, &mut |piece: &str| {
-                    let safe = stops.push(piece);
-                    if !safe.is_empty() {
-                        stream.push(&safe, &mut *od);
-                    }
-                    // A stop sequence hit aborts THIS sequence's decode at its next poll, freeing
-                    // the GPU slot promptly (the server's `cancel` already reaches it through `req`).
-                    if stops.hit() {
-                        req.abort();
-                    }
-                })
-                .map_err(|e| {
-                    context_length_exceeded(&e, params.max_tokens.is_some())
-                        .or_else(|| unsupported_sampling(&e))
-                        .unwrap_or(e)
-                })?;
-            // No stop fired: whatever the matcher was holding back was never a stop prefix.
-            let tail = stops.flush();
-            if !tail.is_empty() {
-                stream.push(&tail, &mut *od);
+                .generate(
+                    &prompt,
+                    max_new,
+                    Some(&mut constraint),
+                    &req,
+                    &mut |piece| {
+                        reply.push(&stops.push(piece), &mut *on_delta);
+                        if stops.hit() {
+                            req.abort();
+                        }
+                    },
+                )
+                .map_err(|e| refusal(&e, Some("response_format")).unwrap_or(e))?;
+            reply.push(&stops.flush(), &mut *on_delta);
+            let finish = if reply.finish(on_delta) {
+                infr_server::Finish::ToolCalls
+            } else {
+                finish_reason(stops.hit(), &stats, max_new)
+            };
+            Ok(chat_outcome(finish, &stats))
+        }
+        Plan::Free { tools } => {
+            let mut stream = infr_engine::ChatStream::new(tools);
+            // Stop sequences run on the RAW decoded text, BEFORE the reasoning/tool splitter — so
+            // a stop string that spans two tokens still fires, and a partial stop prefix is held
+            // back instead of being streamed out (see `StopMatcher`). A hit latches an abort on
+            // THIS sequence's own `RequestCtx`, which its decode loop polls after the current
+            // token. The matcher and the latch are both per-call locals, so N concurrent requests
+            // each stop on their OWN stop strings and nobody else's.
+            let mut stops = infr_server::StopMatcher::new(params.stop.clone());
+            let stats = {
+                let od = &mut *on_delta;
+                // Template-prefilled thinking (the PROMPT ends with the `<think>` opener): inject
+                // a synthetic opener so the splitter emits the head as Reasoning deltas,
+                // mirroring `Chat::turn` — run and serve expose thinking identically.
+                if infr_engine::prompt_prefills_think(&prompt) {
+                    stream.push("<think>", &mut *od);
+                }
+                let stats = be
+                    .generate(&prompt, max_new, None, &req, &mut |piece: &str| {
+                        let safe = stops.push(piece);
+                        if !safe.is_empty() {
+                            stream.push(&safe, &mut *od);
+                        }
+                        // A stop sequence hit aborts THIS sequence's decode at its next poll,
+                        // freeing the GPU slot promptly (the server's `cancel` already reaches it
+                        // through `req`).
+                        if stops.hit() {
+                            req.abort();
+                        }
+                    })
+                    .map_err(|e| refusal(&e, None).unwrap_or(e))?;
+                // No stop fired: whatever the matcher was holding back was never a stop prefix.
+                let tail = stops.flush();
+                if !tail.is_empty() {
+                    stream.push(&tail, &mut *od);
+                }
+                stats
+            };
+            stream.finish(on_delta);
+            Ok(chat_outcome(
+                finish_reason(stops.hit(), &stats, max_new),
+                &stats,
+            ))
+        }
+    }
+}
+
+/// A backend's [`infr_llama::grammar::ConstraintUnsupported`] — a model that does not implement
+/// constrained generation — as the [`infr_server::ParamError`] serve answers `400`, naming
+/// `param`, the field that asked for the constraint.
+fn unsupported_constraint(e: &anyhow::Error, param: &'static str) -> Option<anyhow::Error> {
+    e.downcast_ref::<infr_llama::grammar::ConstraintUnsupported>()?;
+    Some(
+        infr_server::ParamError {
+            param,
+            message: format!("{e}: this request needs grammar-constrained generation"),
+        }
+        .into(),
+    )
+}
+
+/// The text a model emits to open a Hermes tool call — the `response_format` grammar's call
+/// branch, and the opener the forced tool path primes.
+const TOOL_CALL_OPEN: &str = "<tool_call>";
+
+/// Routes a `response_format` reply: content as it arrives, or — when the grammar let the model
+/// call tools and it did — calls, parsed once the reply ends. The grammar admits exactly those two
+/// shapes, so the first non-blank text decides which one this is.
+///
+/// Deliberately not `ChatStream`: its reasoning markers and bare-JSON call detection would misread
+/// a JSON answer that contains the text `<think>`, or happens to be shaped like a call.
+struct ConstrainedReply {
+    /// `None` until the reply's first non-blank text decides; then whether it is calls. Decided
+    /// from the start when the grammar has no call branch.
+    calls: Option<bool>,
+    /// Text not yet sent: everything so far while undecided, the whole reply for calls.
+    held: String,
+}
+
+impl ConstrainedReply {
+    fn new(calls_allowed: bool) -> Self {
+        Self {
+            calls: (!calls_allowed).then_some(false),
+            held: String::new(),
+        }
+    }
+
+    fn push(&mut self, text: &str, on_delta: &mut dyn FnMut(infr_engine::Delta)) {
+        if text.is_empty() {
+            return;
+        }
+        if self.calls == Some(false) {
+            on_delta(infr_engine::Delta::Content(text.to_string()));
+            return;
+        }
+        self.held.push_str(text);
+        if self.calls.is_some() {
+            return;
+        }
+        let head = self.held.trim_start();
+        if head.starts_with(TOOL_CALL_OPEN) {
+            self.calls = Some(true);
+        } else if !TOOL_CALL_OPEN.starts_with(head) {
+            self.calls = Some(false);
+            on_delta(infr_engine::Delta::Content(std::mem::take(&mut self.held)));
+        }
+    }
+
+    /// Send what is held. Returns whether tool calls were sent. A call block that does not parse
+    /// (cut off by `max_tokens`) is sent as content, as an unforced reply's would be.
+    fn finish(self, on_delta: &mut dyn FnMut(infr_engine::Delta)) -> bool {
+        if self.held.is_empty() {
+            return false;
+        }
+        if self.calls == Some(true) {
+            let (rest, calls) = infr_engine::parse_hermes_tool_calls(&self.held);
+            if !calls.is_empty() {
+                if !rest.trim().is_empty() {
+                    on_delta(infr_engine::Delta::Content(rest));
+                }
+                for call in calls {
+                    on_delta(infr_engine::Delta::ToolCall {
+                        name: call.name,
+                        arguments: serde_json::to_string(&call.arguments)
+                            .unwrap_or_else(|_| "{}".to_string()),
+                    });
+                }
+                return true;
             }
-            stats
-        };
-        stream.finish(on_delta);
-        Ok(chat_outcome(
-            finish_reason(stops.hit(), &stats, max_new),
-            &stats,
-        ))
+        }
+        on_delta(infr_engine::Delta::Content(self.held));
+        false
     }
 }
 
@@ -2289,27 +2661,22 @@ fn context_length_exceeded(
 ) -> Option<anyhow::Error> {
     let o = e.downcast_ref::<infr_llama::ContextOverflow>()?;
     let usable = o.max_ctx.saturating_sub(1);
-    let message = if o.gen == 0 {
-        format!(
-            "This model's maximum context length is {} tokens. However, your messages resulted in \
-             {} tokens. Please reduce the length of the messages.",
-            usable, o.prompt
-        )
+    if o.gen == 0 {
+        return Some(infr_server::ContextLengthExceeded::prompt_too_long(usable, o.prompt).into());
+    }
+    let advice = if client_set_max_tokens {
+        "Please reduce the length of the messages or completion."
     } else {
-        let advice = if client_set_max_tokens {
-            "Please reduce the length of the messages or completion."
-        } else {
-            "Please reduce the length of the messages."
-        };
-        format!(
-            "This model's maximum context length is {} tokens. However, you requested {} tokens \
-             ({} in the messages, {} in the completion). {advice}",
-            usable,
-            o.prompt + o.gen,
-            o.prompt,
-            o.gen
-        )
+        "Please reduce the length of the messages."
     };
+    let message = format!(
+        "This model's maximum context length is {} tokens. However, you requested {} tokens ({} \
+         in the messages, {} in the completion). {advice}",
+        usable,
+        o.prompt + o.gen,
+        o.prompt,
+        o.gen
+    );
     Some(infr_server::ContextLengthExceeded { message }.into())
 }
 
@@ -5621,5 +5988,490 @@ mod tests {
             1,
             "the KV session is dropped once, after the panic, not on every request"
         );
+    }
+
+    // --- response_format: reply routing and request planning --------------------------------
+
+    /// Feed `pieces` through a [`ConstrainedReply`]; returns its deltas and whether it fired calls.
+    fn route_reply(calls_allowed: bool, pieces: &[&str]) -> (Vec<infr_engine::Delta>, bool) {
+        let mut out = Vec::new();
+        let mut reply = ConstrainedReply::new(calls_allowed);
+        for p in pieces {
+            reply.push(p, &mut |d| out.push(d));
+        }
+        let fired = reply.finish(&mut |d| out.push(d));
+        (out, fired)
+    }
+
+    fn content_of(deltas: &[infr_engine::Delta]) -> String {
+        deltas
+            .iter()
+            .filter_map(|d| match d {
+                infr_engine::Delta::Content(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A constrained JSON reply is content, streamed as it is decided — including text a
+    /// reasoning splitter would misread — while a reply that took the grammar's call branch
+    /// fires its calls, even with the opener split across pieces. A call block cut short is
+    /// shown as content, as an unforced reply's would be.
+    #[test]
+    fn a_constrained_reply_is_content_or_calls() {
+        let (d, fired) = route_reply(false, &["{\"a\": ", "\"<think>\"}"]);
+        assert!(!fired);
+        assert_eq!(d.len(), 2, "content must stream piece by piece: {d:?}");
+        assert_eq!(content_of(&d), "{\"a\": \"<think>\"}");
+
+        let (d, fired) = route_reply(true, &[" ", "{\"name\": \"x\"", "}"]);
+        assert!(!fired);
+        assert_eq!(content_of(&d), " {\"name\": \"x\"}");
+
+        let (d, fired) = route_reply(
+            true,
+            &[
+                "<tool",
+                "_call>\n{\"name\": \"get_weather\", ",
+                "\"arguments\": {\"city\": \"Oslo\"}}\n</tool_call>",
+            ],
+        );
+        assert!(fired);
+        assert_eq!(content_of(&d), "");
+        match d.as_slice() {
+            [infr_engine::Delta::ToolCall { name, arguments }] => {
+                assert_eq!(name, "get_weather");
+                assert_eq!(arguments, "{\"city\":\"Oslo\"}");
+            }
+            other => panic!("expected one call: {other:?}"),
+        }
+
+        let cut = "<tool_call>\n{\"name\": \"get_w";
+        let (d, fired) = route_reply(true, &[cut]);
+        assert!(!fired);
+        assert_eq!(content_of(&d), cut);
+    }
+
+    /// A chat-template GGUF with no weights: a byte-level vocabulary plus Qwen's control and
+    /// marker tokens, and a template that honours `enable_thinking` as Qwen3's does — enough for
+    /// an [`infr_llama::chat::OaiRenderer`] and the grammar environment, with no model download.
+    fn chat_only_gguf() -> infr_testkit::gguf::TempGguf {
+        use infr_testkit::gguf::{Meta, SyntheticModel, TempGguf};
+        // The byte-level alphabet: one token per byte, as GPT-2's BPE spells bytes.
+        let mut bytes: Vec<String> = (0u8..=255)
+            .map(|b| {
+                let c = match b {
+                    b'!'..=b'~' | 0xA1..=0xAC | 0xAE..=0xFF => char::from(b),
+                    _ => char::from_u32(256 + u32::from(b)).expect("a char"),
+                };
+                c.to_string()
+            })
+            .collect();
+        bytes.sort_unstable();
+        bytes.dedup();
+        let mut types = vec![1i32; bytes.len()];
+        let mut tokens = bytes;
+        for (t, ty) in [
+            ("<|im_start|>", 3),
+            ("<|im_end|>", 3),
+            ("<think>", 4),
+            ("</think>", 4),
+            ("<tool_call>", 4),
+            ("</tool_call>", 4),
+        ] {
+            tokens.push(t.to_string());
+            types.push(ty);
+        }
+        let eos = tokens.iter().position(|t| t == "<|im_end|>").expect("eos") as u32;
+        let template = "{% for m in messages %}{{ '<|im_start|>' + m.role + '\\n' + m.content + \
+                        '<|im_end|>\\n' }}{% endfor %}{% if add_generation_prompt %}{{ \
+                        '<|im_start|>assistant\\n' }}{% if enable_thinking is defined and \
+                        enable_thinking is false %}{{ '<think>\\n\\n</think>\\n\\n' }}{% endif \
+                        %}{% endif %}";
+        let model = SyntheticModel {
+            meta: vec![
+                ("tokenizer.ggml.model".into(), Meta::Str("gpt2".into())),
+                ("tokenizer.ggml.tokens".into(), Meta::StrArr(tokens)),
+                ("tokenizer.ggml.token_type".into(), Meta::I32Arr(types)),
+                ("tokenizer.ggml.merges".into(), Meta::StrArr(Vec::new())),
+                ("tokenizer.ggml.eos_token_id".into(), Meta::U32(eos)),
+                ("tokenizer.chat_template".into(), Meta::Str(template.into())),
+            ],
+            tensors: Vec::new(),
+        };
+        TempGguf::write("chat-only", &model)
+    }
+
+    /// A serve backend over [`chat_only_gguf`]'s renderer, with no model: `generate` records the
+    /// prompt and replies with `reply`'s pieces. `renders` counts every reach for the renderer —
+    /// the render, the constraint build and the token count all go through it.
+    struct ScriptBackend {
+        _gguf: infr_testkit::gguf::TempGguf,
+        renderer: infr_llama::chat::OaiRenderer,
+        watch: infr_llama::WeightWatch,
+        constrains: bool,
+        renders: std::sync::atomic::AtomicUsize,
+        reply: Vec<&'static str>,
+        prompts: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl ScriptBackend {
+        fn new(constrains: bool, reply: &[&'static str]) -> Self {
+            let gguf = chat_only_gguf();
+            Self {
+                renderer: infr_llama::chat::OaiRenderer::open(
+                    gguf.path(),
+                    Arc::new(Config::default()),
+                )
+                .expect("renderer"),
+                watch: infr_llama::WeightWatch::open_model(gguf.path()).expect("watch"),
+                _gguf: gguf,
+                constrains,
+                renders: Default::default(),
+                reply: reply.to_vec(),
+                prompts: Default::default(),
+            }
+        }
+
+        fn renders(&self) -> usize {
+            self.renders.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    impl GenBackend for ScriptBackend {
+        fn renderer(&self) -> &infr_llama::chat::OaiRenderer {
+            self.renders
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            &self.renderer
+        }
+        fn weights(&self) -> &infr_llama::WeightWatch {
+            &self.watch
+        }
+        fn max_new_default(&self) -> usize {
+            64
+        }
+        fn request_ctx(
+            &self,
+            sampling: infr_llama::sampling::RequestSampling,
+        ) -> infr_llama::sampling::RequestCtx {
+            infr_llama::sampling::RequestCtx::new(sampling)
+        }
+        fn can_constrain(&self) -> bool {
+            self.constrains
+        }
+        fn max_prompt_tokens(&self) -> Option<usize> {
+            Some(4095)
+        }
+        fn generate(
+            &self,
+            prompt: &str,
+            _max_new: usize,
+            _constraint: Option<&mut infr_llama::grammar::Constraint>,
+            _req: &infr_llama::sampling::RequestCtx,
+            on_piece: &mut dyn FnMut(&str),
+        ) -> anyhow::Result<infr_llama::GenStats> {
+            self.prompts.lock().unwrap().push(prompt.to_string());
+            for p in &self.reply {
+                on_piece(p);
+            }
+            Ok(infr_llama::GenStats {
+                n_gen: self.reply.len(),
+                natural_stop: true,
+                ..Default::default()
+            })
+        }
+    }
+
+    fn params_with(format: Option<infr_server::ResponseFormat>) -> infr_server::GenParams {
+        infr_server::GenParams {
+            response_format: format,
+            ..Default::default()
+        }
+    }
+
+    fn user_hi() -> [infr_engine::ChatMessage; 1] {
+        [infr_engine::ChatMessage {
+            role: "user".into(),
+            content: "hi".into(),
+            ..Default::default()
+        }]
+    }
+
+    fn weather_tools() -> serde_json::Value {
+        serde_json::json!([{"type": "function", "function": {
+            "name": "get_weather",
+            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}
+        }}])
+    }
+
+    /// How `tools`, `tool_choice` and `response_format` combine (B137): a forced call wins and
+    /// primes the call opener; with tools callable (`auto` or unset) the JSON grammar also admits
+    /// calls, as OpenAI allows; `none` or no tools leaves JSON only. Every `response_format` plan
+    /// renders with thinking off; free text keeps it. No model: a template-only GGUF.
+    #[test]
+    fn response_format_and_tools_combine_as_openai_does() {
+        let be = ScriptBackend::new(true, &[]);
+        let msgs = user_hi();
+        let tools = weather_tools();
+        let json = params_with(Some(infr_server::ResponseFormat::JsonObject));
+        let plan = |tools: Option<&serde_json::Value>, choice: Option<&str>| {
+            prepare(&be, &msgs, tools, choice, &json).expect("prepare")
+        };
+        const NO_THINK: &str = "<think>\n\n</think>\n\n";
+
+        for forced in ["required", "get_weather"] {
+            let p = plan(Some(&tools), Some(forced));
+            assert!(matches!(p.plan, Plan::ForcedTool(_)), "{forced}");
+            assert!(p.prompt.ends_with("<tool_call>\n"), "{forced}");
+        }
+        for choice in [None, Some("auto")] {
+            let p = plan(Some(&tools), choice);
+            assert!(
+                matches!(p.plan, Plan::Json { calls: true, .. }),
+                "{choice:?}"
+            );
+            assert!(p.prompt.ends_with(NO_THINK), "{choice:?}: {:?}", p.prompt);
+        }
+        for (t, choice) in [(Some(&tools), Some("none")), (None, None)] {
+            let p = plan(t, choice);
+            assert!(
+                matches!(p.plan, Plan::Json { calls: false, .. }),
+                "{choice:?}"
+            );
+            assert!(p.prompt.ends_with(NO_THINK));
+        }
+        let free = prepare(&be, &msgs, Some(&tools), None, &params_with(None)).expect("prepare");
+        assert!(matches!(free.plan, Plan::Free { tools: true }));
+        assert!(
+            !free.prompt.ends_with(NO_THINK),
+            "thinking stays on: {:?}",
+            free.prompt
+        );
+
+        // The count is the planned prompt's, against the backend's limit.
+        let prepared = prepare_for_server(&be, &msgs, None, None, &json).expect("prepare");
+        let want = be
+            .renderer
+            .count_tokens(&plan(None, None).prompt)
+            .expect("tokenize");
+        assert_eq!(prepared.prompt_tokens as usize, want);
+        assert_eq!(prepared.context_length, Some(4095));
+    }
+
+    /// A request prepared for the server renders, builds its constraint and counts
+    /// its tokens once; generating from that preparation reaches for the renderer no more, and
+    /// generates the very prompt that was counted. Generation through the constrained reply path
+    /// still yields the reply as content.
+    #[test]
+    fn a_prepared_request_is_rendered_once() {
+        let be = ScriptBackend::new(true, &["{\"a\"", ": 1}"]);
+        let msgs = user_hi();
+        let json = params_with(Some(infr_server::ResponseFormat::JsonObject));
+        let prepared = prepare_for_server(&be, &msgs, None, None, &json).expect("prepare");
+        let after_prepare = be.renders();
+        assert!(after_prepare > 0);
+        let state: Prepared = prepared.into_state().expect("our own state");
+        let counted_prompt = state.prompt.clone();
+        let mut content = String::new();
+        let outcome = run_prepared(
+            &be,
+            state,
+            &json,
+            &Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            &mut |d| {
+                if let infr_engine::Delta::Content(t) = d {
+                    content.push_str(&t);
+                }
+            },
+        )
+        .expect("generate");
+        assert_eq!(be.renders(), after_prepare, "generation rendered again");
+        assert_eq!(*be.prompts.lock().unwrap(), vec![counted_prompt]);
+        assert_eq!(content, "{\"a\": 1}");
+        assert_eq!(outcome.finish, infr_server::Finish::Stop);
+
+        // Unprepared, `run_chat` prepares itself — once.
+        let be = ScriptBackend::new(true, &["{}"]);
+        run_chat(
+            &be,
+            &msgs,
+            None,
+            None,
+            &json,
+            &Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            &mut |_| {},
+        )
+        .expect("generate");
+        let once = be.renders();
+        let be2 = ScriptBackend::new(true, &[]);
+        prepare(&be2, &msgs, None, None, &json).expect("prepare");
+        assert_eq!(once, be2.renders(), "run_chat prepared more than once");
+    }
+
+    /// What cannot be honoured is a `400` naming the field at fault, before anything generates: a
+    /// schema the grammar engine rejects (the tools' fault when a tool's schema is), a malformed
+    /// tool, or a constraint on a backend that cannot apply one. A `oneOf` is no longer one of
+    /// them.
+    #[test]
+    fn an_unenforceable_request_is_a_param_error_naming_its_field() {
+        let be = ScriptBackend::new(true, &[]);
+        let plain = ScriptBackend::new(false, &[]);
+        let msgs = user_hi();
+        let param_of = |r: anyhow::Result<Prepared>| -> (&'static str, String) {
+            let e = r.err().expect("must be refused");
+            let p = e
+                .downcast_ref::<infr_server::ParamError>()
+                .unwrap_or_else(|| panic!("untyped: {e:#}"));
+            (p.param, p.message.clone())
+        };
+        let schema = |v| params_with(Some(infr_server::ResponseFormat::JsonSchema(v)));
+        let bad = schema(serde_json::json!({"if": {}}));
+        let (param, msg) = param_of(prepare(&be, &msgs, None, None, &bad));
+        assert_eq!(param, "response_format");
+        assert!(msg.contains("if"), "{msg}");
+
+        let json = params_with(Some(infr_server::ResponseFormat::JsonObject));
+        let bad_tool = serde_json::json!([{"type": "function", "function": {
+            "name": "f", "parameters": {"if": {}}
+        }}]);
+        assert_eq!(
+            param_of(prepare(&be, &msgs, Some(&bad_tool), None, &json)).0,
+            "tools"
+        );
+        assert_eq!(
+            param_of(prepare(
+                &be,
+                &msgs,
+                Some(&bad_tool),
+                Some("required"),
+                &params_with(None)
+            ))
+            .0,
+            "tools"
+        );
+        let nameless = serde_json::json!([{"type": "function", "function": {}}]);
+        assert_eq!(
+            param_of(prepare(&be, &msgs, Some(&nameless), None, &json)).0,
+            "tools"
+        );
+        let one_of = serde_json::json!([{"type": "function", "function": {
+            "name": "f", "parameters": {"oneOf": [
+                {"type": "object", "properties": {"a": {"type": "string"}}},
+                {"type": "object", "properties": {"b": {"type": "integer"}}}
+            ]}
+        }}]);
+        assert!(
+            prepare(&be, &msgs, Some(&one_of), None, &json).is_ok(),
+            "oneOf in a tool"
+        );
+
+        assert_eq!(
+            param_of(prepare(&plain, &msgs, None, None, &json)).0,
+            "response_format"
+        );
+        let tools = serde_json::json!([{"type": "function", "function": {"name": "f"}}]);
+        assert_eq!(
+            param_of(prepare(
+                &plain,
+                &msgs,
+                Some(&tools),
+                Some("required"),
+                &params_with(None)
+            ))
+            .0,
+            "tool_choice"
+        );
+        // A backend that cannot constrain is refused before any grammar is compiled: the bad
+        // tool schema is never reached.
+        assert_eq!(
+            param_of(prepare(
+                &plain,
+                &msgs,
+                Some(&bad_tool),
+                Some("required"),
+                &params_with(None)
+            ))
+            .0,
+            "tool_choice"
+        );
+        assert_eq!(
+            param_of(prepare(&plain, &msgs, None, None, &bad)).0,
+            "response_format"
+        );
+        // Free text needs no constraint, so the same backend serves it.
+        assert!(prepare(&plain, &msgs, None, None, &params_with(None)).is_ok());
+    }
+
+    /// A model that keeps `ChatModel`'s default `generate_constrained` fails a
+    /// constrained request with the typed `ConstraintUnsupported`, which serve answers as a `400`
+    /// naming the field that asked for the grammar — not a `500`.
+    #[test]
+    fn an_unsupported_constraint_from_the_backend_is_a_param_error() {
+        for (field, want) in [
+            ("response_format", "response_format"),
+            ("tool_choice", "tool_choice"),
+        ] {
+            let e: anyhow::Error = infr_llama::grammar::ConstraintUnsupported.into();
+            let mapped = unsupported_constraint(&e, want).expect("typed");
+            let p = mapped
+                .downcast_ref::<infr_server::ParamError>()
+                .expect("a ParamError");
+            assert_eq!(p.param, want, "{field}");
+        }
+        assert!(unsupported_constraint(&anyhow::anyhow!("other"), "tools").is_none());
+    }
+
+    /// A model whose session opens after the generator is built: `limit` is what it reports once
+    /// open, `0` before.
+    struct LateSession(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl infr_llama::chat::ChatModel for LateSession {
+        fn render(&self, _messages: &[(&str, &str)]) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+
+        fn generate(
+            &mut self,
+            _prompt: &str,
+            _max_new: usize,
+            _req: Option<&infr_llama::sampling::RequestCtx>,
+            _on_piece: &mut dyn FnMut(&str),
+        ) -> anyhow::Result<infr_llama::GenStats> {
+            Ok(Default::default())
+        }
+
+        fn max_prompt_tokens(&self) -> Option<usize> {
+            match self.0.load(std::sync::atomic::Ordering::Relaxed) {
+                0 => None,
+                n => Some(n),
+            }
+        }
+    }
+
+    /// The serialised generator learns a session's size when a request is prepared, not only after
+    /// a generation: a session opened after construction bounds the very next request, and a
+    /// generation holding the model is never waited on.
+    #[test]
+    fn a_late_session_bounds_the_next_prepared_request() {
+        let gguf = chat_only_gguf();
+        let limit = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let generator = SeamGenerator {
+            model: std::sync::Mutex::new(Box::new(LateSession(limit.clone()))),
+            renderer: infr_llama::chat::OaiRenderer::open(gguf.path(), Arc::new(Config::default()))
+                .expect("renderer"),
+            watch: infr_llama::WeightWatch::open_model(gguf.path()).expect("watch"),
+            backend: "cpu",
+            vocab: 0,
+            constrains: false,
+            max_prompt: 0.into(),
+        };
+        assert_eq!(GenBackend::max_prompt_tokens(&generator), None);
+        limit.store(4095, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(GenBackend::max_prompt_tokens(&generator), Some(4095));
+        // While a generation holds the model, the last value read stands.
+        let held = generator.model.lock().unwrap();
+        limit.store(10, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(GenBackend::max_prompt_tokens(&generator), Some(4095));
+        drop(held);
     }
 }

@@ -535,6 +535,68 @@ fn non_presence_grammars_are_preserved() {
     );
 }
 
+/// The serve keys for Host validation, SSE keep-alive and the body limit (B137, B82). The host
+/// list reads the same from every layer — comma-separated in the environment and `--set`, a TOML
+/// array in a file — and an empty value is "unset" (the default policy), not an empty list. A
+/// keep-alive of `0` is a value (off) that beats a file; a body limit of `0` is junk and falls
+/// back to the default.
+#[test]
+fn serve_host_list_keepalive_and_body_limit_grammars() {
+    let d = Config::default();
+    assert_eq!(d.serve.allowed_hosts, None);
+    assert_eq!(d.serve.sse_keepalive_secs, 15);
+    assert_eq!(d.serve.max_body_bytes, 2 << 20);
+
+    let hosts = |layer: PartialConfig| Config::load_from_layers(&[layer]).serve.allowed_hosts;
+    let two = Some(vec!["a.example".to_string(), "b.example".to_string()]);
+    assert_eq!(
+        hosts(env_layer(&[(
+            "INFR_SERVE_ALLOWED_HOSTS",
+            " a.example, b.example,"
+        )])),
+        two
+    );
+    for blank in ["", " ", ",", " , ", "none"] {
+        assert_eq!(
+            hosts(env_layer(&[("INFR_SERVE_ALLOWED_HOSTS", blank)])),
+            None,
+            "{blank:?}"
+        );
+    }
+    assert_eq!(
+        hosts(file_layer(
+            "[serve]\nallowed_hosts = [\"a.example\", \"b.example\"]\n"
+        )),
+        two
+    );
+    assert_eq!(
+        hosts(cli_layer(&["serve.allowed_hosts=a.example,b.example"])),
+        two
+    );
+    assert_eq!(
+        hosts(env_layer(&[("INFR_SERVE_ALLOWED_HOSTS", "*")])),
+        Some(vec!["*".to_string()])
+    );
+
+    assert_eq!(
+        Config::load_from_layers(&[
+            file_layer("[serve]\nsse_keepalive_secs = 30\n"),
+            env_layer(&[("INFR_SERVE_SSE_KEEPALIVE_SECS", "0")]),
+        ])
+        .serve
+        .sse_keepalive_secs,
+        0,
+        "an explicit 0 in the environment must switch off a keep-alive the file set"
+    );
+    for (value, want) in [("0", 2u64 << 20), ("8388608", 8 << 20)] {
+        let cfg = Config::load_from_layers(&[env_layer(&[("INFR_SERVE_MAX_BODY_BYTES", value)])]);
+        assert_eq!(
+            cfg.serve.max_body_bytes, want,
+            "INFR_SERVE_MAX_BODY_BYTES={value:?}"
+        );
+    }
+}
+
 /// The asymmetric mrows-attn pair: `INFR_NO_MROWS_ATTN` WINS when both are set.
 #[test]
 fn mrows_attn_pair_is_asymmetric() {
@@ -1332,6 +1394,9 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_TUNE_DISABLE",
         "INFR_TUNE_FILE",
         "INFR_TUNE_NO_ROWS",
+        "INFR_SERVE_ALLOWED_HOSTS",
+        "INFR_SERVE_SSE_KEEPALIVE_SECS",
+        "INFR_SERVE_MAX_BODY_BYTES",
     ];
 
     let mut got: Vec<&str> = KEYS.iter().filter(|k| k.migrated).map(|k| k.env).collect();

@@ -839,6 +839,34 @@ cfg_struct! {
         /// happened emits nothing, so an idle server's log stays clean and the knob is only worth
         /// reaching for when the log itself is expensive.
         stats_interval_secs: u64 = 5,
+        /// `INFR_SERVE_ALLOWED_HOSTS`: the host names a request's `Host` may carry, comma-separated
+        /// in the environment, a list in a file. `*` turns the check off; an empty list is unset.
+        /// An entry that is not a bare host name or address (a URL, a path, a `*.x` pattern) stops
+        /// the server at startup.
+        ///
+        /// Unset, the check guards only a KEYLESS LOOPBACK server, and allows the loopback names
+        /// (`localhost`, `*.localhost`, `127.0.0.1`, `[::1]`) and the bind host, on any port, and a
+        /// request with no `Host`. That is DNS-rebinding protection: a web page whose hostname
+        /// re-resolves to `127.0.0.1` is same-origin with the server and could otherwise drive
+        /// it, but its requests carry its own hostname. A server with an API key, or one bound to
+        /// a non-loopback address, has chosen its exposure and is not checked. Set, the listed
+        /// names are allowed IN ADDITION to the loopback ones, and the check applies whatever the
+        /// bind address or key — the reverse-proxy and custom-hostname case. `/health` is never
+        /// checked.
+        allowed_hosts: Option<Vec<String>> = None,
+        /// `INFR_SERVE_SSE_KEEPALIVE_SECS`: how long a streamed reply may go quiet before the
+        /// server sends an SSE comment line, in seconds. `0` sends none; an interval past the
+        /// server's ceiling (`MAX_SSE_KEEPALIVE` in infr-server) is held to that ceiling.
+        ///
+        /// A long prefill or a grammar-forced tool call sends nothing until the first token, and a
+        /// proxy with an idle timeout cuts a stream that has been silent too long. A comment line
+        /// is ignored by every conforming SSE parser, so it keeps the connection alive without
+        /// changing what the client reads. The default is axum's own keep-alive interval.
+        sse_keepalive_secs: u64 = 15,
+        /// `INFR_SERVE_MAX_BODY_BYTES`: the largest request body accepted, in bytes; a larger one
+        /// is a `413`. Must be positive, else the default — which is axum's own default body
+        /// limit, the limit this server applied before the knob existed.
+        max_body_bytes: u64 = 2_097_152,
     }
 }
 

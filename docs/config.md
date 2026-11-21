@@ -432,7 +432,36 @@ deadline in seconds; `0`, the default, means no deadline — a deadline truncate
 a legitimate slow reply, so it is opt-in), and `stats_interval_secs`
 (`INFR_SERVE_STATS_SECS` — how often the server logs its throughput line,
 default `5`; `0` switches the line off). Per-request sampling is not here — it
-stays on the request.
+stays on the request. Three more keys shape the HTTP surface:
+
+| key                  | env                             | what it does                                                                                                                     |
+| -------------------- | ------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| `allowed_hosts`      | `INFR_SERVE_ALLOWED_HOSTS`      | host names a request's `Host` header may carry (comma-separated in the environment, a list in the file); `*` turns the check off |
+| `sse_keepalive_secs` | `INFR_SERVE_SSE_KEEPALIVE_SECS` | how long a streamed reply may stay silent before the server sends an SSE comment line; `0` sends none                            |
+| `max_body_bytes`     | `INFR_SERVE_MAX_BODY_BYTES`     | the largest request body accepted; a larger one is a `413`                                                                       |
+
+**The `Host` check is DNS-rebinding protection.** A web page whose hostname
+re-resolves to `127.0.0.1` is same-origin with a local server and could drive
+it, but its requests still carry the page's own hostname. With `allowed_hosts`
+unset, the check guards only a server with no API key bound to a loopback
+address: it accepts `localhost`, any `*.localhost` name, `127.0.0.1`, `[::1]`
+and the bind host, on any port (so an SSH or container port forward works), and
+a request with no `Host` at all, which no browser sends. Anything else is a
+`403` whose body names this key. A server with an API key, or one bound to a
+non-loopback address, is not checked unless the key is set; once set, the listed
+names are allowed in addition to the loopback ones and the check always applies,
+which is the reverse-proxy and custom-hostname case. An entry that could never
+match (a URL, a path, a `*.x` pattern) stops the server at startup. `/health` is
+never checked.
+
+**`response_format`** is enforced, not ignored: `json_object` constrains the
+reply to a JSON object and `json_schema` to the given schema, streamed or not,
+on every path that can force a tool call (Vulkan at any `--parallel`, CPU, a
+Metal session). A path that cannot constrain (DiffusionGemma, a Metal
+speculative draft) answers `400`, as does a schema the grammar engine rejects.
+Thinking is switched off for such a request. Numbers the schema leaves unbounded
+are limited in length so a reply cannot run digits to `max_tokens`, and exponent
+form is not produced; strings and nesting are not bounded.
 
 The throughput line is **activity-only**: an interval in which nothing happened
 emits nothing, so an idle server leaves a clean log and there is no heartbeat to

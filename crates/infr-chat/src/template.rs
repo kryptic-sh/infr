@@ -373,6 +373,7 @@ pub fn render_chat_jinja(
         Value::Null,
         add_generation_prompt,
         cfg,
+        thinking_enabled(cfg),
     )
     .ok()
 }
@@ -398,6 +399,32 @@ pub fn render_chat_oai(
     add_generation_prompt: bool,
     cfg: &Config,
 ) -> Result<String, TemplateError> {
+    render_chat_oai_thinking(
+        gguf,
+        tokenizer,
+        eos,
+        messages,
+        tools,
+        add_generation_prompt,
+        cfg,
+        thinking_enabled(cfg),
+    )
+}
+
+/// [`render_chat_oai`] with the template's `enable_thinking` given per call instead of read from
+/// `sampling.no_think` — for a request that must not reason (serve's `response_format`, whose
+/// grammar constrains the whole reply).
+#[allow(clippy::too_many_arguments)]
+pub fn render_chat_oai_thinking(
+    gguf: &Gguf,
+    tokenizer: &Tokenizer,
+    eos: u32,
+    messages: &[ChatMessage],
+    tools: Option<&Value>,
+    add_generation_prompt: bool,
+    cfg: &Config,
+    enable_thinking: bool,
+) -> Result<String, TemplateError> {
     let msgs: Vec<Value> = messages.iter().map(message_to_json).collect();
     let tools = tools.cloned().unwrap_or(Value::Null);
     render_core(
@@ -408,6 +435,7 @@ pub fn render_chat_oai(
         tools,
         add_generation_prompt,
         cfg,
+        enable_thinking,
     )
 }
 
@@ -453,6 +481,7 @@ fn render_core(
     tools: Value,
     add_generation_prompt: bool,
     cfg: &Config,
+    think: bool,
 ) -> Result<String, TemplateError> {
     let template = gguf
         .metadata()
@@ -472,7 +501,7 @@ fn render_core(
     // ignored by non-thinking templates, and thinking-capable models (Qwen3, Qwen3.5)
     // then behave the same under `infr run`/`serve` regardless of what their template's own
     // default is (Qwen3.5 defaults itself OFF via `enable_thinking is defined and is true`).
-    let think = thinking_enabled(cfg);
+    // `think` is that default (`thinking_enabled`) unless the caller overrides it for one render.
     match render_template(
         template,
         msgs,
@@ -497,13 +526,13 @@ fn render_core(
     }
 }
 
-/// The `enable_thinking` a render gets, from `sampling.no_think` ([`render_core`] used to
-/// read the `INFR_NO_THINK` variable from the process environment right here).
+/// The `enable_thinking` a render gets by default, from `sampling.no_think` (the renderer used to
+/// read the `INFR_NO_THINK` variable from the process environment instead).
 ///
 /// `INFR_NO_THINK=1` turns thinking OFF and `INFR_NO_THINK=0` is a NO-OP, matching the other
 /// `INFR_NO_*` toggles — that is the `SetNotZero` env grammar the config layer parses, so the
 /// polarity lives in exactly one place and this is a plain negation.
-fn thinking_enabled(cfg: &Config) -> bool {
+pub fn thinking_enabled(cfg: &Config) -> bool {
     !cfg.sampling.no_think
 }
 

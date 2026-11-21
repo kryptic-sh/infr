@@ -8,6 +8,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Breaking
 
+- **`infr serve` checks the `Host` header on a keyless loopback server.** A
+  request whose `Host` is not a loopback name (`localhost`, `*.localhost`,
+  `127.0.0.1`, `[::1]`, or the bind host, on any port) now gets a `403` naming
+  `serve.allowed_hosts`. A same-host reverse proxy that forwards the public
+  hostname, or a container reaching the server as `host.docker.internal`, must
+  list that name in `serve.allowed_hosts` (`INFR_SERVE_ALLOWED_HOSTS`), set an
+  API key, or set `["*"]`. A request with no `Host` passes. `/health` is never
+  checked.
+- **`infr_server` request types gained public fields.**
+  `ChatRequest::response_format` and `GenParams::response_format` are new, so a
+  struct literal of either must set one or use `..Default::default()`.
+  `infr_llama::ChatModel::generate_constrained`'s default now fails with the
+  typed `grammar::ConstraintUnsupported`, and `ConstraintEnv::constraint` fails
+  with `grammar::GrammarRejected` for a schema the grammar engine refuses.
+
 - **Host paging API.** `infr_cpu::paged::plan_pools` takes the model's weights
   as `Pageable`s (size and read pattern, an expert bank's with its layer)
   instead of `TensorInfo`s; `PoolPlan` gains a public `experts` field, so struct
@@ -41,6 +56,48 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `GenParams::from_request`.
 
 ### Added
+
+- **`response_format` is enforced by `infr serve`.** `{"type":"json_object"}`
+  constrains the reply to a JSON object and
+  `{"type":"json_schema","json_schema":{"schema":…}}` to that schema, streamed
+  or not, through the grammar engine that already forces tool calls. With tools
+  offered and `tool_choice` unset or `auto`, the model may answer in the format
+  or call a tool; a forced `tool_choice` wins; `none` leaves only the format. A
+  `json_schema` with no schema means any JSON value, and `oneOf` is read as
+  `anyOf`. Thinking is switched off for such a request. A number the schema
+  leaves unbounded is limited in length and exponent form is not produced, so a
+  reply cannot run digits to `max_tokens`; strings and nesting are not bounded.
+  A type infr does not know, a schema the grammar engine cannot enforce or a
+  backend that cannot constrain (DiffusionGemma, a Metal speculative draft) is a
+  `400` naming the field. It was accepted and ignored before.
+- **Schemas are checked before they reach the grammar engine**, for
+  `response_format` and for every tool's `parameters`. A `400` naming the field
+  now answers: a schema nested too deep counting the references it follows, or
+  with too many references or values (a long `$ref` chain in a small request
+  used to overflow the compiler's stack and take the server down); a `$ref` that
+  is not a plain local pointer (`#` or `#/…`), and `$id`, `$anchor` and the
+  dynamic and recursive reference keywords; a `$schema` other than draft-06,
+  draft-07, 2019-09 or 2020-12; a keyword the engine does not implement, such as
+  `not` or `if`; a `multipleOf` too fine or too large for it to match, alone or
+  combined with another in the same schema; and an integer bound past what its
+  arithmetic holds. Grammars compile on a thread with its own large stack.
+- **`serve.allowed_hosts`, `serve.sse_keepalive_secs`, `serve.max_body_bytes`**
+  (`INFR_SERVE_ALLOWED_HOSTS`, `INFR_SERVE_SSE_KEEPALIVE_SECS`,
+  `INFR_SERVE_MAX_BODY_BYTES`). The first extends or disables the `Host` check
+  above; an entry that could never match stops the server at startup. The second
+  sets how long a streamed reply may stay silent before the server sends an SSE
+  comment line, so an idle-timeout proxy does not cut a long prefill; it is on
+  by default and `0` turns it off. The third is the largest request body
+  accepted, defaulting to the limit that already applied.
+- **A request is prepared before it takes a slot.** New defaulted
+  `infr_server::ChatGenerator::prepare` and `chat_prepared`, with
+  `PreparedRequest`: the prompt is rendered and counted and any grammar built
+  once, up front, and generation starts from that result. A generator that
+  implements only `chat` keeps working. New in `infr_llama`:
+  `ChatModel::supports_constraint` and `max_prompt_tokens` (both defaulted),
+  `ToolConstrainer::response_constraint`, `grammar::forces_tool_call`, and
+  `OaiRenderer::{render_no_think, response_constraint, count_tokens}`; in
+  `infr_chat`, `render_chat_oai_thinking` and a public `thinking_enabled`.
 
 - **GPU logits held to the CPU reference within a tolerance.** New public module
   `infr_llama::tolerance`: `score_row` and `RunScore` (KL divergence, top-set
@@ -342,6 +399,27 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   the slot alignment each needs.
 
 ### Changed
+
+- **An over-long prompt is a real `400` on a stream.** `infr serve` counts the
+  prompt before it queues the request, so a streamed request whose prompt does
+  not fit gets `400 context_length_exceeded` where it used to get a `200`
+  followed by an error frame, and it no longer waits for a slot first. The
+  `request start` log line now carries `prompt_tokens`. A session with no fixed
+  context (CPU, MTP) is still refused by the runner.
+- **Request errors name the field at fault.** A tool with no `function.name`, a
+  tool schema the grammar engine rejects, a `tool_choice` naming a tool that was
+  not offered, and a forced `tool_choice` on a backend that cannot constrain are
+  `400`s naming `tools` or `tool_choice`; some were `500`s. Forced tool calls
+  now read `oneOf` as `anyOf` and bound the whitespace between JSON tokens, as
+  `response_format` replies do, and a tool whose `parameters` use `#/$defs/…`
+  references (the shape Pydantic generates) now compiles: its references are
+  rewritten to where the parameters sit in the call schema. They did not resolve
+  before.
+- **DiffusionGemma under `serve` trims its reply to the room left.** A session
+  is capped at the model's trained context; a reply that would not fit is cut to
+  the whole blocks that do and finishes `length`, and only a prompt that leaves
+  no room for one block is refused, with `400 context_length_exceeded`. An
+  over-long prompt used to open an arbitrarily large session.
 
 - **NEON int8 kernels on aarch64 (Apple Silicon, Arm Linux).** Q4_K, Q6_K and
   Q8_0 weights, one-row and batch (the default `Q4_K_M` quantization is Q4_K and

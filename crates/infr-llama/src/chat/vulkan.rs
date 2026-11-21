@@ -174,6 +174,11 @@ impl ChatModel for DenseSeamChat {
         )
     }
 
+    /// One row of the session is kept for the first reply token (see `reply_budget`).
+    fn max_prompt_tokens(&self) -> Option<usize> {
+        self.session.as_ref().map(|s| s.max_ctx.saturating_sub(1))
+    }
+
     fn generate_constrained(
         &mut self,
         prompt: &str,

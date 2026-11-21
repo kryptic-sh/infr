@@ -48,6 +48,12 @@ reference to judge tuned values against.
 | 10    | [Kernels with per-device tunable parameters](10-tunable-kernels.md), one tuning table           | S1 done                                        |
 | 12    | [Vulkan devices without matrix units or fast int8 dot (GCN class)](12-low-capability-vulkan.md) | not started; S0 waits on the issue 94 reporter |
 
+## Caps, refusals and open decisions
+
+| Phase | What                                                                                                    | Status                         |
+| ----- | ------------------------------------------------------------------------------------------------------- | ------------------------------ |
+| 13    | [Replace the caps, refusals and open decisions with implementations](13-caps-refusals-and-decisions.md) | S1 done; S2 onward not started |
+
 ## Notes on the model phases
 
 Every phase was scoped on 2026-11-13 from the llama.cpp checkout at

@@ -125,9 +125,33 @@ pub trait ChatModel {
         Ok(())
     }
 
+    /// Whether [`generate_constrained`](Self::generate_constrained) works on this backend, so
+    /// serve can refuse a request that needs a grammar before it is queued instead of failing it
+    /// mid-generation. Answers for the backend as built, without opening a session.
+    ///
+    /// `true` by default, because that is what a backend that implements `generate_constrained`
+    /// needs, and the trait cannot tell whether one does. A backend that does not — and so keeps
+    /// the default `generate_constrained` — still fails a constrained request with the typed
+    /// [`crate::grammar::ConstraintUnsupported`], which serve also answers `400`; overriding this
+    /// to `false` only moves that answer ahead of the queue.
+    fn supports_constraint(&self) -> bool {
+        true
+    }
+
+    /// The longest prompt, in tokens, a [`generate`](Self::generate) call accepts here — one
+    /// longer fails with [`crate::ContextOverflow`]. `None` when the backend does not know yet
+    /// (a session not opened) or has no fixed limit (a stateless backend that sizes its context
+    /// per call). Serve reads it to refuse an over-long prompt before the request is queued.
+    fn max_prompt_tokens(&self) -> Option<usize> {
+        None
+    }
+
     /// Like [`generate`](Self::generate), with an llguidance grammar constraint applied to the
-    /// decode (serve's FORCED tool_choice). Backends without constraint support return an error,
-    /// and the serve request then fails: a forced choice is never answered unconstrained.
+    /// decode (serve's FORCED tool_choice and `response_format`). Backends without constraint
+    /// support return an error, and the serve request then fails: a forced choice is never
+    /// answered unconstrained. The default refuses with the typed
+    /// [`crate::grammar::ConstraintUnsupported`]; an in-tree backend that keeps it also overrides
+    /// [`supports_constraint`](Self::supports_constraint) to `false`, so serve refuses up front.
     fn generate_constrained(
         &mut self,
         _prompt: &str,
@@ -136,9 +160,7 @@ pub trait ChatModel {
         _req: Option<&crate::sampling::RequestCtx>,
         _on_piece: &mut dyn FnMut(&str),
     ) -> Result<GenStats> {
-        Err(anyhow::anyhow!(
-            "grammar-constrained generation is not supported by this backend"
-        ))
+        Err(crate::grammar::ConstraintUnsupported.into())
     }
 }
 
@@ -292,7 +314,8 @@ pub struct OaiRenderer {
     gguf: infr_gguf::Gguf,
     tokenizer: tokenizers::Tokenizer,
     eos: u32,
-    /// Forced tool-call constraints, sharing one tokenizer environment across requests.
+    /// Forced tool-call and `response_format` constraints, sharing one tokenizer environment
+    /// across requests.
     tools: crate::grammar::ToolConstrainer,
     /// The engine configuration this renderer was opened with — `infr-chat`'s renderer reads
     /// `sampling.no_think` / `debug.chat` off it. Held as the `Arc` the caller resolved in
@@ -342,7 +365,34 @@ impl OaiRenderer {
         messages: &[infr_chat::ChatMessage],
         tools: Option<&serde_json::Value>,
     ) -> Result<String> {
-        infr_chat::render_chat_oai(
+        self.render_thinking(messages, tools, infr_chat::thinking_enabled(&self.ecfg))
+    }
+
+    /// [`Self::render`] with the model's reasoning switched off for this one prompt, whatever
+    /// `sampling.no_think` says — for a reply that must be nothing but grammar-constrained JSON.
+    ///
+    /// The template's `enable_thinking` is the switch, and a template that ignores it still
+    /// prefills an open `<think>`: that block is closed here, empty, the way thinking templates
+    /// close it themselves when told not to think, so the reply starts at the answer.
+    pub fn render_no_think(
+        &self,
+        messages: &[infr_chat::ChatMessage],
+        tools: Option<&serde_json::Value>,
+    ) -> Result<String> {
+        let mut prompt = self.render_thinking(messages, tools, false)?;
+        if infr_chat::prompt_prefills_think(&prompt) {
+            prompt.push_str("\n</think>\n\n");
+        }
+        Ok(prompt)
+    }
+
+    fn render_thinking(
+        &self,
+        messages: &[infr_chat::ChatMessage],
+        tools: Option<&serde_json::Value>,
+        enable_thinking: bool,
+    ) -> Result<String> {
+        infr_chat::render_chat_oai_thinking(
             &self.gguf,
             &self.tokenizer,
             self.eos,
@@ -350,6 +400,7 @@ impl OaiRenderer {
             tools,
             true,
             &self.ecfg,
+            enable_thinking,
         )
         .map_err(|e| match e {
             // No embedded template at all → the standard "infr requires an instruct model" error.
@@ -370,6 +421,29 @@ impl OaiRenderer {
         let vocab = self.tokenizer.get_vocab_size(true);
         self.tools
             .constraint(&self.tokenizer, vocab, &[self.eos], tools, tool_choice)
+    }
+
+    /// The `response_format` constraint for this model's tokenizer: a JSON value matching
+    /// `schema`, or tool calls when `tools` are offered and callable (see
+    /// [`crate::grammar::ToolConstrainer::response_constraint`]).
+    pub fn response_constraint(
+        &self,
+        schema: &serde_json::Value,
+        tools: Option<&serde_json::Value>,
+    ) -> Result<crate::grammar::Constraint> {
+        let vocab = self.tokenizer.get_vocab_size(true);
+        self.tools
+            .response_constraint(&self.tokenizer, vocab, &[self.eos], schema, tools)
+    }
+
+    /// How many tokens `prompt` is, tokenized exactly as the generation paths tokenize a rendered
+    /// prompt (`SeamModel::encode`: special tokens parsed, nothing added).
+    pub fn count_tokens(&self, prompt: &str) -> Result<usize> {
+        Ok(self
+            .tokenizer
+            .encode(prompt, false)
+            .map_err(|e| anyhow::anyhow!("encode: {e}"))?
+            .len())
     }
 
     /// Detokenize ids (markers preserved) — the serve-side parse of a constrained tool-call body.
@@ -415,6 +489,32 @@ mod tests {
             on_piece(&self.reply);
             Ok(GenStats::default())
         }
+    }
+
+    /// A `ChatModel` that predates `supports_constraint` — one that implements
+    /// only `generate` — must not start refusing constrained requests up front: the default says
+    /// it supports them, and its default `generate_constrained` refuses with the typed
+    /// `ConstraintUnsupported` serve answers as a `400`, as before.
+    #[test]
+    fn an_old_chat_model_keeps_its_constraint_behaviour() {
+        let mut model = ScriptModel {
+            rendered: Default::default(),
+            reply: "x".into(),
+        };
+        assert!(model.supports_constraint());
+        let tok = crate::grammar::tests_support::byte_tokenizer();
+        let vocab = tok.get_vocab_size(true);
+        let mut c = crate::grammar::ToolConstrainer::default()
+            .response_constraint(&tok, vocab, &[0], &serde_json::json!({}), None)
+            .expect("constraint");
+        let e = model
+            .generate_constrained("p", 4, &mut c, None, &mut |_| {})
+            .unwrap_err();
+        assert!(
+            e.downcast_ref::<crate::grammar::ConstraintUnsupported>()
+                .is_some(),
+            "{e:#}"
+        );
     }
 
     #[test]

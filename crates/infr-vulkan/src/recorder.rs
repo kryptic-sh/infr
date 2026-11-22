@@ -2149,7 +2149,9 @@ impl<'a> Recorder<'a> {
     }
 
     /// Decode (m=1) f32 GEMV over `linear_f32_mo.comp` with `2^tpo_log2` threads per output
-    /// (1..=8). Requires `in_f % 4 == 0` and a 16-byte-aligned `arena_addr`.
+    /// (`tpo_log2` at most 8). Requires `in_f % 4 == 0` and a 16-byte-aligned `arena_addr`. The
+    /// grid is one workgroup per `256 >> tpo_log2` outputs, split into two dimensions past the
+    /// guaranteed grid width, which a vocabulary-sized `out_f` reaches.
     pub fn linear_f32_mo_at(
         &self,
         arena_addr: u64,
@@ -2171,7 +2173,7 @@ impl<'a> Recorder<'a> {
         push[12..16].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
         push[16..20].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
         let per_wg = 256usize >> tpo_log2;
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(x), Self::vkb(x), Self::vkb(y)],
             1,
@@ -12247,6 +12249,8 @@ mod tests {
         // Workgroup-per-unit kernels (rope family, attention, qk_norm_rope, linear_bf16).
         const HD: usize = 64;
         const UNITS: usize = 5;
+        // `linear_f32_mo` outputs.
+        const N_MO: usize = 4 * 10 + 3;
         // `deltanet_gates_seq` runs one thread per (row, value head) in 256-wide workgroups.
         const DN_ROWS: usize = 3 * 256 / 4 + 1;
         // Sentinel bytes after every buffer's declared size.
@@ -12675,6 +12679,16 @@ mod tests {
                         b[0], b[1], b[2], ka, va, b[3], UNITS, UNITS, 1, 1, HD, 0, 0, 0.0, false,
                         false, 0,
                     )
+                }),
+            ),
+            // Four outputs per workgroup at 64 threads per output: the grid is ragged, and
+            // splits with padding workgroups after it.
+            (
+                "linear_f32_mo_at",
+                vec![f(HD), (N_MO * HD * 4, Fill::Data, Kv), f(N_MO)],
+                Box::new(|r, b| {
+                    let a = b[1].device_addr().unwrap();
+                    r.linear_f32_mo_at(a, b[0], b[2], HD, N_MO, 6)
                 }),
             ),
             (

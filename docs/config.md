@@ -180,8 +180,9 @@ path list. What follows is the shape plus the knobs people actually reach for.
 
 **`[device]`** — which GPU (`dev`), how much context (`ctx`), the prefill
 micro-batch (`ubatch`, `ubatch_parallel`), CPU `threads`, and three low-level
-device knobs (`submit_dispatches` for the iGPU submit splitter, `subgroup_pref`
-to force subgroup 16 or 32, and `gpu_wait_timeout_ms`, below).
+device knobs (`submit_dispatches`, the submit splitter's starting cap and kill
+switch, see [Vulkan kernel tuning](#vulkan-kernel-tuning); `subgroup_pref` to
+force subgroup 16 or 32, and `gpu_wait_timeout_ms`, below).
 
 **`device.gpu_wait_timeout_ms`** (`INFR_GPU_WAIT_TIMEOUT_MS`, default 120000) is
 the longest the Vulkan backend waits for one piece of submitted GPU work. A wait
@@ -255,8 +256,8 @@ and these exist to force one off when bisecting a correctness or perf problem.
   `flash_min_rows`, `pv_splits`), DeltaNet (`dn_chunk_scan`, `dn_chunk`,
   `dn_split`), and the plumbing switches (`push_desc`, `pipeline_cache_disk`,
   `no_replay`, `no_vram_guard`, `gfx_queue` — stay on the compositor's graphics
-  ring instead of a compute-only one — the BDA chunk caps). Note `f16 = false` also
-  disables coopmat regardless of `coopmat`, matching `INFR_NO_F16`'s effect
+  ring instead of a compute-only one — the BDA chunk caps). Note `f16 = false`
+  also disables coopmat regardless of `coopmat`, matching `INFR_NO_F16`'s effect
   today. The hardware-shaped numbers (split counts, thresholds, rows per
   workgroup, subgroup pins) are per-device tuning parameters, set under
   `[kernels.vulkan.tune]`; see the next section.
@@ -312,16 +313,74 @@ gemv_sg.rows                2      default
 `--json` prints the same as a document. The `hash` is also in the device banner
 (`tune:7751091e`), so a log says whether two runs tuned alike.
 
-One parameter is not a kernel choice: `submit.initial_dispatches`, the submit
-splitter's cap before any forward has been measured (`0` = one command buffer
-per forward). Its default is 128 on an integrated GPU, 64 on a discrete device
-that is wave64-only or has neither 16x16x16 f16 cooperative matrices nor an
-accelerated int8 dot (the device facts `matrix_units` and `dot_accelerated` in
-`infr tune show --json`), and 0 otherwise. A device that reports neither fact,
-an unknown card included, starts at 64: splitting a fast card's first forward
-costs a few submits, while not splitting a slow one's lost the device (issue
-94). The default spares single-token forwards on a discrete card; a value set at
-any other level, or `device.submit_dispatches`, applies to every forward.
+Three parameters are not kernel choices; they decide how a forward is cut into
+submits, so that no submit runs long enough for a driver's watchdog to reset the
+GPU and drop the work. That limit is a time, about 2 s by default on both
+systems measured: Windows' `TdrDelay`, and amdgpu's `lockup_timeout` on Linux
+(2000 ms, issue 94). Vulkan does not report either, so the defaults assume it.
+
+`submit.initial_dispatches` is the submit splitter's dispatch cap before any
+forward has been measured (`0` = no cap). Its default is 128 on an integrated
+GPU, 64 on a discrete device that is wave64-only or has neither 16x16x16 f16
+cooperative matrices nor an accelerated int8 dot (the device facts
+`matrix_units` and `dot_accelerated` in `infr tune show --json`), and 0
+otherwise. A device that reports neither fact, an unknown card included, starts
+at 64: splitting a fast card's first forward costs a few submits, while not
+splitting a slow one's lost the device (issue 94). The default spares
+single-token forwards on a discrete card; a value set at any other level, or
+`device.submit_dispatches`, applies to every forward. Whatever the starting
+value, after each forward the splitter lowers the cap to what would have kept
+that forward's submits at 250 ms each (never below 16), and never raises it
+again in that process. So `device.submit_dispatches = N`
+(`INFR_SUBMIT_DISPATCHES=N`) sets where the cap STARTS, not where it ends: on
+issue 94's RX 580, 128 and 256 both ended on the 62 the measured forwards asked
+for. `device.submit_dispatches = 0` is the kill switch: one submit per forward,
+nothing measured, and no cut from the work bound below either.
+
+`submit.budget_ms` bounds work rather than dispatches, on every device and from
+the first forward. Its default is 250 on an integrated GPU or a slow-class
+device (the ones above that start with a dispatch cap) and 1000 elsewhere. Every
+prefill GEMM and GEMV over more than one row, and the non-coopmat flash prefill
+attention, estimates its GPU time before it is recorded. A dispatch estimated
+past the budget is cut into ranges of its workgroup grid, each in a submit of
+its own, with output bit-identical to the whole dispatch; and a submit is closed
+at the next op boundary once the work recorded into it reaches the budget. The
+watchdog counts a submit's time, not a dispatch's (on the integrated GPU
+measured, eight dispatches of 0.39 s in one submit were reset like one dispatch
+of 3.1 s, and the same eight in eight submits completed), so the ranges need
+their own submits. 250 is an eighth of the 2 s limit: the estimate before a
+kernel has been measured is a guess, a second program using the GPU stretches a
+submit (by about a second in one measurement), and 250 ms is what the
+dispatch-count splitter already aims at. 1000, half the limit, is the forward
+time at which that splitter already starts cutting a card it otherwise leaves
+alone: there the estimates stay the pessimistic guess for all but the heaviest
+dispatches, and a tighter budget would cut forwards that measure far under it.
+`0` turns the work bound off; the dispatch-count splitter still applies.
+
+The estimate is the op's FLOPs over a throughput: the one measured for that
+kernel earlier in the process when there is one (a dispatch estimated at a
+thirty-second of the budget or more is timed; the first sample replaces the
+prior, later ones can only make the kernel slower), else `submit.prior_gflops`,
+8 GFLOP/s per compute unit (16 on a device that reports none), scaled up for the
+faster kernel families (8 times for an accelerated int8 dot, 16 for matrix
+units). The prior is meant to be pessimistic, so a device's first forward is cut
+more than it needs, not less: the integrated GPU measured takes three extra
+submits in its first prefill forward at default settings and none after. On a
+fast card the estimates of a small or mid-sized model's forward at the default
+batch stay under the budget and nothing is cut or timed; a large model's can
+reach it and take a cut that a measurement would show it did not need. On an
+integrated device or one in the slow class, a dispatch whose kernel cannot be
+cut and has been MEASURED at more than eight times the budget is refused with an
+error naming the kernel before it is submitted; no kernel that carries an
+estimate is uncuttable today, and anywhere else nothing is refused. Dispatches
+without an estimate (everything but the kernels above, and every single-row
+forward) count as free: the dispatch cap is what bounds those.
+
+`kernels.vulkan.gfx_queue` decides which queue the submits go to, and with it
+which of the driver's watchdogs applies: a discrete card submits on a
+compute-only queue family when it has one. amdgpu documents a longer job timeout
+for its compute rings than for the graphics ring, but the budget does not count
+on it: the 2 s figure is the tighter one, and it is the one that was measured.
 
 Each value is resolved once, when the backend is created, from these levels —
 the last one that sets a parameter wins, per parameter:

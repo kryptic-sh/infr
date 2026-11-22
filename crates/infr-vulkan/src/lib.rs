@@ -31,6 +31,7 @@ pub mod tp_allreduce;
 pub mod tp_sem;
 pub mod tuning;
 mod vkext;
+mod work;
 
 pub use ep::{EpBuffer, ExpertParallelBackend};
 pub use gpu_wait::DEFAULT_GPU_WAIT_TIMEOUT_MS;
@@ -375,6 +376,11 @@ struct VulkanShared {
     external_semaphore_fd: Option<ash::khr::external_semaphore_fd::Device>,
     /// Generic cache of compute kernels by name (see `ops.rs`).
     kernels: Mutex<HashMap<&'static str, crate::ops::ComputeKernel>>,
+    /// `DISPATCH_BASE` twins of kernels whose dispatches the work bound cut into ranges, by
+    /// kernel name (see `VulkanBackend::dispatch_base_pipeline`).
+    base_pipelines: Mutex<HashMap<&'static str, vk::Pipeline>>,
+    /// The work bound on one dispatch and one submit (`crate::work`).
+    work: crate::work::WorkModel,
     /// Device pipeline cache, seeded from disk at init and persisted back (see `pcache.rs`) so
     /// pipeline creation after the first-ever launch reuses cached driver binaries. Null when
     /// creation failed (caching is then simply off — Vulkan accepts a null cache everywhere).
@@ -454,6 +460,8 @@ struct VulkanShared {
     /// Segments a forward closed and submitted before its recording ended, by cause — see
     /// [`SegmentCuts`].
     segment_cuts: [AtomicU64; SegmentCut::COUNT],
+    /// Dispatches the work bound recorded as several ranges ([`VulkanBackend::work_splits`]).
+    work_splits: AtomicU64,
     /// The per-device kernel parameters, resolved once at creation (`tuning::resolve`). Every
     /// kernel choice reads its field here; nothing looks a parameter up by name.
     tuning: tuning::Tuning,
@@ -559,6 +567,11 @@ impl Drop for VulkanShared {
         }
         unsafe {
             self.gpu_wait.destroy(&self.device);
+            if let Ok(map) = self.base_pipelines.lock() {
+                for p in map.values() {
+                    self.device.destroy_pipeline(*p, None);
+                }
+            }
             if let Ok(map) = self.kernels.lock() {
                 for k in map.values() {
                     crate::ops::destroy_compute_kernel(&self.device, k);
@@ -2798,6 +2811,13 @@ impl VulkanBackend {
         // `infr_core::initial_submit_dispatch_cap` over the device facts, so `infr tune show`
         // says what the first forward runs with and why).
         let slow_device = facts.slow_class();
+        // The work bound (`crate::work`); only a reset-prone device ever refuses a dispatch.
+        let work = crate::work::WorkModel::new(
+            tuned.submit_budget_ms,
+            tuned.submit_prior_gflops,
+            facts.dot_accelerated,
+            facts.reset_prone(),
+        );
         let submit_dispatch_cap = cfg
             .device
             .submit_dispatches
@@ -2949,6 +2969,8 @@ impl VulkanBackend {
                 has_dma_buf: has_ext_mem_dma_buf,
                 external_semaphore_fd,
                 kernels: Mutex::new(HashMap::new()),
+                base_pipelines: Mutex::new(HashMap::new()),
+                work,
                 pipeline_cache,
                 pcache,
                 weight_pb: Mutex::new(None),
@@ -2971,6 +2993,7 @@ impl VulkanBackend {
                 segment_gpu_ns: AtomicU64::new(0),
                 untimed_segments: AtomicU64::new(0),
                 segment_cuts: [const { AtomicU64::new(0) }; SegmentCut::COUNT],
+                work_splits: AtomicU64::new(0),
                 uma_overflow_type,
                 host_overflow_type,
                 kv_spill: SpillTally::default(),
@@ -3303,6 +3326,16 @@ impl VulkanBackend {
     /// large a cap costs a device-lost. So a slow sample tightens the bound and a fast one is
     /// simply ignored.
     pub(crate) fn observe_forward(&self, busy_ns: u64, dispatches: usize) {
+        // What the splitter did, for a report (`RUST_LOG=infr_vulkan=debug`): the totals are the
+        // backend's so far, not this forward's.
+        tracing::debug!(
+            "[infr] forward: {dispatches} dispatches, GPU busy {:.1} ms; so far {:?}, {} \
+             dispatch(es) cut into ranges, measured GFLOP/s {:?}",
+            busy_ns as f64 / 1e6,
+            self.segment_cuts(),
+            self.work_splits(),
+            self.work_measured_gflops(),
+        );
         let cur = self.submit_dispatch_cap();
         let next = next_submit_cap(cur, busy_ns, dispatches, self.shared.submit_split_disabled);
         if next != cur {
@@ -3321,11 +3354,56 @@ impl VulkanBackend {
             // the same reason.
             if cur == 0 {
                 tracing::warn!(
-                    "[infr] submit splitter ARMED: a forward kept the GPU busy {:.0} ms over                      {dispatches} dispatches (past the {} ms danger threshold), so forwards now                      split every {next} dispatches for the rest of this process. Set                      INFR_SUBMIT_DISPATCHES=0 to disable.",
+                    "[infr] submit splitter ARMED: a forward kept the GPU busy {:.0} ms over \
+                     {dispatches} dispatches (past the {} ms danger threshold), so forwards now \
+                     split every {next} dispatches for the rest of this process. Set \
+                     INFR_SUBMIT_DISPATCHES=0 to disable.",
                     busy_ns as f64 / 1e6,
                     infr_core::SUBMIT_DANGER_NS / 1_000_000,
                 );
             }
+        }
+    }
+
+    /// Count one dispatch the work bound recorded as several ranges (`crate::work`).
+    pub(crate) fn note_work_split(&self) {
+        self.shared.work_splits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Dispatches this backend's work bound has recorded as several ranges, because their
+    /// estimated GPU time passed `submit.budget_ms`, since the backend was created.
+    pub fn work_splits(&self) -> u64 {
+        self.shared.work_splits.load(Ordering::Relaxed)
+    }
+
+    /// The kernels whose dispatches the work bound has cut into ranges in this backend (each had
+    /// a `DISPATCH_BASE` twin built), sorted.
+    pub fn split_kernels(&self) -> Vec<&'static str> {
+        let mut v: Vec<_> = self
+            .shared
+            .base_pipelines
+            .lock()
+            .unwrap()
+            .keys()
+            .copied()
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// The throughput the work bound has measured for each kernel it timed in this backend, in
+    /// GFLOP/s, sorted by kernel name: what its estimates use in place of `submit.prior_gflops`.
+    pub fn work_measured_gflops(&self) -> Vec<(&'static str, f64)> {
+        self.shared.work.measured_gflops()
+    }
+
+    /// The estimated work, in ns, at which a forward closes its open segment: `submit.budget_ms`,
+    /// or `0` (never) when it is 0 or the kill switch `device.submit_dispatches = 0` is set.
+    pub(crate) fn work_cut_budget_ns(&self) -> u64 {
+        if self.shared.submit_split_disabled {
+            0
+        } else {
+            self.shared.work.budget_ns()
         }
     }
 
@@ -3344,6 +3422,7 @@ impl VulkanBackend {
             early: n(SegmentCut::Early),
             rotation: n(SegmentCut::Rotation),
             drain: n(SegmentCut::Drain),
+            work: n(SegmentCut::Work),
         }
     }
 
@@ -5181,10 +5260,10 @@ fn next_submit_cap(cur: usize, busy_ns: u64, dispatches: usize, disabled: bool) 
 }
 
 /// Why a forward closed the open segment and submitted it before its recording ended — without
-/// waiting, except for [`SegmentCut::Drain`], which waits for the queue. The first two are
-/// `adapter::execute_static`'s cuts at an op boundary, checked in this order by [`segment_cut`]:
-/// the watchdog bound first, so the early cadence can only ever add cuts to the ones the splitter
-/// makes.
+/// waiting, except for [`SegmentCut::Drain`], which waits for the queue. `Watchdog`, `Work` and
+/// `Early` are `adapter::execute_static`'s cuts at an op boundary, checked in that order by
+/// [`segment_cut`]: the splitter's two bounds first, so the early cadence can only ever add cuts
+/// to the ones the splitter makes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SegmentCut {
     /// The submit splitter's dispatch cap (`VulkanShared::submit_dispatch_cap`) was reached.
@@ -5196,22 +5275,30 @@ pub(crate) enum SegmentCut {
     /// A paged MoE layer that was not wholly resident read its router ids back
     /// (`adapter::sync_stream`), submitting the open segment and draining the queue.
     Drain = 3,
+    /// The work recorded into the segment reached the work bound (`submit.budget_ms`, see
+    /// `crate::work`).
+    Work = 4,
 }
 
 impl SegmentCut {
     /// How many causes there are: the size of `VulkanShared::segment_cuts`.
-    const COUNT: usize = SegmentCut::Drain as usize + 1;
+    const COUNT: usize = SegmentCut::Work as usize + 1;
 }
 
-/// Which cut, if any, a segment holding `dispatches` takes under the splitter's `watchdog_cap` and
-/// the paged `early` cadence (either `0` = off). Pure, so the precedence is testable without a GPU.
+/// Which cut, if any, a segment holding `dispatches` dispatches and `work_ns` of estimated work
+/// takes under the splitter's `watchdog_cap`, its `work_budget_ns` and the paged `early` cadence
+/// (each `0` = off). Pure, so the precedence is testable without a GPU.
 pub(crate) fn segment_cut(
     dispatches: usize,
     watchdog_cap: usize,
+    work_ns: u64,
+    work_budget_ns: u64,
     early: usize,
 ) -> Option<SegmentCut> {
     if watchdog_cap > 0 && dispatches >= watchdog_cap {
         Some(SegmentCut::Watchdog)
+    } else if work_budget_ns > 0 && work_ns >= work_budget_ns {
+        Some(SegmentCut::Work)
     } else if early > 0 && dispatches >= early {
         Some(SegmentCut::Early)
     } else {
@@ -5234,6 +5321,9 @@ pub struct SegmentCuts {
     /// submitted the open segment and waited for the queue to drain before it could stage its
     /// routed experts.
     pub drain: u64,
+    /// Cuts made by the work bound: the estimated GPU time recorded into the segment reached
+    /// `submit.budget_ms`.
+    pub work: u64,
 }
 
 /// One forward's timing for the submit splitter, started by [`VulkanBackend::forward_clock`] and
@@ -5843,13 +5933,36 @@ mod tests {
     /// cadence says; the cadence only cuts below the cap, and either count at `0` is off.
     #[test]
     fn the_watchdog_cut_takes_precedence_over_early_submit() {
-        assert_eq!(segment_cut(64, 64, 16), Some(SegmentCut::Watchdog));
-        assert_eq!(segment_cut(64, 64, 64), Some(SegmentCut::Watchdog));
-        assert_eq!(segment_cut(20, 64, 16), Some(SegmentCut::Early));
-        assert_eq!(segment_cut(15, 64, 16), None);
-        assert_eq!(segment_cut(20, 0, 16), Some(SegmentCut::Early));
-        assert_eq!(segment_cut(20, 16, 0), Some(SegmentCut::Watchdog));
-        assert_eq!(segment_cut(1_000_000, 0, 0), None);
+        assert_eq!(segment_cut(64, 64, 0, 0, 16), Some(SegmentCut::Watchdog));
+        assert_eq!(segment_cut(64, 64, 0, 0, 64), Some(SegmentCut::Watchdog));
+        assert_eq!(segment_cut(20, 64, 0, 0, 16), Some(SegmentCut::Early));
+        assert_eq!(segment_cut(15, 64, 0, 0, 16), None);
+        assert_eq!(segment_cut(20, 0, 0, 0, 16), Some(SegmentCut::Early));
+        assert_eq!(segment_cut(20, 16, 0, 0, 0), Some(SegmentCut::Watchdog));
+        assert_eq!(segment_cut(1_000_000, 0, 0, 0, 0), None);
+    }
+
+    /// The work cut: a segment of FEW dispatches whose estimated work reaches the budget is cut,
+    /// which the dispatch count alone (the rule before it) never did; the count cap still comes
+    /// first, the early cadence after, and a budget of `0` is off.
+    #[test]
+    fn the_work_cut_closes_a_heavy_segment_of_few_dispatches() {
+        const MS: u64 = 1_000_000;
+        assert_eq!(
+            segment_cut(3, 128, 250 * MS, 250 * MS, 0),
+            Some(SegmentCut::Work)
+        );
+        assert_eq!(segment_cut(3, 128, 249 * MS, 250 * MS, 0), None);
+        assert_eq!(
+            segment_cut(128, 128, 900 * MS, 250 * MS, 0),
+            Some(SegmentCut::Watchdog)
+        );
+        assert_eq!(
+            segment_cut(20, 0, 300 * MS, 250 * MS, 16),
+            Some(SegmentCut::Work)
+        );
+        assert_eq!(segment_cut(20, 0, 300 * MS, 0, 16), Some(SegmentCut::Early));
+        assert_eq!(segment_cut(3, 0, u64::MAX, 0, 0), None);
     }
 
     /// The arming rule over GPU-busy time: a never-split device arms only past the danger

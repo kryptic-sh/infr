@@ -203,6 +203,7 @@ fn cuts_since(be: &VulkanBackend, before: SegmentCuts) -> SegmentCuts {
         early: after.early - before.early,
         rotation: after.rotation - before.rotation,
         drain: after.drain - before.drain,
+        work: after.work - before.work,
     }
 }
 

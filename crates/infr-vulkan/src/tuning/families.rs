@@ -694,6 +694,36 @@ pub(crate) static PARAMS: &[Param] = &[
         get: |t, _| Value::Uint(t.submit_initial_dispatches as u64),
         set: |t, _, v| t.submit_initial_dispatches = v.usize(),
     },
+    Param {
+        family: "submit",
+        name: "budget_ms",
+        kind: Kind::Host,
+        ty: uint(0, 60_000),
+        axis: Axis::None,
+        doc: "GPU time, in ms, that no single dispatch and no single submit of a forward is \
+              estimated to exceed: a heavier prefill GEMM or GEMV is cut into ranges of its \
+              grid, each in its own submit, and a submit is closed once its estimated work \
+              reaches it (0 = no work bound; the dispatch-count splitter still applies)",
+        rule: "250 on an integrated or slow-class device (an eighth of the 2 s after which a \
+               driver's watchdog resets a submit); else 1000",
+        default: |f, _| Value::Uint(u64::from(crate::work::default_budget_ms(f.reset_prone()))),
+        get: |t, _| Value::Uint(u64::from(t.submit_budget_ms)),
+        set: |t, _, v| t.submit_budget_ms = v.u32(),
+    },
+    Param {
+        family: "submit",
+        name: "prior_gflops",
+        kind: Kind::Host,
+        ty: uint(1, U32),
+        axis: Axis::None,
+        doc: "throughput, in GFLOP/s for the whole device, the work estimate assumes for the \
+              slowest prefill kernel family before this process has measured the kernel \
+              (faster families scale it up; a measurement replaces it)",
+        rule: "8 per compute unit (2 units when the count is unknown)",
+        default: |f, _| Value::Uint(crate::work::prior_gflops(f.compute_units) as u64),
+        get: |t, _| Value::Uint(u64::from(t.submit_prior_gflops)),
+        set: |t, _, v| t.submit_prior_gflops = v.u32(),
+    },
     // ── prefill GEMM ─────────────────────────────────────────────────────────
     Param {
         family: "split_k",

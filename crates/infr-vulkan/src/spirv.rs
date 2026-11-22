@@ -126,6 +126,38 @@ pub(crate) fn local_size(spv: &[u32]) -> Option<[u32; 3]> {
 /// The first word of a `LocalSize` instruction: six words, `OpExecutionMode`.
 const OP_EXECUTION_MODE_WORD: u32 = inst_word(6, OP_EXECUTION_MODE);
 
+const OP_DECORATE: u32 = 71;
+/// `Decoration BuiltIn`, whose one literal is the built-in.
+const DECORATION_BUILT_IN: u32 = 11;
+/// `BuiltIn NumWorkgroups`: GLSL's `gl_NumWorkGroups`.
+const BUILT_IN_NUM_WORKGROUPS: u32 = 24;
+
+/// Whether `spv` declares `gl_NumWorkGroups` (an `OpDecorate … BuiltIn NumWorkgroups`). A shader
+/// that does not cannot tell how many workgroups its dispatch has, so the same grid recorded as
+/// several `vkCmdDispatchBase` ranges runs every workgroup exactly as one dispatch would (see
+/// `crate::work`). A module too malformed to read answers `true`, the answer that forbids the
+/// split.
+pub(crate) fn reads_num_workgroups(spv: &[u32]) -> bool {
+    if spv.len() < HEADER_WORDS || spv[0] != MAGIC {
+        return true;
+    }
+    let mut at = HEADER_WORDS;
+    while at < spv.len() {
+        let word_count = (spv[at] >> 16) as usize;
+        if word_count == 0 || at + word_count > spv.len() {
+            return true;
+        }
+        // Operands: target <id>, decoration, then the decoration's literals.
+        if let [w, _, DECORATION_BUILT_IN, BUILT_IN_NUM_WORKGROUPS] = spv[at..at + word_count] {
+            if w == inst_word(4, OP_DECORATE) {
+                return true;
+            }
+        }
+        at += word_count;
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,6 +260,35 @@ mod tests {
             Some([widest, 1, 1]),
             "rmsnorm's -DWIDE build is the widest workgroup here"
         );
+    }
+
+    #[test]
+    fn finds_a_num_workgroups_decoration() {
+        let plain = module(0x0001_0600, 16);
+        assert!(!reads_num_workgroups(&plain));
+        let mut decorated = plain.clone();
+        // OpDecorate %3 BuiltIn NumWorkgroups, after the execution mode.
+        decorated.splice(23..23, [inst_word(4, OP_DECORATE), 3, 11, 24]);
+        assert!(reads_num_workgroups(&decorated));
+        let mut other = plain.clone();
+        // BuiltIn WorkgroupId (26) is not NumWorkgroups.
+        other.splice(23..23, [inst_word(4, OP_DECORATE), 3, 11, 26]);
+        assert!(!reads_num_workgroups(&other));
+        let mut truncated = decorated.clone();
+        truncated.truncate(25);
+        assert!(reads_num_workgroups(&truncated), "unreadable answers true");
+        // Real shaders: the GEMV recovers its flat index from gl_NumWorkGroups.x; the dp4a
+        // K-quant GEMM reads only gl_WorkGroupID.
+        assert!(reads_num_workgroups(
+            crate::gemm::native_streamed_build_spv(infr_core::DType::Q4K, false)
+                .expect("GEMV build")
+                .1
+        ));
+        assert!(!reads_num_workgroups(
+            crate::gemm::native_gemm_dp4a_kq_spv(infr_core::DType::Q4K)
+                .expect("dp4a build")
+                .1
+        ));
     }
 
     /// A real shader from this crate's build, not just the hand-written module above: the patch

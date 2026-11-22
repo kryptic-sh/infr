@@ -5655,6 +5655,10 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
     } else {
         be_.submit_dispatch_cap()
     };
+    // The splitter's second bound: the estimated GPU time recorded into the segment
+    // (`crate::work`). Only multi-row GEMMs and GEMVs carry an estimate, so a single-token
+    // forward never reaches it.
+    let work_budget = be_.work_cut_budget_ns();
     // Paged forwards only: see `EarlySubmit`. It reuses the splitter's submit-and-continue
     // below, so its segments are pipelined, windowed and timed exactly like the watchdog's, and
     // `crate::segment_cut` checks the watchdog cap first, so it only ever adds cuts.
@@ -5716,9 +5720,15 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
         // share transient scratch, and the hazard tracking that orders them is per-recorder.
         // Crossing the cap, or the paged early-submit cadence, therefore closes the segment at the
         // next op boundary.
-        let cut = rec
-            .as_ref()
-            .and_then(|r| crate::segment_cut(r.dispatches(), cap, early.threshold(r.serial())));
+        let cut = rec.as_ref().and_then(|r| {
+            crate::segment_cut(
+                r.dispatches(),
+                cap,
+                r.work_ns(),
+                work_budget,
+                early.threshold(r.serial()),
+            )
+        });
         if let Some(cut) = cut {
             be_.note_segment_cut(cut);
             let seg = submit_nowait(be_, rec.take().expect("segment always Some between ops"))?;
@@ -7825,7 +7835,10 @@ mod tests {
         assert_eq!(off.threshold(1), 0);
         off.cut(2);
         assert_eq!(off.threshold(2), 0);
-        assert_eq!(crate::segment_cut(1_000_000, 0, off.threshold(2)), None);
+        assert_eq!(
+            crate::segment_cut(1_000_000, 0, 0, 0, off.threshold(2)),
+            None
+        );
 
         let mut big = EarlySubmit::new(usize::MAX / 2 + 1);
         big.cut(3);

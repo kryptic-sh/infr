@@ -460,6 +460,36 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   models' CPU decode output changes once (`cpu_golden_qwen3moe` re-blessed, the
   same on Windows and Linux under WSL; CI does not run the MoE goldens).
 
+- **The Vulkan backend bounds the GPU time of every submit and of every single
+  dispatch (issue 94, plan 12 S2).** A driver's watchdog resets the GPU when one
+  submit runs for about 2 s (Windows' `TdrDelay`, amdgpu's `lockup_timeout`) and
+  drops its work; the dispatch cap could not see a dispatch that is heavy on its
+  own, so a large `-u` on a slow device ended in an error. Now every prefill
+  GEMM and GEMV over more than one row, and the non-coopmat flash prefill
+  attention, estimates its GPU time before it is recorded (FLOPs over a
+  throughput: the one measured for that kernel in the process, else a
+  pessimistic prior from the compute-unit count). A dispatch estimated past the
+  budget is cut into ranges of its workgroup grid, each in a submit of its own
+  and bit-identical to the whole dispatch, and a submit is closed once its
+  estimated work reaches the budget. Two new tuning parameters:
+  `submit.budget_ms` (250 on an integrated or slow-class device, 1000 elsewhere;
+  `0` = off) and `submit.prior_gflops` (8 GFLOP/s per compute unit). On a Ryzen
+  integrated GPU, `infr bench` of SmolLM3-3B Q4_K_M with `-u 512` and
+  `INFR_NO_I8DOT=1`, which was reset in every run before, completed five runs of
+  five (5.1 t/s: the per-row GEMV's own speed), `-u 2048 -p 2048` five of five,
+  and `-u 2048` with the int8 kernels off, whose heaviest dispatch is about 6 s
+  whole, completed its one run; no engine reset was logged. **Upgrade notes:**
+  the tuning hash in the device banner changes on every device (two new
+  parameters). An integrated GPU's first prefill forward takes a few more
+  submits than before, until its kernels have been timed. On an RX 7900 XTX,
+  Qwen3-1.7B at default settings takes no cut and measures the same as before
+  (pp512 and tg128 within 0.05% over six interleaved rounds); a large model's
+  forward whose estimate reaches the budget takes a cut it did not take before.
+  `device.submit_dispatches = 0` still means one submit per forward and turns
+  this off as well. `RUST_LOG=infr_vulkan=debug` prints one line per forward
+  with the splitter's cut counts and the throughput measured per kernel.
+  `docs/config.md` has the rules.
+
 - **A slow discrete GPU splits its first forward (issue 94).** A device that is
   wave64-only, or has neither 16x16x16 f16 cooperative matrices nor an
   accelerated int8 dot (GCN such as the RX 580), now starts the submit splitter
@@ -1026,6 +1056,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   forward segments submitted, newest first, each with its dispatch count, first
   and last kernel, how long before the failure it was submitted and how long it
   ran on the GPU.
+
+- **`device.submit_dispatches` is documented as what it does.** A value above 0
+  sets the dispatch cap a device STARTS with; the measured loop only lowers it
+  from there, so a larger value does not raise where it ends (on issue 94's RX
+  580, 128 and 256 both ended on 62). The docs called it the cap. The "submit
+  splitter ARMED" warning also lost the runs of spaces it carried.
 
 - **A GPU submit that never completes is an error, not a hang.** Every Vulkan
   host wait (segment fences, replays, one-shot copies, `Backend::sync`,

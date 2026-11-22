@@ -76,6 +76,13 @@ impl DeviceFacts {
         self.wave64 || (!self.matrix_units && !self.dot_accelerated)
     }
 
+    /// A device a driver's watchdog is known to reset under long work: an integrated GPU, or one
+    /// in the slow class. It gets the tight default of `submit.budget_ms`, and is the only kind
+    /// on which the work bound ever refuses a dispatch (`crate::work`).
+    pub fn reset_prone(&self) -> bool {
+        self.integrated || self.slow_class()
+    }
+
     /// The vendor's short name, as a row's `match.vendor` spells it.
     pub fn vendor(&self) -> &'static str {
         vendor_name(self.vendor_id)
@@ -247,6 +254,12 @@ pub(crate) struct Tuning {
     /// `submit.initial_dispatches`: the submit splitter's cap before any forward has been
     /// measured (`0` = never split).
     pub submit_initial_dispatches: usize,
+    /// `submit.budget_ms`: the GPU time no single dispatch and no single submit is expected to
+    /// exceed (`0` = no work bound; see `crate::work`).
+    pub submit_budget_ms: u32,
+    /// `submit.prior_gflops`: the throughput the work estimate assumes for a prefill GEMM or GEMV
+    /// kernel this process has not measured yet, in GFLOP/s for the whole device.
+    pub submit_prior_gflops: u32,
 }
 
 impl Tuning {

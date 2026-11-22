@@ -40,9 +40,12 @@
 # Prefill chunk for a sequence sharing the GPU (`serve --parallel N`).
 ubatch_parallel = 256
 
-# Submit-splitter cap; 0 = never split. Raise only to chase an iGPU watchdog
-# reset. Default: unset = the measured per-device cap. A bad value is a HARD
-# error, not a fallback.
+# Dispatches per submit a forward STARTS with; the splitter only lowers it from
+# there, to what each measured forward needed, so a larger value does not raise
+# where it ends. 0 = never split: one submit per forward, by dispatch count and
+# by the work bound (`submit.budget_ms` under [kernels.vulkan.tune]) alike.
+# Default: unset = the per-device value (`infr tune show`,
+# `submit.initial_dispatches`). A bad value is a HARD error, not a fallback.
 # submit_dispatches = 64
 
 # Longest one host wait for GPU work, in milliseconds, before the Vulkan
@@ -176,6 +179,11 @@ no_replay = false # sanctioned negative: true DISABLES the decode replay tape
 # [kernels.vulkan.tune]
 # "gemv_sg.rows" = 4
 # "mmv_mw.warps@q4_k" = 1
+# "submit.budget_ms" = 250   # GPU time, in ms, one dispatch or one submit may
+#                            # be estimated to take; a heavier prefill GEMM is
+#                            # cut into ranges, each its own submit. 0 = off.
+#                            # Default: 250 integrated or slow-class, else 1000
+# "submit.prior_gflops" = 16 # throughput assumed before a kernel is measured
 #
 # [kernels.vulkan.tuning]
 # rows = true            # false: generic defaults only, no table rows. On AMD's

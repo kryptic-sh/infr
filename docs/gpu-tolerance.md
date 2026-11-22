@@ -286,12 +286,25 @@ INFR_DEV=Vulkan0 cargo nextest run --release --run-ignored all --test-threads 1 
   | (package(infr-vulkan) & (kind(lib) | binary(dense_tier_parity)
     | binary(shared_decode_parity) | binary(pager_gemv_parity)
     | binary(pager_mmq_parity) | binary(first_forward_split)
-    | binary(work_split_parity)))
+    | binary(work_split_parity) | binary(dense_float_stream_parity)
+    | binary(attn_decode_parity) | binary(attn_split_host)
+    | binary(kq_fma_gemv) | binary(logits_tail) | test(linear_f32)))
   | test(gpu_seam) | test(gpu_synthetic) | test(gpu_prefill) | test(lfm3)
   | test(qwen35) | test(gemma) | test(paged) | test(deepseek) | test(dsv4)
   | test(mtp_head_cpu_vulkan_parity))
-  & not test(qwen3_14b) & not binary(gemm_bench)'
+  & not test(qwen3_14b) & not binary(gemm_bench)
+  & not (test(/_bw$/) | test(logits_tail_time))'
 ```
+
+The second line of `infr-vulkan` binaries came with the kernels of PRs 105 to
+107 (2026-11-22): the float decode GEMVs' streamed parity, decode split-K
+attention against its general build and against a host reference, the fp32
+K-quant GEMVs with the tuning parameter that selects them, the logits tail, and
+`small_m_bench`'s two f32 GEMV parity tests by name. The last line keeps the
+micro-benches that share those binaries out. A test that opens its backend
+through `infr_testkit::gpu_or_skip` skips, printing why, when no Vulkan device
+opens; with `INFR_DEV` set, as in every gate run, a device that does not open is
+a failure instead, so a gate run cannot pass such a test without running it.
 
 On the integrated GPU the gate of 2026-11-22 ran the same filter with
 `& not (test(moe) | test(ernie))` appended, and the ERNIE tolerance case on its

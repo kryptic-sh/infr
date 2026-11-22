@@ -10960,6 +10960,7 @@ impl<'a> Recorder<'a> {
         // with an ordinary error queued nothing and its objects are freed; any failure that
         // poisons the backend (a failed wait, a lost device) leaves them to the GPU that may
         // still be running them: leaked, never freed (see `gpu_wait`).
+        let submitted = std::time::Instant::now();
         let waited = self.be.shared.submit_wait(
             &[vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&self.cmd))],
             &|| format!("a forward submitted as one command buffer of {desc}"),
@@ -10970,9 +10971,11 @@ impl<'a> Recorder<'a> {
             }
             return Err(e);
         }
+        // Remembered only now: a failed submit or wait names this segment itself.
+        let recent = self.be.shared.note_segment_submitted_at(desc, submitted);
         // A missing closing stamp poisons the backend (see `account_segment`); what the reset
         // discarded is leaked like any other failed wait.
-        account_segment(&self.be.shared, self.seg_query_pool, desc)?;
+        account_segment(&self.be.shared, self.seg_query_pool, desc, recent)?;
         if self.stages {
             eprintln!(
                 "[prof] record={:.1}ms submit+gpu={:.1}ms",
@@ -11033,6 +11036,7 @@ impl<'a> Recorder<'a> {
                 pools: Vec::new(),
                 seg_query_pool: vk::QueryPool::null(),
                 desc,
+                recent: 0,
             });
         }
         let device = &self.be.shared.device;
@@ -11077,6 +11081,7 @@ impl<'a> Recorder<'a> {
             pools: self.pools.borrow().clone(),
             seg_query_pool: self.seg_query_pool,
             desc,
+            recent: self.be.shared.note_segment_submitted(desc),
         })
     }
 
@@ -11442,6 +11447,8 @@ pub struct PendingSegment {
     /// Dispatches this segment carried — the submit splitter sums them across a forward to feed
     /// `VulkanBackend::observe_forward` — and its first and last kernel, for a failed wait.
     desc: SubmitDesc,
+    /// Its id among the segments a later failure reports (`VulkanShared::note_segment_submitted`).
+    recent: u64,
 }
 
 impl PendingSegment {
@@ -11467,7 +11474,7 @@ impl PendingSegment {
         // Only reached once the segment completed: a failed wait (above, or a backend already
         // poisoned) returns first and leaks the command buffer, pools and fence the GPU may still
         // be using (see `gpu_wait`).
-        account_segment(&self.shared, self.seg_query_pool, desc)?;
+        account_segment(&self.shared, self.seg_query_pool, desc, self.recent)?;
         let device = &self.shared.device;
         unsafe {
             if self.seg_query_pool != vk::QueryPool::null() {
@@ -11504,6 +11511,7 @@ fn account_segment(
     shared: &crate::VulkanShared,
     qp: vk::QueryPool,
     desc: SubmitDesc,
+    recent: u64,
 ) -> Result<()> {
     use std::sync::atomic::Ordering;
     let Some(period) = shared
@@ -11527,6 +11535,7 @@ fn account_segment(
         Ok(()) | Err(vk::Result::NOT_READY) if ticks[0][1] != 0 && ticks[1][1] != 0 => {
             let ns = (ticks[1][0].wrapping_sub(ticks[0][0]) as f64 * period as f64) as u64;
             shared.segment_gpu_ns.fetch_add(ns, Ordering::Relaxed);
+            shared.note_segment_ran(recent, ns);
             Ok(())
         }
         Ok(()) | Err(vk::Result::NOT_READY) => {

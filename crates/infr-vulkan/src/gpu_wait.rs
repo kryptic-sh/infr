@@ -27,6 +27,7 @@
 
 use ash::vk;
 use infr_core::error::{backend as be, Error, Result};
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -76,6 +77,56 @@ pub(crate) struct GpuWait {
     /// `vkGetDeviceFaultInfoEXT`, when the device offers `VK_EXT_device_fault` and the feature
     /// was enabled at creation. Only meaningful after the device has been lost.
     fault: Option<ash::ext::device_fault::Device>,
+    /// The forward segments submitted last, oldest first, at most [`RECENT_SEGMENTS`]: what a
+    /// failure reports beside its own submit (see [`RecentSegment`]).
+    recent: Mutex<VecDeque<RecentSegment>>,
+    /// The id the next remembered segment gets.
+    next_segment: AtomicU64,
+}
+
+/// How many forward segments a failure's report can name.
+const RECENT_SEGMENTS: usize = 3;
+
+/// One forward segment as a later failure reports it. A driver can let a submit whose work it
+/// cut short run to its end and signal its fence, and report the lost device only at the NEXT
+/// submit (RADV after amdgpu's soft recovery, issue 94: a prefill forward was cancelled after
+/// about 2.4 s and the error came from the one-shot copy after it). That error names the copy, so
+/// it also lists these: the loss most likely happened in the newest of them.
+#[derive(Clone, Copy, Debug)]
+struct RecentSegment {
+    id: u64,
+    desc: SubmitDesc,
+    submitted: Instant,
+    /// The GPU time between its two timestamps, once it has completed and was timed.
+    gpu_ns: Option<u64>,
+}
+
+/// The clause a failure appends about the forward segments submitted last, newest first: each
+/// one's dispatches and kernels, how long before the failure it was submitted and, when it was
+/// timed, how long it ran. A segment whose own wait failed is among them. Empty with no segment.
+/// Pure, so the wording is testable without a GPU.
+fn recent_report(newest_first: &[(SubmitDesc, Duration, Option<u64>)]) -> String {
+    if newest_first.is_empty() {
+        return String::new();
+    }
+    let each: Vec<String> = newest_first
+        .iter()
+        .map(|&(desc, ago, gpu_ns)| {
+            let ran = match gpu_ns {
+                Some(ns) => format!(
+                    ", ran {} on the GPU",
+                    fmt_duration(Duration::from_nanos(ns))
+                ),
+                None => ", not seen to complete".to_string(),
+            };
+            format!("{desc} submitted {} earlier{ran}", fmt_duration(ago))
+        })
+        .collect();
+    format!(
+        "; the last forward segments submitted, newest first (a lost device is most likely \
+         the newest one's doing): {}",
+        each.join("; ")
+    )
 }
 
 impl GpuWait {
@@ -92,6 +143,8 @@ impl GpuWait {
             poison: OnceLock::new(),
             idle_fence: Mutex::new(idle_fence),
             fault,
+            recent: Mutex::new(VecDeque::with_capacity(RECENT_SEGMENTS)),
+            next_segment: AtomicU64::new(0),
         })
     }
 
@@ -321,6 +374,60 @@ impl VulkanShared {
         )
     }
 
+    /// Remember a forward segment that was just submitted, for a later failure's report (see
+    /// [`RecentSegment`]). Returns the id [`Self::note_segment_ran`] takes.
+    pub(crate) fn note_segment_submitted(&self, desc: SubmitDesc) -> u64 {
+        self.note_segment_submitted_at(desc, Instant::now())
+    }
+
+    /// [`Self::note_segment_submitted`] for a segment submitted at `submitted`: a submit that is
+    /// waited in the same call is remembered once that call has returned.
+    pub(crate) fn note_segment_submitted_at(&self, desc: SubmitDesc, submitted: Instant) -> u64 {
+        let id = self.gpu_wait.next_segment.fetch_add(1, Ordering::Relaxed);
+        let mut recent = self
+            .gpu_wait
+            .recent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if recent.len() == RECENT_SEGMENTS {
+            recent.pop_front();
+        }
+        recent.push_back(RecentSegment {
+            id,
+            desc,
+            submitted,
+            gpu_ns: None,
+        });
+        id
+    }
+
+    /// The remembered segment `id` completed after `gpu_ns` between its timestamps.
+    pub(crate) fn note_segment_ran(&self, id: u64, gpu_ns: u64) {
+        let mut recent = self
+            .gpu_wait
+            .recent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(seg) = recent.iter_mut().find(|s| s.id == id) {
+            seg.gpu_ns = Some(gpu_ns);
+        }
+    }
+
+    /// [`recent_report`] over the remembered segments, as of now.
+    fn recent_segments_report(&self) -> String {
+        let recent = self
+            .gpu_wait
+            .recent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let newest_first: Vec<_> = recent
+            .iter()
+            .rev()
+            .map(|s| (s.desc, s.submitted.elapsed(), s.gpu_ns))
+            .collect();
+        recent_report(&newest_first)
+    }
+
     /// Record the first fatal failure and return the error every later call will see.
     fn poison(
         &self,
@@ -352,6 +459,7 @@ impl VulkanShared {
             );
         msg.push_str("; ");
         msg.push_str(&self.fault_report(lost));
+        msg.push_str(&self.recent_segments_report());
         msg.push_str("; ");
         msg.push_str(UNUSABLE);
         // The FIRST failure is the cause; a later one (another thread's wait on the same dead
@@ -517,6 +625,78 @@ mod tests {
             t0.elapsed() < Duration::from_secs(1),
             "drop waited {:?}",
             t0.elapsed()
+        );
+    }
+
+    /// A failure on a one-shot also names the forward segments submitted before it: issue 94's
+    /// RX 580 lost its device during a prefill forward, and the error came from the copy after
+    /// it and named only the copy. Forced with the timeout hook: one forward completes, a second
+    /// is submitted and left running, and a one-shot queued behind it meets a 1 ms bound.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn a_failed_one_shot_names_the_forward_segments_before_it() {
+        let be = VulkanBackend::new_with(Arc::new(crate::test_config())).expect("backend");
+        let buf = be.alloc(FILL_BYTES, BufferUsage::Activations).unwrap();
+        let light = be.recorder().expect("recorder");
+        light.zero(buf.as_ref(), FILL_BYTES / 4);
+        light.finish().expect("the completed forward");
+        let running = heavy_recorder(&be, buf.as_ref())
+            .finish_nowait()
+            .expect("submit");
+        be.shared.set_gpu_wait_timeout_ms(1);
+        let err = be
+            .one_shot(|_| {})
+            .expect_err("a one-shot behind running work must pass a 1 ms bound")
+            .to_string();
+        println!("{err}");
+        let list = err
+            .find("; the last forward segments")
+            .expect("the segment list");
+        assert!(
+            err[..list].contains("did not complete") && err[..list].contains("one-shot"),
+            "{err}"
+        );
+        assert!(
+            !err[..list].contains("zero_fill"),
+            "the failing submit must be the one-shot, not a forward: {err}"
+        );
+        // Newest first: the one still running, then the one that completed, with its GPU time.
+        let newest = err[list..]
+            .find(&format!(
+                "{FILLS} dispatches (first `zero_fill`, last `zero_fill`) submitted "
+            ))
+            .expect("the running segment");
+        let older = err[list..]
+            .find("1 dispatch (`zero_fill`) submitted ")
+            .expect("the completed segment");
+        assert!(newest < older, "{err}");
+        assert!(
+            err[list + newest..list + older].contains("not seen to complete")
+                && err[list + older..].contains(" earlier, ran ")
+                && err[list + older..].contains(" on the GPU"),
+            "{err}"
+        );
+        drop(running);
+    }
+
+    #[test]
+    fn the_segment_list_reads_newest_first_with_age_and_gpu_time() {
+        assert_eq!(recent_report(&[]), "");
+        let seg = |n| SubmitDesc {
+            dispatches: n,
+            first: Some("a"),
+            last: Some("b"),
+        };
+        let r = recent_report(&[
+            (seg(757), Duration::from_millis(2400), None),
+            (seg(64), Duration::from_millis(2900), Some(310_000_000)),
+        ]);
+        assert_eq!(
+            r,
+            "; the last forward segments submitted, newest first (a lost device is most \
+             likely the newest one's doing): 757 dispatches (first `a`, last `b`) submitted \
+             2.4 s earlier, not seen to complete; 64 dispatches (first `a`, last `b`) submitted \
+             2.9 s earlier, ran 310.0 ms on the GPU"
         );
     }
 

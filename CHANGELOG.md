@@ -103,11 +103,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   compositor's graphics ring.** A discrete Vulkan GPU now submits on a
   COMPUTE-only queue family (amdgpu's `comp` rings) instead of the universal
   `gfx` family the compositor renders its frames on, so a multi-second prefill
-  delays the desktop's frame instead of blocking it: on the RX 580 with
-  zeta-2.1 Q4_K_M, glxgears held 130 fps through a prefill that used to drop it
-  to 7 (153 → 166 tok/s prefill, 31.2 → 30.7 tok/s decode). Integrated GPUs and
-  devices without a COMPUTE-only family keep the universal family, where the
-  `comp` ring's measured hang budget was tighter; `gfx_queue = true` forces it
+  delays the desktop's frame instead of blocking it: on the RX 580 with zeta-2.1
+  Q4_K_M, glxgears held 130 fps through a prefill that used to drop it to 7 (153
+  → 166 tok/s prefill, 31.2 → 30.7 tok/s decode). Integrated GPUs and devices
+  without a COMPUTE-only family keep the universal family, where the `comp`
+  ring's measured hang budget was tighter; `gfx_queue = true` forces it
   everywhere, and the startup log names the ring the backend bound. The choice
   itself is now a testable `VulkanBackend::pick_queue_family` rather than an
   inline scan.
@@ -1017,6 +1017,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   outliers (the CPU goldens were re-blessed, Windows and Linux under WSL
   agreeing); one-token llama.cpp parity dumps now differ at position 0 by design
   (B212).
+
+- **A lost GPU reported one submit late now names the forward before it (issue
+  94).** After a watchdog cuts a forward short, some drivers let that submit
+  finish and report the lost device only on the next one (RADV after amdgpu's
+  soft recovery; AMD's Windows driver just past its limit), so the error named a
+  copy or the following forward. Every fatal GPU error now also lists the last
+  forward segments submitted, newest first, each with its dispatch count, first
+  and last kernel, how long before the failure it was submitted and how long it
+  ran on the GPU.
 
 - **A GPU submit that never completes is an error, not a hang.** Every Vulkan
   host wait (segment fences, replays, one-shot copies, `Backend::sync`,

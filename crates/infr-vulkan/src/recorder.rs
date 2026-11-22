@@ -1066,8 +1066,8 @@ impl WatchStamps {
 
 /// Feed a completed segment into the work estimate (`crate::work`): its timed dispatches first,
 /// each an exact sample of one kernel, then its whole GPU time, `gpu_ns` (`None` when the
-/// segment went untimed), set against the work recorded into it for the kernels still on their
-/// prior.
+/// segment went untimed), set against the work recorded into it, for the kernels that have no
+/// timed dispatch.
 fn account_work(
     shared: &crate::VulkanShared,
     watch: &mut WatchStamps,

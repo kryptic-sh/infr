@@ -26,15 +26,15 @@
 //!   ([`WorkModel::watch`]), and its time per FLOP replaces the prior for that kernel (the first
 //!   sample) or raises it (any later, slower one);
 //! - a whole segment's GPU time, which every forward segment already measures, corrects the
-//!   kernels in it that are still on the prior ([`WorkModel::calibrate`]). Without it a device
+//!   kernels in it that have no timed dispatch ([`WorkModel::calibrate`]). Without it a device
 //!   whose dispatches all stay under the timing threshold would keep its prior, and a forward
 //!   whose prior passes the budget would be cut on every pass however fast it ran.
 //!
-//! So a kernel's estimate can go down once, on evidence, never by more than [`MAX_PRIOR_GAIN`],
-//! and only up after that. Until a segment has completed, a device's first forward runs on the
-//! prior alone. Dispatches with no estimate (every other kernel) count as free, as do single-row
-//! ones: a decode step is never split, timed or cut by this, and the dispatch cap is what bounds
-//! a submit of those.
+//! So a kernel's estimate goes down only on what the GPU measured, never by more than
+//! [`MAX_PRIOR_GAIN`] from its prior, and once one of its dispatches has been timed, only up.
+//! Until a segment has completed, a device's first forward runs on the prior alone. Dispatches
+//! with no estimate (every other kernel) count as free, as do single-row ones: a decode step is
+//! never split, timed or cut by this, and the dispatch cap is what bounds a submit of those.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -177,6 +177,15 @@ impl SegmentWork {
     }
 }
 
+/// A kernel's learned time per FLOP, and where it came from.
+#[derive(Clone, Copy)]
+struct Learned {
+    ns_per_flop: f64,
+    /// From a timed dispatch of the kernel ([`WorkModel::record`]), which a segment's time no
+    /// longer corrects; otherwise from segments' GPU times ([`WorkModel::calibrate`]).
+    timed: bool,
+}
+
 /// The per-backend estimator: the budget, the priors, and each kernel's learned time per FLOP.
 pub(crate) struct WorkModel {
     /// `0` = no work bound.
@@ -184,9 +193,8 @@ pub(crate) struct WorkModel {
     /// The slowest family's prior time per FLOP.
     prior_ns_per_flop: f64,
     dot_accelerated: bool,
-    /// Learned nanoseconds per FLOP, by kernel name: from a timed dispatch ([`Self::record`]) or
-    /// from a segment's GPU time ([`Self::calibrate`]).
-    measured: Mutex<HashMap<&'static str, f64>>,
+    /// What has been learned so far, by kernel name.
+    measured: Mutex<HashMap<&'static str, Learned>>,
 }
 
 impl WorkModel {
@@ -220,34 +228,41 @@ impl WorkModel {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(kernel)
-            .copied();
+            .map(|l| l.ns_per_flop);
         let rate = learned.unwrap_or_else(|| self.prior_rate(family));
         (flops as f64 * rate).ceil() as u64
     }
 
     /// Feed one timed dispatch back: `flops` of `kernel`, a `family` kernel, took `ns`. The first
-    /// sample of a kernel replaces its prior; a later one only ever raises it. A sample of no
-    /// time or no work says nothing and is dropped, and no sample takes the kernel's throughput
-    /// past [`MAX_PRIOR_GAIN`] times its prior.
+    /// sample of a kernel replaces its prior, or what segments had made of it; a later one only
+    /// ever raises it. A sample of no time or no work says nothing and is dropped, and no sample
+    /// takes the kernel's throughput past [`MAX_PRIOR_GAIN`] times its prior.
     pub(crate) fn record(&self, kernel: &'static str, family: Family, flops: u64, ns: u64) {
         if flops == 0 || ns == 0 {
             return;
         }
         let rate = (ns as f64 / flops as f64).max(self.prior_rate(family) / MAX_PRIOR_GAIN);
         let mut m = self.measured.lock().unwrap_or_else(|e| e.into_inner());
-        let e = m.entry(kernel).or_insert(rate);
-        if rate > *e {
-            *e = rate;
+        let sample = Learned {
+            ns_per_flop: rate,
+            timed: true,
+        };
+        let e = m.entry(kernel).or_insert(sample);
+        if !e.timed || rate > e.ns_per_flop {
+            *e = sample;
         }
     }
 
     /// Set a completed segment's estimated work against the GPU time it measured, `gpu_ns`. When
-    /// the segment ran faster than its estimate, every kernel in it that is still on the prior
-    /// takes its prior scaled by measured over estimated, bounded by [`MAX_PRIOR_GAIN`]. Kernels
-    /// that already have a learned rate keep it, so the segment's estimate afterwards is never
-    /// under the time it measured, and equals it when every kernel in it was on the prior.
+    /// the segment ran faster than its estimate, every kernel in it without a timed dispatch has
+    /// its time per FLOP scaled by measured over estimated, never past [`MAX_PRIOR_GAIN`] from
+    /// its prior. Kernels with a timed dispatch keep their rate, so the segment's estimate
+    /// afterwards is never under the time it measured, and equals it when no kernel in it had
+    /// been timed.
     ///
     /// The segment's time also holds whatever ran in it without an estimate, so this errs slow.
+    /// A later segment that runs faster still lowers the rate again: a small first forward, whose
+    /// time is mostly per-dispatch overhead, must not fix the estimate of the large one after it.
     /// A segment that ran slower than its estimate changes nothing: its untagged work could be
     /// all of the difference, and only a timed dispatch ([`Self::record`]) raises an estimate.
     pub(crate) fn calibrate(&self, work: &SegmentWork, gpu_ns: u64) {
@@ -255,32 +270,37 @@ impl WorkModel {
             return;
         }
         let mut m = self.measured.lock().unwrap_or_else(|e| e.into_inner());
+        let rate = |m: &HashMap<&'static str, Learned>, kernel, family| {
+            m.get(kernel)
+                .map_or_else(|| self.prior_rate(family), |l| l.ns_per_flop)
+        };
         let estimated: f64 = work
             .kernels
             .iter()
-            .map(|&(kernel, family, flops)| {
-                let rate = m.get(kernel).copied();
-                flops as f64 * rate.unwrap_or_else(|| self.prior_rate(family))
-            })
+            .map(|&(kernel, family, flops)| flops as f64 * rate(&m, kernel, family))
             .sum();
         let measured = gpu_ns as f64;
         if measured >= estimated {
             return;
         }
-        let scale = (measured / estimated).max(1.0 / MAX_PRIOR_GAIN);
+        let scale = measured / estimated;
         for &(kernel, family, _) in &work.kernels {
-            m.entry(kernel)
-                .or_insert_with(|| self.prior_rate(family) * scale);
+            if m.get(kernel).is_some_and(|l| l.timed) {
+                continue;
+            }
+            let floor = self.prior_rate(family) / MAX_PRIOR_GAIN;
+            let learned = Learned {
+                ns_per_flop: (rate(&m, kernel, family) * scale).max(floor),
+                timed: false,
+            };
+            m.insert(kernel, learned);
         }
     }
 
     /// Every kernel with a learned rate so far and its throughput in GFLOP/s, sorted by name.
     pub(crate) fn measured_gflops(&self) -> Vec<(&'static str, f64)> {
         let m = self.measured.lock().unwrap_or_else(|e| e.into_inner());
-        let mut v: Vec<_> = m
-            .iter()
-            .map(|(&k, &ns_per_flop)| (k, 1.0 / ns_per_flop))
-            .collect();
+        let mut v: Vec<_> = m.iter().map(|(&k, l)| (k, 1.0 / l.ns_per_flop)).collect();
         v.sort_unstable_by_key(|&(k, _)| k);
         v
     }
@@ -469,33 +489,61 @@ mod tests {
         assert_eq!(crate::segment_cut(1, 0, after, m.budget_ns(), 0), None);
     }
 
-    /// A segment's time can only make an estimate less pessimistic, once: a segment that ran
-    /// slower than estimated changes nothing (its untagged work may be the whole difference),
-    /// and a kernel already corrected is not corrected again by a faster segment.
+    /// A segment's time can only make an estimate less pessimistic: a segment that ran slower
+    /// than estimated changes nothing (its untagged work may be the whole difference), a faster
+    /// one lowers it again, and once a dispatch of the kernel has been timed, segments leave it
+    /// alone.
     #[test]
-    fn a_segment_corrects_a_kernel_once_and_never_upward() {
+    fn a_segment_only_lowers_an_estimate_and_a_timed_dispatch_settles_it() {
         let m = igpu();
         let flops = gemm_flops(64, 2048, 2048);
         let mut work = SegmentWork::default();
         work.add("dp4a", Family::Int8, flops);
         let prior = m.estimate("dp4a", Family::Int8, flops);
+        let est = |m: &WorkModel| m.estimate("dp4a", Family::Int8, flops);
 
         m.calibrate(&work, 3 * prior);
         assert!(!learned(&m, "dp4a"));
-        assert_eq!(m.estimate("dp4a", Family::Int8, flops), prior);
+        assert_eq!(est(&m), prior);
 
         m.calibrate(&work, prior / 2);
-        let once = m.estimate("dp4a", Family::Int8, flops);
-        assert!(
-            once.abs_diff(prior / 2) <= 1,
-            "{once} against {}",
-            prior / 2
-        );
+        assert!(est(&m).abs_diff(prior / 2) <= 1, "{}", est(&m));
         m.calibrate(&work, prior / 4);
-        assert_eq!(m.estimate("dp4a", Family::Int8, flops), once);
-        // A timed dispatch still raises it.
+        assert!(est(&m).abs_diff(prior / 4) <= 1, "{}", est(&m));
+        // Slower than the estimate now is: nothing moves.
+        m.calibrate(&work, prior / 3);
+        assert!(est(&m).abs_diff(prior / 4) <= 1, "{}", est(&m));
+
+        // A timed dispatch replaces what the segments made of it, faster or slower, and then
+        // only a slower timed dispatch moves it.
+        m.record("dp4a", Family::Int8, flops, prior / 5);
+        assert!(est(&m).abs_diff(prior / 5) <= 1, "{}", est(&m));
+        m.calibrate(&work, prior / 6);
+        assert!(est(&m).abs_diff(prior / 5) <= 1, "{}", est(&m));
         m.record("dp4a", Family::Int8, flops, prior);
-        assert!(m.estimate("dp4a", Family::Int8, flops).abs_diff(prior) <= 1);
+        assert!(est(&m).abs_diff(prior) <= 1, "{}", est(&m));
+        m.record("dp4a", Family::Int8, flops, prior / 2);
+        assert!(est(&m).abs_diff(prior) <= 1, "{}", est(&m));
+    }
+
+    /// A small forward first (a short prompt: its GPU time is mostly per-dispatch overhead, so
+    /// it reads close to the prior) must not fix the estimate the large forward after it gets:
+    /// the large one is cut once, by the estimate the small one left, and not again.
+    #[test]
+    fn a_small_first_forward_does_not_keep_a_large_one_cut() {
+        let m = fast();
+        let (small_est, small) = smollm3_forward(&m, 64);
+        m.calibrate(&small, small_est - small_est / 25);
+        let (first, work) = smollm3_forward(&m, 4096);
+        assert_eq!(
+            crate::segment_cut(1, 0, first, m.budget_ns(), 0),
+            Some(crate::SegmentCut::Work)
+        );
+        let measured = 850 * MS;
+        m.calibrate(&work, measured);
+        let (after, _) = smollm3_forward(&m, 4096);
+        assert!(after >= measured && after - measured < MS, "{after} ns");
+        assert_eq!(crate::segment_cut(1, 0, after, m.budget_ns(), 0), None);
     }
 
     /// In a segment that mixes a timed kernel with one still on the prior, only the second

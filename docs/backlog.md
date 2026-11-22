@@ -7671,6 +7671,16 @@ taken while a forward ran), so on Windows the benefit the default is for is
 unmeasured, and with a desktop running on Linux it is too, beyond the
 contributor's glxgears figure.
 
+**A confound in the Windows table, not controlled.** Which GPU drove the desktop
+during those runs was not recorded. The owner's reading is that the integrated
+GPU showed no cost because it was not driving any display, while the RX 7900
+XTX, which was, showed 4.2%. If that is right, the cost follows the display, not
+the device: it supports the display-detection follow-up below, and it means the
+tuning row that sets `queue.family = auto` for AMD integrated GPUs on the
+proprietary driver rests on a measurement of an integrated GPU with no display
+attached. To settle it on Windows: repeat the A/B with the monitor on the
+integrated GPU's output, and again with the RX 7900 XTX driving nothing.
+
 **Commands.** Build `infr` in release. The model is `Qwen3-1.7B-Q4_K_M.gguf`
 from the `unsloth/Qwen3-1.7B-GGUF` repository (`$M` below). Pick the device with
 `infr devices` and put its name in `$DEV` (`Vulkan0`, ...).

@@ -7,6 +7,7 @@
 mod bench_support;
 
 use infr_core::backend::{Backend, BufferUsage};
+use infr_vulkan::VulkanBackend;
 
 #[test]
 #[ignore = "requires a Vulkan GPU (perf micro-bench)"]
@@ -310,28 +311,126 @@ fn mmv_mrow_matches_single_row_mmv() {
     eprintln!("mmv_mrow == m=1 mmv GEMV at reassociation tolerance (Q4K/Q6K, both layouts)");
 }
 
-/// The vec4 f32 GEMV variants (`linear_f32r_v4` rows=1, `linear_f32r_mrow4_v4` rows<=4,
-/// `linear_f32r_mrow8_v4`) must match a host f64 reference to f32 reassociation tolerance
+/// A backend on the test environment's device with the tuning parameter `gemv.kq_fma` forced:
+/// it decides whether a one-row f32 GEMV runs `linear_f32_mo` or `linear_f32r_v4`, and each of
+/// the two needs a test that runs it on every device, whatever the device's default.
+fn backend_with_kq_fma(on: bool) -> Option<VulkanBackend> {
+    let value = if on { "true" } else { "false" };
+    let cfg = infr_testkit::gpu_env::env_config_with_tune(&[("gemv.kq_fma", value)]);
+    let be = infr_testkit::gpu_or_skip(VulkanBackend::new_with(std::sync::Arc::new(cfg)));
+    if be.is_none() {
+        eprintln!("skip: no Vulkan device");
+    }
+    be
+}
+
+/// Every f32 GEMV build must match a host f64 reference to f32 reassociation tolerance
 /// (vec4-lane accumulation + pairwise horizontal add reorders the K sum vs the scalar kernels —
-/// tolerance-level only). in_f % 4 != 0 shapes (the scalar 1-row kernel and the scalar mrow8
-/// fallback) ride along to pin the whole dispatch table.
+/// tolerance-level only): the `linear_f32r` family with `gemv.kq_fma` off (`linear_f32r_v4`
+/// rows=1, `linear_f32r_mrow4_v4` rows<=4, `linear_f32r_mrow8_v4`, and the in_f % 4 != 0 scalar
+/// kernels, which pin the whole dispatch table), and with it on the one-row shapes again, now on
+/// `linear_f32_mo` at both of its threads-per-output settings. Each side asserts the kernels it
+/// BUILT, so a shape that quietly took another kernel fails here.
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn linear_f32_v4_matches_host() {
-    let Some(be) = bench_support::optional_backend() else {
-        return;
-    };
-    // (rows, in_f, out_f, the kernel the shape must reach under the default config).
-    for (rows, in_f, out_f, kernel) in [
-        (4usize, 1536usize, 256usize, "linear_f32r_mrow4_v4"), // the E2B per-layer proj shape
-        (2, 256, 1536, "linear_f32r_mrow4_v4"),                // transposed direction
+    // (rows, in_f, out_f, the kernel the shape must reach with `gemv.kq_fma` off).
+    let off: &[(usize, usize, usize, &str)] = &[
+        (4, 1536, 256, "linear_f32r_mrow4_v4"), // the E2B per-layer proj shape
+        (2, 256, 1536, "linear_f32r_mrow4_v4"), // transposed direction
         (6, 1536, 256, "linear_f32r_mrow8_v4"),
         (1, 1536, 256, "linear_f32r_v4"),
         (1, 2560, 64, "linear_f32r_v4"), // the ERNIE-4.5 MoE router shape
         (1, 1000, 96, "linear_f32r_v4"), // in_f/4 = 250: a ragged last 64-lane stride
         (1, 250, 64, "linear_f32r"),     // in_f % 4 != 0 → 1-row scalar kernel
         (4, 250, 64, "linear_f32r_mrow8"), // in_f % 4 != 0 → scalar mrow8 fallback
-    ] {
+    ];
+    // ... and with it on: 64 threads per output, 32 for a short row, a ragged last stride, and
+    // the shapes the parameter leaves alone.
+    let on: &[(usize, usize, usize, &str)] = &[
+        (1, 1536, 256, "linear_f32_mo"),
+        (1, 2560, 64, "linear_f32_mo"),
+        (1, 256, 1536, "linear_f32_mo"), // in_f/4 = 64: 32 threads per output
+        (1, 1000, 97, "linear_f32_mo"),  // ragged stride, and a ragged last workgroup
+        (1, 250, 64, "linear_f32r"),
+        (4, 1536, 256, "linear_f32r_mrow4_v4"),
+    ];
+    for (kq_fma, cases) in [(false, off), (true, on)] {
+        let Some(be) = backend_with_kq_fma(kq_fma) else {
+            return;
+        };
+        f32_gemv_cases_match_host(&be, cases);
+        let built = be.built_kernel_names();
+        for (.., kernel) in cases {
+            assert!(
+                built.contains(kernel),
+                "gemv.kq_fma={kq_fma}: `{kernel}` was never built ({built:?})"
+            );
+        }
+        let other = if kq_fma {
+            "linear_f32r_v4"
+        } else {
+            "linear_f32_mo"
+        };
+        assert!(
+            !built.contains(&other),
+            "gemv.kq_fma={kq_fma}: `{other}` was built too ({built:?})"
+        );
+    }
+    eprintln!("linear_f32 (mo, v4 and scalar variants) == host reference");
+}
+
+/// `linear_f32_mo` at a vocabulary-sized output: 262144 outputs at 4 per workgroup is one more
+/// workgroup than the guaranteed grid width holds in one dimension, so the dispatch must split
+/// (`Recorder::dispatch_wide`) and the kernel recover its flat index. Every output is checked.
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn linear_f32_mo_covers_a_vocabulary_wide_output() {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    const IN_F: usize = 8;
+    const OUT_F: usize = 262_144;
+    let ws: Vec<f32> = (0..OUT_F * IN_F)
+        .map(|i| ((i % 113) as f32 - 56.0) * 0.017)
+        .collect();
+    let xs: Vec<f32> = (0..IN_F).map(|i| (i as f32 - 3.0) * 0.23).collect();
+    let w = be.alloc(OUT_F * IN_F * 4, BufferUsage::Weights).unwrap();
+    be.upload(w.as_ref(), bytemuck::cast_slice(&ws)).unwrap();
+    let x = be.alloc(IN_F * 4, BufferUsage::Activations).unwrap();
+    be.upload(x.as_ref(), bytemuck::cast_slice(&xs)).unwrap();
+    let addr = w.device_addr().expect("weight device address");
+    // 64 threads per output (4 outputs per workgroup, 65536 workgroups), and one output per
+    // workgroup (262144 workgroups).
+    for tpo_log2 in [6u32, 8] {
+        let y = be.alloc(OUT_F * 4, BufferUsage::Activations).unwrap();
+        be.upload(y.as_ref(), bytemuck::cast_slice(&vec![f32::NAN; OUT_F]))
+            .unwrap();
+        let rec = be.recorder().unwrap();
+        rec.linear_f32_mo_at(addr, x.as_ref(), y.as_ref(), IN_F, OUT_F, tpo_log2);
+        rec.finish().unwrap();
+        let mut got = vec![0f32; OUT_F];
+        be.download(y.as_ref(), bytemuck::cast_slice_mut(&mut got))
+            .unwrap();
+        for o in 0..OUT_F {
+            let want: f64 = (0..IN_F)
+                .map(|i| ws[o * IN_F + i] as f64 * xs[i] as f64)
+                .sum();
+            let want = want as f32;
+            assert!(
+                (want - got[o]).abs() <= 1e-4 * want.abs().max(1.0),
+                "tpo_log2={tpo_log2} output {o} of {OUT_F}: host {want} vs gpu {}",
+                got[o]
+            );
+        }
+    }
+}
+
+/// Run each `(rows, in_f, out_f, kernel)` f32 GEMV on `be`, assert it is the kernel the recorder
+/// names for the shape, and compare every output with a host f64 reference.
+fn f32_gemv_cases_match_host(be: &VulkanBackend, cases: &[(usize, usize, usize, &str)]) {
+    for &(rows, in_f, out_f, kernel) in cases {
         let ws: Vec<f32> = (0..out_f * in_f)
             .map(|i| ((i % 113) as f32 - 56.0) * 0.017)
             .collect();
@@ -372,5 +471,4 @@ fn linear_f32_v4_matches_host() {
             }
         }
     }
-    eprintln!("linear_f32 (v4 + scalar variants) == host reference");
 }

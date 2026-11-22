@@ -1,5 +1,10 @@
 //! Parity and decode bandwidth for the fp32 K-quant GEMV (`native_gemv_kq_fma.comp`) and its
-//! multi-row verify twin (`native_gemv_kq_fma_mrow.comp`).
+//! multi-row verify twin (`native_gemv_kq_fma_mrow.comp`), and the tuning parameter that selects
+//! them and the two float decode GEMVs that came with them (`gemv.kq_fma`).
+//!
+//! The recorder-level tests call the kernels directly and run on every device. The adapter-level
+//! ones force `gemv.kq_fma` through the tuning override, since the parameter is off by default
+//! on a device with an accelerated int8 dot.
 //! Run: cargo test -p infr-vulkan --release --test kq_fma_gemv -- --ignored --nocapture
 use infr_core::backend::{Backend, Buffer, BufferUsage};
 use infr_core::DType;
@@ -401,50 +406,95 @@ fn kq_fma_mrow_bw() {
     }
 }
 
+/// A backend on the test environment's device with `gemv.kq_fma` forced to `on`, whatever the
+/// device's default: on a device with an accelerated int8 dot the parameter is off, and these
+/// tests would otherwise never reach the kernels they are about. `None` (after a printed reason)
+/// when no Vulkan device opens.
+fn backend_with_kq_fma(on: bool) -> Option<VulkanBackend> {
+    let value = if on { "true" } else { "false" };
+    let cfg = infr_testkit::gpu_env::env_config_with_tune(&[("gemv.kq_fma", value)]);
+    let be = infr_testkit::gpu_or_skip(VulkanBackend::new_with(std::sync::Arc::new(cfg)));
+    if be.is_none() {
+        eprintln!("skip: no Vulkan device");
+    }
+    be
+}
+
+/// One `Op::Linear` of `m` rows over a `dt` weight, through the adapter.
+fn run_linear(
+    be: &VulkanBackend,
+    dt: DType,
+    w_bytes: &[u8],
+    x: &[f32],
+    (m, in_f, out_f): (usize, usize, usize),
+    mtp_verify: bool,
+) -> Vec<f32> {
+    use infr_core::graph::{Graph, Op};
+    use infr_core::tensor::TensorDesc;
+    let mut g = Graph::new();
+    g.mtp_verify = mtp_verify;
+    let xid = g.input(TensorDesc::new(vec![m, in_f], DType::F32));
+    let wid = g.weight(TensorDesc::new(vec![out_f, in_f], dt));
+    let dst = g.output(TensorDesc::new(vec![m, out_f], DType::F32));
+    g.push(Op::Linear {
+        x: xid,
+        weight: wid,
+        dst,
+        m: m as u32,
+        in_f: in_f as u32,
+        out_f: out_f as u32,
+        w_off: 0,
+    });
+    infr_testkit::run_graph(
+        be,
+        &g,
+        &[(xid, infr_testkit::f32_bytes(x)), (wid, w_bytes.to_vec())],
+        dst,
+        m * out_f,
+    )
+}
+
+/// The kernels of the `gemv.kq_fma` family among those `be` has built.
+fn built_kq_fma_family(be: &VulkanBackend) -> Vec<&'static str> {
+    be.built_kernel_names()
+        .into_iter()
+        .filter(|n| {
+            n.starts_with("native_gemv_kq_fma") || *n == "linear_f32_mo" || *n == "linear_bf16"
+        })
+        .collect()
+}
+
+/// MTP verify shapes, in and out of the int8 multi-row bands: the bands stop at 8192 outputs
+/// from 5 rows up, and their 9..=16 row tier needs a weight of 8M elements; a verify batch has
+/// to take the fp32 kernel at all of these when decode does.
+const VERIFY_SHAPES: [(usize, usize, usize); 7] = [
+    (2, 2048, 4096),
+    (7, 2048, 4096),
+    (8, 2048, 4101),
+    (13, 1024, 8192),
+    (7, 256, 8448),  // 5..=8 rows past the bands' output width
+    (13, 256, 1024), // 9..=16 rows under the int8 tier's weight size floor
+    (16, 256, 8448), // both
+];
+
 /// End-to-end through the adapter: an MTP-verify-flagged graph (`Graph::mtp_verify`, the
-/// speculative-verify batched forward, m = drafts+1 rows) must take the fp32 kq_fma mrow kernel.
-/// Scored TIGHT (rel 1e-5): the int8 mrow this replaces carries activation-quant noise ~1e-3, so
-/// it cannot pass — the tolerance IS the proof the fp32 arm fired. Shapes sit above the int8
-/// gate's 8M-element floor (where the old verify path was int8, not dequant) and span both mrow
-/// bands, with an NR-tail out_f and multi-group row counts.
+/// speculative-verify batched forward, m = drafts+1 rows) must take the fp32 kq_fma mrow kernel
+/// where `gemv.kq_fma` is on. Scored TIGHT (rel 1e-5): the int8 mrow this replaces carries
+/// activation-quant noise ~1e-3, so it cannot pass, and the kernel the run built is asserted
+/// beside it.
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn kq_fma_mtp_verify_tight() {
-    use infr_core::graph::{Graph, Op};
-    use infr_core::tensor::TensorDesc;
-    let be = VulkanBackend::new().unwrap();
+    let Some(be) = backend_with_kq_fma(true) else {
+        return;
+    };
     for dt in [DType::Q4K, DType::Q6K] {
-        for (m, in_f, out_f) in [
-            (2usize, 2048usize, 4096usize),
-            (7, 2048, 4096),
-            (8, 2048, 4101),
-            (13, 1024, 8192),
-        ] {
+        for (m, in_f, out_f) in VERIFY_SHAPES {
             let case = infr_testkit::LinearCase::new(dt, m, in_f, out_f).with_seed(0x9e7);
             let (w_bytes, x) = infr_testkit::case_inputs(case);
             let w_ref = infr_testkit::dequant_oracle(dt, &w_bytes);
             let want = infr_testkit::ref_linear(&x, &w_ref, m, in_f, out_f);
-            let mut g = Graph::new();
-            g.mtp_verify = true;
-            let xid = g.input(TensorDesc::new(vec![m, in_f], DType::F32));
-            let wid = g.weight(TensorDesc::new(vec![out_f, in_f], dt));
-            let dst = g.output(TensorDesc::new(vec![m, out_f], DType::F32));
-            g.push(Op::Linear {
-                x: xid,
-                weight: wid,
-                dst,
-                m: m as u32,
-                in_f: in_f as u32,
-                out_f: out_f as u32,
-                w_off: 0,
-            });
-            let got = infr_testkit::run_graph(
-                &be,
-                &g,
-                &[(xid, infr_testkit::f32_bytes(&x)), (wid, w_bytes)],
-                dst,
-                m * out_f,
-            );
+            let got = run_linear(&be, dt, &w_bytes, &x, (m, in_f, out_f), true);
             let abs = want
                 .iter()
                 .zip(&got)
@@ -458,5 +508,114 @@ fn kq_fma_mtp_verify_tight() {
             );
             println!("{dt:?} verify m={m} {in_f}x{out_f}: rel={rel:.3e} OK (fp32 arm)");
         }
+    }
+    let built = built_kq_fma_family(&be);
+    assert!(
+        built
+            .iter()
+            .all(|n| n.starts_with("native_gemv_kq_fma_mrow"))
+            && !built.is_empty(),
+        "the verify batches built {built:?}, not only the fp32 multi-row GEMV"
+    );
+}
+
+/// The contract the verify twin exists for, through the adapter: every row of an MTP verify
+/// batch equals, bit for bit, the decode `Linear` of that row alone, at shapes in and out of the
+/// int8 multi-row bands.
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn kq_fma_verify_rows_match_decode_rows() {
+    let Some(be) = backend_with_kq_fma(true) else {
+        return;
+    };
+    for dt in [DType::Q4K, DType::Q6K] {
+        for (m, in_f, out_f) in VERIFY_SHAPES {
+            let case = infr_testkit::LinearCase::new(dt, m, in_f, out_f).with_seed(0x51d);
+            let (w_bytes, x) = infr_testkit::case_inputs(case);
+            let verify = run_linear(&be, dt, &w_bytes, &x, (m, in_f, out_f), true);
+            for r in 0..m {
+                let xr = &x[r * in_f..(r + 1) * in_f];
+                let decode = run_linear(&be, dt, &w_bytes, xr, (1, in_f, out_f), false);
+                let differs = decode
+                    .iter()
+                    .zip(&verify[r * out_f..(r + 1) * out_f])
+                    .position(|(a, b)| a.to_bits() != b.to_bits());
+                assert_eq!(
+                    differs, None,
+                    "{dt:?} m={m} {in_f}x{out_f}: verify row {r} differs from its decode row at \
+                     output {differs:?}"
+                );
+            }
+            println!("{dt:?} m={m} {in_f}x{out_f}: every verify row is its decode row");
+        }
+    }
+    let built = built_kq_fma_family(&be);
+    assert!(
+        built
+            .iter()
+            .any(|n| n.starts_with("native_gemv_kq_fma_mrow"))
+            && built.iter().any(|n| !n.contains("_mrow")),
+        "expected the decode GEMV and its multi-row twin, built {built:?}"
+    );
+}
+
+/// `gemv.kq_fma` is the one switch for the whole family: on, a one-row K-quant, f32 and bf16
+/// `Linear` each take their fp32 decode kernel; off, none of those kernels is built and the
+/// kernels the device was tuned with before them run instead. Both sides must agree with the
+/// host reference.
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn kq_fma_parameter_selects_the_decode_gemvs() {
+    const IN_F: usize = 512;
+    const OUT_F: usize = 96;
+    let x = infr_testkit::gen_f32(IN_F, 3);
+    let vals = infr_testkit::gen_f32(OUT_F * IN_F, 7);
+    let f32_w: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+    // bf16 is the top half of an f32: keep those bits, and score against the value they hold.
+    let bf16_w: Vec<u8> = vals
+        .iter()
+        .flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes())
+        .collect();
+    let bf16_vals: Vec<f32> = vals
+        .iter()
+        .map(|v| f32::from_bits(v.to_bits() & 0xFFFF_0000))
+        .collect();
+    let (q4k_w, _) =
+        infr_testkit::case_inputs(infr_testkit::LinearCase::new(DType::Q4K, 1, IN_F, OUT_F));
+    let q4k_vals = infr_testkit::dequant_oracle(DType::Q4K, &q4k_w);
+    let cases: [(DType, &[u8], &[f32], &str); 3] = [
+        (DType::F32, &f32_w, &vals, "linear_f32_mo"),
+        (DType::Bf16, &bf16_w, &bf16_vals, "linear_bf16"),
+        (DType::Q4K, &q4k_w, &q4k_vals, "native_gemv_kq_fma_q4k"),
+    ];
+    for on in [true, false] {
+        let Some(be) = backend_with_kq_fma(on) else {
+            return;
+        };
+        for (dt, w_bytes, w_vals, _) in cases {
+            let want = infr_testkit::ref_linear(&x, w_vals, 1, IN_F, OUT_F);
+            let got = run_linear(&be, dt, w_bytes, &x, (1, IN_F, OUT_F), false);
+            // The off side of Q4_K may be an int8 kernel, which quantizes the activations.
+            let tol = if dt == DType::Q4K && !on { 2e-2 } else { 1e-4 };
+            let ref_mag = want.iter().map(|v| v.abs()).fold(1.0f32, f32::max);
+            for (o, (g, w)) in got.iter().zip(&want).enumerate() {
+                assert!(
+                    (g - w).abs() <= tol * ref_mag,
+                    "{dt:?} gemv.kq_fma={on}: output {o} is {g}, the host reference {w}"
+                );
+            }
+        }
+        let built = built_kq_fma_family(&be);
+        if on {
+            for (dt, .., kernel) in cases {
+                assert!(
+                    built.iter().any(|n| n.starts_with(kernel)),
+                    "gemv.kq_fma=true: the {dt:?} decode Linear did not build {kernel} ({built:?})"
+                );
+            }
+        } else {
+            assert!(built.is_empty(), "gemv.kq_fma=false still built {built:?}");
+        }
+        println!("gemv.kq_fma={on}: built {built:?}");
     }
 }

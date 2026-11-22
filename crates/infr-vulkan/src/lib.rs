@@ -249,17 +249,45 @@ fn check_bindable_size(bytes: usize) -> Result<()> {
     Ok(())
 }
 
-/// What became of a request for a COMPUTE-only queue family ([`VulkanBackend::pick_queue_family`]).
+/// Why [`VulkanBackend::pick_queue_family`] chose the family it did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ComputeRing {
-    /// `queue.compute_only` is off.
-    NotAsked,
-    /// Asked for, and the chosen family is one.
-    Taken,
-    /// Asked for, but the device has no COMPUTE-only family.
-    Missing,
-    /// Asked for, but no COMPUTE-only family writes timestamps.
+enum QueueOutcome {
+    /// A COMPUTE-only family that writes timestamps, as `auto` or `compute` asked.
+    ComputeOnly,
+    /// The setting is `graphics`.
+    GraphicsAsked,
+    /// `auto` or `compute`, but the device has no COMPUTE-only family.
+    NoComputeFamily,
+    /// `auto` or `compute`, but no COMPUTE-only family writes timestamps.
     NoTimestamps,
+}
+
+impl QueueOutcome {
+    /// The outcome in words, for the startup log and `infr tune show`.
+    fn reason(self) -> &'static str {
+        match self {
+            QueueOutcome::ComputeOnly => "a compute-only family that writes timestamps",
+            QueueOutcome::GraphicsAsked => "the universal family, as set",
+            QueueOutcome::NoComputeFamily => {
+                "the universal family: this device has no compute-only family"
+            }
+            QueueOutcome::NoTimestamps => {
+                "the universal family: the compute-only family writes no timestamps \
+                 (timestampValidBits 0), which the submit splitter, the work bound, the \
+                 dropped-work check and the per-op profile need"
+            }
+        }
+    }
+
+    /// Whether the fallback is worth a warning under `setting`: always when a family was refused
+    /// for its timestamps, and for a missing family only when `compute` asked for one by name.
+    fn warns(self, setting: tuning::QueueFamily) -> bool {
+        match self {
+            QueueOutcome::ComputeOnly | QueueOutcome::GraphicsAsked => false,
+            QueueOutcome::NoTimestamps => true,
+            QueueOutcome::NoComputeFamily => setting == tuning::QueueFamily::Compute,
+        }
+    }
 }
 
 /// Device features the kernels rely on with no fallback: `shaderInt8` for the int8 arithmetic in
@@ -1625,46 +1653,44 @@ impl VulkanBackend {
         }
     }
 
-    /// Which queue family inference submits on, out of the device's families, and what became of
-    /// a request for a COMPUTE-only one.
+    /// Which queue family inference submits on, out of the device's families, and why: a pure
+    /// function of the families' properties and the tuning parameter `queue.family`.
     ///
-    /// `compute_only` is the tuning parameter `queue.compute_only`. When set, the first
-    /// COMPUTE-only family that writes timestamps is taken: a long forward then runs on an engine
-    /// the driver schedules beside graphics (amdgpu's `comp` rings) instead of on the ring the
-    /// compositor renders on. A COMPUTE-only family with no valid timestamp bits is never taken,
-    /// asked for or not, while another family can compute: the submit splitter's segment timing,
-    /// the dropped-work check and the per-op profile all read timestamps written on the submit
-    /// queue. Otherwise the universal (GRAPHICS and COMPUTE) family is preferred, then any family
-    /// that can compute. `None` = the device cannot compute at all.
+    /// `auto` and `compute` take the first COMPUTE-only family that writes timestamps: a long
+    /// forward then runs on an engine the driver schedules beside graphics (amdgpu's `comp`
+    /// rings) instead of on the ring the compositor renders on. A COMPUTE-only family with no
+    /// valid timestamp bits is never taken while another family can compute: the submit
+    /// splitter's segment timing, the work bound, the dropped-work check and the per-op profile
+    /// all read timestamps written on the submit queue. Without a usable one, and under
+    /// `graphics`, the universal (GRAPHICS and COMPUTE) family is taken, then any family that
+    /// can compute. The two settings differ only in whether a fallback warns
+    /// ([`QueueOutcome::warns`]). `None` = the device cannot compute at all.
     fn pick_queue_family(
         families: &[vk::QueueFamilyProperties],
-        compute_only: bool,
-    ) -> Option<(u32, ComputeRing)> {
+        setting: tuning::QueueFamily,
+    ) -> Option<(u32, QueueOutcome)> {
         let compute =
             |p: &vk::QueueFamilyProperties| p.queue_flags.contains(vk::QueueFlags::COMPUTE);
         let universal = |p: &vk::QueueFamilyProperties| {
             compute(p) && p.queue_flags.contains(vk::QueueFlags::GRAPHICS)
         };
-        let compute_only_family = |p: &vk::QueueFamilyProperties| compute(p) && !universal(p);
+        let compute_only = |p: &vk::QueueFamilyProperties| compute(p) && !universal(p);
         let timed = |p: &vk::QueueFamilyProperties| p.timestamp_valid_bits > 0;
-        let ring = if !compute_only {
-            ComputeRing::NotAsked
-        } else if let Some(i) = families
-            .iter()
-            .position(|p| compute_only_family(p) && timed(p))
-        {
-            return Some((i as u32, ComputeRing::Taken));
-        } else if families.iter().any(compute_only_family) {
-            ComputeRing::NoTimestamps
+        let outcome = if setting == tuning::QueueFamily::Graphics {
+            QueueOutcome::GraphicsAsked
+        } else if let Some(i) = families.iter().position(|p| compute_only(p) && timed(p)) {
+            return Some((i as u32, QueueOutcome::ComputeOnly));
+        } else if families.iter().any(compute_only) {
+            QueueOutcome::NoTimestamps
         } else {
-            ComputeRing::Missing
+            QueueOutcome::NoComputeFamily
         };
         families
             .iter()
             .position(universal)
             .or_else(|| families.iter().position(|p| compute(p) && timed(p)))
             .or_else(|| families.iter().position(compute))
-            .map(|i| (i as u32, ring))
+            .map(|i| (i as u32, outcome))
     }
 
     /// Enumerate ALL Vulkan physical devices WITHOUT building a backend (a cheap instance +
@@ -2560,43 +2586,37 @@ impl VulkanBackend {
         };
         let tuning::resolve::Resolved {
             tuning: tuned,
-            report: tuning_report,
+            report: mut tuning_report,
         } = tuning::resolve::resolve(&facts, &cfg).map_err(be)?;
 
         // ── compute queue family ───────────────────────────────────────────────
-        // `queue.compute_only` (see `tuning::families`) decides between a COMPUTE-only family and
-        // the universal one; `pick_queue_family` holds the rule, including the refusal of a
-        // family that writes no timestamps.
+        // `queue.family` (see `tuning::families`) decides between a COMPUTE-only family and the
+        // universal one; `pick_queue_family` holds the rule, including the refusal of a family
+        // that writes no timestamps.
         let qf_props =
             unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
-        let (queue_family_index, compute_ring) =
-            Self::pick_queue_family(&qf_props, tuned.queue_compute_only)
+        let (queue_family_index, queue_outcome) =
+            Self::pick_queue_family(&qf_props, tuned.queue_family)
                 .ok_or_else(|| be("no compute queue family found"))?;
-        match compute_ring {
-            ComputeRing::NotAsked | ComputeRing::Taken => {}
-            // The parameter is on by default, so a device without such a family is the ordinary
-            // case, not a refused request.
-            ComputeRing::Missing => tracing::info!(
-                "[infr] vulkan: queue.compute_only is on, but this device has no COMPUTE-only \
-                 queue family; submitting on queue family {queue_family_index}"
-            ),
-            ComputeRing::NoTimestamps => tracing::warn!(
-                "[infr] vulkan: queue.compute_only is on, but this device's COMPUTE-only queue \
-                 family writes no timestamps (timestampValidBits 0), which the submit splitter, \
-                 the dropped-work check and the per-op profile need; submitting on queue family \
-                 {queue_family_index}"
-            ),
-        }
         let chosen_family = &qf_props[queue_family_index as usize];
-        tracing::info!(
-            "[infr] vulkan: queue family {queue_family_index} ({}, timestampValidBits {})",
+        // One line for the log and for `infr tune show`: the family, and why it was picked.
+        let queue_note = format!(
+            "queue family {queue_family_index} ({}, timestampValidBits {}): {}",
             if chosen_family.queue_flags.contains(vk::QueueFlags::GRAPHICS) {
                 "universal: graphics and compute"
             } else {
                 "compute-only"
             },
-            chosen_family.timestamp_valid_bits
+            chosen_family.timestamp_valid_bits,
+            queue_outcome.reason()
         );
+        let queue_setting = tuned.queue_family.name();
+        if queue_outcome.warns(tuned.queue_family) {
+            tracing::warn!("[infr] vulkan: queue.family = {queue_setting}, picked {queue_note}");
+        } else {
+            tracing::info!("[infr] vulkan: queue.family = {queue_setting}, picked {queue_note}");
+        }
+        tuning_report.note("queue.family", &format!("picked {queue_note}"));
         // Per-segment GPU timing for the submit splitter (`ForwardClock`): usable only when the
         // chosen queue family writes timestamps at all.
         let segment_ts_bits = chosen_family.timestamp_valid_bits;
@@ -5498,61 +5518,92 @@ mod tests {
         ]
     }
 
+    /// `auto` and `compute` take the compute-only family; `graphics` never does, wherever the
+    /// driver lists it.
     #[test]
-    fn compute_only_submits_on_the_compute_only_family() {
+    fn the_setting_chooses_between_the_two_families() {
+        use tuning::QueueFamily::{Auto, Compute, Graphics};
+        let amd = amd_families();
+        let swapped = [amd[1], amd[0]];
+        for setting in [Auto, Compute] {
+            assert_eq!(
+                VulkanBackend::pick_queue_family(&amd, setting),
+                Some((1, QueueOutcome::ComputeOnly)),
+                "{setting:?}"
+            );
+            assert_eq!(
+                VulkanBackend::pick_queue_family(&swapped, setting),
+                Some((0, QueueOutcome::ComputeOnly)),
+                "{setting:?}"
+            );
+        }
         assert_eq!(
-            VulkanBackend::pick_queue_family(&amd_families(), true),
-            Some((1, ComputeRing::Taken))
+            VulkanBackend::pick_queue_family(&amd, Graphics),
+            Some((0, QueueOutcome::GraphicsAsked))
+        );
+        assert_eq!(
+            VulkanBackend::pick_queue_family(&swapped, Graphics),
+            Some((1, QueueOutcome::GraphicsAsked))
         );
     }
 
-    #[test]
-    fn without_compute_only_inference_stays_on_the_universal_family() {
-        assert_eq!(
-            VulkanBackend::pick_queue_family(&amd_families(), false),
-            Some((0, ComputeRing::NotAsked))
-        );
-        // The preference must not depend on which family the driver enumerates first.
-        let swapped = [amd_families()[1], amd_families()[0]];
-        assert_eq!(
-            VulkanBackend::pick_queue_family(&swapped, false),
-            Some((1, ComputeRing::NotAsked))
-        );
-    }
-
+    /// A device with only the universal family takes it under every setting; only `compute`,
+    /// which asked for the other by name, warns.
     #[test]
     fn a_device_without_a_compute_only_family_falls_back() {
+        use tuning::QueueFamily::{Auto, Compute, Graphics};
         let families = [queue_family(
             vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE,
         )];
+        for setting in [Auto, Compute] {
+            assert_eq!(
+                VulkanBackend::pick_queue_family(&families, setting),
+                Some((0, QueueOutcome::NoComputeFamily)),
+                "{setting:?}"
+            );
+        }
+        assert!(!QueueOutcome::NoComputeFamily.warns(Auto));
+        assert!(QueueOutcome::NoComputeFamily.warns(Compute));
         assert_eq!(
-            VulkanBackend::pick_queue_family(&families, true),
-            Some((0, ComputeRing::Missing))
+            VulkanBackend::pick_queue_family(&families, Graphics),
+            Some((0, QueueOutcome::GraphicsAsked))
         );
     }
 
-    /// The segment timing, the dropped-work check and the per-op profile read timestamps from
-    /// the submit queue, so a COMPUTE-only family that writes none is not taken even when asked
-    /// for; a second one that does write them is.
+    /// The segment timing, the work bound, the dropped-work check and the per-op profile read
+    /// timestamps from the submit queue, so a COMPUTE-only family that writes none is not taken
+    /// under any setting, and the fallback warns under `auto` and `compute` alike; a second one
+    /// that does write them is taken.
     #[test]
     fn a_compute_only_family_without_timestamps_is_refused() {
+        use tuning::QueueFamily::{Auto, Compute, Graphics};
         let mut families = amd_families();
         families[1].timestamp_valid_bits = 0;
-        assert_eq!(
-            VulkanBackend::pick_queue_family(&families, true),
-            Some((0, ComputeRing::NoTimestamps))
-        );
         let mut three = [families[0], families[1], amd_families()[1]];
-        assert_eq!(
-            VulkanBackend::pick_queue_family(&three, true),
-            Some((2, ComputeRing::Taken))
-        );
-        // Not asked for, and only compute-only families can compute: the timed one.
+        for setting in [Auto, Compute] {
+            assert_eq!(
+                VulkanBackend::pick_queue_family(&families, setting),
+                Some((0, QueueOutcome::NoTimestamps)),
+                "{setting:?}"
+            );
+            assert!(QueueOutcome::NoTimestamps.warns(setting), "{setting:?}");
+            assert_eq!(
+                VulkanBackend::pick_queue_family(&three, setting),
+                Some((2, QueueOutcome::ComputeOnly)),
+                "{setting:?}"
+            );
+        }
+        // `graphics`, and only compute-only families can compute: the timed one.
         three[0].queue_flags = vk::QueueFlags::GRAPHICS;
         assert_eq!(
-            VulkanBackend::pick_queue_family(&three, false),
-            Some((2, ComputeRing::NotAsked))
+            VulkanBackend::pick_queue_family(&three, Graphics),
+            Some((2, QueueOutcome::GraphicsAsked))
         );
+        for quiet in [QueueOutcome::ComputeOnly, QueueOutcome::GraphicsAsked] {
+            for setting in [Auto, Compute, Graphics] {
+                assert!(!quiet.warns(setting), "{quiet:?} under {setting:?}");
+            }
+        }
     }
 
     #[test]
@@ -5561,8 +5612,9 @@ mod tests {
             queue_family(vk::QueueFlags::GRAPHICS),
             queue_family(vk::QueueFlags::TRANSFER),
         ];
-        assert_eq!(VulkanBackend::pick_queue_family(&families, true), None);
-        assert_eq!(VulkanBackend::pick_queue_family(&families, false), None);
+        for (_, setting) in tuning::QueueFamily::ALL {
+            assert_eq!(VulkanBackend::pick_queue_family(&families, setting), None);
+        }
     }
 
     /// A `Buffer` impl that is NOT a `VkBuffer` — stands in for what the multi-backend paths can

@@ -256,7 +256,7 @@ and these exist to force one off when bisecting a correctness or perf problem.
   `flash_min_rows`, `pv_splits`), DeltaNet (`dn_chunk_scan`, `dn_chunk`,
   `dn_split`), and the plumbing switches (`push_desc`, `pipeline_cache_disk`,
   `no_replay`, `no_vram_guard`, `gfx_queue` — an alias that turns the
-  `queue.compute_only` tuning parameter off — the BDA chunk caps). Note
+  `queue.family` tuning parameter to `graphics` — the BDA chunk caps). Note
   `f16 = false` also disables coopmat regardless of `coopmat`, matching
   `INFR_NO_F16`'s effect today. The hardware-shaped numbers (split counts,
   thresholds, rows per workgroup, subgroup pins) are per-device tuning
@@ -327,10 +327,11 @@ on wherever it applies:
   attention. Default: 16 on a discrete device in the slow class (wave64-only, or
   neither matrix units nor an accelerated int8 dot), 64 elsewhere. It changes
   the last bits of decode attention for every context under 32 times its value.
-- `queue.compute_only` submits on a compute-only queue family. Default: on for
-  every discrete device (PR 106's rule, kept by the project owner's decision so
-  that the desktop stays responsive), and for an integrated GPU under the AMD
-  Windows driver by a table row; described with the submit parameters below.
+- `queue.family` chooses the queue family inference submits on (`auto`,
+  `compute` or `graphics`). Default: `auto` on every discrete device (PR 106's
+  rule, kept by the project owner's decision so that the desktop stays
+  responsive), and on an integrated GPU under the AMD Windows driver by a table
+  row; described under "Which queue inference runs on" below.
 
 Three parameters are not kernel choices; they decide how a forward is cut into
 submits, so that no submit runs long enough for a driver's watchdog to reset the
@@ -430,24 +431,63 @@ mid-sized model's forward at the default batch takes no cut. SmolLM3-3B at
 pass: one is owed, the other comes from its estimate standing above the real
 time.
 
-`queue.compute_only` decides which queue family the submits go to, and with it
-which of the driver's watchdogs applies. It is on by default: where the device
-has a COMPUTE-only family, the submits go there and not to the universal family
-the compositor renders on, so a long forward delays the desktop's frames instead
-of blocking them (an RX 580 under RADV held 130 fps in glxgears through a
-prefill that used to drop it to 7). The exception is an integrated GPU, which
-keeps the universal family unless a table row for its driver says otherwise (the
-AMD Windows driver's does): under RADV the compute ring's hang budget measured
-tighter on one. It is not free everywhere: on an RX 7900 XTX under the AMD
-Windows driver it measured 4.2% off decode and 1.1% off prefill (backlog B227).
-Turn it off with `INFR_TUNE=queue.compute_only=false`, or with its alias
-`kernels.vulkan.gfx_queue = true` (`INFR_GFX_QUEUE`). A compute-only family that
-writes no timestamps is never used, with a warning, because the submit splitter,
-the work bound, the dropped-work check and `INFR_PROF_OPS` all read timestamps
-from the submit queue. amdgpu documents a longer job timeout for its compute
-rings than for the graphics ring, but the budget does not count on it: the 2 s
-figure is the tighter one, and it is the one that was measured, on the graphics
-ring.
+**Which queue inference runs on.** A GPU takes work on queues, and most devices
+have at least two kinds: a universal one that does graphics and compute, which
+is the one your desktop's compositor draws its frames on, and often a
+compute-only one. `queue.family` says which of them infr submits its work to:
+
+- **`auto`** (the default on a discrete GPU): the compute-only queue when the
+  device has one that infr can use, otherwise the universal one. On the
+  compute-only queue a long forward does not sit in front of the compositor's
+  frames, so the desktop stays responsive while a model runs: an RX 580 under
+  RADV held 130 fps in glxgears through a prefill that used to drop it to 7.
+- **`compute`**: the same choice, asked for by name. If the device has no
+  compute-only queue, or has one infr cannot use, infr falls back to the
+  universal queue and logs a warning that says which of the two it was.
+- **`graphics`**: always the universal queue. Choose it when throughput matters
+  more than the desktop, for example on a headless machine or a dedicated
+  inference box.
+
+The difference in speed is measured, not assumed: on an RX 7900 XTX under the
+AMD Windows driver the compute-only queue cost 4.2% of decode speed and 1.1% of
+prefill speed, on a Ryzen integrated GPU under the same driver nothing
+measurable, and the contributor measured about 6% of decode on an RX 580 under
+RADV (the figures are in the changelog and in backlog B227 and B228; Linux
+headless is not measured yet). An integrated GPU defaults to `graphics` unless a
+table row for its driver says otherwise (the AMD Windows driver's sets `auto`):
+under RADV the compute ring's hang budget measured tighter on one.
+
+Set it in any of the three places every tuning parameter is set from:
+
+```toml
+# infr.toml
+[kernels.vulkan.tune]
+"queue.family" = "graphics"   # auto | compute | graphics
+```
+
+```sh
+INFR_TUNE=queue.family=graphics infr run model.gguf
+infr bench model.gguf --set kernels.vulkan.tune.queue.family=graphics
+```
+
+`--set` is accepted by `infr run`, `infr bench`, `infr serve` and
+`infr tune show`. Any other word is an error that lists the three. The older
+`kernels.vulkan.gfx_queue = true` (`INFR_GFX_QUEUE`) is an alias of `graphics`.
+`infr tune show` prints the value, where it came from and the family that was
+picked, and the startup log has the same line:
+
+```
+queue.family                 auto   default; picked queue family 1 (compute-only, timestampValidBits 64): a compute-only family that writes timestamps
+```
+
+"A queue infr cannot use" is one that writes no timestamps (`timestampValidBits`
+0): the submit splitter, the work bound, the dropped-work check and
+`INFR_PROF_OPS` all read timestamps from the submit queue, so such a family is
+never picked, under any setting, with a warning. The choice also decides which
+of the driver's watchdogs applies. amdgpu documents a longer job timeout for its
+compute rings than for the graphics ring, but the work budget does not count on
+it: the 2 s figure is the tighter one, and it is the one that was measured, on
+the graphics ring.
 
 Each value is resolved once, when the backend is created, from these levels —
 the last one that sets a parameter wins, per parameter:

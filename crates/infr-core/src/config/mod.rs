@@ -448,7 +448,7 @@ cfg_struct! {
         push_desc: bool = true,
         /// `INFR_GFX_QUEUE` — submit on the universal (graphics) family even where the device
         /// rule would pick a COMPUTE-only one. An alias of the Vulkan tuning parameter
-        /// `queue.compute_only`, which it sets to `false`.
+        /// `queue.family`, which it sets to `graphics`.
         gfx_queue: bool = false,
         /// `INFR_NO_PIPELINE_CACHE` (inverted).
         pipeline_cache_disk: bool = true,

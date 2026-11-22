@@ -44,6 +44,8 @@ pub(crate) enum Ty {
     Set(&'static [u64]),
     /// One of a fixed set of build names, or `none` for no build.
     Names(&'static [&'static str]),
+    /// Exactly one of a fixed set of words.
+    Choice(&'static [&'static str]),
 }
 
 impl Ty {
@@ -54,6 +56,7 @@ impl Ty {
             Ty::Bool => "true|false".to_string(),
             Ty::Set(v) => v.iter().map(u64::to_string).collect::<Vec<_>>().join("|"),
             Ty::Names(names) => format!("{}|none", names.join("|")),
+            Ty::Choice(words) => words.join("|"),
         }
     }
 
@@ -102,6 +105,13 @@ impl Ty {
                     Err(format!("must be one of {} (got {raw:?})", self.describe()))
                 }
             }
+            Ty::Choice(words) => {
+                if words.contains(&raw) {
+                    Ok(Value::Text(raw.to_string()))
+                } else {
+                    Err(format!("must be one of {} (got {raw:?})", self.describe()))
+                }
+            }
         }
     }
 
@@ -112,6 +122,7 @@ impl Ty {
             (Ty::Set(set), Value::Uint(x)) => set.contains(x),
             (Ty::Bool, Value::Bool(_)) => true,
             (Ty::Names(names), Value::Text(s)) => s == "none" || names.contains(&s.as_str()),
+            (Ty::Choice(words), Value::Text(s)) => words.contains(&s.as_str()),
             _ => false,
         }
     }
@@ -665,7 +676,13 @@ pub(crate) static PARAMS: &[Param] = &[
               its value",
         rule: "16 on a discrete device in the slow class (no matrix units and no accelerated \
                int8 dot, or wave64-only), where it was measured; else 64",
-        default: |f, _| Value::Uint(if !f.integrated && f.slow_class() { 16 } else { 64 }),
+        default: |f, _| {
+            Value::Uint(if !f.integrated && f.slow_class() {
+                16
+            } else {
+                64
+            })
+        },
         get: |t, _| Value::Uint(t.attn_decode_min_chunk as u64),
         set: |t, _, v| t.attn_decode_min_chunk = v.usize(),
     },
@@ -711,15 +728,30 @@ pub(crate) static PARAMS: &[Param] = &[
     // ── queue ────────────────────────────────────────────────────────────────
     Param {
         family: "queue",
-        name: "compute_only",
+        name: "family",
         kind: Kind::Host,
-        ty: Ty::Bool,
+        ty: Ty::Choice(super::QueueFamily::NAMES),
         axis: Axis::None,
-        doc: "submit on a COMPUTE-only queue family when the device has one that writes               timestamps (amdgpu: the comp rings, scheduled beside the ring the compositor               renders on), else on the universal family",
-        rule: "true on a discrete device; false on an integrated one, where the compute ring's                hang budget measured tighter under RADV (a measured driver's row turns it on)",
-        default: |f, _| Value::Bool(!f.integrated),
-        get: |t, _| Value::Bool(t.queue_compute_only),
-        set: |t, _, v| t.queue_compute_only = v.flag(),
+        doc: "which queue family inference submits on. auto: a COMPUTE-only family when the \
+              device has one that writes timestamps (amdgpu: the comp rings, scheduled beside \
+              the ring the compositor renders on, so the desktop stays responsive), else the \
+              universal family. compute: the same choice, with a warning that says why when it \
+              falls back. graphics: always the universal (graphics and compute) family",
+        rule: "auto on a discrete device; graphics on an integrated one, where the compute \
+               ring's hang budget measured tighter under RADV (a measured driver's row sets auto)",
+        default: |f, _| {
+            let v = if f.integrated {
+                super::QueueFamily::Graphics
+            } else {
+                super::QueueFamily::Auto
+            };
+            Value::Text(v.name().to_string())
+        },
+        get: |t, _| Value::Text(t.queue_family.name().to_string()),
+        set: |t, _, v| {
+            t.queue_family =
+                super::QueueFamily::from_name(v.text()).expect("validated as a queue family");
+        },
     },
     // ── submit splitter ──────────────────────────────────────────────────────
     Param {
@@ -1069,13 +1101,13 @@ pub(crate) static ALIASES: &[Alias] = &[
     },
     Alias {
         path: "kernels.vulkan.gfx_queue",
-        params: &["queue.compute_only"],
+        params: &["queue.family"],
         // Only ON ever meant anything: unset leaves the device rule and the table in charge.
         read: |c, _| {
             c.kernels
                 .vulkan
                 .gfx_queue
-                .then(|| vec![("queue.compute_only", Value::Bool(false))])
+                .then(|| vec![("queue.family", Value::Text("graphics".to_string()))])
         },
     },
     Alias {

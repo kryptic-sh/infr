@@ -105,8 +105,8 @@ through the hang); a compute-only queue family (on this part it makes the hang
 DETERMINISTIC — the `comp` ring budget is TIGHTER, which is why integrated GPUs
 keep the universal family under RADV; discrete GPUs submit on the compute ring
 on purpose, and so does an integrated GPU under the AMD Windows driver, where it
-was measured; see the `queue.compute_only` tuning parameter). `RADV_DEBUG=hang`
-is a **red herring**: syncshaders serializes the IB so the job itself blows the
+was measured; see the `queue.family` tuning parameter). `RADV_DEBUG=hang` is a
+**red herring**: syncshaders serializes the IB so the job itself blows the
 budget, "naming" whatever shader ran at the 2 s mark.
 
 ### The dense-decode routing bug (found while chasing the above)

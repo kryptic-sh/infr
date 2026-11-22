@@ -1,6 +1,6 @@
 device:  AMD Radeon RX 7900 XTX (AmdRdna3, AMD_PROPRIETARY)
 match:   vendor=amd arch=AmdRdna3 driver=AMD_PROPRIETARY integrated=false device_id=0x744c cu=96 subgroup=32-64 driver_version=0x800161
-hash:    b7ca1944
+hash:    37fd3a37
 rows:
   amd-proprietary-split-k [class row, maintainer] sets split_k.scale_by_cu
   amd-proprietary-i8cm-kq [class row, maintainer] sets gemm_i8cm_kq.enabled
@@ -51,7 +51,7 @@ attn_split.decode_min_chunk  64     default
 attn_split.max_chunk         512    fixed
 mla.sg_width                 32     fixed
 moe.small_m                  8      default
-queue.compute_only           true   default
+queue.family                 auto   default
 submit.initial_dispatches    0      default
 submit.budget_ms             500    default
 submit.prior_gflops          768    default

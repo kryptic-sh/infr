@@ -99,25 +99,31 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `OaiRenderer::{render_no_think, response_constraint, count_tokens}`; in
   `infr_chat`, `render_chat_oai_thinking` and a public `thinking_enabled`.
 
-- **Inference submits on a compute-only queue family by default (tuning
-  parameter `queue.compute_only`).** Where a Vulkan device has a COMPUTE-only
-  queue family (amdgpu's `comp` rings), infr now submits there instead of on the
-  universal family the compositor renders its frames on, so the desktop stays
-  responsive while a long forward runs: on an RX 580 under RADV with zeta-2.1
-  Q4_K_M, glxgears held 130 fps through a prefill that used to drop it to 7 (153
-  → 166 tok/s prefill, 31.2 → 30.7 tok/s decode; the contributor's figures, PR
-  106). It is on for every discrete GPU, and for an integrated GPU under the AMD
-  Windows driver, where it was measured; an integrated GPU under any other
-  driver keeps the universal family, because the `comp` ring's hang budget
-  measured tighter on one under RADV. What it costs on the devices measured
-  here, Qwen3-1.7B Q4_K_M under the AMD Windows driver with a desktop running:
-  on the RX 7900 XTX tg128 474.86 → 454.79 t/s (-4.2%) and pp512 11611.42 →
-  11482.28 t/s (-1.1%); on a Ryzen integrated GPU nothing measurable (tg128
-  27.12 → 27.12, pp512 230.94 → 230.84). Desktop responsiveness itself was not
-  measured here. To turn it off: `INFR_TUNE=queue.compute_only=false`,
-  `"queue.compute_only" = false` under `[kernels.vulkan.tune]`, or the alias
-  `kernels.vulkan.gfx_queue = true` (`INFR_GFX_QUEUE`). `infr tune show` and the
-  startup log say which family the backend bound. A COMPUTE-only family that
+- **Tuning parameter `queue.family`: which queue family inference submits on,
+  `auto` by default.** Three values. `auto` takes a COMPUTE-only queue family
+  where the device has one that writes timestamps (amdgpu's `comp` rings), and
+  otherwise the universal family. `compute` asks for the COMPUTE-only family and
+  warns, saying why, when it has to fall back. `graphics` always takes the
+  universal family, the one the compositor renders its frames on. The point of
+  the default is a desktop that stays responsive while a long forward runs: on
+  an RX 580 under RADV with zeta-2.1 Q4_K_M, glxgears held 130 fps through a
+  prefill that used to drop it to 7 (153 → 166 tok/s prefill, 31.2 → 30.7 tok/s
+  decode; the contributor's figures, PR 106). `auto` is the default on every
+  discrete GPU, and on an integrated GPU under the AMD Windows driver, where it
+  was measured; an integrated GPU under any other driver defaults to `graphics`,
+  because the `comp` ring's hang budget measured tighter on one under RADV. What
+  the compute-only family costs on the devices measured here, Qwen3-1.7B Q4_K_M
+  under the AMD Windows driver with a desktop running: on the RX 7900 XTX tg128
+  474.86 → 454.79 t/s (-4.2%) and pp512 11611.42 → 11482.28 t/s (-1.1%); on a
+  Ryzen integrated GPU nothing measurable (tg128 27.12 → 27.12, pp512 230.94 →
+  230.84). Desktop responsiveness itself was not measured here. Set it in the
+  config file (`"queue.family" = "graphics"` under `[kernels.vulkan.tune]`), in
+  the environment (`INFR_TUNE=queue.family=graphics`) or on the command line
+  (`--set kernels.vulkan.tune.queue.family=graphics`, on `infr run`, `bench`,
+  `serve` and `tune show`); any other word is an error that lists the three.
+  `kernels.vulkan.gfx_queue = true` (`INFR_GFX_QUEUE`) is an alias of
+  `graphics`. `infr tune show` prints the value, where it came from and the
+  family picked, and the startup log says the same. A COMPUTE-only family that
   writes no timestamps is never used, with a warning, since the submit splitter,
   the work bound, the dropped-work check and `INFR_PROF_OPS` read timestamps
   from the submit queue. The generation golden and the tolerance tests run on

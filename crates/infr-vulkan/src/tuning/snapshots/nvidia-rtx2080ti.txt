@@ -1,6 +1,6 @@
 device:  NVIDIA GeForce RTX 2080 Ti (NvidiaTuring, NVIDIA_PROPRIETARY)
 match:   vendor=nvidia arch=NvidiaTuring driver=NVIDIA_PROPRIETARY integrated=false device_id=0x1e07 cu=68 subgroup=32-32 driver_version=0x0
-hash:    ca923f57
+hash:    1c9241fa
 rows: none
 
 device.sg_pref               32     default
@@ -49,7 +49,7 @@ attn_split.decode_min_chunk  64     default
 attn_split.max_chunk         512    fixed
 mla.sg_width                 32     fixed
 moe.small_m                  8      default
-queue.compute_only           true   default
+queue.family                 auto   default
 submit.initial_dispatches    0      default
 submit.budget_ms             500    default
 submit.prior_gflops          544    default

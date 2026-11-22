@@ -287,6 +287,13 @@ fn every_parameter_is_in_range_and_round_trips() {
                         (Value::Uint(v), families::Ty::Uint { min, max }) => {
                             Value::Uint(if *v < max { v + 1 } else { min })
                         }
+                        (Value::Text(t), families::Ty::Choice(words)) => Value::Text(
+                            words
+                                .iter()
+                                .find(|w| **w != t.as_str())
+                                .expect("a choice has more than one word")
+                                .to_string(),
+                        ),
                         (Value::Text(_), _) => Value::Text("other".to_string()),
                         _ => unreachable!(),
                     };
@@ -693,10 +700,7 @@ fn every_alias_writes_the_old_value() {
             &[("INFR_MMV_MW_WARPS", "4")],
             &[("mmv_mw.warps@q4_k", "4"), ("mmv_mw.warps@q6_k", "4")],
         ),
-        (
-            &[("INFR_GFX_QUEUE", "1")],
-            &[("queue.compute_only", "false")],
-        ),
+        (&[("INFR_GFX_QUEUE", "1")], &[("queue.family", "graphics")]),
         (&[("INFR_KQ_FMA_GEMV", "1")], &[("gemv.kq_fma", "true")]),
         (&[("INFR_KQ_FMA_GEMV", "0")], &[("gemv.kq_fma", "false")]),
         (&[("INFR_MOE_SMALL_M", "16")], &[("moe.small_m", "16")]),
@@ -1599,39 +1603,120 @@ fn initial_submit_cap_follows_the_device_facts() {
     assert_eq!(r.tuning.submit_initial_dispatches, 16);
 }
 
-/// `queue.compute_only` is on by default on every discrete device, so inference stays off the
-/// ring the compositor renders on. An integrated GPU is off by rule (the compute ring's hang
-/// budget measured tighter there under RADV, `docs/igpu.md`) and on only through the row of a
-/// driver it was measured on; `kernels.vulkan.gfx_queue` turns it off, and a user value wins.
+/// `queue.family` is `auto` by default on every discrete device, so inference leaves the ring
+/// the compositor renders on wherever a usable compute-only family exists. An integrated GPU is
+/// `graphics` by rule (the compute ring's hang budget measured tighter there under RADV,
+/// `docs/igpu.md`) and `auto` only through the row of a driver it was measured on.
 #[test]
-fn compute_only_queue_follows_the_device_facts() {
-    let on = |id: &str| fixture_tuning(id).queue_compute_only;
-    assert!(on("rx580-gcn-radv"));
-    assert!(on("rx7900xtx-amdwin"));
-    assert!(on("rx7900xtx-radv"));
-    assert!(on("nvidia-rtx2080ti"));
-    // The integrated GPU: on by the AMD Windows driver's row, off without the rows and off
-    // under any other driver.
+fn queue_family_follows_the_device_facts() {
+    use super::QueueFamily::{Auto, Compute, Graphics};
+    let of = |id: &str| fixture_tuning(id).queue_family;
+    for discrete in [
+        "rx580-gcn-radv",
+        "rx7900xtx-amdwin",
+        "rx7900xtx-radv",
+        "nvidia-rtx2080ti",
+        "intel-arc-a770-anv",
+        "unknown",
+    ] {
+        assert_eq!(of(discrete), Auto, "{discrete}");
+    }
+    // The integrated GPU: `auto` by the AMD Windows driver's row, `graphics` without the rows
+    // and under any other driver.
     let r = resolve_fixture("raphael-igpu-amdwin", &Config::default());
-    assert!(r.tuning.queue_compute_only);
+    assert_eq!(r.tuning.queue_family, Auto);
     assert_eq!(
-        value_of(&r, "queue.compute_only").1,
-        "row amd-proprietary-integrated-compute-queue"
+        value_of(&r, "queue.family"),
+        (
+            "auto".into(),
+            "row amd-proprietary-integrated-compute-queue".into()
+        )
     );
     let igpu = fixture("raphael-igpu-amdwin");
     let r = resolve_with(&igpu, &Config::default(), &[], None).unwrap();
-    assert!(!r.tuning.queue_compute_only);
+    assert_eq!(r.tuning.queue_family, Graphics);
     let mut radv = igpu.clone();
     radv.driver = Some("MESA_RADV".to_string());
     let r = resolve_with(&radv, &Config::default(), table::builtin(), None).unwrap();
-    assert!(!r.tuning.queue_compute_only);
+    assert_eq!(r.tuning.queue_family, Graphics);
+    // The alias, and a user's value on an integrated device.
     let r = resolve_fixture("rx580-gcn-radv", &env_cfg(&[("INFR_GFX_QUEUE", "1")]));
-    assert!(!r.tuning.queue_compute_only);
-    let r = resolve_fixture(
-        "rx7900xtx-amdwin",
-        &env_cfg(&[("INFR_TUNE", "queue.compute_only=false")]),
+    assert_eq!(r.tuning.queue_family, Graphics);
+    let r = resolve_with(
+        &radv,
+        &env_cfg(&[("INFR_TUNE", "queue.family=compute")]),
+        table::builtin(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(r.tuning.queue_family, Compute);
+}
+
+/// The three surfaces a user sets `queue.family` from all reach the resolver, each labelled
+/// with where it came from and the later one winning: the config file's `[kernels.vulkan.tune]`
+/// table, `INFR_TUNE`, and `--set kernels.vulkan.tune.queue.family=...` on the command line.
+#[test]
+fn queue_family_is_set_from_config_env_and_command_line() {
+    use super::QueueFamily::{Compute, Graphics};
+    let facts = fixture("rx7900xtx-amdwin");
+    let file = file_layer("[kernels.vulkan.tune]\n\"queue.family\" = \"graphics\"\n");
+    let env = env_layer(&[("INFR_TUNE", "queue.family=compute")]);
+    let cli = cli_layer(&["kernels.vulkan.tune.queue.family=graphics"]);
+    let resolve = |layers: &[PartialConfig]| {
+        resolve_with(
+            &facts,
+            &Config::load_from_layers(layers),
+            table::builtin(),
+            None,
+        )
+        .unwrap()
+    };
+    let r = resolve(std::slice::from_ref(&file));
+    assert_eq!(r.tuning.queue_family, Graphics);
+    assert!(
+        value_of(&r, "queue.family").1.starts_with("config"),
+        "{:?}",
+        value_of(&r, "queue.family")
     );
-    assert!(!r.tuning.queue_compute_only);
+    let r = resolve(&[file.clone(), env.clone()]);
+    assert_eq!(r.tuning.queue_family, Compute);
+    assert!(
+        value_of(&r, "queue.family").1.starts_with("env INFR_TUNE"),
+        "{:?}",
+        value_of(&r, "queue.family")
+    );
+    let r = resolve(&[file, env, cli]);
+    assert_eq!(r.tuning.queue_family, Graphics);
+    assert!(
+        value_of(&r, "queue.family").1.starts_with("cli --set"),
+        "{:?}",
+        value_of(&r, "queue.family")
+    );
+}
+
+/// `queue.family` takes exactly its three words: every one parses to its value and prints back
+/// as itself, and anything else (the old on/off spellings, `none`, another case) is an error
+/// that names the three.
+#[test]
+fn queue_family_takes_its_three_words_only() {
+    let facts = fixture("rx7900xtx-amdwin");
+    for (word, value) in super::QueueFamily::ALL {
+        let cfg = env_cfg(&[("INFR_TUNE", &format!("queue.family={word}"))]);
+        let r = resolve_with(&facts, &cfg, &[], None).unwrap();
+        assert_eq!(r.tuning.queue_family, value, "{word}");
+        assert_eq!(value_of(&r, "queue.family").0, word);
+        assert_eq!(value.name(), word);
+        assert_eq!(super::QueueFamily::from_name(word), Some(value));
+    }
+    assert_eq!(super::QueueFamily::from_name("gfx"), None);
+    for bad in ["true", "on", "none", "Auto", "gfx"] {
+        let cfg = env_cfg(&[("INFR_TUNE", &format!("queue.family={bad}"))]);
+        let e = resolve_with(&facts, &cfg, &[], None).unwrap_err();
+        assert!(
+            e.contains("queue.family") && e.contains("auto|compute|graphics"),
+            "{bad:?}: {e}"
+        );
+    }
 }
 
 /// `attn_split.decode_min_chunk` keeps PR 105's 16 on the class it was measured on, a discrete

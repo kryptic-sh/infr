@@ -206,6 +206,43 @@ impl AttnSplit {
     }
 }
 
+/// `queue.family`: which of a device's queue families inference submits on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum QueueFamily {
+    /// A COMPUTE-only family when the device has one that writes timestamps, else the universal
+    /// family, without comment.
+    #[default]
+    Auto,
+    /// Ask for a COMPUTE-only family; fall back to the universal one with a warning that says
+    /// why when there is none, or none that writes timestamps.
+    Compute,
+    /// The universal (GRAPHICS and COMPUTE) family, the one a compositor renders on.
+    Graphics,
+}
+
+impl QueueFamily {
+    /// Every value with its spelling, in the order `infr tune list` prints them.
+    pub(crate) const ALL: [(&'static str, QueueFamily); 3] = [
+        ("auto", QueueFamily::Auto),
+        ("compute", QueueFamily::Compute),
+        ("graphics", QueueFamily::Graphics),
+    ];
+    /// The spellings alone, for the parameter's declared range.
+    pub(crate) const NAMES: &'static [&'static str] = &["auto", "compute", "graphics"];
+
+    pub(crate) fn name(self) -> &'static str {
+        Self::ALL
+            .iter()
+            .find(|(_, v)| *v == self)
+            .map(|(n, _)| *n)
+            .expect("every value is listed")
+    }
+
+    pub(crate) fn from_name(s: &str) -> Option<Self> {
+        Self::ALL.iter().find(|(n, _)| *n == s).map(|(_, v)| *v)
+    }
+}
+
 /// The resolved parameter set, typed, one field per parameter. Built once per backend by
 /// [`resolve::resolve`]; every kernel choice reads its field here.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -256,9 +293,9 @@ pub(crate) struct Tuning {
     /// `rmsnorm.*`: the 1024-wide decode RMSNorm build.
     pub rmsnorm_wide: bool,
     pub rmsnorm_wide_min_dim: usize,
-    /// `queue.compute_only`: submit on a COMPUTE-only queue family when the device has a usable
-    /// one (`VulkanBackend::pick_queue_family`).
-    pub queue_compute_only: bool,
+    /// `queue.family`: which queue family inference submits on
+    /// (`VulkanBackend::pick_queue_family`).
+    pub queue_family: QueueFamily,
     /// `submit.initial_dispatches`: the submit splitter's cap before any forward has been
     /// measured (`0` = never split).
     pub submit_initial_dispatches: usize,

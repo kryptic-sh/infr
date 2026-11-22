@@ -166,8 +166,7 @@ flash_min_rows = 24
 push_desc = true
 pipeline_cache_disk = true
 # Submit on the universal (graphics) queue family instead of a compute-only one.
-# Alias of the tuning parameter `queue.compute_only`, which is on by default so
-# that a long forward does not stall the desktop (`infr tune show`).
+# Alias of `"queue.family" = "graphics"` under [kernels.vulkan.tune] below.
 gfx_queue = false
 gpu_pos = true
 fuse_add = true
@@ -177,6 +176,11 @@ no_replay = false # sanctioned negative: true DISABLES the decode replay tape
 # says where each value on a device comes from. A value here beats the built-in
 # table's rows; INFR_TUNE and --set kernels.vulkan.tune.<key>=<value> beat it.
 # [kernels.vulkan.tune]
+# Which queue family inference submits on: auto (a compute-only family when the
+# device has a usable one, so a long forward does not stall the desktop),
+# compute (the same, warning when it has to fall back), or graphics (always the
+# universal family; a little faster on some devices, see docs/config.md).
+# "queue.family" = "auto"
 # "gemv_sg.rows" = 4
 # "mmv_mw.warps@q4_k" = 1
 # "submit.budget_ms" = 250   # estimated GPU time, in ms, past which work is cut:

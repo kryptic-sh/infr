@@ -7755,9 +7755,9 @@ benchmark is labelled with that load or retaken.
 is cabled to the RX 7900 XTX and nothing drew to it), Qwen3-1.7B Q4_K_M, context
 8192, 6 interleaved rounds with the first arm alternating, one process per
 sample, `graphics` against `compute`. Each cell is the mean with the lowest and
-highest sample. The machine was between 95.4% and 96.6% idle over 3 s before
-each sample, the remainder being other sessions' own idle load (no build, test
-or GPU work was running).
+highest sample. The machine's CPU was between 89.8% and 96.8% idle over 3 s
+before each sample; no build, test or GPU work of ours was running, and what
+used the rest was not identified.
 
 | Device                                    | What, t/s | `graphics`                      | `compute`                       | Change |
 | ----------------------------------------- | --------- | ------------------------------- | ------------------------------- | ------ |

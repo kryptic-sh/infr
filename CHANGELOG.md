@@ -477,31 +477,36 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   twice the budget, a dispatch has at most one range per workgroup along the cut
   dimension, and some prefill GEMMs carry no estimate yet (the batched MoE
   expert GEMM among them; backlog B226 has the list). The prior is replaced only
-  by measurement: a timed heavy dispatch, or the GPU time of a completed submit
-  set against its estimate, neither by more than 8 times. Two new tuning
-  parameters: `submit.budget_ms` (250 on an integrated or slow-class device,
-  1000 elsewhere; `0` = off) and `submit.prior_gflops` (8 GFLOP/s per compute
-  unit). On a Ryzen integrated GPU, `infr bench` of SmolLM3-3B Q4_K_M with
-  `-u 512` and `INFR_NO_I8DOT=1`, which was reset in every run before, completed
-  five runs of five (5.1 t/s: the per-row GEMV's own speed), `-u 2048 -p 2048`
-  five of five, and `-u 2048` with the int8 kernels off, whose heaviest dispatch
-  is about 6 s whole, completed its one run; no engine reset was logged. Those
-  runs were of the first build; the final one ran `-u 2048 -p 2048` three more
-  times and `-u 512` with `INFR_NO_I8DOT=1` once, all completing. **Upgrade
-  notes:** the tuning hash in the device banner changes on every device (two new
-  parameters). An integrated GPU's first prefill forward takes three more
-  submits than before (Qwen3-1.7B, `pp512`), then none. Throughput against
-  `main`, interleaved, two file copies of each binary, the first copy rotating
-  every round, on 2026-11-22 with under one busy core of 32: on an RX 7900 XTX,
-  Qwen3-1.7B Q4_K_M at default settings takes no cut and reads pp512 11701.77
-  against 11706.98 t/s (-0.04%) and tg128 469.33 against 469.24 (+0.02%) over
-  twelve rounds; Qwen3-30B-A3B at `-u 1024` takes no cut and reads pp1024
-  3565.74 against 3563.74 (+0.06%) over six; SmolLM3-3B at `-u 4096`, whose
-  prior passes the budget, takes one cut in its first forward and none after and
-  reads pp4096 4562.15 against 4562.16 over six. The two copies of one binary
-  differ by up to 0.31% in these sets, so none of the differences is one. On the
-  integrated GPU, six rounds: Qwen3-1.7B pp512 231.03 against 231.07 (-0.02%),
-  tg128 27.04 against 27.06 (the bench prints that one to a decimal).
+  by measurement: the slowest of a kernel's last four timed heavy dispatches, or
+  the GPU time of a completed submit set against the estimate of its untimed
+  kernels. Neither raises a kernel's throughput past a bound that follows from
+  the budget (3 times the prior at 250 ms, 2 times at 500), so that a submit
+  whose estimates one bad reading took to that floor still runs within the
+  limit. Two new tuning parameters: `submit.budget_ms` (250 on an integrated or
+  slow-class device, 500 elsewhere; `0` = off) and `submit.prior_gflops` (8
+  GFLOP/s per compute unit). On a Ryzen integrated GPU, `infr bench` of
+  SmolLM3-3B Q4_K_M with `-u 512` and `INFR_NO_I8DOT=1`, which was reset in
+  every run before, completed five runs of five (5.1 t/s: the per-row GEMV's own
+  speed), `-u 2048 -p 2048` five of five, and `-u 2048` with the int8 kernels
+  off, whose heaviest dispatch is about 6 s whole, completed its one run; no
+  engine reset was logged. Those runs were of the first build; the final one ran
+  `-u 2048 -p 2048` three more times and `-u 512` with `INFR_NO_I8DOT=1` once,
+  all completing. **Upgrade notes:** the tuning hash in the device banner
+  changes on every device (two new parameters). On an integrated GPU a prefill
+  forward is now cut by work where the dispatch cap cut it, as many times
+  (Qwen3-1.7B, `pp512`: four a forward). Throughput against `main`, interleaved,
+  two file copies of each binary, the first copy rotating every round, on
+  2026-11-22. With the final build: on an RX 7900 XTX, Qwen3-1.7B Q4_K_M at
+  default settings takes no cut and reads pp512 11669.40 against 11662.84 t/s
+  (+0.06%, eight rounds, the copies of one binary 0.3% apart); SmolLM3-3B at
+  `-u 4096`, a forward of about 850 ms of GPU time, takes two cuts a forward and
+  reads pp4096 4557.78 against 4556.24 (+0.03%, six rounds); on the integrated
+  GPU Qwen3-1.7B pp512 reads 230.98 against 231.09 (-0.05%, six rounds). With
+  the build before the default budget went from 1000 to 500 ms, for runs that
+  change did not touch (decode is never cut, and the MoE forward is estimated
+  far under either budget): tg128 469.33 against 469.24 on the RX 7900 XTX
+  (twelve rounds) and 27.04 against 27.06 on the integrated GPU (six), and
+  Qwen3-30B-A3B pp1024 3565.74 against 3563.74 (six).
   `device.submit_dispatches = 0` still means one submit per forward and turns
   this off as well. `RUST_LOG=infr_vulkan=debug` prints one line per forward
   with its dispatches, GPU time and estimated work, the splitter's cut counts

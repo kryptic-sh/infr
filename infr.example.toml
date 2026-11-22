@@ -183,7 +183,7 @@ no_replay = false # sanctioned negative: true DISABLES the decode replay tape
 #                            # a heavier prefill GEMM is recorded as ranges,
 #                            # each its own submit, and a submit closes at the
 #                            # next op once it holds this much. 0 = off.
-#                            # Default: 250 integrated or slow-class, else 1000
+#                            # Default: 250 integrated or slow-class, else 500
 # "submit.prior_gflops" = 16 # throughput assumed before a kernel is measured
 #
 # [kernels.vulkan.tuning]

@@ -7165,8 +7165,16 @@ op boundary once its estimated work reaches the budget. Plan 12 sections 0d and
   just under it takes one more op and can hold about twice the budget; and a
   dispatch has no more ranges than workgroups along the dimension that is cut
   (`WorkModel::pieces`), so a range of a coarse grid can pass the budget on its
-  own. Neither was seen to matter: the budget is an eighth of the limit on the
-  devices that get reset and half of it elsewhere.
+  own. The defaults are set for the first: twice the budget is a quarter of the
+  2 s limit on the devices that get reset and half of it elsewhere (500 ms since
+  the second fix round; it was 1000, which with estimates corrected to real time
+  made a full submit the whole limit). The second was not seen to matter.
+- **Whether a fast discrete card is reset at 2 s was not tested.** The 500 ms
+  default assumes it: Windows' `TdrDelay` is a system setting, not a per-adapter
+  one, and `infr_core::SUBMIT_DANGER_NS` already treats a 1 s forward as
+  dangerous on any device. No submit of 2 s was run on the RX 7900 XTX to see it
+  reset; the measured resets are the integrated GPU's (plan 12 section 0d) and
+  the reporter's RX 580.
 - **Kernels that carry no estimate count as free.** Only these say what they
   cost (`Recorder::work_next`), and only over more than one row: the GEMMs
   recorded by `matmul_native_off`, `matmul_native_cm8`, `matmul_native_f16a`,
@@ -7221,34 +7229,51 @@ op boundary once its estimated work reaches the budget. Plan 12 sections 0d and
 - **The estimate follows timestamps around one dispatch, which other dispatches
   can overlap.** A timed dispatch is bracketed by two timestamps with no barrier
   before the first, so a dispatch that started while earlier work was still
-  running can read short. The model keeps the SLOWEST timed sample per kernel,
-  which the first dispatch of an overlapping group always is, and on the
-  integrated GPU eight independent GEMV dispatches in one submit read the same
-  throughput as one alone (29.2 to 29.9 GFLOP/s over the four probe points). Not
-  shown: a kernel whose every dispatch overlaps a heavier one of another kernel.
-  What bounds the damage is `MAX_PRIOR_GAIN`: no reading takes a kernel's
-  throughput more than that many times past its prior, and a reading of no time
-  is dropped. A barrier before the opening stamp would make the reading exact at
-  the cost of serialising those dispatches; not done, since it would change what
-  a slow device runs.
-- **A segment's time is shared among its kernels by their priors.**
-  `WorkModel::calibrate` scales every kernel of a segment without a timed
-  dispatch by the same factor, measured over estimated. The segment's estimate
-  then equals what it measured (never less), but a kernel much slower against
-  its prior than its neighbours comes out too fast, by at most `MAX_PRIOR_GAIN`,
-  and no later segment raises it: only a timed dispatch does, and a dispatch is
-  timed only from a thirty-second of the budget up. Such a kernel met later in a
-  submit of its own, in many small dispatches, would be under-estimated; the
-  dispatch cap is what still bounds that submit. No failure from it in what ran;
-  nothing was built to provoke it on a GPU. A segment's time also holds its
-  untagged work (attention, on the RX 7900 XTX), which the scaling books to the
-  GEMMs; that errs slow.
-- **`MAX_PRIOR_GAIN` clamps a kernel that really is that much faster.** The
-  flash prefill attention on the integrated GPU was timed at 170 GFLOP/s before
-  the bound (prior 16) and is held at 128 with it, so its estimate is about a
-  third too high. Extra ranges for that dispatch, no failure; the cut counts of
-  the two runs compared (Qwen3-1.7B `pp512`, SmolLM3-3B `-u 2048`) moved by at
-  most two a forward.
+  running can read short. The model keeps the slowest of a kernel's last four
+  timed samples (`work::TIMED_WINDOW`), which the first dispatch of an
+  overlapping group always is, and on the integrated GPU eight independent GEMV
+  dispatches in one submit read the same throughput as one alone (29.2 to 29.9
+  GFLOP/s over the four probe points). Not shown: a kernel whose every dispatch
+  overlaps a heavier one of another kernel. What bounds the damage is the gain
+  bound (`work::max_prior_gain`): no reading takes a kernel's throughput past
+  it, and a reading of no time is dropped. A barrier before the opening stamp
+  would make the reading exact at the cost of serialising those dispatches; not
+  done, since it would change what a slow device runs.
+- **A segment's time is shared among its UNTIMED kernels by their priors, and a
+  segment of mostly timed work corrects nothing.** `WorkModel::calibrate` treats
+  the kernels without a timed dispatch as if they had taken the whole segment,
+  and scales them by one factor when even so they ran faster than estimated.
+  That can only err slow for the group, and a timed kernel latched on a slow
+  sample no longer pushes the others down (the first version set the measured
+  time against the whole estimate, timed kernels included, and did). Subtracting
+  the timed kernels' estimate from the measured time, as review suggested, was
+  not done: their rate is the slowest of a few samples, so it overstates them,
+  and the overstatement would be handed to the untimed kernels as speed (a timed
+  kernel estimated at 100 ms that really took 50, beside an untimed one whose
+  200 ms prior is exact: measured 250 less 100 leaves 150, and the untimed
+  kernel would be scaled to three quarters of its true time). Two costs. Within
+  the group one factor is shared, so a kernel much slower against its prior than
+  its neighbours still comes out too fast, by at most the gain bound, and only a
+  timed dispatch raises it; nothing was built to provoke that on a GPU. And
+  where a timed kernel carries most of a segment, the untimed ones stay on their
+  priors: on the RX 7900 XTX with SmolLM3-3B at `-u 4096` only
+  `native_gemm_i8cm_q4k_l` is learned, and the forward is estimated at 1098 ms
+  against about 850 ms of GPU time.
+- **The gain bound holds estimates above real time wherever a kernel is more
+  than that much faster than its prior.** It is 3 at the integrated GPU's 250 ms
+  budget (it was a constant 8, which let a full submit at the floor run 4 s if
+  the prior was exact) and 2 at 500 ms. On the integrated GPU the int8 GEMMs are
+  held at 384 GFLOP/s (timed at 502 to 770 before the bound) and the flash
+  prefill attention at 48 (170 before), so its estimates read about twice the
+  GPU time: Qwen3-1.7B `pp512` 1018 to 1253 ms a forward against 510 to 594,
+  SmolLM3-3B `-u 2048` 55.8 s against 27.4 to 27.6. More cuts by work, no
+  failure and no throughput seen lost: SmolLM3 takes 216 work cuts a forward
+  where it took 180, and Qwen3-1.7B is cut by work where the dispatch cap cut
+  it, four cuts a forward either way (pp512 231.0 t/s). On the RX 7900 XTX the
+  timed matrix GEMM is held at 24576 GFLOP/s (27100 to 34952 measured before the
+  bound). Raising the int8 and attention priors toward what was measured would
+  remove the clamp on this GPU, at the price of a less pessimistic first forward
+  on devices nobody measured; not done.
 - **The prior's margin is thin for one shape.** `submit.prior_gflops` is 16 on
   the 2-CU integrated GPU; its per-row GEMV measured 29.9 GFLOP/s on a 2048 x
   22016 weight and 18.8 on 22016 x 2048 (the slow-class test's shapes). The
@@ -7258,16 +7283,28 @@ op boundary once its estimated work reaches the budget. Plan 12 sections 0d and
   download allowance. SmolLM3-3B at `-u 4096` stood in (about the same FLOPs a
   forward, by the prior 1875 ms of estimated work): plan 12's S2 status has the
   cut counts and the A/B.
-- **The measured dispatch-cap loop double-counts.** `observe_forward` divides a
-  forward's whole GPU time by its dispatch count, tagged dispatches included, so
-  at a large batch the cap ratchets to its floor of 16 although the work bound
-  already cuts the heavy dispatches (`submit split/16` on the integrated GPU at
-  `-u 512` with int8 off and at `-u 2048`). More submits than needed, no
-  failure. Subtracting the estimated work from the loop's sample would fix it.
-- **The integrated GPU's first prefill forward takes three more submits** at
-  default settings than before the work bound (the pessimistic prior), then
-  none: Qwen3-1.7B, `pp512`, counted from the `RUST_LOG=infr_vulkan=debug`
-  forward lines, the same before and after the fix round.
+- **The dispatch-cap loop still judges a forward the work bound already cut.**
+  `observe_forward` divides a forward's whole GPU time by its dispatch count
+  (`submit_cap_from_measurement`), heavy tagged dispatches included, and lowers
+  the cap to what would have put that average at 250 ms a submit. With the count
+  now every range of every recorder (2026-11-22, second fix round), on the
+  integrated GPU: SmolLM3-3B `-u 2048` reports 802 dispatches for 27.4 to 27.6
+  s, 34 ms each, which asks for a cap of 7; `-u 512` with `INFR_NO_I8DOT=1`
+  reports 874 for 100.4 s, 115 ms each, a cap of 2. Both land on the floor of 16
+  (`submit split/16`), as they did with the short counts of before. So the cap
+  goes as low as it can although the heavy dispatches are already held by the
+  work bound, and the light ones (norms, activations, the quantisation passes)
+  are then cut every 16 for the rest of the process: more submits than needed,
+  no failure. It is not double counting in the count any more; it is one average
+  over two kinds of dispatch. Feeding the loop the forward's time less its
+  estimated work, over its untagged dispatches only, would fix it; not done,
+  because the estimate reads about twice the real time on this GPU (the gain
+  bound, above), so the remainder would be negative here.
+- **The integrated GPU's first prefill forward takes three submits by work** at
+  default settings where it took none before the work bound (the pessimistic
+  prior): Qwen3-1.7B, `pp512`, counted from the `RUST_LOG=infr_vulkan=debug`
+  forward lines. Since the second fix round its later forwards are cut by work
+  too, in place of the dispatch cap's cuts and as many (four a forward).
 - **SmolLM3-3B `-u 2048 -p 2048` on the integrated GPU reads in two states,
   about 76 and about 89 t/s, and which one a run gets is not explained.** The
   first S2 run recorded 91.3 to 91.9 t/s; on 2026-11-22, later, three runs of
@@ -7282,10 +7319,12 @@ op boundary once its estimated work reaches the budget. Plan 12 sections 0d and
   81.22 t/s after the fix round against 82.06 before, with the two copies of one
   binary 3.3% and 1.4% apart, so that set does not compare the binaries. Under
   one busy core of 32 throughout but for one round at 1.07 (Windows'
-  `CompatTelRunner`). Qwen3-1.7B `pp512` on the same GPU is steady (231.03
-  against 231.07 t/s over six rounds). To separate the binaries on this workload
-  the state has to be found first: memory bandwidth taken by another process is
-  the first thing to rule out, since this GPU reads its weights from DRAM [I].
+  `CompatTelRunner`). The second fix round's three runs read 73.8, 73.8 and 79.2
+  t/s, the third with forwards of 23.2 to 26.9 s where the other two took 27.4
+  to 28.4. Qwen3-1.7B `pp512` on the same GPU is steady (231.03 against 231.07
+  t/s over six rounds). To separate the binaries on this workload the state has
+  to be found first: memory bandwidth taken by another process is the first
+  thing to rule out, since this GPU reads its weights from DRAM [I].
 - **`device.submit_dispatches = N` moves where the cap starts, not where it
   ends** (issue 94: 128 and 256 both ended on 62). The docs now say so. A
   DECISION for the owner: whether an explicit N should instead pin the cap,
@@ -7301,14 +7340,37 @@ op boundary once its estimated work reaches the budget. Plan 12 sections 0d and
   `seed_barrier`; removing it left every parity test green on the RX 7900 XTX,
   whose queue runs submits in order anyway. It is kept because Vulkan requires
   it.
-- **Two recorder fixes have no test.** `Recorder::free_transient` now waits for
-  the buffers a cut dispatch already submitted before it destroys the profiling
-  query pool they write to (a discarded recorder under `INFR_PROF_OPS`), and a
-  segment's dispatch count now includes every buffer its recorder submitted
-  (`PendingSegment::dispatches`). The second was checked by reading the debug
-  line (SmolLM3-3B `-u 2048` on the integrated GPU: 766 dispatches a forward
-  with and without `INFR_PROF_OPS`, where the branch before reported 397); the
-  first needs a shutdown during a cut forward under profiling and was only read.
+- **The dispatch count of a cut forward was fixed in two steps, and one path has
+  no test.** The first fix round counted every buffer a recorder submitted
+  itself for a segment finished without waiting (`PendingSegment::dispatches`)
+  and said the forward's count was then whole. It was not: the recorder a
+  forward ends with is finished by a blocking `Recorder::finish`, and for it
+  `execute_static` still took the open buffer's count. The second round added
+  `Recorder::total_dispatches` for that one. `tests/work_split_parity.rs` now
+  asserts the count a forward reports (`VulkanBackend::last_forward_dispatches`)
+  against the uncut forward's count and the ranges recorded; its forwards end in
+  the recorder that made the cuts, so it covers the blocking path (it failed
+  four of six with the old line: 99 reported where 104 were recorded). The
+  pipelined path has no assertion: it was read off the debug line (SmolLM3-3B
+  `-u 2048` on the integrated GPU, 766 dispatches a forward where the first
+  branch reported 397, the same with `INFR_PROF_OPS`).
+- **`Recorder::free_transient`'s wait has no test.** It now waits for the
+  buffers a cut dispatch already submitted before it destroys the profiling
+  query pool they write to (a discarded recorder under `INFR_PROF_OPS`). It
+  needs a shutdown during a cut forward under profiling and was only read.
+- **`INFR_PROF_OPS` across a cut dispatch was checked once, by a run.**
+  SmolLM3-3B `-u 2048 -r 1` on the integrated GPU, profiled: the per-op tables
+  of the measured forward (73 of them, one a recorder) sum to 27311.6 ms against
+  27266.0 ms of GPU time for that forward, no stamp was dropped, and a cut
+  dispatch is counted once, with all its ranges under its one label (the tables
+  count 694 dispatches where the forward reports 802; the difference fits the
+  extra ranges, which were not counted separately). The warm-up forwards are not
+  profiled. No test asserts any of it.
+- **A timestamp counter that wraps is handled in the arithmetic only.**
+  `work::ticks_between` takes an interval under the queue's
+  `timestampValidBits`, with a unit test; no device here was seen to wrap, and
+  the per-op profile's own differences (`Recorder::report_timestamps`) still
+  subtract over 64 bits.
 - **A `LiveKernelEvent` 0x141 entry does not always mean dropped work.** Two
   were logged during runs all of whose segments wrote their closing timestamps
   (plan 12 section 0d), so counting those entries over-reports.

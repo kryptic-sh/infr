@@ -390,9 +390,9 @@ through a `DISPATCH_BASE` twin of its pipeline, each range in a submit of its
 own; and `segment_cut` closes a submit at the next op boundary once its
 estimated work reaches the budget, after the dispatch cap and before the paged
 cadence. The budget is a time because the limit is (sections 0d and 0e): 250 ms,
-an eighth of the 2 s, on an integrated or slow-class device, and 1000 ms
-elsewhere. Decisions are made when a forward is recorded; a decode replay tape
-and a single-row forward are never cut or timed.
+an eighth of the 2 s, on an integrated or slow-class device, and 1000 ms (500
+since the second fix round) elsewhere. Decisions are made when a forward is
+recorded; a decode replay tape and a single-row forward are never cut or timed.
 
 What ran, all on 2026-11-22 with the final binary unless said:
 
@@ -544,6 +544,99 @@ sampled before each round, lowest and highest:
   one; a zero-time segment kept, one; the bound doubled, two.
   `work_split_parity` with a misspelt tuning key fails on the RX 7900 XTX where
   the old file passed, and fails without a device when `INFR_DEV` is set.
+
+**S2 second fix round (2026-11-22, after a second review).** It supersedes parts
+of the block above: the default budget off reset-prone devices is 500 ms, not
+1000; the gain bound is derived from the budget, not a constant 8; and the
+figures of the first round's table for the SmolLM3 row and the two `pp512` rows
+are replaced below (its `tg128` and MoE rows were not re-run: decode is never
+cut, and the MoE forward is estimated at 151 ms under either budget).
+
+- **The last recorder of a forward was still counted short.** The first round
+  fixed `PendingSegment::dispatches`; the recorder a forward ends with is
+  finished by a blocking `Recorder::finish`, and `execute_static` took its open
+  buffer's count. `Recorder::total_dispatches` is the whole count, and
+  `work_split_parity` asserts what a forward reports: with the old line four of
+  its six tests fail on the RX 7900 XTX (99 dispatches reported for 5 uncut and
+  2 cut into 101 ranges, which is 104).
+- **A segment's time could push an untimed kernel to the floor with no
+  evidence.** `calibrate` set the measured time against the whole estimate, so a
+  timed kernel latched on one slow sample made every later segment read fast and
+  the correction landed on the untimed kernels. They are now corrected as if
+  they had taken the whole segment, which can only err slow. Subtracting the
+  timed kernels' estimate from the measured time was considered and not done:
+  that estimate overstates them (the slowest of a few samples), and the
+  overstatement would become speed for the untimed ones (B226 has the numbers).
+- **The gain bound did not hold what its comment claimed.** A submit holds about
+  two budgets, so a constant 8 let a full submit at the floor run 4 s on a
+  reset-prone device, and it ignored the budget in use. It is now what keeps two
+  budgets of floor-estimated work within the 2 s limit if the prior was exact,
+  1.5 s on a reset-prone device: 3 at 250 ms, 2 at 500 ms, none above 750 or
+  1000 ms. The test that re-derived the constant is replaced by one that builds
+  such a submit and checks its real time, for the defaults and for budgets a
+  user sets.
+- **A sample was bounded on the fast side only.** An interval is now taken under
+  the queue's `timestampValidBits` (across a wrap of a narrower counter it read
+  as nearly 2^64 ticks), a sample is held within 64 times its prior on the slow
+  side, and a timed rate is the slowest of the kernel's last four samples
+  instead of the slowest ever, so one outlier is forgotten.
+- **The 1000 ms budget relied on pessimism the calibration removes.** With
+  estimates at real time, twice the budget was 2 s of real work. No reset of the
+  RX 7900 XTX at 2 s was measured, but Windows' `TdrDelay` is not per adapter
+  and the dispatch-count splitter already calls a 1 s forward dangerous on any
+  device, so the default is 500 ms: a full submit of true estimates is 1 s. The
+  four fixture snapshots of devices outside the reset-prone class change by that
+  line and the hash (the RX 7900 XTX's two, the Arc A770's and the RTX 2080
+  Ti's).
+- **The dispatch-cap entry of B226** is rewritten against the corrected counts.
+
+What ran with the final binary of this round, 2026-11-22. Same protocol as the
+table above (`main` at `7488e8fc`, two copies of each binary, `-r 3`):
+
+| Device, model, bench                      | Rounds | `main` t/s | Branch t/s | Difference | Copies       | Load         |
+| ----------------------------------------- | ------ | ---------- | ---------- | ---------- | ------------ | ------------ |
+| RX 7900 XTX, SmolLM3-3B, pp4096 `-u 4096` | 6      | 4556.24    | 4557.78    | +0.03%     | 0.03%, 0.15% | 0.21 to 0.77 |
+| RX 7900 XTX, Qwen3-1.7B, pp512            | 8      | 11662.84   | 11669.40   | +0.06%     | 0.28%, 0.32% | 0.17 to 0.65 |
+| Integrated, Qwen3-1.7B, pp512             | 6      | 231.09     | 230.98     | -0.05%     | 0.01%, 0.01% | 0.17 to 2.07 |
+
+- The integrated row's difference is larger than its copies' spread, and is one
+  step of what the bench prints (a tenth of a t/s); its first round was sampled
+  with a browser process at 1.7 cores. Taken as it reads, the branch is 0.05%
+  slower there.
+- **Cuts per forward on the RX 7900 XTX** (`RUST_LOG=infr_vulkan=debug`).
+  SmolLM3-3B `-u 4096`: three work cuts in the first prefill forward (estimated
+  1760 ms), two in every later one (estimated 1098 ms against 846 to 849 ms of
+  GPU time). The forward really runs longer than the budget, so one cut is owed;
+  the second comes from the estimate standing above the real time: only the
+  heaviest kernel is timed, at the bound (24576 GFLOP/s), and the others stay on
+  the prior because a segment mostly made of timed work corrects nothing. It
+  costs nothing measurable (the first row). Qwen3-1.7B `pp512`: none (estimated
+  117 ms, then 59 ms against 41 to 43). Qwen3-30B-A3B `-u 1024`: none.
+- **Cuts per forward on the integrated GPU.** Qwen3-1.7B `pp512`: three by work
+  in the first prefill forward, then four a forward by work or by the dispatch
+  cap, where the cap alone made four before; estimates read about twice the GPU
+  time (the bound of 3 holds the int8 GEMMs at 384 GFLOP/s and the attention at
+  48). SmolLM3-3B `-u 2048`: 72 dispatches cut and 216 work cuts a forward, 802
+  dispatches reported.
+- **The integrated GPU's reproductions** complete: SmolLM3-3B `-u 2048 -p 2048`
+  three of three (73.8, 73.8 and 79.2 t/s), `-u 512` with `INFR_NO_I8DOT=1` one
+  of one (5.1 t/s; 72 dispatches cut and 432 or 434 work cuts a forward), both
+  GPUs listed after each.
+- **`INFR_PROF_OPS` across cut dispatches**, checked by one profiled run of the
+  `-u 2048` reproduction: the per-op tables of the measured forward sum to
+  27311.6 ms against 27266.0 ms of GPU time, with no stamp dropped.
+- **The targeted GPU tests**: 20 of 20 on the RX 7900 XTX (369 s) and on the
+  integrated GPU (652 s), native lanes; the ten outside the tolerance tests also
+  with `INFR_FORCE_WAVE64=1`, on both. The full gate was not run by this round.
+- **The unit tests fail without what they guard** (`work::tests`, 20 tests, each
+  change made and undone): `calibrate` doing nothing, six fail; the measured
+  time set against timed kernels' estimates too, two; a timed kernel corrected
+  by a segment, one; no gain bound on a segment, two, or on a timed sample, two;
+  a segment allowed to raise, three; a zero-time segment or sample kept, one
+  each; the gain fixed at 8, one; the bound sized for one budget, one; no margin
+  on a reset-prone device, one; no slow-side bound, one; the slowest sample
+  ever, one; the latest sample only, two; an unmasked interval, one; the default
+  budget back at 1000 ms, five.
 
 What it leaves out is in the backlog (B226): the budget as a starting point and
 not a ceiling, the kernels without an estimate (some prefill GEMMs and the

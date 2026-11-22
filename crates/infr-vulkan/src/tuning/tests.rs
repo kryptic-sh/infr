@@ -1599,29 +1599,39 @@ fn initial_submit_cap_follows_the_device_facts() {
     assert_eq!(r.tuning.submit_initial_dispatches, 16);
 }
 
-/// `queue.compute_only` is on only where the compute ring was measured: a discrete device in the
-/// slow class. The fast discrete card and the integrated GPU stay on the universal family, an
-/// integrated GPU even when it is in the slow class (its compute ring's hang budget measured
-/// tighter, `docs/igpu.md`); `kernels.vulkan.gfx_queue` turns it off, and a user value wins.
+/// `queue.compute_only` is on by default on every discrete device, so inference stays off the
+/// ring the compositor renders on. An integrated GPU is off by rule (the compute ring's hang
+/// budget measured tighter there under RADV, `docs/igpu.md`) and on only through the row of a
+/// driver it was measured on; `kernels.vulkan.gfx_queue` turns it off, and a user value wins.
 #[test]
 fn compute_only_queue_follows_the_device_facts() {
     let on = |id: &str| fixture_tuning(id).queue_compute_only;
     assert!(on("rx580-gcn-radv"));
-    assert!(!on("rx7900xtx-amdwin"));
-    assert!(!on("rx7900xtx-radv"));
-    assert!(!on("raphael-igpu-amdwin"));
-    let mut slow_igpu = fixture("raphael-igpu-amdwin");
-    slow_igpu.wave64 = true;
-    assert!(slow_igpu.slow_class());
-    let r = resolve_with(&slow_igpu, &Config::default(), &[], None).unwrap();
+    assert!(on("rx7900xtx-amdwin"));
+    assert!(on("rx7900xtx-radv"));
+    assert!(on("nvidia-rtx2080ti"));
+    // The integrated GPU: on by the AMD Windows driver's row, off without the rows and off
+    // under any other driver.
+    let r = resolve_fixture("raphael-igpu-amdwin", &Config::default());
+    assert!(r.tuning.queue_compute_only);
+    assert_eq!(
+        value_of(&r, "queue.compute_only").1,
+        "row amd-proprietary-integrated-compute-queue"
+    );
+    let igpu = fixture("raphael-igpu-amdwin");
+    let r = resolve_with(&igpu, &Config::default(), &[], None).unwrap();
+    assert!(!r.tuning.queue_compute_only);
+    let mut radv = igpu.clone();
+    radv.driver = Some("MESA_RADV".to_string());
+    let r = resolve_with(&radv, &Config::default(), table::builtin(), None).unwrap();
     assert!(!r.tuning.queue_compute_only);
     let r = resolve_fixture("rx580-gcn-radv", &env_cfg(&[("INFR_GFX_QUEUE", "1")]));
     assert!(!r.tuning.queue_compute_only);
     let r = resolve_fixture(
         "rx7900xtx-amdwin",
-        &env_cfg(&[("INFR_TUNE", "queue.compute_only=true")]),
+        &env_cfg(&[("INFR_TUNE", "queue.compute_only=false")]),
     );
-    assert!(r.tuning.queue_compute_only);
+    assert!(!r.tuning.queue_compute_only);
 }
 
 /// `attn_split.decode_min_chunk` keeps PR 105's 16 on the class it was measured on, a discrete

@@ -716,8 +716,8 @@ pub(crate) static PARAMS: &[Param] = &[
         ty: Ty::Bool,
         axis: Axis::None,
         doc: "submit on a COMPUTE-only queue family when the device has one that writes               timestamps (amdgpu: the comp rings, scheduled beside the ring the compositor               renders on), else on the universal family",
-        rule: "true on a discrete device in the slow class (no matrix units and no accelerated                int8 dot, or wave64-only), where it was measured; else false",
-        default: |f, _| Value::Bool(!f.integrated && f.slow_class()),
+        rule: "true on a discrete device; false on an integrated one, where the compute ring's                hang budget measured tighter under RADV (a measured driver's row turns it on)",
+        default: |f, _| Value::Bool(!f.integrated),
         get: |t, _| Value::Bool(t.queue_compute_only),
         set: |t, _, v| t.queue_compute_only = v.flag(),
     },
@@ -1070,7 +1070,7 @@ pub(crate) static ALIASES: &[Alias] = &[
     Alias {
         path: "kernels.vulkan.gfx_queue",
         params: &["queue.compute_only"],
-        // Only ON ever meant anything: unset left the device rule in charge.
+        // Only ON ever meant anything: unset leaves the device rule and the table in charge.
         read: |c, _| {
             c.kernels
                 .vulkan

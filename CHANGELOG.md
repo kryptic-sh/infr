@@ -99,22 +99,29 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `OaiRenderer::{render_no_think, response_constraint, count_tokens}`; in
   `infr_chat`, `render_chat_oai_thinking` and a public `thinking_enabled`.
 
-- **Tuning parameter `queue.compute_only`: keep inference off the compositor's
-  graphics ring on a slow discrete GPU.** Such a device (no matrix units and no
-  accelerated int8 dot, or wave64-only) now submits on a COMPUTE-only queue
-  family (amdgpu's `comp` rings) instead of the universal `gfx` family the
-  compositor renders its frames on, so a multi-second prefill delays the
-  desktop's frame instead of blocking it: on the RX 580 with zeta-2.1 Q4_K_M,
-  glxgears held 130 fps through a prefill that used to drop it to 7 (153 → 166
-  tok/s prefill, 31.2 → 30.7 tok/s decode). Every other device keeps the
-  universal family: an integrated GPU because the `comp` ring's hang budget
-  measured tighter there, a fast discrete one because nothing was measured on
-  it. `INFR_TUNE=queue.compute_only=true` turns it on anywhere,
-  `kernels.vulkan.gfx_queue` (`INFR_GFX_QUEUE`) is an alias that turns it off,
-  and `infr tune show` and the startup log say which family the backend bound. A
-  COMPUTE-only family that writes no timestamps is refused with a warning, since
-  the submit splitter, the dropped-work check and `INFR_PROF_OPS` read
-  timestamps from the submit queue.
+- **Inference submits on a compute-only queue family by default (tuning
+  parameter `queue.compute_only`).** Where a Vulkan device has a COMPUTE-only
+  queue family (amdgpu's `comp` rings), infr now submits there instead of on the
+  universal family the compositor renders its frames on, so the desktop stays
+  responsive while a long forward runs: on an RX 580 under RADV with zeta-2.1
+  Q4_K_M, glxgears held 130 fps through a prefill that used to drop it to 7 (153
+  → 166 tok/s prefill, 31.2 → 30.7 tok/s decode; the contributor's figures, PR
+  106). It is on for every discrete GPU, and for an integrated GPU under the AMD
+  Windows driver, where it was measured; an integrated GPU under any other
+  driver keeps the universal family, because the `comp` ring's hang budget
+  measured tighter on one under RADV. What it costs on the devices measured
+  here, Qwen3-1.7B Q4_K_M under the AMD Windows driver with a desktop running:
+  on the RX 7900 XTX tg128 474.86 → 454.79 t/s (-4.2%) and pp512 11611.42 →
+  11482.28 t/s (-1.1%); on a Ryzen integrated GPU nothing measurable (tg128
+  27.12 → 27.12, pp512 230.94 → 230.84). Desktop responsiveness itself was not
+  measured here. To turn it off: `INFR_TUNE=queue.compute_only=false`,
+  `"queue.compute_only" = false` under `[kernels.vulkan.tune]`, or the alias
+  `kernels.vulkan.gfx_queue = true` (`INFR_GFX_QUEUE`). `infr tune show` and the
+  startup log say which family the backend bound. A COMPUTE-only family that
+  writes no timestamps is never used, with a warning, since the submit splitter,
+  the work bound, the dropped-work check and `INFR_PROF_OPS` read timestamps
+  from the submit queue. The generation golden and the tolerance tests run on
+  both devices pass unchanged on the compute-only family.
 
 - **Tuning parameter `gemv.kq_fma`: fp32 decode GEMVs for GPUs without an
   accelerated int8 dot.** Three decode (one-row) kernels, on by default where

@@ -2574,12 +2574,14 @@ impl VulkanBackend {
                 .ok_or_else(|| be("no compute queue family found"))?;
         match compute_ring {
             ComputeRing::NotAsked | ComputeRing::Taken => {}
-            ComputeRing::Missing => tracing::warn!(
-                "[infr] vulkan: queue.compute_only is set, but this device has no COMPUTE-only \
+            // The parameter is on by default, so a device without such a family is the ordinary
+            // case, not a refused request.
+            ComputeRing::Missing => tracing::info!(
+                "[infr] vulkan: queue.compute_only is on, but this device has no COMPUTE-only \
                  queue family; submitting on queue family {queue_family_index}"
             ),
             ComputeRing::NoTimestamps => tracing::warn!(
-                "[infr] vulkan: queue.compute_only is set, but this device's COMPUTE-only queue \
+                "[infr] vulkan: queue.compute_only is on, but this device's COMPUTE-only queue \
                  family writes no timestamps (timestampValidBits 0), which the submit splitter, \
                  the dropped-work check and the per-op profile need; submitting on queue family \
                  {queue_family_index}"

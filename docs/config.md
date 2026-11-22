@@ -314,8 +314,9 @@ gemv_sg.rows                2      default
 (`tune:7751091e`), so a log says whether two runs tuned alike.
 
 Three parameters carry kernels and choices contributed from an RX 580 under RADV
-(PRs 105 to 107), and default to what was measured there on that class of device
-only, so every other device runs what it ran before them:
+(PRs 105 to 107). The first two default to what was measured there on that class
+of device only, so every other device runs what it ran before them; the third is
+on wherever it applies:
 
 - `gemv.kq_fma` turns on the fp32 decode GEMVs (`native_gemv_kq_fma` for
   Q4_K/Q6_K with its MTP verify twin, `linear_f32_mo`, one-row bf16). Default:
@@ -327,8 +328,9 @@ only, so every other device runs what it ran before them:
   neither matrix units nor an accelerated int8 dot), 64 elsewhere. It changes
   the last bits of decode attention for every context under 32 times its value.
 - `queue.compute_only` submits on a compute-only queue family. Default: on for
-  the same slow discrete class, off elsewhere; described with the submit
-  parameters below.
+  every discrete device (PR 106's rule, kept by the project owner's decision so
+  that the desktop stays responsive), and for an integrated GPU under the AMD
+  Windows driver by a table row; described with the submit parameters below.
 
 Three parameters are not kernel choices; they decide how a forward is cut into
 submits, so that no submit runs long enough for a driver's watchdog to reset the
@@ -429,18 +431,23 @@ pass: one is owed, the other comes from its estimate standing above the real
 time.
 
 `queue.compute_only` decides which queue family the submits go to, and with it
-which of the driver's watchdogs applies. It is on by default only on a discrete
-device in the slow class (no matrix units and no accelerated int8 dot, or
-wave64-only), where it was measured: an RX 580 under RADV kept its desktop
-responsive through a prefill that used to stall it. Everywhere else the submits
-stay on the universal family, as before; `kernels.vulkan.gfx_queue`
-(`INFR_GFX_QUEUE`) is an alias that turns the parameter off. A compute-only
-family that writes no timestamps is never used, with a warning when it was asked
-for, because the submit splitter, the dropped-work check and `INFR_PROF_OPS` all
-read timestamps from the submit queue. amdgpu documents a longer job timeout for
-its compute rings than for the graphics ring, but the budget does not count on
-it: the 2 s figure is the tighter one, and it is the one that was measured, on
-the graphics ring.
+which of the driver's watchdogs applies. It is on by default: where the device
+has a COMPUTE-only family, the submits go there and not to the universal family
+the compositor renders on, so a long forward delays the desktop's frames instead
+of blocking them (an RX 580 under RADV held 130 fps in glxgears through a
+prefill that used to drop it to 7). The exception is an integrated GPU, which
+keeps the universal family unless a table row for its driver says otherwise (the
+AMD Windows driver's does): under RADV the compute ring's hang budget measured
+tighter on one. It is not free everywhere: on an RX 7900 XTX under the AMD
+Windows driver it measured 4.2% off decode and 1.1% off prefill (backlog B227).
+Turn it off with `INFR_TUNE=queue.compute_only=false`, or with its alias
+`kernels.vulkan.gfx_queue = true` (`INFR_GFX_QUEUE`). A compute-only family that
+writes no timestamps is never used, with a warning, because the submit splitter,
+the work bound, the dropped-work check and `INFR_PROF_OPS` all read timestamps
+from the submit queue. amdgpu documents a longer job timeout for its compute
+rings than for the graphics ring, but the budget does not count on it: the 2 s
+figure is the tighter one, and it is the one that was measured, on the graphics
+ring.
 
 Each value is resolved once, when the backend is created, from these levels —
 the last one that sets a parameter wins, per parameter:

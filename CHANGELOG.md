@@ -460,35 +460,52 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   models' CPU decode output changes once (`cpu_golden_qwen3moe` re-blessed, the
   same on Windows and Linux under WSL; CI does not run the MoE goldens).
 
-- **The Vulkan backend bounds the GPU time of every submit and of every single
-  dispatch (issue 94, plan 12 S2).** A driver's watchdog resets the GPU when one
-  submit runs for about 2 s (Windows' `TdrDelay`, amdgpu's `lockup_timeout`) and
-  drops its work; the dispatch cap could not see a dispatch that is heavy on its
-  own, so a large `-u` on a slow device ended in an error. Now every prefill
-  GEMM and GEMV over more than one row, and the non-coopmat flash prefill
-  attention, estimates its GPU time before it is recorded (FLOPs over a
-  throughput: the one measured for that kernel in the process, else a
-  pessimistic prior from the compute-unit count). A dispatch estimated past the
-  budget is cut into ranges of its workgroup grid, each in a submit of its own
-  and bit-identical to the whole dispatch, and a submit is closed once its
-  estimated work reaches the budget. Two new tuning parameters:
-  `submit.budget_ms` (250 on an integrated or slow-class device, 1000 elsewhere;
-  `0` = off) and `submit.prior_gflops` (8 GFLOP/s per compute unit). On a Ryzen
-  integrated GPU, `infr bench` of SmolLM3-3B Q4_K_M with `-u 512` and
-  `INFR_NO_I8DOT=1`, which was reset in every run before, completed five runs of
-  five (5.1 t/s: the per-row GEMV's own speed), `-u 2048 -p 2048` five of five,
-  and `-u 2048` with the int8 kernels off, whose heaviest dispatch is about 6 s
-  whole, completed its one run; no engine reset was logged. **Upgrade notes:**
-  the tuning hash in the device banner changes on every device (two new
-  parameters). An integrated GPU's first prefill forward takes a few more
-  submits than before, until its kernels have been timed. On an RX 7900 XTX,
-  Qwen3-1.7B at default settings takes no cut and measures the same as before
-  (pp512 and tg128 within 0.05% over six interleaved rounds); a large model's
-  forward whose estimate reaches the budget takes a cut it did not take before.
+- **The Vulkan backend cuts a forward by the estimated GPU time of its heavy
+  dispatches and of its submits (issue 94, plan 12 S2).** A driver's watchdog
+  resets the GPU when one submit runs for about 2 s (Windows' `TdrDelay`,
+  amdgpu's `lockup_timeout`) and drops its work; the dispatch cap could not see
+  a dispatch that is heavy on its own, so a large `-u` on a slow device ended in
+  an error. Now the heavy prefill kernels (the prefill GEMMs and the per-row
+  GEMV over more than one row, and the non-coopmat flash prefill attention)
+  estimate their GPU time before they are recorded: FLOPs over a throughput,
+  which is a pessimistic prior from the compute-unit count until the GPU has
+  measured the kernel. A dispatch estimated past the budget is recorded as
+  ranges of its workgroup grid, each in a submit of its own and bit-identical to
+  the whole dispatch, and a submit is closed at the next op boundary once its
+  estimated work reaches the budget. The budget is where cutting starts, not a
+  ceiling: a submit that was just under it takes one more op and can hold about
+  twice the budget, a dispatch has at most one range per workgroup along the cut
+  dimension, and some prefill GEMMs carry no estimate yet (the batched MoE
+  expert GEMM among them; backlog B226 has the list). The prior is replaced only
+  by measurement: a timed heavy dispatch, or the GPU time of a completed submit
+  set against its estimate, neither by more than 8 times. Two new tuning
+  parameters: `submit.budget_ms` (250 on an integrated or slow-class device,
+  1000 elsewhere; `0` = off) and `submit.prior_gflops` (8 GFLOP/s per compute
+  unit). On a Ryzen integrated GPU, `infr bench` of SmolLM3-3B Q4_K_M with
+  `-u 512` and `INFR_NO_I8DOT=1`, which was reset in every run before, completed
+  five runs of five (5.1 t/s: the per-row GEMV's own speed), `-u 2048 -p 2048`
+  five of five, and `-u 2048` with the int8 kernels off, whose heaviest dispatch
+  is about 6 s whole, completed its one run; no engine reset was logged. Those
+  runs were of the first build; the final one ran `-u 2048 -p 2048` three more
+  times and `-u 512` with `INFR_NO_I8DOT=1` once, all completing. **Upgrade
+  notes:** the tuning hash in the device banner changes on every device (two new
+  parameters). An integrated GPU's first prefill forward takes three more
+  submits than before (Qwen3-1.7B, `pp512`), then none. Throughput against
+  `main`, interleaved, two file copies of each binary, the first copy rotating
+  every round, on 2026-11-22 with under one busy core of 32: on an RX 7900 XTX,
+  Qwen3-1.7B Q4_K_M at default settings takes no cut and reads pp512 11701.77
+  against 11706.98 t/s (-0.04%) and tg128 469.33 against 469.24 (+0.02%) over
+  twelve rounds; Qwen3-30B-A3B at `-u 1024` takes no cut and reads pp1024
+  3565.74 against 3563.74 (+0.06%) over six; SmolLM3-3B at `-u 4096`, whose
+  prior passes the budget, takes one cut in its first forward and none after and
+  reads pp4096 4562.15 against 4562.16 over six. The two copies of one binary
+  differ by up to 0.31% in these sets, so none of the differences is one. On the
+  integrated GPU, six rounds: Qwen3-1.7B pp512 231.03 against 231.07 (-0.02%),
+  tg128 27.04 against 27.06 (the bench prints that one to a decimal).
   `device.submit_dispatches = 0` still means one submit per forward and turns
   this off as well. `RUST_LOG=infr_vulkan=debug` prints one line per forward
-  with the splitter's cut counts and the throughput measured per kernel.
-  `docs/config.md` has the rules.
+  with its dispatches, GPU time and estimated work, the splitter's cut counts
+  and the throughput learned per kernel. `docs/config.md` has the rules.
 
 - **A slow discrete GPU splits its first forward (issue 94).** A device that is
   wave64-only, or has neither 16x16x16 f16 cooperative matrices nor an

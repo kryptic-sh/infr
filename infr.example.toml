@@ -179,9 +179,10 @@ no_replay = false # sanctioned negative: true DISABLES the decode replay tape
 # [kernels.vulkan.tune]
 # "gemv_sg.rows" = 4
 # "mmv_mw.warps@q4_k" = 1
-# "submit.budget_ms" = 250   # GPU time, in ms, one dispatch or one submit may
-#                            # be estimated to take; a heavier prefill GEMM is
-#                            # cut into ranges, each its own submit. 0 = off.
+# "submit.budget_ms" = 250   # estimated GPU time, in ms, past which work is cut:
+#                            # a heavier prefill GEMM is recorded as ranges,
+#                            # each its own submit, and a submit closes at the
+#                            # next op once it holds this much. 0 = off.
 #                            # Default: 250 integrated or slow-class, else 1000
 # "submit.prior_gflops" = 16 # throughput assumed before a kernel is measured
 #

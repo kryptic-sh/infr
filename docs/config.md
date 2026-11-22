@@ -339,12 +339,17 @@ nothing measured, and no cut from the work bound below either.
 
 `submit.budget_ms` bounds work rather than dispatches, on every device and from
 the first forward. Its default is 250 on an integrated GPU or a slow-class
-device (the ones above that start with a dispatch cap) and 1000 elsewhere. Every
-prefill GEMM and GEMV over more than one row, and the non-coopmat flash prefill
-attention, estimates its GPU time before it is recorded. A dispatch estimated
-past the budget is cut into ranges of its workgroup grid, each in a submit of
-its own, with output bit-identical to the whole dispatch; and a submit is closed
-at the next op boundary once the work recorded into it reaches the budget. The
+device (the ones above that start with a dispatch cap) and 1000 elsewhere. The
+heavy prefill kernels estimate their GPU time before they are recorded: the
+prefill GEMMs and the per-row GEMV over more than one row, and the non-coopmat
+flash prefill attention (backlog B226 names the GEMMs that carry no estimate
+yet). A dispatch estimated past the budget is cut into ranges of its workgroup
+grid, each in a submit of its own, with output bit-identical to the whole
+dispatch; and a submit is closed at the next op boundary once the work recorded
+into it reaches the budget. So the budget is where cutting starts, not a
+ceiling: a submit that was just under it takes one more op and can hold about
+twice the budget, and a dispatch has at most one range per workgroup along the
+dimension that is cut, so a range of a very coarse grid can still pass it. The
 watchdog counts a submit's time, not a dispatch's (on the integrated GPU
 measured, eight dispatches of 0.39 s in one submit were reset like one dispatch
 of 3.1 s, and the same eight in eight submits completed), so the ranges need
@@ -353,28 +358,35 @@ kernel has been measured is a guess, a second program using the GPU stretches a
 submit (by about a second in one measurement), and 250 ms is what the
 dispatch-count splitter already aims at. 1000, half the limit, is the forward
 time at which that splitter already starts cutting a card it otherwise leaves
-alone: there the estimates stay the pessimistic guess for all but the heaviest
-dispatches, and a tighter budget would cut forwards that measure far under it.
-`0` turns the work bound off; the dispatch-count splitter still applies.
+alone, so a tighter budget would cut forwards the splitter leaves whole. `0`
+turns the work bound off; the dispatch-count splitter still applies.
 
-The estimate is the op's FLOPs over a throughput: the one measured for that
-kernel earlier in the process when there is one (a dispatch estimated at a
-thirty-second of the budget or more is timed; the first sample replaces the
-prior, later ones can only make the kernel slower), else `submit.prior_gflops`,
-8 GFLOP/s per compute unit (16 on a device that reports none), scaled up for the
+The estimate is the op's FLOPs over a throughput: the one learned for that
+kernel earlier in the process when there is one, else `submit.prior_gflops`, 8
+GFLOP/s per compute unit (16 on a device that reports none), scaled up for the
 faster kernel families (8 times for an accelerated int8 dot, 16 for matrix
 units). The prior is meant to be pessimistic, so a device's first forward is cut
-more than it needs, not less: the integrated GPU measured takes three extra
-submits in its first prefill forward at default settings and none after. On a
-fast card the estimates of a small or mid-sized model's forward at the default
-batch stay under the budget and nothing is cut or timed; a large model's can
-reach it and take a cut that a measurement would show it did not need. On an
-integrated device or one in the slow class, a dispatch whose kernel cannot be
-cut and has been MEASURED at more than eight times the budget is refused with an
-error naming the kernel before it is submitted; no kernel that carries an
-estimate is uncuttable today, and anywhere else nothing is refused. Dispatches
+more than it needs, not less, and only what the GPU measured replaces it, in two
+ways. A dispatch estimated at a thirty-second of the budget or more is timed:
+the first sample replaces the kernel's estimate, later ones can only make the
+kernel slower. And the GPU time of every submit of a forward is set against its
+estimate: when the submit ran faster, the kernels in it that have no timed
+dispatch are scaled to it, so the same submit is next estimated at what it
+measured, never under; a submit that ran slower changes nothing. No measurement
+raises a kernel's throughput more than 8 times over its prior, so one bad
+reading cannot take a kernel out of the bound. A kernel that cannot be cut the
+way it is tagged, and any dispatch recorded where no submit can be opened (a
+decode replay, or under `device.submit_dispatches = 0`), stays whole. Dispatches
 without an estimate (everything but the kernels above, and every single-row
 forward) count as free: the dispatch cap is what bounds those.
+
+What that costs, measured on 2026-11-22: the integrated GPU takes three extra
+submits in its first prefill forward at default settings (Qwen3-1.7B, `pp512`)
+and none after. On the RX 7900 XTX a small or mid-sized model's forward at the
+default batch is estimated under the budget and nothing is cut or timed. A
+forward estimated past it takes a cut until its first submits have completed:
+SmolLM3-3B at `-u 4096` is estimated at 1875 ms by the prior, runs in about 860
+ms, takes one work cut in its first forward and none after.
 
 `kernels.vulkan.gfx_queue` decides which queue the submits go to, and with it
 which of the driver's watchdogs applies: a discrete card submits on a

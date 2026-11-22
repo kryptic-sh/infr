@@ -7154,35 +7154,64 @@ tasks).
 
 **Tag:** vulkan · submit · watchdog · **Kind:** coverage gaps, decisions
 
-`crate::work` bounds the estimated GPU time of every submit and of every single
-dispatch (`submit.budget_ms`), by cutting a heavy dispatch into ranges of its
-grid, each in its own submit, and closing a submit once its estimated work
-reaches the budget. Plan 12 sections 0d and 0e have the measurements behind it.
-What it does not do:
+`crate::work` estimates the GPU time of the heavy prefill dispatches and cuts by
+it (`submit.budget_ms`): a dispatch estimated past the budget is recorded as
+ranges of its grid, each in its own submit, and a submit is closed at the next
+op boundary once its estimated work reaches the budget. Plan 12 sections 0d and
+0e have the measurements behind it. What it does not do:
 
+- **The budget is where cutting starts, not a ceiling.** A submit is closed at
+  the next op boundary after its estimate reaches the budget, so one that was
+  just under it takes one more op and can hold about twice the budget; and a
+  dispatch has no more ranges than workgroups along the dimension that is cut
+  (`WorkModel::pieces`), so a range of a coarse grid can pass the budget on its
+  own. Neither was seen to matter: the budget is an eighth of the limit on the
+  devices that get reset and half of it elsewhere.
 - **Kernels that carry no estimate count as free.** Only these say what they
-  cost (`Recorder::work_next`), and only over more than one row: every prefill
-  GEMM (`tag_gemm`'s call sites: the cooperative-matrix, int8-dot, dp4a K-quant
-  and float tiled kernels), the per-row GEMV (`linear_native_at`'s multi-row
-  dispatch), the fork's multi-row `native_gemv_kq_fma_mrow`, and the non-coopmat
-  flash prefill attention (`attention_prefill_nc_fa`). Everything else is
-  bounded by the dispatch cap alone: the multi-row GEMVs of the 2-to-16 row band
+  cost (`Recorder::work_next`), and only over more than one row: the GEMMs
+  recorded by `matmul_native_off`, `matmul_native_cm8`, `matmul_native_f16a`,
+  `matmul_native_f32a`, `matmul_native_splitk`, `matmul_i8cm_kq`,
+  `matmul_dp4a_kq`, `matmul_mmq_q4k`, `matmul_mmq_q6k`, `matmul_mmq_at` and
+  `matmul_fma_at` (`tag_gemm`'s call sites), the per-row GEMV
+  (`linear_native_at`'s multi-row dispatch), the fork's multi-row
+  `native_gemv_kq_fma_mrow`, and the non-coopmat flash prefill attention
+  (`attention_prefill_nc_fa`). Everything else is bounded by the dispatch cap
+  alone. That includes prefill GEMMs, which the docs first described as all
+  tagged: the cooperative-matrix GEMM of f16 weights outside the split-K plan
+  (`matmul_proj_at`), the BF16 one (`matmul_bf16cm`), the opt-in Q8_0
+  cooperative-matrix tiers (`matmul_i8cm_q8_0*`, `matmul_f8cm_q8_0*`) and the
+  batched MoE expert GEMM (`matmul_mmq_experts`, `matmul_mmq_experts_paged`).
+  And the rest: the multi-row GEMVs of the 2-to-16 row band
   (`native_mmv_mrow*`), every other attention kernel (the cooperative-matrix
   flash prefill, `attention_kv*`, MLA, the split-K decode kernels),
   convolutions, the DeltaNet and hyper kernels, MoE routing and scatter,
-  embedding gathers, norms and activations. None of those was seen heavy in the
-  profiles of plan 12 section 0d (the heaviest untagged dispatch there is under
-  4 ms, `rope_f16`); a model family whose prefill is dominated by one of them on
-  a slow device would get no cut from the work bound. To add one: tag it where
-  it is recorded, with its FLOPs and `work::Split` (`Flat` only if the shader
-  does not read `gl_NumWorkGroups`, which `record_dispatch` checks against the
-  SPIR-V).
-- **No estimated kernel is uncuttable today, so the refusal has no GPU test.** A
-  dispatch whose kernel cannot be cut (`work::Split::No`, or a `WideGrid` kernel
-  on a three-dimensional grid) and that was MEASURED at more than eight times
-  the budget is refused on a reset-prone device with an error naming the kernel.
-  Nothing produces such a dispatch, so only `WorkModel::refuse`'s unit test
-  covers it.
+  embedding gathers, norms and activations. None of the second group was seen
+  heavy in the profiles of plan 12 section 0d (the heaviest untagged dispatch
+  there is under 4 ms, `rope_f16`); the untagged GEMMs were not profiled on a
+  slow device. A model whose prefill is dominated by one of them there gets no
+  cut from the work bound. To add one: tag it where it is recorded, with its
+  FLOPs and `work::Split` (`Flat` only if the shader does not read
+  `gl_NumWorkGroups`, which `record_dispatch` checks against the SPIR-V), and
+  add its kernel to `tests/work_split_parity.rs`.
+- **A batched MoE layer is one op with most of its work untagged.** Checked
+  because a submit is only closed between ops: one `Op::MoeFfn` records ONE
+  tagged dispatch, the router GEMV (`linear_native`), and its expert GEMMs
+  through `matmul_mmq_experts`, which carry no estimate. No op records several
+  tagged dispatches (`quant_linear`, `float_linear` and `nc_prefill_gemm` record
+  one GEMM per `Op::Linear`, read 2026-11-22), so no op can run a submit far
+  past the budget by estimate; but a MoE layer's real work is outside the
+  estimate altogether. On the RX 7900 XTX, Qwen3-30B-A3B Q4_K_M at
+  `-u 1024 -p 1024` was estimated at 151 ms a forward against 270 to 288 ms of
+  GPU time, with no work cut and nothing learned (a segment that runs slower
+  than its estimate corrects nothing). Not run on a slow device.
+- **Refusing an uncuttable dispatch was removed (2026-11-22).** The first
+  version refused, before submit, a dispatch that could not be cut and had been
+  measured far past the budget on a reset-prone device. No tagged kernel is
+  uncuttable, so nothing reached it and it had no GPU test; it went, with
+  `work::Split::No`. A kernel that cannot be cut the way its tag says (a `Flat`
+  tag on a shader that reads `gl_NumWorkGroups`, a `WideGrid` kernel on a
+  three-dimensional grid) is recorded whole. If such a kernel is ever tagged and
+  heavy, a refusal needs a GPU test that produces it.
 - **A recording that cannot open submits keeps heavy dispatches whole.** A
   persistent recording (the decode replay tape, replayed whole) and every
   recording under `device.submit_dispatches = 0` record a tagged dispatch as
@@ -7192,27 +7221,43 @@ What it does not do:
 - **The estimate follows timestamps around one dispatch, which other dispatches
   can overlap.** A timed dispatch is bracketed by two timestamps with no barrier
   before the first, so a dispatch that started while earlier work was still
-  running can read short. The model keeps the SLOWEST sample per kernel, which
-  the first dispatch of an overlapping group always is, and on the integrated
-  GPU eight independent GEMV dispatches in one submit read the same throughput
-  as one alone (29.2 to 29.9 GFLOP/s over the four probe points). Not shown: a
-  kernel whose every dispatch overlaps a heavier one of another kernel. A
-  barrier before the opening stamp would make the reading exact at the cost of
-  serialising those dispatches; not done, since it would change what a slow
-  device runs.
+  running can read short. The model keeps the SLOWEST timed sample per kernel,
+  which the first dispatch of an overlapping group always is, and on the
+  integrated GPU eight independent GEMV dispatches in one submit read the same
+  throughput as one alone (29.2 to 29.9 GFLOP/s over the four probe points). Not
+  shown: a kernel whose every dispatch overlaps a heavier one of another kernel.
+  What bounds the damage is `MAX_PRIOR_GAIN`: no reading takes a kernel's
+  throughput more than that many times past its prior, and a reading of no time
+  is dropped. A barrier before the opening stamp would make the reading exact at
+  the cost of serialising those dispatches; not done, since it would change what
+  a slow device runs.
+- **A segment's time is shared among its kernels by their priors.**
+  `WorkModel::calibrate` scales every kernel of a segment without a timed
+  dispatch by the same factor, measured over estimated. The segment's estimate
+  then equals what it measured (never less), but a kernel much slower against
+  its prior than its neighbours comes out too fast, by at most `MAX_PRIOR_GAIN`,
+  and no later segment raises it: only a timed dispatch does, and a dispatch is
+  timed only from a thirty-second of the budget up. Such a kernel met later in a
+  submit of its own, in many small dispatches, would be under-estimated; the
+  dispatch cap is what still bounds that submit. No failure from it in what ran;
+  nothing was built to provoke it on a GPU. A segment's time also holds its
+  untagged work (attention, on the RX 7900 XTX), which the scaling books to the
+  GEMMs; that errs slow.
+- **`MAX_PRIOR_GAIN` clamps a kernel that really is that much faster.** The
+  flash prefill attention on the integrated GPU was timed at 170 GFLOP/s before
+  the bound (prior 16) and is held at 128 with it, so its estimate is about a
+  third too high. Extra ranges for that dispatch, no failure; the cut counts of
+  the two runs compared (Qwen3-1.7B `pp512`, SmolLM3-3B `-u 2048`) moved by at
+  most two a forward.
 - **The prior's margin is thin for one shape.** `submit.prior_gflops` is 16 on
   the 2-CU integrated GPU; its per-row GEMV measured 29.9 GFLOP/s on a 2048 x
   22016 weight and 18.8 on 22016 x 2048 (the slow-class test's shapes). The
   budget's eighth of 2 s is what absorbs a prior that is wrong.
-- **A fast card keeps the prior for most of its dispatches.** Only a dispatch
-  estimated at a thirty-second of the budget or more is timed, which on the RX
-  7900 XTX (budget 1000 ms, prior 768 GFLOP/s times 16 for matrix units) leaves
-  every GEMM of a model up to about 14B at 1024 rows untimed. A large model's
-  forward can therefore reach the budget by estimate and take a cut that a
-  measurement would not ask for (by the prior, a 14B model at 1024 rows is about
-  2.3 s of estimated work: two cuts a forward [I: computed from the prior, not
-  run]). Each cut is a submit and a barrier; Qwen3-1.7B at default settings
-  takes none. Calibrating from whole-segment times would remove them.
+- **No 14B-class dense model was run.** The review asked for Qwen3-14B at
+  `-u 1024` on the RX 7900 XTX; it is not in the cache and is larger than the
+  download allowance. SmolLM3-3B at `-u 4096` stood in (about the same FLOPs a
+  forward, by the prior 1875 ms of estimated work): plan 12's S2 status has the
+  cut counts and the A/B.
 - **The measured dispatch-cap loop double-counts.** `observe_forward` divides a
   forward's whole GPU time by its dispatch count, tagged dispatches included, so
   at a large batch the cap ratchets to its floor of 16 although the work bound
@@ -7220,8 +7265,27 @@ What it does not do:
   `-u 512` with int8 off and at `-u 2048`). More submits than needed, no
   failure. Subtracting the estimated work from the loop's sample would fix it.
 - **The integrated GPU's first prefill forward takes three more submits** at
-  default settings than before (the pessimistic prior), then none: Qwen3-1.7B,
-  `pp512`, counted from the `RUST_LOG=infr_vulkan=debug` forward lines.
+  default settings than before the work bound (the pessimistic prior), then
+  none: Qwen3-1.7B, `pp512`, counted from the `RUST_LOG=infr_vulkan=debug`
+  forward lines, the same before and after the fix round.
+- **SmolLM3-3B `-u 2048 -p 2048` on the integrated GPU reads in two states,
+  about 76 and about 89 t/s, and which one a run gets is not explained.** The
+  first S2 run recorded 91.3 to 91.9 t/s; on 2026-11-22, later, three runs of
+  the final binary gave 72.3, 72.5 and 71.7 and one of the binary from before
+  the fix round 73.6, with the same cuts per forward as the first run (72
+  dispatches cut, 180 work cuts), so the same work took longer on the GPU (about
+  28 s a forward). An interleaved A/B of the two binaries then (six rounds, one
+  run each of two copies per round, `-r 1`) read 72.6 to 81.0 t/s in its first
+  three rounds and mostly 87.0 to 90.3 from the fourth on, with single runs of
+  either binary in the other state among them (one binary 76.7 then the other
+  87.0 in consecutive runs; three runs at 89 to 90 then one at 76.5). Means:
+  81.22 t/s after the fix round against 82.06 before, with the two copies of one
+  binary 3.3% and 1.4% apart, so that set does not compare the binaries. Under
+  one busy core of 32 throughout but for one round at 1.07 (Windows'
+  `CompatTelRunner`). Qwen3-1.7B `pp512` on the same GPU is steady (231.03
+  against 231.07 t/s over six rounds). To separate the binaries on this workload
+  the state has to be found first: memory bandwidth taken by another process is
+  the first thing to rule out, since this GPU reads its weights from DRAM [I].
 - **`device.submit_dispatches = N` moves where the cap starts, not where it
   ends** (issue 94: 128 and 256 both ended on 62). The docs now say so. A
   DECISION for the owner: whether an explicit N should instead pin the cap,
@@ -7237,6 +7301,14 @@ What it does not do:
   `seed_barrier`; removing it left every parity test green on the RX 7900 XTX,
   whose queue runs submits in order anyway. It is kept because Vulkan requires
   it.
+- **Two recorder fixes have no test.** `Recorder::free_transient` now waits for
+  the buffers a cut dispatch already submitted before it destroys the profiling
+  query pool they write to (a discarded recorder under `INFR_PROF_OPS`), and a
+  segment's dispatch count now includes every buffer its recorder submitted
+  (`PendingSegment::dispatches`). The second was checked by reading the debug
+  line (SmolLM3-3B `-u 2048` on the integrated GPU: 766 dispatches a forward
+  with and without `INFR_PROF_OPS`, where the branch before reported 397); the
+  first needs a shutdown during a cut forward under profiling and was only read.
 - **A `LiveKernelEvent` 0x141 entry does not always mean dropped work.** Two
   were logged during runs all of whose segments wrote their closing timestamps
   (plan 12 section 0d), so counting those entries over-reports.

@@ -270,6 +270,34 @@ Every test ends as a pass, a fail or a printed `skip:` line, never a hang:
   last row only, under a submit cap of 4: a harness workaround, removed with no
   table row changed.
 
+These tests are one part of the **GPU gate**, the ignored GPU tests run on each
+device before a slice lands. Its filter was kept in the scripts of whoever ran
+it; it is written here so that a new GPU test is either selected by it or added
+to it. The work bound's tests are an example: `binary(work_split_parity)` is
+named, and the two ignored lib tests
+(`attention_prefill_nc_fa_cut_is_bit_identical` and
+`a_failed_one_shot_names_the_forward_segments_before_it`) come in through
+`kind(lib)` of `infr-vulkan`, which no `test(gpu_seam)`-style name filter
+selects.
+
+```text
+INFR_DEV=Vulkan0 cargo nextest run --release --run-ignored all --test-threads 1 \
+  --no-fail-fast -E '(binary(seam_op_parity)
+  | (package(infr-vulkan) & (kind(lib) | binary(dense_tier_parity)
+    | binary(shared_decode_parity) | binary(pager_gemv_parity)
+    | binary(pager_mmq_parity) | binary(first_forward_split)
+    | binary(work_split_parity)))
+  | test(gpu_seam) | test(gpu_synthetic) | test(gpu_prefill) | test(lfm3)
+  | test(qwen35) | test(gemma) | test(paged) | test(deepseek) | test(dsv4)
+  | test(mtp_head_cpu_vulkan_parity))
+  & not test(qwen3_14b) & not binary(gemm_bench)'
+```
+
+On the integrated GPU the gate of 2026-11-22 ran the same filter with
+`& not (test(moe) | test(ernie))` appended, and the ERNIE tolerance case on its
+own. `infr-vulkan`'s bench and probe binaries stay out on purpose: some of them
+have lost the device on the integrated GPU.
+
 `INFR_FORCE_WAVE64=1` runs the wave64 path and `INFR_TUNE_NO_ROWS=1` the generic
 tuning defaults (both reach these tests through `infr_testkit::honour_env`).
 `measure_gpu_tolerance` (also ignored) prints the full comparison for the models

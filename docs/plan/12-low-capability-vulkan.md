@@ -379,14 +379,15 @@ on the XTX 590 passed and 1 failed, the native-device half of
 it (re-run: both pass). The RX 580's reporter has since confirmed S1 on the card
 (section 0e).
 
-**S2 done (branch `fix/vulkan-work-budget`, 2026-11-22).** `crate::work`: every
-prefill GEMM and multi-row GEMV, and the non-coopmat flash prefill attention,
-estimates its GPU time before it is recorded (FLOPs over the throughput measured
-for that kernel in the process, else the prior `submit.prior_gflops`, 8 GFLOP/s
-per compute unit, times 8 for an accelerated int8 dot and 16 for matrix units);
-a dispatch estimated past `submit.budget_ms` is cut into ranges of its workgroup
-grid through a `DISPATCH_BASE` twin of its pipeline, each range in a submit of
-its own; and `segment_cut` closes a submit at the next op boundary once its
+**S2 done (branch `fix/vulkan-work-budget`, 2026-11-22).** `crate::work`: the
+tagged prefill GEMMs and multi-row GEMVs (B226 names the GEMMs that are not
+tagged), and the non-coopmat flash prefill attention, estimate their GPU time
+before they are recorded (FLOPs over the throughput measured for that kernel in
+the process, else the prior `submit.prior_gflops`, 8 GFLOP/s per compute unit,
+times 8 for an accelerated int8 dot and 16 for matrix units); a dispatch
+estimated past `submit.budget_ms` is cut into ranges of its workgroup grid
+through a `DISPATCH_BASE` twin of its pipeline, each range in a submit of its
+own; and `segment_cut` closes a submit at the next op boundary once its
 estimated work reaches the budget, after the dispatch cap and before the paged
 cadence. The budget is a time because the limit is (sections 0d and 0e): 250 ms,
 an eighth of the 2 s, on an integrated or slow-class device, and 1000 ms
@@ -444,20 +445,111 @@ What ran, all on 2026-11-22 with the final binary unless said:
   `segment_cut`, `the_work_cut_closes_a_heavy_segment_of_few_dispatches` fails;
   with a dispatch never cut, three of `work::tests` fail; with a prior ten times
   faster, three; with a measurement allowed to lower an estimate twice, one.
-- **Gates.** The GPU gate (the filter of `docs/gpu-tolerance.md` plus
-  `mtp_head_cpu_vulkan_parity` and `work_split_parity`): 616 passed on the
-  integrated GPU, the tolerance tests among them with the harness workaround
-  removed and no table row changed; on the RX 7900 XTX 676 passed and 1 failed,
-  `gpu_seam_golden_qwen3`. It fails with the same hash on `main` at `86f90c95`
-  (the three fork PRs merged), which the gate of 2026-11-19, before them, did
-  not report, so one of those PRs moved that golden on native lanes (the
-  decode-attention change is the likely one [I]), not this slice; left for the
-  slice that reviews those PRs. With `INFR_FORCE_WAVE64=1` on the RX 7900 XTX
-  616 passed.
+- **Gates.** The GPU gate (its filter is now written out in
+  `docs/gpu-tolerance.md`): 616 passed on the integrated GPU, the tolerance
+  tests among them with the harness workaround removed and no table row changed;
+  on the RX 7900 XTX 676 passed and 1 failed, `gpu_seam_golden_qwen3`. It fails
+  with the same hash on `main` at `86f90c95` (the three fork PRs merged), which
+  the gate of 2026-11-19, before them, did not report, so one of those PRs moved
+  that golden on native lanes (the decode-attention change is the likely one
+  [I]), not this slice; left for the slice that reviews those PRs. With
+  `INFR_FORCE_WAVE64=1` on the RX 7900 XTX 616 passed.
 
-What it leaves out is in the backlog (B226): kernels without an estimate, the
-thin margin of the prior for one GEMV shape, the cuts a large model takes on a
-fast card by estimate, and the RX 580's limit on the compute ring.
+**S2 fix round (2026-11-22, after review).** Six findings, all on the branch:
+
+- **A fast card kept paying for its prior.** No 14B-class dense model is in the
+  cache (Qwen3-14B is not, and is past the download allowance), so SmolLM3-3B at
+  `-u 4096 -p 4096` stood in on the RX 7900 XTX: about the FLOPs a forward of a
+  14B model at 1024 rows has, 1875 ms of estimated work by the prior against 845
+  to 877 ms of GPU time, every GEMM under the timing threshold. Before the fix
+  it took one work cut in EVERY forward and learned nothing (`measured []`). Now
+  a completed segment's GPU time is set against its estimate
+  (`WorkModel::calibrate`): the first forward takes the one cut, its kernels
+  come out at about 27100 GFLOP/s (prior 12288), and every later forward is
+  estimated at about 850 ms and takes none. The correction only lowers, only
+  kernels without a timed dispatch, never past `MAX_PRIOR_GAIN` from the prior,
+  and never takes a segment's estimate under what it measured; a slow device's
+  first forward still runs on the prior. A later, faster segment lowers again,
+  because a short first forward reads close to the prior (a 64-row forward on
+  the XTX: 12798 GFLOP/s) and would otherwise have fixed the estimate.
+- **A bad sample latched.** A timed dispatch that read zero or short set the
+  kernel's estimate to nothing for the process. Zero-time readings are dropped
+  and every reading is bounded by `MAX_PRIOR_GAIN` (8: the watchdog's limit over
+  the reset-prone budget).
+- **The wording overpromised**: the budget is where cutting starts. A submit is
+  closed at the next op boundary, so it can hold about twice the budget, and a
+  dispatch has at most one range per workgroup along the cut dimension. The
+  tuning parameter's description, the changelog and `docs/config.md` say so. Not
+  every prefill GEMM is tagged either (B226 names the ones that are not), and a
+  batched MoE layer is one op whose expert GEMMs carry no estimate:
+  Qwen3-30B-A3B at `-u 1024` on the XTX is estimated at 151 ms a forward and
+  runs 270 to 288 ms.
+- **Tests outside the gate, and a silent skip.** The gate's filter was not
+  written down anywhere; it is in `docs/gpu-tolerance.md` now and selects the
+  two ignored lib tests and `work_split_parity` (682 tests listed on
+  2026-11-22). `work_split_parity` skipped, and passed, whenever a backend did
+  not open, a rejected tuning key included; it now skips only with no Vulkan
+  device and no `INFR_DEV`.
+- **The refusal path could not be reached** and is gone, with `Split::No`.
+- **Recorder**: a cut recorder waits for its submitted buffers before freeing
+  the profiling pool they write to, and reports all of its dispatches (766 a
+  forward where it said 397, SmolLM3-3B `-u 2048` on the integrated GPU); the
+  cut machinery moved to `recorder/work_cut.rs` (a move, visibility aside).
+
+What ran with the final binary, 2026-11-22. Throughput is `infr bench` against
+local `main` (`7488e8fc`), interleaved, two file copies of each binary, the
+first copy rotating every round, `-r 3`; "copies" is how far apart the two
+copies of one binary read, `main` then branch; "load" is the busy cores of 32
+sampled before each round, lowest and highest:
+
+| Device, model, bench                      | Rounds | `main` t/s | Branch t/s | Difference | Copies       | Load         |
+| ----------------------------------------- | ------ | ---------- | ---------- | ---------- | ------------ | ------------ |
+| RX 7900 XTX, Qwen3-1.7B, pp512            | 12     | 11706.98   | 11701.77   | -0.04%     | 0.15%, 0.05% | 0.09 to 0.79 |
+| RX 7900 XTX, Qwen3-1.7B, tg128            | 12     | 469.24     | 469.33     | +0.02%     | 0.01%, 0.02% | 0.13 to 0.50 |
+| RX 7900 XTX, Qwen3-30B-A3B, pp1024        | 6      | 3563.74    | 3565.74    | +0.06%     | 0.02%, 0.31% | 0.17 to 0.50 |
+| RX 7900 XTX, SmolLM3-3B, pp4096 `-u 4096` | 6      | 4562.16    | 4562.15    | -0.00%     | 0.10%, 0.19% | 0.15 to 0.38 |
+| Integrated, Qwen3-1.7B, pp512             | 6      | 231.07     | 231.03     | -0.02%     | 0.01%, 0.04% | 0.22 to 0.94 |
+| Integrated, Qwen3-1.7B, tg128             | 6      | 27.06      | 27.04      | -0.06%     | 0.18%, 0.31% | 0.10 to 0.51 |
+
+- No difference in the table is larger than the spread between two copies of one
+  binary. The SmolLM3 row had a third arm, the branch before this round (one
+  work cut in every forward): 4566.56 t/s, +0.10% against `main`, its copies
+  0.20% apart. So the cut the fix removes was not costing a measurable amount
+  there; what the fix buys is that the cut count no longer depends on a prior
+  nothing corrects. The integrated tg128 figures are printed to one decimal by
+  the bench.
+- **Cuts per forward** (`RUST_LOG=infr_vulkan=debug`): RX 7900 XTX, Qwen3-1.7B
+  pp512 none (estimated 117 ms in the first prefill forward, 41 ms after,
+  against 41 to 43 ms of GPU time) and Qwen3-30B-A3B none; SmolLM3-3B `-u 4096`
+  one in the first forward and none after, where the branch before took one in
+  each. Integrated GPU, Qwen3-1.7B pp512: three work cuts in the first prefill
+  forward and none after, before and after the round.
+- **The integrated GPU's reproduction** completes: SmolLM3-3B `-u 2048 -p 2048`
+  three of three (72.3, 72.5 and 71.7 t/s; 72 dispatches cut and 180 work cuts a
+  forward; both GPUs listed after each run), and `-u 512` with `INFR_NO_I8DOT=1`
+  once (5.1 t/s; 72 dispatches cut and 432 or 434 work cuts a forward). The
+  `-u 2048` throughput is not the 91 t/s recorded above: the same day it read
+  between 72 and 90 with either binary (B226).
+- **The GPU tests of this round** (`binary(work_split_parity)`, the two ignored
+  lib tests, `test(gpu_seam_tolerance)`, `binary(first_forward_split)`): 20 of
+  20 on the RX 7900 XTX (354 s) and 20 of 20 on the integrated GPU (671 s),
+  native lanes; with `INFR_FORCE_WAVE64=1` the ten of them outside the tolerance
+  tests passed on both. The full gate was not run in this round.
+- **The unit tests fail without what they guard** (`work::tests`, each change
+  made and undone): with `calibrate` doing nothing, five fail; keeping a
+  zero-time sample, one; without the gain bound on a timed sample, one, and on a
+  segment, one; a segment allowed to raise an estimate, one; a segment
+  correcting a kernel that has a timed dispatch, two; a segment correcting a
+  kernel only once, two; a timed dispatch not replacing what segments learned,
+  one; a zero-time segment kept, one; the bound doubled, two.
+  `work_split_parity` with a misspelt tuning key fails on the RX 7900 XTX where
+  the old file passed, and fails without a device when `INFR_DEV` is set.
+
+What it leaves out is in the backlog (B226): the budget as a starting point and
+not a ceiling, the kernels without an estimate (some prefill GEMMs and the
+batched MoE expert GEMM among them), how a segment's time is shared among its
+kernels, the thin margin of the prior for one GEMV shape, the two states of the
+integrated GPU's SmolLM3 run, and the RX 580's limit on the compute ring.
 
 Declined: the fork's opt-in SSBO weight binding, which its own config doc marks
 as producing wrong output in a model on the RX 580, and its GQA decode pass,

@@ -145,8 +145,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `kernels.vulkan.kq_fma_gemv` (`INFR_KQ_FMA_GEMV=0|1`) is an alias, and
   `infr tune show` says which a device runs. A verify batch takes the multi-row
   twin wherever the decode row takes the fp32 kernel, at any output width, so a
-  verify row is bit-identical to its decode row; the Q6_K kernels' accumulators
-  are `precise` so that this holds on drivers that contract the two shaders
+  verify row is bit-identical to its decode row; the Q4_K and Q6_K kernels' dot
+  sums are `precise` so that this holds on drivers that contract the two shaders
   differently (the AMD Windows driver on RDNA3 did, by one ulp).
   `linear_f32_mo`'s grid splits past 65535 workgroups, which a 262144-wide f32
   output reaches.

@@ -6934,24 +6934,94 @@ values. What it leaves:
 - **Not run: a whole f16-weight model.** No F16 GGUF is cached here; the f16
   dot's gain (native 0.321 to 0.084 ns per element) is from the microbench.
 
-### B220 — waiting on others, and next in the queues (2026-11-18)
+### B220 — next up: plan 11 G3 and G4 first; then the queues (2026-11-22)
 
 **Tag:** handoff · **Kind:** queue
 
-Both branches this entry tracked have landed (`fix/cpu-act-quant`,
-`fix/vulkan-submit-bounds`), and the quiet-machine measurements it listed were
-taken on 2026-11-19 (`docs/math.md`, `docs/cpu-activations.md`). What is left:
+**Top priority, the first slice when work resumes: plan 11's G3 and G4**
+(`docs/plan/11-cpu-bit-identical.md`, section 6). It can be done on the Linux
+machine as well as on the Windows box.
 
-- **Waiting on other people:** issue 94 (the RX 580 owner was asked for
-  diagnostic runs on `main`), issue 100 (Apple Silicon numbers for the CPU
-  math), issue 101 (the reporter was invited to open a PR for an incremental
-  shader cache), llama.cpp issue 32424.
-- **Next in the queues, not started:** the NEON kernels' measured ratios from CI
-  into `docs/math.md`, and the families still scalar on aarch64 (B206); plan
-  11's G3 and G4 (commit the planted-bug tests; convert the exact GPU goldens
-  and wire `infr tune check`); plan 10's tuning slices S2 onward; plan 12's
-  kernel ports from the fork; the activation split's sparse dot on the grid
-  formats (B223).
+- **G3, what is left:** commit the planted-bug demonstrations as feature-gated
+  tests (six were measured by hand on Qwen3-0.6B, see the table in
+  `docs/gpu-tolerance.md`); run them on a second GPU and on a float model; add
+  the router-bias and quant-nibble-map bugs.
+- **G4, what it converts:** the whole-vocabulary cosine tests and the exact-hash
+  GPU goldens in `crates/infr-llama/tests/cpu_backend.rs` (`gpu_seam_golden_*`)
+  move to the tolerance test, and `infr tune check --against cpu-reference` is
+  wired to `SeamModel::forced_logits` and `tolerance::table::TABLE`.
+- **Order:** the goldens stay in the gate until G3's demonstrations are
+  committed and run. Until then they are the only check that fails on any change
+  at all.
+- **Why it is first:** on 2026-11-22 the golden `gpu_seam_golden_qwen3` failed
+  twice for changes the tolerance tests passed: PR 105's decode attention floor
+  of 16, and `gemv.kq_fma` forced on (B227). It is what holds
+  `attn_split.decode_min_chunk` at 64 on the RX 7900 XTX, where 16 measured
+  about 4% faster decode at shallow depth (B227). After G4 that default can
+  change on a tolerance pass alone, with no hash to bless.
+- **What the Linux machine adds:** the tolerance table is set from two GPUs on
+  one Windows box; a run there is a third driver. It needs the models the
+  `gpu_seam_tolerance_*` tests load in its Hugging Face cache first (the tests
+  name them; `docs/gpu-tolerance.md` lists the command). B228's compute-queue
+  measurement can be taken in the same sitting.
+
+Then:
+
+- **Waiting on other people:** issue 94 (the RX 580 owner; a follow-up with
+  commands for the work bound is drafted, not posted), issue 100 (Apple Silicon
+  numbers for the CPU math), issue 101 (the reporter was invited to open a PR
+  for an incremental shader cache), llama.cpp issue 32424.
+- **Next in the queues, not started:** the review findings on the PR follow-ups
+  (B229); the families still scalar on aarch64 and the packed GEMM there (B206);
+  plan 10's tuning slices S2 onward; plan 12's kernel ports from the fork; the
+  activation split's sparse dot on the grid formats (B223).
+
+### B229 — review findings on the PR 105 to 107 follow-ups, not yet fixed (2026-11-22)
+
+**Tag:** vulkan · review · **Kind:** findings, not fixed (the session ended)
+
+A reviewer read the follow-up commits on PRs 105 to 107 (B227) and found nothing
+that blocked landing them. These were left; each was read in the code by the
+reviewer, none was run.
+
+- **Verify batches on the slow class cut at floor 16, unmeasured.** PR 105
+  applied 16 to one-row decode only; `uses_decode_floor` extends it to every MTP
+  verify batch that reaches split-K, so an RX 580 verify batch under 2048 keys
+  runs up to four times the workgroups it did as merged.
+- **`attn_combine.comp` changed on every device with no timing.** PR 105's
+  rewrite (shared arrays, an extra barrier, batched loads) is ungated. The sum
+  order reads unchanged and the goldens pass; no old-against-new timing exists.
+- **Streamed weights never take the kq_fma kernels.** The dispatch in
+  `quant_linear` needs `w.buffer`, and the streamed arm passes none, so on a
+  `gemv.kq_fma` device a paged model decodes on the int8 or dequant route while
+  its resident twin runs fp32. `quant_linear`'s doc lists its exceptions and
+  omits this one. Inherited from PR 107.
+- **About 55 GPU tests still skip silently.** `gpu_or_skip` now fails when
+  `INFR_DEV` names a device that does not open, but tests that call
+  `VulkanBackend::new()` themselves and return on an error do not go through it
+  (unit tests in `adapter.rs`, `lib.rs`, `pager.rs`, `kq_gemm_tests.rs`, and
+  `infr-llama`'s `seam/runner.rs` and `seam/weights.rs`).
+- **The AMD integrated `queue.family` row cannot be limited to Windows.** The
+  tuning table's `Match` has no OS field, so an AMD integrated GPU on a Linux
+  driver reporting the same driver id would get the compute-only family,
+  unmeasured. The row also rests on one integrated GPU.
+- **`the_chunks_cover_each_key_once` cannot fail.** It checks a helper defined
+  in the test. The GPU test `attn_split_host` is the real cover check.
+- **`precise` does not cover every add in the kq_fma kernels.** `hsum`, the
+  accumulator adds, the cross-subgroup sum and `subgroupAdd` are undecorated. No
+  multiply is uncovered. The per-device parity tests are the guard.
+- **Smaller:** the two Q4_K kernels do not spell identical float operations (one
+  multiplies by a power of two where the other shifts; equal except at subnormal
+  products); `QueueOutcome::reason` can contradict the family printed beside it;
+  `docs/config.md` says an untimed compute-only family is never picked, while
+  under `graphics` nothing warns and it is the last resort; bare literals for
+  the floor defaults and in several comments; `honour_env` carries `INFR_TUNE`
+  but not the `INFR_KQ_FMA_GEMV` and `INFR_GFX_QUEUE` aliases; the changelog
+  cites a depth-2048 figure as a floor effect where the chunk is the same at
+  either floor.
+- **Not checked:** whether `gpu_seam_golden_qwen3` can pass on a device where
+  `gemv.kq_fma` is the default. With the parameter forced on, on the RX 7900
+  XTX, it fails (B227). G4 above retires it.
 
 ### B209 — gemma-3-1b's mid-sequence CPU distance is int8 noise, not outliers (2026-11-18)
 

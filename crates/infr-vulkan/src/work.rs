@@ -4,26 +4,37 @@
 //! an engine reset (`LiveKernelEvent` 0x141), on Linux amdgpu's job timeout. A bound on
 //! dispatches per submit (`VulkanShared::submit_dispatch_cap`) cannot see a dispatch that is
 //! heavy on its own, which a slow device meets at a large batch: a prefill GEMV over 512 rows on
-//! the 2-CU integrated GPU here is one 1.5 s dispatch. So every heavy prefill GEMM and GEMV, and
-//! the non-coopmat flash prefill attention, says what it costs before it is recorded
+//! the 2-CU integrated GPU here is one 1.5 s dispatch. So the heavy prefill GEMMs and GEMVs, and
+//! the non-coopmat flash prefill attention, say what they cost before they are recorded
 //! (`Recorder::work_next`), and the recorder
 //!
 //! - splits a dispatch whose estimate passes the budget into several dispatches over ranges of
 //!   its workgroup grid (`vkCmdDispatchBase`), each in a submit of its own and each running the
 //!   same shader on the same inputs as in the whole grid, so the output is bit-identical;
-//! - closes the submit once the work recorded into it reaches the budget
-//!   (`crate::SegmentCut::Work`);
-//! - refuses, with an error before anything is submitted, a dispatch it cannot split whose
-//!   MEASURED cost is far past the budget on a device prone to resets.
+//! - closes the submit at the next op boundary once the work recorded into it reaches the budget
+//!   (`crate::SegmentCut::Work`).
 //!
-//! **The estimate** is the op's FLOPs times a time per FLOP: the one measured for that kernel in
+//! A dispatch whose kernel cannot be cut that way, or that is recorded where no submit can be
+//! opened, stays whole, as before the bound existed.
+//!
+//! **The estimate** is the op's FLOPs times a time per FLOP: the one learned for that kernel in
 //! this process when there is one, else a prior, `submit.prior_gflops` (a tuning parameter, scaled
-//! by compute units) times a speed-up for the kernel's [`Family`]. A dispatch whose estimate is a
-//! noticeable part of the budget is bracketed by two timestamps, and its measured time per FLOP
-//! replaces the prior for that kernel (the first sample) or raises it (any later, slower one): a
-//! kernel's estimate can go down once, on evidence, and only up after that. Dispatches with no
-//! estimate (every other kernel) count as free, as do single-row ones: a decode step is never
-//! split, timed or cut by this, and the dispatch cap is what bounds a submit of those.
+//! by compute units) times a speed-up for the kernel's [`Family`]. The prior is meant to be
+//! pessimistic, and is replaced only by what the GPU measured, from two sources:
+//!
+//! - a dispatch whose estimate is a noticeable part of the budget is bracketed by two timestamps
+//!   ([`WorkModel::watch`]), and its time per FLOP replaces the prior for that kernel (the first
+//!   sample) or raises it (any later, slower one);
+//! - a whole segment's GPU time, which every forward segment already measures, corrects the
+//!   kernels in it that are still on the prior ([`WorkModel::calibrate`]). Without it a device
+//!   whose dispatches all stay under the timing threshold would keep its prior, and a forward
+//!   whose prior passes the budget would be cut on every pass however fast it ran.
+//!
+//! So a kernel's estimate can go down once, on evidence, never by more than [`MAX_PRIOR_GAIN`],
+//! and only up after that. Until a segment has completed, a device's first forward runs on the
+//! prior alone. Dispatches with no estimate (every other kernel) count as free, as do single-row
+//! ones: a decode step is never split, timed or cut by this, and the dispatch cap is what bounds
+//! a submit of those.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -37,9 +48,8 @@ use std::sync::Mutex;
 /// ([`infr_core::SUBMIT_BUDGET_NS`]), an eighth of that: its estimate is a prior until a kernel
 /// has been timed, and another program on the GPU stretches a submit. Any other device gets the
 /// time at which the splitter already starts cutting its forwards
-/// ([`infr_core::SUBMIT_DANGER_NS`]), half the limit: its estimates stay the pessimistic prior
-/// for all but its heaviest dispatches, and a tighter budget would cut forwards that measure
-/// far under it.
+/// ([`infr_core::SUBMIT_DANGER_NS`]), half the limit: a tighter budget would cut forwards that
+/// the dispatch-count splitter leaves whole.
 pub(crate) fn default_budget_ms(reset_prone: bool) -> u32 {
     let ns = if reset_prone {
         infr_core::SUBMIT_BUDGET_NS
@@ -51,7 +61,7 @@ pub(crate) fn default_budget_ms(reset_prone: bool) -> u32 {
 
 /// `submit.prior_gflops` per compute unit. Measured on the 2-CU integrated GPU (RDNA2), the slowest
 /// family, the per-row GEMV, ran at 19 to 30 GFLOP/s depending on the weight's shape (9 to 15 per
-/// unit); 8 keeps the prior under the slowest of those.
+/// unit); this keeps the prior under the slowest of those.
 const PRIOR_GFLOPS_PER_CU: u32 = 8;
 
 /// The compute units assumed when the device reports none: the weakest part measured.
@@ -71,9 +81,27 @@ pub(crate) fn prior_gflops(compute_units: u32) -> u32 {
 /// so its kernel's estimate follows measurement.
 const WATCH_FRACTION: u64 = 32;
 
-/// A dispatch that cannot be split is refused only when its measured estimate passes the budget
-/// by this factor: with the default budget, 2 s, the watchdog's own limit.
-const REFUSE_FACTOR: u64 = 8;
+/// The prior throughput of an int8-dot GEMM the device accelerates, as a multiple of
+/// `submit.prior_gflops`. Measured on the integrated GPU: the dp4a GEMM ran about 23 times as
+/// fast as the per-row GEMV (690 against 30 GFLOP/s); this keeps the prior pessimistic.
+const INT8_SPEEDUP: f64 = 8.0;
+
+/// The prior throughput of a cooperative-matrix GEMM as a multiple of `submit.prior_gflops`: a
+/// fraction of what the RX 7900 XTX's matrix units run.
+const MATRIX_SPEEDUP: f64 = 16.0;
+
+/// The most a measurement may raise a kernel's throughput over its prior: the ratio of the
+/// watchdog's limit (twice [`infr_core::SUBMIT_DANGER_NS`], see [`default_budget_ms`]) to the
+/// reset-prone budget ([`infr_core::SUBMIT_BUDGET_NS`]).
+///
+/// A timed dispatch is bracketed by two timestamps with no barrier before the first, so it can
+/// read short when it overlaps earlier work, and a segment's time is shared out among its
+/// kernels by their priors, which can favour one of them. Without a bound, one such reading
+/// would take a kernel's estimate to nearly nothing for the rest of the process, out of both
+/// the split and the submit cut. With it, the worst a bad reading does to a kernel whose prior
+/// was exact is a budget of estimated work that really takes this many budgets, which on a
+/// reset-prone device is the watchdog's limit and no more.
+const MAX_PRIOR_GAIN: f64 = (2 * infr_core::SUBMIT_DANGER_NS / infr_core::SUBMIT_BUDGET_NS) as f64;
 
 /// How a kernel family's throughput compares with the prior, the slowest family's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -90,25 +118,23 @@ pub(crate) enum Family {
 }
 
 impl Family {
-    /// The family's prior throughput as a multiple of `submit.prior_gflops`. Measured on the
-    /// integrated GPU: the dp4a GEMM ran about 23 times as fast as the per-row GEMV (690 against
-    /// 30 GFLOP/s); 8 keeps that pessimistic. An int8 dot the driver only emulates gets no
-    /// speed-up. Matrix units get 16, a fraction of what the RX 7900 XTX's run.
+    /// The family's prior throughput as a multiple of `submit.prior_gflops`: [`INT8_SPEEDUP`]
+    /// for an int8 dot the device accelerates (one the driver only emulates gets none) and
+    /// [`MATRIX_SPEEDUP`] for matrix units.
     fn speedup(self, dot_accelerated: bool) -> f64 {
         match self {
             Family::Gemv | Family::FloatTile => 1.0,
-            Family::Int8 if dot_accelerated => 8.0,
+            Family::Int8 if dot_accelerated => INT8_SPEEDUP,
             Family::Int8 => 1.0,
-            Family::Matrix => 16.0,
+            Family::Matrix => MATRIX_SPEEDUP,
         }
     }
 }
 
-/// How a dispatch's grid may be cut into ranges, stated by the op that records it.
+/// How a dispatch's grid may be cut into ranges, stated by the op that records it. A kernel
+/// whose workgroups depend on each other, or on the grid's size in any other way, is not tagged.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Split {
-    /// Not at all: the workgroups depend on each other or on the grid's size.
-    No,
     /// The shader reads only `gl_WorkGroupID`, so any contiguous range of the highest non-unit
     /// dimension runs exactly as in the whole grid. Checked against the SPIR-V
     /// (`ComputeKernel::reads_num_workgroups`) before a split.
@@ -133,40 +159,42 @@ pub(crate) fn gemm_flops(rows: usize, in_f: usize, out_f: usize) -> u64 {
     2 * rows as u64 * in_f as u64 * out_f as u64
 }
 
-/// One dispatch's estimated GPU time.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Estimate {
-    pub ns: u64,
-    /// From a measurement of this kernel in this process, not the prior.
-    pub measured: bool,
+/// The estimated work recorded into one segment (one command buffer), by kernel: what
+/// [`WorkModel::calibrate`] sets against the GPU time the segment measured.
+#[derive(Default)]
+pub(crate) struct SegmentWork {
+    /// Each kernel's family and the FLOPs of its tagged dispatches in the segment.
+    kernels: Vec<(&'static str, Family, u64)>,
 }
 
-/// The per-backend estimator: the budget, the priors, and each kernel's measured time per FLOP.
+impl SegmentWork {
+    /// Count `flops` of `kernel`, a `family` kernel, into the segment.
+    pub(crate) fn add(&mut self, kernel: &'static str, family: Family, flops: u64) {
+        match self.kernels.iter_mut().find(|(k, _, _)| *k == kernel) {
+            Some((_, _, f)) => *f = f.saturating_add(flops),
+            None => self.kernels.push((kernel, family, flops)),
+        }
+    }
+}
+
+/// The per-backend estimator: the budget, the priors, and each kernel's learned time per FLOP.
 pub(crate) struct WorkModel {
     /// `0` = no work bound.
     budget_ns: u64,
     /// The slowest family's prior time per FLOP.
     prior_ns_per_flop: f64,
     dot_accelerated: bool,
-    /// A device a watchdog is known to reset under long work (integrated, or in the slow class):
-    /// the only kind on which a dispatch is ever refused.
-    reset_prone: bool,
-    /// Measured nanoseconds per FLOP, by kernel name.
+    /// Learned nanoseconds per FLOP, by kernel name: from a timed dispatch ([`Self::record`]) or
+    /// from a segment's GPU time ([`Self::calibrate`]).
     measured: Mutex<HashMap<&'static str, f64>>,
 }
 
 impl WorkModel {
-    pub(crate) fn new(
-        budget_ms: u32,
-        prior_gflops: u32,
-        dot_accelerated: bool,
-        reset_prone: bool,
-    ) -> Self {
+    pub(crate) fn new(budget_ms: u32, prior_gflops: u32, dot_accelerated: bool) -> Self {
         WorkModel {
             budget_ns: u64::from(budget_ms) * 1_000_000,
             prior_ns_per_flop: 1.0 / f64::from(prior_gflops.max(1)),
             dot_accelerated,
-            reset_prone,
             measured: Mutex::new(HashMap::new()),
         }
     }
@@ -180,34 +208,32 @@ impl WorkModel {
         self.budget_ns
     }
 
-    /// The estimated GPU time of `flops` of `kernel`, a `family` kernel.
-    pub(crate) fn estimate(&self, kernel: &'static str, family: Family, flops: u64) -> Estimate {
-        let measured = self
+    /// A `family` kernel's prior time per FLOP.
+    fn prior_rate(&self, family: Family) -> f64 {
+        self.prior_ns_per_flop / family.speedup(self.dot_accelerated)
+    }
+
+    /// The estimated GPU time, in ns, of `flops` of `kernel`, a `family` kernel.
+    pub(crate) fn estimate(&self, kernel: &'static str, family: Family, flops: u64) -> u64 {
+        let learned = self
             .measured
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(kernel)
             .copied();
-        let (rate, measured) = match measured {
-            Some(r) => (r, true),
-            None => (
-                self.prior_ns_per_flop / family.speedup(self.dot_accelerated),
-                false,
-            ),
-        };
-        Estimate {
-            ns: (flops as f64 * rate).ceil() as u64,
-            measured,
-        }
+        let rate = learned.unwrap_or_else(|| self.prior_rate(family));
+        (flops as f64 * rate).ceil() as u64
     }
 
-    /// Feed one timed dispatch back: `flops` of `kernel` took `ns`. The first sample of a kernel
-    /// replaces its prior; a later one only ever raises it.
-    pub(crate) fn record(&self, kernel: &'static str, flops: u64, ns: u64) {
-        if flops == 0 {
+    /// Feed one timed dispatch back: `flops` of `kernel`, a `family` kernel, took `ns`. The first
+    /// sample of a kernel replaces its prior; a later one only ever raises it. A sample of no
+    /// time or no work says nothing and is dropped, and no sample takes the kernel's throughput
+    /// past [`MAX_PRIOR_GAIN`] times its prior.
+    pub(crate) fn record(&self, kernel: &'static str, family: Family, flops: u64, ns: u64) {
+        if flops == 0 || ns == 0 {
             return;
         }
-        let rate = ns as f64 / flops as f64;
+        let rate = (ns as f64 / flops as f64).max(self.prior_rate(family) / MAX_PRIOR_GAIN);
         let mut m = self.measured.lock().unwrap_or_else(|e| e.into_inner());
         let e = m.entry(kernel).or_insert(rate);
         if rate > *e {
@@ -215,7 +241,40 @@ impl WorkModel {
         }
     }
 
-    /// Every kernel measured so far with its throughput in GFLOP/s, sorted by name.
+    /// Set a completed segment's estimated work against the GPU time it measured, `gpu_ns`. When
+    /// the segment ran faster than its estimate, every kernel in it that is still on the prior
+    /// takes its prior scaled by measured over estimated, bounded by [`MAX_PRIOR_GAIN`]. Kernels
+    /// that already have a learned rate keep it, so the segment's estimate afterwards is never
+    /// under the time it measured, and equals it when every kernel in it was on the prior.
+    ///
+    /// The segment's time also holds whatever ran in it without an estimate, so this errs slow.
+    /// A segment that ran slower than its estimate changes nothing: its untagged work could be
+    /// all of the difference, and only a timed dispatch ([`Self::record`]) raises an estimate.
+    pub(crate) fn calibrate(&self, work: &SegmentWork, gpu_ns: u64) {
+        if self.budget_ns == 0 || gpu_ns == 0 {
+            return;
+        }
+        let mut m = self.measured.lock().unwrap_or_else(|e| e.into_inner());
+        let estimated: f64 = work
+            .kernels
+            .iter()
+            .map(|&(kernel, family, flops)| {
+                let rate = m.get(kernel).copied();
+                flops as f64 * rate.unwrap_or_else(|| self.prior_rate(family))
+            })
+            .sum();
+        let measured = gpu_ns as f64;
+        if measured >= estimated {
+            return;
+        }
+        let scale = (measured / estimated).max(1.0 / MAX_PRIOR_GAIN);
+        for &(kernel, family, _) in &work.kernels {
+            m.entry(kernel)
+                .or_insert_with(|| self.prior_rate(family) * scale);
+        }
+    }
+
+    /// Every kernel with a learned rate so far and its throughput in GFLOP/s, sorted by name.
     pub(crate) fn measured_gflops(&self) -> Vec<(&'static str, f64)> {
         let m = self.measured.lock().unwrap_or_else(|e| e.into_inner());
         let mut v: Vec<_> = m
@@ -227,7 +286,8 @@ impl WorkModel {
     }
 
     /// Into how many ranges a dispatch estimated at `est_ns` is cut so each stays within the
-    /// budget, given `extent` workgroups along the dimension that is cut. 1 = whole.
+    /// budget, given `extent` workgroups along the dimension that is cut. 1 = whole. A grid has
+    /// no more ranges than workgroups along that dimension, so a range can still pass the budget.
     pub(crate) fn pieces(&self, est_ns: u64, extent: u32) -> u32 {
         if self.budget_ns == 0 || est_ns <= self.budget_ns {
             return 1;
@@ -240,16 +300,6 @@ impl WorkModel {
     /// measurement.
     pub(crate) fn watch(&self, est_ns: u64) -> bool {
         self.budget_ns > 0 && est_ns >= self.budget_ns / WATCH_FRACTION
-    }
-
-    /// Whether a dispatch that cannot be split is refused before submit: only on a reset-prone
-    /// device, only on a measured estimate, and only far past the budget. Anywhere else it is
-    /// submitted as it always was.
-    pub(crate) fn refuse(&self, est: Estimate) -> bool {
-        self.budget_ns > 0
-            && self.reset_prone
-            && est.measured
-            && est.ns > self.budget_ns.saturating_mul(REFUSE_FACTOR)
     }
 }
 
@@ -275,7 +325,12 @@ mod tests {
     /// The integrated GPU here (2 CUs): its per-row GEMV over the SmolLM3 gate/up weight at 512
     /// rows measured about 1.57 s, the reproduction's heaviest dispatch.
     fn igpu() -> WorkModel {
-        WorkModel::new(default_budget_ms(true), prior_gflops(2), true, true)
+        WorkModel::new(default_budget_ms(true), prior_gflops(2), true)
+    }
+
+    /// Whether `kernel` has a learned rate in `m`, from a timed dispatch or a segment.
+    fn learned(m: &WorkModel, kernel: &str) -> bool {
+        m.measured_gflops().iter().any(|&(k, _)| k == kernel)
     }
 
     #[test]
@@ -295,15 +350,15 @@ mod tests {
         let m = igpu();
         let flops = gemm_flops(512, 2048, 22016);
         let est = m.estimate("gemv", Family::Gemv, flops);
-        assert!(!est.measured);
+        assert!(!learned(&m, "gemv"));
         let measured_ns = 1_570 * MS;
         assert!(
-            est.ns >= measured_ns,
+            est >= measured_ns,
             "prior {} ms under the measured {} ms",
-            est.ns / MS,
+            est / MS,
             measured_ns / MS
         );
-        let pieces = m.pieces(est.ns, 172);
+        let pieces = m.pieces(est, 172);
         assert!(
             measured_ns / u64::from(pieces) <= m.budget_ns(),
             "{pieces} ranges leave a real range over the budget"
@@ -314,43 +369,58 @@ mod tests {
 
     /// The RX 7900 XTX's device facts.
     fn fast() -> WorkModel {
-        WorkModel::new(default_budget_ms(false), prior_gflops(96), true, false)
+        WorkModel::new(default_budget_ms(false), prior_gflops(96), true)
     }
 
     /// On the RX 7900 XTX, by the prior alone, the default-batch GEMMs of the models run there
-    /// stay whole and unwatched: nothing changes on a fast device.
+    /// stay whole and untimed.
     #[test]
-    fn a_fast_device_at_default_batch_is_left_alone() {
+    fn a_fast_device_at_default_batch_keeps_its_dispatches_whole_and_untimed() {
         let m = fast();
         // Qwen3-1.7B gate/up at 512 rows on the coopmat GEMM, and Qwen3-14B's at 1024 rows.
         for flops in [gemm_flops(512, 2048, 12288), gemm_flops(1024, 5120, 34816)] {
             let est = m.estimate("native_gemm_warp_q4k", Family::Matrix, flops);
-            assert_eq!(m.pieces(est.ns, 1 << 16), 1);
-            assert!(est.ns < m.budget_ns() / 4, "{} ms", est.ns / MS);
-            assert!(!m.watch(est.ns));
+            assert_eq!(m.pieces(est, 1 << 16), 1);
+            assert!(est < m.budget_ns() / 4, "{} ms", est / MS);
+            assert!(!m.watch(est));
         }
     }
 
-    /// A whole prefill forward of a 3B model at the default 1024-row batch (SmolLM3-3B's shapes:
-    /// 36 layers, width 2048, feed-forward 11008, 4 of 16 heads' worth of K and V) stays under
-    /// the fast device's budget by the prior alone, so no submit is closed by work. Under the
-    /// reset-prone budget the same estimate would cut it.
+    /// The tagged GEMMs of one SmolLM3-3B layer (width 2048, feed-forward 11008, 4 of 16 heads'
+    /// worth of K and V) at `rows` rows, as `(kernel, FLOPs)`: the K-quant file keeps some
+    /// weights in a second format, so a forward runs two kernels.
+    fn smollm3_layer(rows: usize) -> [(&'static str, u64); 6] {
+        [
+            ("q4k", gemm_flops(rows, 2048, 2048)),      // q
+            ("q4k", gemm_flops(rows, 2048, 512)),       // k
+            ("q6k", gemm_flops(rows, 2048, 512)),       // v
+            ("q4k", gemm_flops(rows, 2048, 2048)),      // o
+            ("q4k", gemm_flops(rows, 2048, 2 * 11008)), // gate and up, fused
+            ("q6k", gemm_flops(rows, 11008, 2048)),     // down
+        ]
+    }
+
+    const SMOLLM3_LAYERS: u64 = 36;
+
+    /// The estimated work of a whole SmolLM3-3B prefill forward at `rows` rows, and the same as
+    /// one segment's work.
+    fn smollm3_forward(m: &WorkModel, rows: usize) -> (u64, SegmentWork) {
+        let mut work = SegmentWork::default();
+        let mut ns = 0;
+        for (kernel, flops) in smollm3_layer(rows) {
+            ns += SMOLLM3_LAYERS * m.estimate(kernel, Family::Matrix, flops);
+            work.add(kernel, Family::Matrix, SMOLLM3_LAYERS * flops);
+        }
+        (ns, work)
+    }
+
+    /// A whole prefill forward of a 3B model at the default 1024-row batch stays under the fast
+    /// device's budget by the prior alone, so no submit is closed by work. Under the reset-prone
+    /// budget the same estimate would cut it.
     #[test]
     fn a_fast_device_forward_at_default_batch_takes_no_work_cut() {
         let m = fast();
-        let rows = 1024;
-        let layer: u64 = [
-            (2048, 2048),      // q
-            (2048, 512),       // k
-            (2048, 512),       // v
-            (2048, 2048),      // o
-            (2048, 2 * 11008), // gate and up, fused
-            (11008, 2048),     // down
-        ]
-        .iter()
-        .map(|&(i, o)| m.estimate("g", Family::Matrix, gemm_flops(rows, i, o)).ns)
-        .sum();
-        let forward = 36 * layer;
+        let (forward, _) = smollm3_forward(&m, 1024);
         assert!(
             crate::segment_cut(1, 0, forward, m.budget_ns(), 0).is_none(),
             "{} ms of estimated work",
@@ -363,29 +433,169 @@ mod tests {
         );
     }
 
+    /// The case the segment calibration exists for, with the figures measured on the RX 7900 XTX
+    /// (SmolLM3-3B, 4096 rows, 2026-11-22: a forward of about 850 ms of GPU time): no GEMM of
+    /// it is heavy enough to be timed, and by the prior the forward passes the budget, so it is
+    /// cut on every pass. Once a segment's GPU time has been set against its estimate, the same
+    /// forward is estimated at what it measured and is left whole.
+    #[test]
+    fn a_segment_faster_than_its_prior_stops_the_cuts_it_caused() {
+        let m = fast();
+        let rows = 4096;
+        for (kernel, flops) in smollm3_layer(rows) {
+            assert!(!m.watch(m.estimate(kernel, Family::Matrix, flops)));
+        }
+        let (by_prior, work) = smollm3_forward(&m, rows);
+        assert_eq!(
+            crate::segment_cut(1, 0, by_prior, m.budget_ns(), 0),
+            Some(crate::SegmentCut::Work),
+            "{} ms by the prior",
+            by_prior / MS
+        );
+        // Before any segment completes nothing has moved: a first forward runs on the prior.
+        assert_eq!(smollm3_forward(&m, rows).0, by_prior);
+        assert!(m.measured_gflops().is_empty());
+
+        let measured = 850 * MS;
+        m.calibrate(&work, measured);
+        let (after, _) = smollm3_forward(&m, rows);
+        // Every kernel was on the prior, so the estimate is now the measured time (each
+        // dispatch's estimate rounds up a nanosecond), never under it.
+        assert!(
+            after >= measured,
+            "{after} ns under the measured {measured}"
+        );
+        assert!(after - measured < MS, "{} ms", after / MS);
+        assert_eq!(crate::segment_cut(1, 0, after, m.budget_ns(), 0), None);
+    }
+
+    /// A segment's time can only make an estimate less pessimistic, once: a segment that ran
+    /// slower than estimated changes nothing (its untagged work may be the whole difference),
+    /// and a kernel already corrected is not corrected again by a faster segment.
+    #[test]
+    fn a_segment_corrects_a_kernel_once_and_never_upward() {
+        let m = igpu();
+        let flops = gemm_flops(64, 2048, 2048);
+        let mut work = SegmentWork::default();
+        work.add("dp4a", Family::Int8, flops);
+        let prior = m.estimate("dp4a", Family::Int8, flops);
+
+        m.calibrate(&work, 3 * prior);
+        assert!(!learned(&m, "dp4a"));
+        assert_eq!(m.estimate("dp4a", Family::Int8, flops), prior);
+
+        m.calibrate(&work, prior / 2);
+        let once = m.estimate("dp4a", Family::Int8, flops);
+        assert!(
+            once.abs_diff(prior / 2) <= 1,
+            "{once} against {}",
+            prior / 2
+        );
+        m.calibrate(&work, prior / 4);
+        assert_eq!(m.estimate("dp4a", Family::Int8, flops), once);
+        // A timed dispatch still raises it.
+        m.record("dp4a", Family::Int8, flops, prior);
+        assert!(m.estimate("dp4a", Family::Int8, flops).abs_diff(prior) <= 1);
+    }
+
+    /// In a segment that mixes a timed kernel with one still on the prior, only the second
+    /// moves, and the segment's estimate stays at or above what it measured: the correction
+    /// cannot make a submit look lighter than it was.
+    #[test]
+    fn a_calibrated_segment_is_never_estimated_under_its_measured_time() {
+        let m = igpu();
+        let (heavy, light) = (gemm_flops(512, 2048, 22016), gemm_flops(512, 2048, 512));
+        m.record("timed", Family::Int8, heavy, 66 * MS);
+        let timed = m.estimate("timed", Family::Int8, heavy);
+        let mut work = SegmentWork::default();
+        work.add("timed", Family::Int8, heavy);
+        work.add("fresh", Family::Int8, light);
+        let before = timed + m.estimate("fresh", Family::Int8, light);
+        for measured in [before - MS, before / 2, 67 * MS, MS] {
+            let m = igpu();
+            m.record("timed", Family::Int8, heavy, 66 * MS);
+            m.calibrate(&work, measured);
+            assert_eq!(m.estimate("timed", Family::Int8, heavy), timed);
+            let after = timed + m.estimate("fresh", Family::Int8, light);
+            assert!(after < before, "measured {measured}: nothing was corrected");
+            assert!(after >= measured, "measured {measured}: estimated {after}");
+        }
+    }
+
+    /// No reading takes a kernel more than `MAX_PRIOR_GAIN` past its prior, and one of no time
+    /// is not a reading: a timed dispatch that read zero or far too short (it overlapped earlier
+    /// work), or a segment that read almost nothing, would otherwise put the kernel's estimate
+    /// at nothing for the rest of the process, outside both the split and the submit cut.
+    #[test]
+    fn a_bad_reading_cannot_take_a_kernel_out_of_the_bound() {
+        let flops = gemm_flops(512, 2048, 22016);
+        let prior = igpu().estimate("gemv", Family::Gemv, flops);
+        let floor = (prior as f64 / MAX_PRIOR_GAIN) as u64;
+
+        let zero = igpu();
+        zero.record("gemv", Family::Gemv, flops, 0);
+        assert!(!learned(&zero, "gemv"), "a zero-time sample was kept");
+        assert_eq!(zero.estimate("gemv", Family::Gemv, flops), prior);
+        let mut work = SegmentWork::default();
+        work.add("gemv", Family::Gemv, flops);
+        zero.calibrate(&work, 0);
+        assert_eq!(zero.estimate("gemv", Family::Gemv, flops), prior);
+
+        let short = igpu();
+        short.record("gemv", Family::Gemv, flops, 1);
+        let est = short.estimate("gemv", Family::Gemv, flops);
+        assert!(
+            est.abs_diff(floor) <= 1,
+            "{est} ns against a floor of {floor}"
+        );
+        // Still a dispatch the bound cuts and times.
+        assert!(short.pieces(est, 172) > 1);
+        assert!(short.watch(est));
+        // A real, slower sample then raises it as usual.
+        short.record("gemv", Family::Gemv, flops, prior / 2);
+        assert!(
+            short
+                .estimate("gemv", Family::Gemv, flops)
+                .abs_diff(prior / 2)
+                <= 1
+        );
+
+        let segment = igpu();
+        segment.calibrate(&work, 1);
+        let est = segment.estimate("gemv", Family::Gemv, flops);
+        assert!(
+            est.abs_diff(floor) <= 1,
+            "{est} ns against a floor of {floor}"
+        );
+    }
+
+    /// The gain bound is the reset-prone budget's margin under the watchdog's limit: a budget of
+    /// estimated work that a bad reading understated by the whole bound still fits the limit.
+    #[test]
+    fn the_gain_bound_is_the_reset_prone_budgets_margin() {
+        let budget = u64::from(default_budget_ms(true)) * MS;
+        let limit = 2 * u64::from(default_budget_ms(false)) * MS;
+        assert_eq!((budget as f64 * MAX_PRIOR_GAIN) as u64, limit);
+    }
+
     #[test]
     fn a_measurement_replaces_the_prior_then_only_raises_it() {
         let m = igpu();
         let flops = gemm_flops(512, 2048, 22016);
-        let prior = m.estimate("dp4a", Family::Int8, flops).ns;
+        let prior = m.estimate("dp4a", Family::Int8, flops);
         // Measured 66 ms: the estimate drops to it.
-        m.record("dp4a", flops, 66 * MS);
+        m.record("dp4a", Family::Int8, flops, 66 * MS);
         let e = m.estimate("dp4a", Family::Int8, flops);
-        assert!(e.measured);
-        assert!(e.ns < prior);
-        assert!(e.ns.abs_diff(66 * MS) < MS);
+        assert!(learned(&m, "dp4a"));
+        assert!(e < prior);
+        assert!(e.abs_diff(66 * MS) < MS);
         // A faster sample does not lower it again; a slower one raises it.
-        m.record("dp4a", flops, 30 * MS);
-        assert!(m.estimate("dp4a", Family::Int8, flops).ns.abs_diff(66 * MS) < MS);
-        m.record("dp4a", flops, 132 * MS);
-        assert!(
-            m.estimate("dp4a", Family::Int8, flops)
-                .ns
-                .abs_diff(132 * MS)
-                < MS
-        );
+        m.record("dp4a", Family::Int8, flops, 60 * MS);
+        assert!(m.estimate("dp4a", Family::Int8, flops).abs_diff(66 * MS) < MS);
+        m.record("dp4a", Family::Int8, flops, 132 * MS);
+        assert!(m.estimate("dp4a", Family::Int8, flops).abs_diff(132 * MS) < MS);
         // Per kernel: another kernel keeps its prior.
-        assert!(!m.estimate("mmq", Family::Int8, flops).measured);
+        assert!(!learned(&m, "mmq"));
     }
 
     #[test]
@@ -396,7 +606,7 @@ mod tests {
         assert_eq!(m.pieces(10 * m.budget_ns(), 100), 10);
         // Never more ranges than workgroups along the cut dimension.
         assert_eq!(m.pieces(10 * m.budget_ns(), 3), 3);
-        let off = WorkModel::new(0, 16, true, true);
+        let off = WorkModel::new(0, 16, true);
         assert!(!off.enabled());
         assert_eq!(off.pieces(u64::MAX, 100), 1);
         assert!(!off.watch(u64::MAX));
@@ -421,36 +631,14 @@ mod tests {
         }
     }
 
-    /// Refusal: only a reset-prone device, only a measured estimate, only past the factor. A
-    /// fast discrete device with no slow-class facts submits as before, however heavy.
-    #[test]
-    fn refusal_needs_a_reset_prone_device_and_a_measured_estimate() {
-        let far = Estimate {
-            ns: 9 * 250 * MS,
-            measured: true,
-        };
-        let prone = igpu();
-        assert!(prone.refuse(far));
-        assert!(!prone.refuse(Estimate {
-            measured: false,
-            ..far
-        }));
-        assert!(!prone.refuse(Estimate {
-            ns: 8 * 250 * MS,
-            ..far
-        }));
-        assert!(!fast().refuse(far));
-        assert!(!WorkModel::new(0, 16, true, true).refuse(far));
-    }
-
     /// A user's budget wins: a larger one keeps a dispatch whole that the default would cut.
     #[test]
     fn a_user_budget_wins() {
         let flops = gemm_flops(512, 2048, 22016);
         let dflt = igpu();
-        let est = dflt.estimate("g", Family::Gemv, flops).ns;
+        let est = dflt.estimate("g", Family::Gemv, flops);
         assert!(dflt.pieces(est, 172) > 1);
-        let big = WorkModel::new(600_000 / 10, prior_gflops(2), true, true);
+        let big = WorkModel::new(600_000 / 10, prior_gflops(2), true);
         assert_eq!(big.pieces(est, 172), 1);
     }
 }

@@ -700,10 +700,12 @@ pub(crate) static PARAMS: &[Param] = &[
         kind: Kind::Host,
         ty: uint(0, 60_000),
         axis: Axis::None,
-        doc: "GPU time, in ms, that no single dispatch and no single submit of a forward is \
-              estimated to exceed: a heavier prefill GEMM or GEMV is cut into ranges of its \
-              grid, each in its own submit, and a submit is closed once its estimated work \
-              reaches it (0 = no work bound; the dispatch-count splitter still applies)",
+        doc: "estimated GPU time, in ms, past which a forward's work is cut: a prefill GEMM or \
+              GEMV estimated above it is recorded as ranges of its grid, each in its own submit \
+              (at most one range per workgroup along the cut dimension), and a submit is closed \
+              at the next op boundary once its estimated work reaches it, so a submit can hold \
+              up to about twice this (0 = no work bound; the dispatch-count splitter still \
+              applies)",
         rule: "250 on an integrated or slow-class device (an eighth of the 2 s after which a \
                driver's watchdog resets a submit); else 1000",
         default: |f, _| Value::Uint(u64::from(crate::work::default_budget_ms(f.reset_prone()))),
@@ -718,7 +720,8 @@ pub(crate) static PARAMS: &[Param] = &[
         axis: Axis::None,
         doc: "throughput, in GFLOP/s for the whole device, the work estimate assumes for the \
               slowest prefill kernel family before this process has measured the kernel \
-              (faster families scale it up; a measurement replaces it)",
+              (faster families scale it up; a timed dispatch or a segment's GPU time replaces \
+              it, within a bounded gain)",
         rule: "8 per compute unit (2 units when the count is unknown)",
         default: |f, _| Value::Uint(crate::work::prior_gflops(f.compute_units) as u64),
         get: |t, _| Value::Uint(u64::from(t.submit_prior_gflops)),

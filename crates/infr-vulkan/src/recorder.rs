@@ -1022,9 +1022,12 @@ pub struct Recorder<'a> {
     work_ns: std::cell::Cell<u64>,
     /// The dispatches timed for the work estimate (`crate::work::WorkModel::watch`).
     watch: RefCell<WatchStamps>,
-    /// An error met while recording that a dispatch method cannot return: the work bound refused
-    /// a dispatch (`crate::work::WorkModel::refuse`), or a mid-op submit failed. The command
-    /// buffer is then never submitted, and finishing the recorder returns this.
+    /// The estimated work recorded into this command buffer, by kernel, for the model to set
+    /// against the buffer's measured GPU time (`crate::work::WorkModel::calibrate`).
+    seg_work: RefCell<crate::work::SegmentWork>,
+    /// An error met while recording that a dispatch method cannot return: a submit made in the
+    /// middle of an op failed ([`Self::rollover`]). The open command buffer is then never
+    /// submitted, and finishing the recorder returns this.
     failed: RefCell<Option<infr_core::error::Error>>,
     /// Command buffers this recorder already submitted itself, oldest first: a dispatch cut into
     /// ranges puts each range in its own submit ([`Self::rollover`]). Finishing the recorder waits
@@ -1036,13 +1039,17 @@ pub struct Recorder<'a> {
 }
 
 /// Timestamp pairs around the dispatches a recorder times for the work estimate, and what each
-/// pair covers: the kernel and its FLOPs. The pool is created on the first timed dispatch, so a
-/// recorder that times none (every one on a fast device at its usual batch) creates nothing.
+/// pair covers: the kernel, its family and its FLOPs. The pool is created on the first timed
+/// dispatch, so a recorder that times none (every one on a fast device at its usual batch)
+/// creates nothing.
 #[derive(Default)]
 pub(crate) struct WatchStamps {
     pool: vk::QueryPool,
-    covered: Vec<(&'static str, u64)>,
+    covered: Vec<Watched>,
 }
+
+/// What one timed dispatch covers: its kernel, the kernel's family, and its FLOPs.
+type Watched = (&'static str, crate::work::Family, u64);
 
 impl WatchStamps {
     /// Timed dispatches one recorder can hold; past it a dispatch is simply not timed.
@@ -1054,6 +1061,22 @@ impl WatchStamps {
             self.pool = vk::QueryPool::null();
         }
         self.covered.clear();
+    }
+}
+
+/// Feed a completed segment into the work estimate (`crate::work`): its timed dispatches first,
+/// each an exact sample of one kernel, then its whole GPU time, `gpu_ns` (`None` when the
+/// segment went untimed), set against the work recorded into it for the kernels still on their
+/// prior.
+fn account_work(
+    shared: &crate::VulkanShared,
+    watch: &mut WatchStamps,
+    work: &crate::work::SegmentWork,
+    gpu_ns: Option<u64>,
+) {
+    account_watched(shared, watch);
+    if let Some(ns) = gpu_ns {
+        shared.work.calibrate(work, ns);
     }
 }
 
@@ -1075,10 +1098,11 @@ fn account_watched(shared: &crate::VulkanShared, w: &mut WatchStamps) {
             )
         };
         if matches!(read, Ok(()) | Err(vk::Result::NOT_READY)) {
-            for (pair, &(kernel, flops)) in ticks.as_chunks::<2>().0.iter().zip(&w.covered) {
+            for (pair, &(kernel, family, flops)) in ticks.as_chunks::<2>().0.iter().zip(&w.covered)
+            {
                 if pair[0][1] != 0 && pair[1][1] != 0 {
                     let ns = (pair[1][0].wrapping_sub(pair[0][0]) as f64 * period as f64) as u64;
-                    shared.work.record(kernel, flops, ns);
+                    shared.work.record(kernel, family, flops, ns);
                 }
             }
         }
@@ -1250,6 +1274,7 @@ impl<'a> Recorder<'a> {
             work_next: std::cell::Cell::new(None),
             work_ns: std::cell::Cell::new(0),
             watch: RefCell::new(WatchStamps::default()),
+            seg_work: RefCell::new(crate::work::SegmentWork::default()),
             failed: RefCell::new(None),
             flushed: RefCell::new(std::collections::VecDeque::new()),
             flushed_dispatches: std::cell::Cell::new(0),
@@ -1787,9 +1812,9 @@ impl<'a> Recorder<'a> {
 
     /// Say what the NEXT dispatch costs, for the work bound (`crate::work`): its kernel `family`,
     /// its `flops`, and how its grid may be cut. Consumed by that dispatch, which is then split
-    /// into ranges, timed, counted toward the submit's work or refused as the bound decides; a
-    /// dispatch nobody tagged is recorded as one, uncounted. Ops tag only work over more than one
-    /// row: a decode step is never touched.
+    /// into ranges, timed and counted toward the submit's work as the bound decides; a dispatch
+    /// nobody tagged is recorded as one, uncounted. Ops tag only work over more than one row: a
+    /// decode step is never touched.
     pub(crate) fn work_next(
         &self,
         family: crate::work::Family,
@@ -1831,9 +1856,10 @@ impl<'a> Recorder<'a> {
     /// the output is bit-identical), each range in its own submit ([`Self::rollover`]). A
     /// watchdog counts a submit's time, so ranges sharing one submit would not help: a recording
     /// that cannot open submits of its own (a persistent one, replayed whole, or any under the
-    /// splitter's kill switch `device.submit_dispatches = 0`) keeps the dispatch whole. A
-    /// dispatch whose kernel cannot be cut and is measured far past the budget on a reset-prone
-    /// device is refused instead.
+    /// splitter's kill switch `device.submit_dispatches = 0`) keeps the dispatch whole, as does
+    /// a kernel whose grid cannot be cut the way its tag says. A grid has no more ranges than
+    /// workgroups along the dimension that is cut, so a range can still be estimated past the
+    /// budget.
     fn record_dispatch(
         &self,
         k: ComputeKernel,
@@ -1858,7 +1884,6 @@ impl<'a> Recorder<'a> {
         let extent = grid[dim];
         let own_submits = !self.persistent && !self.be.shared.submit_split_disabled;
         let cuttable = match tag.split {
-            crate::work::Split::No => false,
             // The op's claim is checked against the shader it was built from: one that does read
             // `gl_NumWorkGroups` is a mistagged call site, and is left whole rather than cut
             // wrongly.
@@ -1873,27 +1898,18 @@ impl<'a> Recorder<'a> {
             // The flat index is x + y * gl_NumWorkGroups.x: whole y rows, or x on a one-row grid.
             crate::work::Split::WideGrid => dim < 2,
         };
-        if own_submits && !cuttable && model.refuse(est) {
-            self.fail(be(format!(
-                "a dispatch of kernel {} was measured to need about {} ms of GPU time, past what \
-                 this device's watchdog allows, and the kernel cannot be split; use a smaller \
-                 batch (device.ubatch / INFR_UBATCH), or submit.budget_ms = 0 to submit it anyway",
-                k.name,
-                est.ns / 1_000_000
-            )));
-            return;
-        }
         let pieces = if own_submits && cuttable {
-            model.pieces(est.ns, extent)
+            model.pieces(est, extent)
         } else {
             1
         };
+        self.be.note_work_estimated(est);
         if pieces <= 1 {
-            self.work_ns.set(self.work_ns.get().saturating_add(est.ns));
-            let watched = model.watch(est.ns) && self.watch_stamp(None);
+            self.count_work(k.name, tag.family, tag.flops, est);
+            let watched = model.watch(est) && self.watch_stamp(None);
             unsafe { device.cmd_dispatch(self.cmd.get(), grid[0], grid[1], grid[2]) };
             if watched {
-                self.watch_stamp(Some((k.name, tag.flops)));
+                self.watch_stamp(Some((k.name, tag.family, tag.flops)));
             }
             return;
         }
@@ -1902,7 +1918,7 @@ impl<'a> Recorder<'a> {
         unsafe { device.cmd_bind_pipeline(self.cmd.get(), vk::PipelineBindPoint::COMPUTE, twin) };
         for (i, (base, n)) in crate::work::ranges(extent, pieces).enumerate() {
             let share = |v: u64| (v as u128 * u128::from(n) / u128::from(extent)) as u64;
-            let (piece_ns, piece_flops) = (share(est.ns), share(tag.flops));
+            let (piece_ns, piece_flops) = (share(est), share(tag.flops));
             // Each range opens a submit of its own, the first too unless the open one is empty
             // of estimated work, so no submit carries more than one range's worth of it.
             if i > 0 || self.work_ns.get() > 0 {
@@ -1917,8 +1933,7 @@ impl<'a> Recorder<'a> {
                     return;
                 }
             }
-            self.work_ns
-                .set(self.work_ns.get().saturating_add(piece_ns));
+            self.count_work(k.name, tag.family, piece_flops, piece_ns);
             let watched = model.watch(piece_ns) && self.watch_stamp(None);
             let mut b = [0u32; 3];
             let mut c = grid;
@@ -1926,10 +1941,24 @@ impl<'a> Recorder<'a> {
             c[dim] = n;
             unsafe { device.cmd_dispatch_base(self.cmd.get(), b[0], b[1], b[2], c[0], c[1], c[2]) };
             if watched {
-                self.watch_stamp(Some((k.name, piece_flops)));
+                self.watch_stamp(Some((k.name, tag.family, piece_flops)));
             }
         }
         self.be.note_work_split();
+    }
+
+    /// Count a tagged dispatch (or one range of it) into the open command buffer: `est_ns` toward
+    /// the submit's work ([`Self::work_ns`]) and its FLOPs toward what the buffer's measured GPU
+    /// time is set against.
+    fn count_work(
+        &self,
+        kernel: &'static str,
+        family: crate::work::Family,
+        flops: u64,
+        est_ns: u64,
+    ) {
+        self.work_ns.set(self.work_ns.get().saturating_add(est_ns));
+        self.seg_work.borrow_mut().add(kernel, family, flops);
     }
 
     /// Submit the command buffer recorded so far, without waiting, and continue in a fresh one in
@@ -1985,6 +2014,7 @@ impl<'a> Recorder<'a> {
             .seg_query_pool
             .replace(Self::open_segment_stamps(self.be, fresh));
         let mut old_watch = std::mem::take(&mut *self.watch.borrow_mut());
+        let old_work = std::mem::take(&mut *self.seg_work.borrow_mut());
         self.flushed_dispatches
             .set(self.flushed_dispatches.get() + desc.dispatches);
         self.dispatches.set(0);
@@ -2036,6 +2066,7 @@ impl<'a> Recorder<'a> {
             pools: Vec::new(),
             seg_query_pool: old_stamps,
             watch: old_watch,
+            work: old_work,
             earlier: Vec::new(),
             earlier_dispatches: 0,
             desc,
@@ -2110,7 +2141,7 @@ impl<'a> Recorder<'a> {
     /// Write one timestamp of a timed dispatch's pair: the opening one (`None`; creates the pool
     /// on first use, and answers `false`, recording nothing, when the dispatch cannot be timed),
     /// or the closing one with what the pair covers.
-    fn watch_stamp(&self, closing: Option<(&'static str, u64)>) -> bool {
+    fn watch_stamp(&self, closing: Option<Watched>) -> bool {
         if self.persistent || self.be.shared.segment_ts_period.is_none() {
             return false;
         }
@@ -11495,8 +11526,13 @@ impl<'a> Recorder<'a> {
         let recent = self.be.shared.note_segment_submitted_at(desc, submitted);
         // A missing closing stamp poisons the backend (see `account_segment`); what the reset
         // discarded is leaked like any other failed wait.
-        account_segment(&self.be.shared, self.seg_query_pool.get(), desc, recent)?;
-        account_watched(&self.be.shared, &mut self.watch.borrow_mut());
+        let gpu_ns = account_segment(&self.be.shared, self.seg_query_pool.get(), desc, recent)?;
+        account_work(
+            &self.be.shared,
+            &mut self.watch.borrow_mut(),
+            &self.seg_work.borrow(),
+            gpu_ns,
+        );
         if self.stages {
             eprintln!(
                 "[prof] record={:.1}ms submit+gpu={:.1}ms",
@@ -11564,6 +11600,7 @@ impl<'a> Recorder<'a> {
                 pools: Vec::new(),
                 seg_query_pool: vk::QueryPool::null(),
                 watch: WatchStamps::default(),
+                work: crate::work::SegmentWork::default(),
                 earlier: Vec::new(),
                 earlier_dispatches,
                 desc,
@@ -11614,6 +11651,7 @@ impl<'a> Recorder<'a> {
             pools: self.pools.borrow().clone(),
             seg_query_pool: self.seg_query_pool.get(),
             watch: std::mem::take(&mut *self.watch.borrow_mut()),
+            work: std::mem::take(&mut *self.seg_work.borrow_mut()),
             earlier: self.flushed.borrow_mut().drain(..).collect(),
             earlier_dispatches,
             desc,
@@ -11988,6 +12026,9 @@ pub struct PendingSegment {
     seg_query_pool: vk::QueryPool,
     /// The recorder's timed dispatches, read into the work estimate once the fence signals.
     watch: WatchStamps,
+    /// The estimated work recorded into this command buffer, set against its GPU time once the
+    /// fence signals.
+    work: crate::work::SegmentWork,
     /// Command buffers the same recorder submitted before this one ([`Recorder::rollover`]) and
     /// has not waited for, oldest first: waited before this one, which holds the descriptor pools
     /// they use.
@@ -12029,8 +12070,8 @@ impl PendingSegment {
         // Only reached once the segment completed: a failed wait (above, or a backend already
         // poisoned) returns first and leaks the command buffer, pools and fence the GPU may still
         // be using (see `gpu_wait`).
-        account_segment(&self.shared, self.seg_query_pool, desc, self.recent)?;
-        account_watched(&self.shared, &mut self.watch);
+        let gpu_ns = account_segment(&self.shared, self.seg_query_pool, desc, self.recent)?;
+        account_work(&self.shared, &mut self.watch, &self.work, gpu_ns);
         let device = &self.shared.device;
         unsafe {
             if self.seg_query_pool != vk::QueryPool::null() {
@@ -12051,7 +12092,7 @@ impl PendingSegment {
 /// Add one segment's GPU interval to the backend's running sum (or count it untimed) — the input
 /// `crate::ForwardClock` judges a forward by — once its fence has signalled. `qp` is that
 /// segment's two-stamp pool, null when it was recorded untimed; it is only read here, never
-/// destroyed.
+/// destroyed. Returns the interval in ns, `None` for an untimed segment.
 ///
 /// The stamps double as a completion check. A signalled fence does not prove the work ran: after
 /// a hang-watchdog reset (Windows TDR, an engine timeout) AMD's Windows driver signalled the
@@ -12068,14 +12109,14 @@ fn account_segment(
     qp: vk::QueryPool,
     desc: SubmitDesc,
     recent: u64,
-) -> Result<()> {
+) -> Result<Option<u64>> {
     use std::sync::atomic::Ordering;
     let Some(period) = shared
         .segment_ts_period
         .filter(|_| qp != vk::QueryPool::null())
     else {
         shared.untimed_segments.fetch_add(1, Ordering::Relaxed);
-        return Ok(());
+        return Ok(None);
     };
     // (value, availability) per stamp.
     let mut ticks = [[0u64; 2]; 2];
@@ -12092,7 +12133,7 @@ fn account_segment(
             let ns = (ticks[1][0].wrapping_sub(ticks[0][0]) as f64 * period as f64) as u64;
             shared.segment_gpu_ns.fetch_add(ns, Ordering::Relaxed);
             shared.note_segment_ran(recent, ns);
-            Ok(())
+            Ok(Some(ns))
         }
         Ok(()) | Err(vk::Result::NOT_READY) => {
             Err(shared.work_dropped(&format!("a forward segment of {desc}")))
@@ -12103,7 +12144,7 @@ fn account_segment(
         // Any other failure only costs this segment its timing, as before.
         Err(_) => {
             shared.untimed_segments.fetch_add(1, Ordering::Relaxed);
-            Ok(())
+            Ok(None)
         }
     }
 }

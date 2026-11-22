@@ -462,6 +462,9 @@ struct VulkanShared {
     segment_cuts: [AtomicU64; SegmentCut::COUNT],
     /// Dispatches the work bound recorded as several ranges ([`VulkanBackend::work_splits`]).
     work_splits: AtomicU64,
+    /// Estimated GPU time of every dispatch the work bound has counted, ns: what a forward's
+    /// report sets beside its measured GPU time ([`ForwardClock`]).
+    work_estimated_ns: AtomicU64,
     /// The per-device kernel parameters, resolved once at creation (`tuning::resolve`). Every
     /// kernel choice reads its field here; nothing looks a parameter up by name.
     tuning: tuning::Tuning,
@@ -2811,12 +2814,11 @@ impl VulkanBackend {
         // `infr_core::initial_submit_dispatch_cap` over the device facts, so `infr tune show`
         // says what the first forward runs with and why).
         let slow_device = facts.slow_class();
-        // The work bound (`crate::work`); only a reset-prone device ever refuses a dispatch.
+        // The work bound (`crate::work`).
         let work = crate::work::WorkModel::new(
             tuned.submit_budget_ms,
             tuned.submit_prior_gflops,
             facts.dot_accelerated,
-            facts.reset_prone(),
         );
         let submit_dispatch_cap = cfg
             .device
@@ -2994,6 +2996,7 @@ impl VulkanBackend {
                 untimed_segments: AtomicU64::new(0),
                 segment_cuts: [const { AtomicU64::new(0) }; SegmentCut::COUNT],
                 work_splits: AtomicU64::new(0),
+                work_estimated_ns: AtomicU64::new(0),
                 uma_overflow_type,
                 host_overflow_type,
                 kv_spill: SpillTally::default(),
@@ -3311,6 +3314,7 @@ impl VulkanBackend {
             wall: std::time::Instant::now(),
             gpu_ns: self.shared.segment_gpu_ns.load(Ordering::Relaxed),
             untimed: self.shared.untimed_segments.load(Ordering::Relaxed),
+            estimated_ns: self.shared.work_estimated_ns.load(Ordering::Relaxed),
         }
     }
 
@@ -3326,16 +3330,6 @@ impl VulkanBackend {
     /// large a cap costs a device-lost. So a slow sample tightens the bound and a fast one is
     /// simply ignored.
     pub(crate) fn observe_forward(&self, busy_ns: u64, dispatches: usize) {
-        // What the splitter did, for a report (`RUST_LOG=infr_vulkan=debug`): the totals are the
-        // backend's so far, not this forward's.
-        tracing::debug!(
-            "[infr] forward: {dispatches} dispatches, GPU busy {:.1} ms; so far {:?}, {} \
-             dispatch(es) cut into ranges, measured GFLOP/s {:?}",
-            busy_ns as f64 / 1e6,
-            self.segment_cuts(),
-            self.work_splits(),
-            self.work_measured_gflops(),
-        );
         let cur = self.submit_dispatch_cap();
         let next = next_submit_cap(cur, busy_ns, dispatches, self.shared.submit_split_disabled);
         if next != cur {
@@ -3365,6 +3359,13 @@ impl VulkanBackend {
         }
     }
 
+    /// Count the estimated GPU time of one dispatch the work bound was told about.
+    pub(crate) fn note_work_estimated(&self, est_ns: u64) {
+        self.shared
+            .work_estimated_ns
+            .fetch_add(est_ns, Ordering::Relaxed);
+    }
+
     /// Count one dispatch the work bound recorded as several ranges (`crate::work`).
     pub(crate) fn note_work_split(&self) {
         self.shared.work_splits.fetch_add(1, Ordering::Relaxed);
@@ -3391,8 +3392,9 @@ impl VulkanBackend {
         v
     }
 
-    /// The throughput the work bound has measured for each kernel it timed in this backend, in
-    /// GFLOP/s, sorted by kernel name: what its estimates use in place of `submit.prior_gflops`.
+    /// The throughput the work bound has learned for each kernel in this backend, from a timed
+    /// dispatch or from a segment's GPU time, in GFLOP/s, sorted by kernel name: what its
+    /// estimates use in place of `submit.prior_gflops`.
     pub fn work_measured_gflops(&self) -> Vec<(&'static str, f64)> {
         self.shared.work.measured_gflops()
     }
@@ -5344,6 +5346,8 @@ pub(crate) struct ForwardClock {
     wall: std::time::Instant,
     gpu_ns: u64,
     untimed: u64,
+    /// `VulkanShared::work_estimated_ns` when the forward started.
+    estimated_ns: u64,
 }
 
 impl ForwardClock {
@@ -5361,7 +5365,20 @@ impl ForwardClock {
     /// Feed this forward (`dispatches` across all its segments, every one of them completed) to
     /// [`VulkanBackend::observe_forward`].
     pub(crate) fn observe(self, be_: &VulkanBackend, dispatches: usize) {
-        be_.observe_forward(self.busy_ns(be_), dispatches);
+        let busy_ns = self.busy_ns(be_);
+        // What the splitter did, for a report (`RUST_LOG=infr_vulkan=debug`): the forward's own
+        // dispatches, GPU time and the work bound's estimate of it, then the backend's totals so
+        // far.
+        tracing::debug!(
+            "[infr] forward: {dispatches} dispatches, GPU busy {:.1} ms, estimated work {:.1} \
+             ms; so far {:?}, {} dispatch(es) cut into ranges, learned GFLOP/s {:?}",
+            busy_ns as f64 / 1e6,
+            (be_.shared.work_estimated_ns.load(Ordering::Relaxed) - self.estimated_ns) as f64 / 1e6,
+            be_.segment_cuts(),
+            be_.work_splits(),
+            be_.work_measured_gflops(),
+        );
+        be_.observe_forward(busy_ns, dispatches);
     }
 }
 

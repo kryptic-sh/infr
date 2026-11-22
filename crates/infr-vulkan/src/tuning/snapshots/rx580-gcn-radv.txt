@@ -1,6 +1,6 @@
 device:  AMD Radeon RX 580 Series (RADV POLARIS10) (AmdGcn, MESA_RADV, wave64 emulation)
 match:   vendor=amd arch=AmdGcn driver=MESA_RADV integrated=false device_id=0x67df cu=36 subgroup=64-64 driver_version=0x0
-hash:    2c5b5776
+hash:    de20e777
 rows: none
 
 device.sg_pref              32     default
@@ -47,6 +47,7 @@ attn_split.min_chunk        64     fixed
 attn_split.max_chunk        512    fixed
 mla.sg_width                32     fixed
 moe.small_m                 8      default
+queue.compute_only          true   default
 submit.initial_dispatches   64     default
 submit.budget_ms            250    default
 submit.prior_gflops         288    default

@@ -103,10 +103,10 @@ unchanged** (pp512 3562.7→3547.1, tg128 143.5→143.1 = noise), gpu_seam 25/25
 MiB `amdgpu_bo_move` across a run); clock throttling (SCLK pinned 2200 MHz
 through the hang); a compute-only queue family (on this part it makes the hang
 DETERMINISTIC — the `comp` ring budget is TIGHTER, which is why integrated GPUs
-keep the universal family; discrete GPUs now prefer the compute ring on purpose,
-see `kernels.vulkan.gfx_queue`). `RADV_DEBUG=hang` is a **red herring**:
-syncshaders serializes the IB so the job itself blows the budget, "naming"
-whatever shader ran at the 2 s mark.
+keep the universal family; a discrete device in the slow class submits on the
+compute ring on purpose, see the `queue.compute_only` tuning parameter).
+`RADV_DEBUG=hang` is a **red herring**: syncshaders serializes the IB so the job
+itself blows the budget, "naming" whatever shader ran at the 2 s mark.
 
 ### The dense-decode routing bug (found while chasing the above)
 

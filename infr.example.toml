@@ -165,9 +165,9 @@ flash_min_rows = 24
 # Misc.
 push_desc = true
 pipeline_cache_disk = true
-# Submit on the compositor's graphics ring instead of a compute-only one. A
-# discrete GPU defaults to the compute ring so a long prefill does not stall the
-# desktop; set this when that ring misbehaves on the device.
+# Submit on the universal (graphics) queue family even where the device rule
+# picks a compute-only one. Alias of the tuning parameter `queue.compute_only`
+# (on by default only on a slow-class discrete GPU; `infr tune show`).
 gfx_queue = false
 gpu_pos = true
 fuse_add = true

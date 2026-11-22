@@ -676,6 +676,19 @@ pub(crate) static PARAMS: &[Param] = &[
         get: |t, _| Value::Uint(t.moe_small_m as u64),
         set: |t, _, v| t.moe_small_m = v.usize(),
     },
+    // ── queue ────────────────────────────────────────────────────────────────
+    Param {
+        family: "queue",
+        name: "compute_only",
+        kind: Kind::Host,
+        ty: Ty::Bool,
+        axis: Axis::None,
+        doc: "submit on a COMPUTE-only queue family when the device has one that writes               timestamps (amdgpu: the comp rings, scheduled beside the ring the compositor               renders on), else on the universal family",
+        rule: "true on a discrete device in the slow class (no matrix units and no accelerated                int8 dot, or wave64-only), where it was measured; else false",
+        default: |f, _| Value::Bool(!f.integrated && f.slow_class()),
+        get: |t, _| Value::Bool(t.queue_compute_only),
+        set: |t, _, v| t.queue_compute_only = v.flag(),
+    },
     // ── submit splitter ──────────────────────────────────────────────────────
     Param {
         family: "submit",
@@ -1010,6 +1023,17 @@ pub(crate) static ALIASES: &[Alias] = &[
         // Only OFF ever meant anything: `true` (the default) left the driver gate in charge.
         read: |c, _| {
             (!c.kernels.vulkan.i8cm_kq).then(|| vec![("gemm_i8cm_kq.enabled", Value::Bool(false))])
+        },
+    },
+    Alias {
+        path: "kernels.vulkan.gfx_queue",
+        params: &["queue.compute_only"],
+        // Only ON ever meant anything: unset left the device rule in charge.
+        read: |c, _| {
+            c.kernels
+                .vulkan
+                .gfx_queue
+                .then(|| vec![("queue.compute_only", Value::Bool(false))])
         },
     },
     Alias {

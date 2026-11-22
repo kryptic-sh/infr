@@ -449,9 +449,9 @@ cfg_struct! {
         delta_strided: bool = false,
         /// `INFR_NO_PUSH_DESC` (inverted).
         push_desc: bool = true,
-        /// `INFR_GFX_QUEUE` — submit on the universal (graphics) family instead of a COMPUTE-only
-        /// one. The compositor renders on that same ring, so inference then competes with the
-        /// desktop's frames; kept for devices whose compute ring is unusable.
+        /// `INFR_GFX_QUEUE` — submit on the universal (graphics) family even where the device
+        /// rule would pick a COMPUTE-only one. An alias of the Vulkan tuning parameter
+        /// `queue.compute_only`, which it sets to `false`.
         gfx_queue: bool = false,
         /// `INFR_NO_PIPELINE_CACHE` (inverted).
         pipeline_cache_disk: bool = true,

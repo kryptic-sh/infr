@@ -250,6 +250,9 @@ pub(crate) struct Tuning {
     /// `rmsnorm.*`: the 1024-wide decode RMSNorm build.
     pub rmsnorm_wide: bool,
     pub rmsnorm_wide_min_dim: usize,
+    /// `queue.compute_only`: submit on a COMPUTE-only queue family when the device has a usable
+    /// one (`VulkanBackend::pick_queue_family`).
+    pub queue_compute_only: bool,
     /// `submit.initial_dispatches`: the submit splitter's cap before any forward has been
     /// measured (`0` = never split).
     pub submit_initial_dispatches: usize,

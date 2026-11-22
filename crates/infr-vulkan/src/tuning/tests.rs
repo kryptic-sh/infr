@@ -693,6 +693,10 @@ fn every_alias_writes_the_old_value() {
             &[("INFR_MMV_MW_WARPS", "4")],
             &[("mmv_mw.warps@q4_k", "4"), ("mmv_mw.warps@q6_k", "4")],
         ),
+        (
+            &[("INFR_GFX_QUEUE", "1")],
+            &[("queue.compute_only", "false")],
+        ),
         (&[("INFR_MOE_SMALL_M", "16")], &[("moe.small_m", "16")]),
         (&[("INFR_MOE_SMALL_M", "100000")], &[("moe.small_m", "64")]),
         (
@@ -1591,4 +1595,29 @@ fn initial_submit_cap_follows_the_device_facts() {
         &env_cfg(&[("INFR_TUNE", "submit.initial_dispatches=16")]),
     );
     assert_eq!(r.tuning.submit_initial_dispatches, 16);
+}
+
+/// `queue.compute_only` is on only where the compute ring was measured: a discrete device in the
+/// slow class. The fast discrete card and the integrated GPU stay on the universal family, an
+/// integrated GPU even when it is in the slow class (its compute ring's hang budget measured
+/// tighter, `docs/igpu.md`); `kernels.vulkan.gfx_queue` turns it off, and a user value wins.
+#[test]
+fn compute_only_queue_follows_the_device_facts() {
+    let on = |id: &str| fixture_tuning(id).queue_compute_only;
+    assert!(on("rx580-gcn-radv"));
+    assert!(!on("rx7900xtx-amdwin"));
+    assert!(!on("rx7900xtx-radv"));
+    assert!(!on("raphael-igpu-amdwin"));
+    let mut slow_igpu = fixture("raphael-igpu-amdwin");
+    slow_igpu.wave64 = true;
+    assert!(slow_igpu.slow_class());
+    let r = resolve_with(&slow_igpu, &Config::default(), &[], None).unwrap();
+    assert!(!r.tuning.queue_compute_only);
+    let r = resolve_fixture("rx580-gcn-radv", &env_cfg(&[("INFR_GFX_QUEUE", "1")]));
+    assert!(!r.tuning.queue_compute_only);
+    let r = resolve_fixture(
+        "rx7900xtx-amdwin",
+        &env_cfg(&[("INFR_TUNE", "queue.compute_only=true")]),
+    );
+    assert!(r.tuning.queue_compute_only);
 }

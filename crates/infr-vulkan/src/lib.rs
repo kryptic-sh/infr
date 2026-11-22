@@ -248,6 +248,19 @@ fn check_bindable_size(bytes: usize) -> Result<()> {
     Ok(())
 }
 
+/// What became of a request for a COMPUTE-only queue family ([`VulkanBackend::pick_queue_family`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ComputeRing {
+    /// `queue.compute_only` is off.
+    NotAsked,
+    /// Asked for, and the chosen family is one.
+    Taken,
+    /// Asked for, but the device has no COMPUTE-only family.
+    Missing,
+    /// Asked for, but no COMPUTE-only family writes timestamps.
+    NoTimestamps,
+}
+
 /// Device features the kernels rely on with no fallback: `shaderInt8` for the int8 arithmetic in
 /// the quantized kernels, and `computeFullSubgroups` for the `REQUIRE_FULL_SUBGROUPS` flag every
 /// subgroup-pinned pipeline is created with (`ops::try_make_compute_kernel`). A device without one
@@ -1611,34 +1624,46 @@ impl VulkanBackend {
         }
     }
 
-    /// Which queue family inference submits on, out of the device's families.
+    /// Which queue family inference submits on, out of the device's families, and what became of
+    /// a request for a COMPUTE-only one.
     ///
-    /// A discrete GPU prefers a COMPUTE-only family (`comp` rings): a long forward then runs on an
-    /// engine the driver interleaves with graphics instead of holding up the `gfx` ring the
-    /// compositor renders on. Integrated GPUs and every device put on the graphics family by
-    /// `kernels.vulkan.gfx_queue` (`INFR_GFX_QUEUE`) prefer the universal family, where the
-    /// `comp` ring's measured hang budget was tighter; both fall back to any COMPUTE-capable
-    /// family, which is all NVIDIA-class drivers offer. `None` = the device cannot compute at all.
+    /// `compute_only` is the tuning parameter `queue.compute_only`. When set, the first
+    /// COMPUTE-only family that writes timestamps is taken: a long forward then runs on an engine
+    /// the driver schedules beside graphics (amdgpu's `comp` rings) instead of on the ring the
+    /// compositor renders on. A COMPUTE-only family with no valid timestamp bits is never taken,
+    /// asked for or not, while another family can compute: the submit splitter's segment timing,
+    /// the dropped-work check and the per-op profile all read timestamps written on the submit
+    /// queue. Otherwise the universal (GRAPHICS and COMPUTE) family is preferred, then any family
+    /// that can compute. `None` = the device cannot compute at all.
     fn pick_queue_family(
         families: &[vk::QueueFamilyProperties],
-        device_type: vk::PhysicalDeviceType,
-        gfx_queue: bool,
-    ) -> Option<u32> {
+        compute_only: bool,
+    ) -> Option<(u32, ComputeRing)> {
         let compute =
             |p: &vk::QueueFamilyProperties| p.queue_flags.contains(vk::QueueFlags::COMPUTE);
         let universal = |p: &vk::QueueFamilyProperties| {
             compute(p) && p.queue_flags.contains(vk::QueueFlags::GRAPHICS)
         };
-        let compute_only = |p: &vk::QueueFamilyProperties| compute(p) && !universal(p);
-        let want_compute_ring = device_type == vk::PhysicalDeviceType::DISCRETE_GPU && !gfx_queue;
-        let preferred = if want_compute_ring {
-            families.iter().position(compute_only)
+        let compute_only_family = |p: &vk::QueueFamilyProperties| compute(p) && !universal(p);
+        let timed = |p: &vk::QueueFamilyProperties| p.timestamp_valid_bits > 0;
+        let ring = if !compute_only {
+            ComputeRing::NotAsked
+        } else if let Some(i) = families
+            .iter()
+            .position(|p| compute_only_family(p) && timed(p))
+        {
+            return Some((i as u32, ComputeRing::Taken));
+        } else if families.iter().any(compute_only_family) {
+            ComputeRing::NoTimestamps
         } else {
-            families.iter().position(universal)
+            ComputeRing::Missing
         };
-        preferred
+        families
+            .iter()
+            .position(universal)
+            .or_else(|| families.iter().position(|p| compute(p) && timed(p)))
             .or_else(|| families.iter().position(compute))
-            .map(|i| i as u32)
+            .map(|i| (i as u32, ring))
     }
 
     /// Enumerate ALL Vulkan physical devices WITHOUT building a backend (a cheap instance +
@@ -2538,43 +2563,40 @@ impl VulkanBackend {
         } = tuning::resolve::resolve(&facts, &cfg).map_err(be)?;
 
         // ── compute queue family ───────────────────────────────────────────────
-        // A COMPUTE-only family runs on the `comp` rings, a separate engine from the `gfx` ring
-        // the compositor submits its frames on, so a multi-second prefill delays KWin's frame
-        // instead of blocking it. Measured on the RX 580 with zeta-2.1 Q4_K_M: 130 fps through a
-        // prefill that used to drop glxgears to 7 (153 → 166 tok/s prefill, 31.2 → 30.7 tok/s
-        // decode). Integrated parts keep the universal family: there the `comp` ring's hang
-        // budget measured tighter than `gfx` (a deterministic device-lost where `gfx` is
-        // intermittent), and the submit splitter (`VulkanShared::submit_dispatch_cap`) already
-        // bounds the job.
+        // `queue.compute_only` (see `tuning::families`) decides between a COMPUTE-only family and
+        // the universal one; `pick_queue_family` holds the rule, including the refusal of a
+        // family that writes no timestamps.
         let qf_props =
             unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
-        let queue_family_index =
-            Self::pick_queue_family(&qf_props, dev_props.device_type, vkcfg.gfx_queue)
+        let (queue_family_index, compute_ring) =
+            Self::pick_queue_family(&qf_props, tuned.queue_compute_only)
                 .ok_or_else(|| be("no compute queue family found"))?;
-        let on_graphics_ring = qf_props[queue_family_index as usize]
-            .queue_flags
-            .contains(vk::QueueFlags::GRAPHICS);
-        if dev_props.device_type == vk::PhysicalDeviceType::DISCRETE_GPU
-            && on_graphics_ring
-            && !vkcfg.gfx_queue
-        {
-            tracing::warn!(
-                "[infr] vulkan: no COMPUTE-only queue family on this device; inference shares \
-                 queue family {queue_family_index} with the compositor's graphics ring, so a \
-                 long forward stalls the desktop's frames"
-            );
+        match compute_ring {
+            ComputeRing::NotAsked | ComputeRing::Taken => {}
+            ComputeRing::Missing => tracing::warn!(
+                "[infr] vulkan: queue.compute_only is set, but this device has no COMPUTE-only \
+                 queue family; submitting on queue family {queue_family_index}"
+            ),
+            ComputeRing::NoTimestamps => tracing::warn!(
+                "[infr] vulkan: queue.compute_only is set, but this device's COMPUTE-only queue \
+                 family writes no timestamps (timestampValidBits 0), which the submit splitter, \
+                 the dropped-work check and the per-op profile need; submitting on queue family \
+                 {queue_family_index}"
+            ),
         }
+        let chosen_family = &qf_props[queue_family_index as usize];
         tracing::info!(
-            "[infr] vulkan: queue family {queue_family_index} ({})",
-            if on_graphics_ring {
-                "graphics ring, shared with the compositor"
+            "[infr] vulkan: queue family {queue_family_index} ({}, timestampValidBits {})",
+            if chosen_family.queue_flags.contains(vk::QueueFlags::GRAPHICS) {
+                "universal: graphics and compute"
             } else {
-                "compute-only ring"
-            }
+                "compute-only"
+            },
+            chosen_family.timestamp_valid_bits
         );
         // Per-segment GPU timing for the submit splitter (`ForwardClock`): usable only when the
         // chosen queue family writes timestamps at all.
-        let segment_ts_bits = qf_props[queue_family_index as usize].timestamp_valid_bits;
+        let segment_ts_bits = chosen_family.timestamp_valid_bits;
         let segment_ts_period = (segment_ts_bits > 0)
             .then_some(dev_props.limits.timestamp_period)
             .filter(|p| *p > 0.0);
@@ -5456,10 +5478,11 @@ mod tests {
     use super::*;
     use infr_core::Backend;
 
-    /// One queue family with the given flags reported; every other field default.
+    /// One queue family with the given flags and 64 valid timestamp bits.
     fn queue_family(flags: vk::QueueFlags) -> vk::QueueFamilyProperties {
         vk::QueueFamilyProperties {
             queue_flags: flags,
+            timestamp_valid_bits: 64,
             ..Default::default()
         }
     }
@@ -5474,41 +5497,24 @@ mod tests {
     }
 
     #[test]
-    fn a_discrete_gpu_submits_on_the_compute_only_ring() {
+    fn compute_only_submits_on_the_compute_only_family() {
         assert_eq!(
-            VulkanBackend::pick_queue_family(
-                &amd_families(),
-                vk::PhysicalDeviceType::DISCRETE_GPU,
-                false
-            ),
-            Some(1)
+            VulkanBackend::pick_queue_family(&amd_families(), true),
+            Some((1, ComputeRing::Taken))
         );
     }
 
     #[test]
-    fn gfx_queue_keeps_inference_on_the_universal_family() {
+    fn without_compute_only_inference_stays_on_the_universal_family() {
         assert_eq!(
-            VulkanBackend::pick_queue_family(
-                &amd_families(),
-                vk::PhysicalDeviceType::DISCRETE_GPU,
-                true
-            ),
-            Some(0)
+            VulkanBackend::pick_queue_family(&amd_families(), false),
+            Some((0, ComputeRing::NotAsked))
         );
-    }
-
-    #[test]
-    fn an_integrated_gpu_keeps_the_universal_family() {
-        // The compute-only ring's hang budget measured tighter there, so the preference must not
-        // depend on which family the driver happens to enumerate first.
-        let families = [amd_families()[1], amd_families()[0]];
+        // The preference must not depend on which family the driver enumerates first.
+        let swapped = [amd_families()[1], amd_families()[0]];
         assert_eq!(
-            VulkanBackend::pick_queue_family(
-                &families,
-                vk::PhysicalDeviceType::INTEGRATED_GPU,
-                false
-            ),
-            Some(1)
+            VulkanBackend::pick_queue_family(&swapped, false),
+            Some((1, ComputeRing::NotAsked))
         );
     }
 
@@ -5518,12 +5524,32 @@ mod tests {
             vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE,
         )];
         assert_eq!(
-            VulkanBackend::pick_queue_family(
-                &families,
-                vk::PhysicalDeviceType::DISCRETE_GPU,
-                false
-            ),
-            Some(0)
+            VulkanBackend::pick_queue_family(&families, true),
+            Some((0, ComputeRing::Missing))
+        );
+    }
+
+    /// The segment timing, the dropped-work check and the per-op profile read timestamps from
+    /// the submit queue, so a COMPUTE-only family that writes none is not taken even when asked
+    /// for; a second one that does write them is.
+    #[test]
+    fn a_compute_only_family_without_timestamps_is_refused() {
+        let mut families = amd_families();
+        families[1].timestamp_valid_bits = 0;
+        assert_eq!(
+            VulkanBackend::pick_queue_family(&families, true),
+            Some((0, ComputeRing::NoTimestamps))
+        );
+        let mut three = [families[0], families[1], amd_families()[1]];
+        assert_eq!(
+            VulkanBackend::pick_queue_family(&three, true),
+            Some((2, ComputeRing::Taken))
+        );
+        // Not asked for, and only compute-only families can compute: the timed one.
+        three[0].queue_flags = vk::QueueFlags::GRAPHICS;
+        assert_eq!(
+            VulkanBackend::pick_queue_family(&three, false),
+            Some((2, ComputeRing::NotAsked))
         );
     }
 
@@ -5533,14 +5559,8 @@ mod tests {
             queue_family(vk::QueueFlags::GRAPHICS),
             queue_family(vk::QueueFlags::TRANSFER),
         ];
-        assert_eq!(
-            VulkanBackend::pick_queue_family(
-                &families,
-                vk::PhysicalDeviceType::DISCRETE_GPU,
-                false
-            ),
-            None
-        );
+        assert_eq!(VulkanBackend::pick_queue_family(&families, true), None);
+        assert_eq!(VulkanBackend::pick_queue_family(&families, false), None);
     }
 
     /// A `Buffer` impl that is NOT a `VkBuffer` — stands in for what the multi-backend paths can

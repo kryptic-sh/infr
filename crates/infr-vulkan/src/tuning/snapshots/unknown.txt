@@ -1,6 +1,6 @@
 device:  Unknown GPU (Other, driver unreported)
 match:   vendor=other arch=Other driver=unreported integrated=false device_id=0x0001 cu=0 subgroup=32-32 driver_version=0x0
-hash:    9f1c83f9
+hash:    a3a3219d
 rows: none
 
 device.sg_pref              32     default
@@ -47,6 +47,7 @@ attn_split.min_chunk        64     fixed
 attn_split.max_chunk        512    fixed
 mla.sg_width                32     fixed
 moe.small_m                 8      default
+queue.compute_only          true   default
 submit.initial_dispatches   64     default
 submit.budget_ms            250    default
 submit.prior_gflops         16     default

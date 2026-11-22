@@ -255,12 +255,12 @@ and these exist to force one off when bisecting a correctness or perf problem.
   `[kernels.vulkan.gemv]` sub-table), attention (`flash_warp`, `flash_splits`,
   `flash_min_rows`, `pv_splits`), DeltaNet (`dn_chunk_scan`, `dn_chunk`,
   `dn_split`), and the plumbing switches (`push_desc`, `pipeline_cache_disk`,
-  `no_replay`, `no_vram_guard`, `gfx_queue` — stay on the compositor's graphics
-  ring instead of a compute-only one — the BDA chunk caps). Note `f16 = false`
-  also disables coopmat regardless of `coopmat`, matching `INFR_NO_F16`'s effect
-  today. The hardware-shaped numbers (split counts, thresholds, rows per
-  workgroup, subgroup pins) are per-device tuning parameters, set under
-  `[kernels.vulkan.tune]`; see the next section.
+  `no_replay`, `no_vram_guard`, `gfx_queue` — an alias that turns the
+  `queue.compute_only` tuning parameter off — the BDA chunk caps). Note
+  `f16 = false` also disables coopmat regardless of `coopmat`, matching
+  `INFR_NO_F16`'s effect today. The hardware-shaped numbers (split counts,
+  thresholds, rows per workgroup, subgroup pins) are per-device tuning
+  parameters, set under `[kernels.vulkan.tune]`; see the next section.
 - **`[kernels.metal]`** — the Apple backend's native/CMM/RT kernel families per
   dtype, plus `deltanet`, `moe` and `pipeline_cache` (persist the compiled
   `MTLComputePipelineState`s as an `MTLBinaryArchive` under `~/.cache/infr`, so
@@ -411,11 +411,19 @@ mid-sized model's forward at the default batch takes no cut. SmolLM3-3B at
 pass: one is owed, the other comes from its estimate standing above the real
 time.
 
-`kernels.vulkan.gfx_queue` decides which queue the submits go to, and with it
-which of the driver's watchdogs applies: a discrete card submits on a
-compute-only queue family when it has one. amdgpu documents a longer job timeout
-for its compute rings than for the graphics ring, but the budget does not count
-on it: the 2 s figure is the tighter one, and it is the one that was measured.
+`queue.compute_only` decides which queue family the submits go to, and with it
+which of the driver's watchdogs applies. It is on by default only on a discrete
+device in the slow class (no matrix units and no accelerated int8 dot, or
+wave64-only), where it was measured: an RX 580 under RADV kept its desktop
+responsive through a prefill that used to stall it. Everywhere else the submits
+stay on the universal family, as before; `kernels.vulkan.gfx_queue`
+(`INFR_GFX_QUEUE`) is an alias that turns the parameter off. A compute-only
+family that writes no timestamps is never used, with a warning when it was asked
+for, because the submit splitter, the dropped-work check and `INFR_PROF_OPS` all
+read timestamps from the submit queue. amdgpu documents a longer job timeout for
+its compute rings than for the graphics ring, but the budget does not count on
+it: the 2 s figure is the tighter one, and it is the one that was measured, on
+the graphics ring.
 
 Each value is resolved once, when the backend is created, from these levels —
 the last one that sets a parameter wins, per parameter:

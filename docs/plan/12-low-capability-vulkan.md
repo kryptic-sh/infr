@@ -325,13 +325,15 @@ not run here:
 - Their fork's prefill is 1136.1 t/s against 238.8 on the same card, from its
   `kq_fma` prefill GEMM (S4).
 
-Since then `main` took the fork's compute-ring change
-(`kernels.vulkan.gfx_queue`, PR 106): a discrete card submits on a compute-only
-queue family. amdgpu documents a longer job timeout for compute rings than for
+Since then `main` took the fork's compute-ring change (PR 106), now the tuning
+parameter `queue.compute_only`: on by default on a discrete device in the slow
+class, which is this card, and off everywhere else (`kernels.vulkan.gfx_queue`
+turns it off). amdgpu documents a longer job timeout for compute rings than for
 the graphics ring [R: the kernel's `lockup_timeout` parameter], so the 2 s above
-may no longer be the limit that applies to that card by default; it is not
-measured, and the work bound keeps assuming 2 s, the tighter figure, which also
-covers `gfx_queue = true` and Windows.
+may no longer be the limit that applies to that card by default. **The work
+bound's 2 s assumption is unverified on the compute ring**: no reset was ever
+provoked there, on any driver. The bound keeps assuming 2 s, the tighter figure,
+which also covers the universal family and Windows (B227).
 
 ## 1. Slices
 

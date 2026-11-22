@@ -15,7 +15,9 @@
 //! A case skips, with a printed line, only on a machine with no Vulkan device and no `INFR_DEV`
 //! request. Where a device is present or was asked for, a backend that does not open fails the
 //! test: every backend here is opened with tuning keys of the work bound, and a key the backend
-//! rejects must not turn into a pass that compared nothing.
+//! rejects must not turn into a pass that compared nothing. "No device" includes an enumeration
+//! that itself fails (no loader, or a broken one): with `INFR_DEV` unset that machine skips too,
+//! since nothing here can tell a broken loader from an absent one.
 //!
 //! Run: `INFR_DEV=Vulkan0 cargo test -p infr-vulkan --release --test work_split_parity --
 //! --ignored --nocapture` (also under `INFR_FORCE_WAVE64=1`).
@@ -56,7 +58,11 @@ fn backend(extra: &[(&str, &str)]) -> Option<VulkanBackend> {
 struct Run {
     y: Vec<f32>,
     splits: u64,
+    /// The ranges the cut dispatches were recorded as.
+    ranges: u64,
     work_cuts: u64,
+    /// The dispatch count the forward reported to the submit splitter.
+    dispatches: u64,
     kernels: Vec<&'static str>,
 }
 
@@ -120,6 +126,7 @@ fn run_chain(be: &VulkanBackend, dt: DType, rows: usize, widths: &[usize]) -> Ru
     }
     binds.bind(y, yb.as_ref());
     let (splits0, cuts0) = (be.work_splits(), be.segment_cuts().work);
+    let ranges0 = be.work_split_ranges();
     be.execute(plan.as_ref(), &binds).expect("execute");
     let mut out = vec![0f32; rows * dim];
     be.download(yb.as_ref(), bytemuck::cast_slice_mut(&mut out))
@@ -128,7 +135,9 @@ fn run_chain(be: &VulkanBackend, dt: DType, rows: usize, widths: &[usize]) -> Ru
     Run {
         y: out,
         splits: be.work_splits() - splits0,
+        ranges: be.work_split_ranges() - ranges0,
         work_cuts: be.segment_cuts().work - cuts0,
+        dispatches: be.last_forward_dispatches(),
         kernels: be.split_kernels(),
     }
 }
@@ -161,6 +170,20 @@ fn case(label: &str, masks: &[(&str, &str)], dt: DType, rows: usize, dim: usize)
     assert!(
         got.work_cuts > 0,
         "{label}: the ranges were not given submits of their own"
+    );
+    // Every range is a dispatch, whichever of the recorder's command buffers it went into: the
+    // forward reports the uncut forward's dispatches plus the ranges, less the dispatches the
+    // ranges replace. These forwards end in the recorder that made the cuts, so a count taken
+    // from its open buffer alone comes out short.
+    assert!(want.dispatches > 0, "{label}: no dispatch count reported");
+    assert_eq!(
+        got.dispatches,
+        want.dispatches + got.ranges - got.splits,
+        "{label}: the forward reported {} dispatches for {} uncut, {} cut into {} ranges",
+        got.dispatches,
+        want.dispatches,
+        got.splits,
+        got.ranges
     );
     let mismatch = got
         .y

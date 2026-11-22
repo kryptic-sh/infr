@@ -462,6 +462,10 @@ struct VulkanShared {
     segment_cuts: [AtomicU64; SegmentCut::COUNT],
     /// Dispatches the work bound recorded as several ranges ([`VulkanBackend::work_splits`]).
     work_splits: AtomicU64,
+    /// The ranges those dispatches were recorded as ([`VulkanBackend::work_split_ranges`]).
+    work_split_ranges: AtomicU64,
+    /// The dispatch count of the last forward fed to `VulkanBackend::observe_forward`.
+    last_forward_dispatches: AtomicU64,
     /// Estimated GPU time of every dispatch the work bound has counted, ns: what a forward's
     /// report sets beside its measured GPU time ([`ForwardClock`]).
     work_estimated_ns: AtomicU64,
@@ -2996,6 +3000,8 @@ impl VulkanBackend {
                 untimed_segments: AtomicU64::new(0),
                 segment_cuts: [const { AtomicU64::new(0) }; SegmentCut::COUNT],
                 work_splits: AtomicU64::new(0),
+                work_split_ranges: AtomicU64::new(0),
+                last_forward_dispatches: AtomicU64::new(0),
                 work_estimated_ns: AtomicU64::new(0),
                 uma_overflow_type,
                 host_overflow_type,
@@ -3330,6 +3336,9 @@ impl VulkanBackend {
     /// large a cap costs a device-lost. So a slow sample tightens the bound and a fast one is
     /// simply ignored.
     pub(crate) fn observe_forward(&self, busy_ns: u64, dispatches: usize) {
+        self.shared
+            .last_forward_dispatches
+            .store(dispatches as u64, Ordering::Relaxed);
         let cur = self.submit_dispatch_cap();
         let next = next_submit_cap(cur, busy_ns, dispatches, self.shared.submit_split_disabled);
         if next != cur {
@@ -3366,9 +3375,25 @@ impl VulkanBackend {
             .fetch_add(est_ns, Ordering::Relaxed);
     }
 
-    /// Count one dispatch the work bound recorded as several ranges (`crate::work`).
-    pub(crate) fn note_work_split(&self) {
+    /// Count one dispatch the work bound recorded as `ranges` ranges (`crate::work`).
+    pub(crate) fn note_work_split(&self, ranges: u32) {
         self.shared.work_splits.fetch_add(1, Ordering::Relaxed);
+        self.shared
+            .work_split_ranges
+            .fetch_add(u64::from(ranges), Ordering::Relaxed);
+    }
+
+    /// The ranges recorded for every dispatch [`Self::work_splits`] counts: each range is a
+    /// dispatch of its own, so a forward's dispatch count grows by the ranges less the dispatches
+    /// they replace.
+    pub fn work_split_ranges(&self) -> u64 {
+        self.shared.work_split_ranges.load(Ordering::Relaxed)
+    }
+
+    /// The dispatch count the last completed forward reported to the submit splitter
+    /// (`observe_forward`), the divisor of its measured time per dispatch.
+    pub fn last_forward_dispatches(&self) -> u64 {
+        self.shared.last_forward_dispatches.load(Ordering::Relaxed)
     }
 
     /// Dispatches this backend's work bound has recorded as several ranges, because their

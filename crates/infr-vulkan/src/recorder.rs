@@ -1292,6 +1292,14 @@ impl<'a> Recorder<'a> {
         self.dispatches.get()
     }
 
+    /// Dispatches recorded through this recorder in all: the open command buffer's and those of
+    /// every buffer it already submitted itself (a dispatch cut into ranges, `work_cut`). What a
+    /// forward reports for the recorder it finishes with a blocking [`Self::finish`];
+    /// `PendingSegment::dispatches` is the same total for one finished without waiting.
+    pub fn total_dispatches(&self) -> usize {
+        self.dispatches.get() + self.flushed_dispatches.get()
+    }
+
     /// This command buffer as a failed wait names it.
     fn submit_desc(&self) -> SubmitDesc {
         SubmitDesc {

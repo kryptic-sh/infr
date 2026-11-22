@@ -5852,7 +5852,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
     }
     transient.extend(pool.into_values());
     let last = rec.take().expect("segment always Some at loop end");
-    submitted_dispatches += last.dispatches();
+    submitted_dispatches += last.total_dispatches();
     let last_serial = last.serial();
     submit_wait(be_, last)?;
     // The blocking finish above waited for the last segment's own fence; waiting each pipelined

@@ -212,7 +212,7 @@ impl<'a> Recorder<'a> {
                 self.watch_stamp(Some((k.name, tag.family, piece_flops)));
             }
         }
-        self.be.note_work_split();
+        self.be.note_work_split(pieces);
     }
 
     /// Count a tagged dispatch (or one range of it) into the open command buffer: `est_ns` toward
@@ -283,8 +283,6 @@ impl<'a> Recorder<'a> {
             .replace(Self::open_segment_stamps(self.be, fresh));
         let mut old_watch = std::mem::take(&mut *self.watch.borrow_mut());
         let old_work = std::mem::take(&mut *self.seg_work.borrow_mut());
-        self.flushed_dispatches
-            .set(self.flushed_dispatches.get() + desc.dispatches);
         self.dispatches.set(0);
         self.first_op.set(Some(k.name));
         self.last_op.set(Some(k.name));
@@ -325,6 +323,8 @@ impl<'a> Recorder<'a> {
                 return Err(e);
             }
         };
+        self.flushed_dispatches
+            .set(self.flushed_dispatches.get() + desc.dispatches);
         // The descriptor pools stay with the recorder (later ranges allocate from them too) and
         // are freed only after every flushed buffer has been waited for.
         self.flushed.borrow_mut().push_back(PendingSegment {

@@ -7354,6 +7354,20 @@ op boundary once its estimated work reaches the budget. Plan 12 sections 0d and
   pipelined path has no assertion: it was read off the debug line (SmolLM3-3B
   `-u 2048` on the integrated GPU, 766 dispatches a forward where the first
   branch reported 397, the same with `INFR_PROF_OPS`).
+- **The paged paths leave their submits out of a forward's dispatch count.**
+  `rotate_stream` and `sync_stream` in `adapter.rs` submit the open segment (a
+  ring rotation, or the blocking drain before a router readback) without adding
+  its dispatches to the count `execute_static` hands the dispatch-cap loop,
+  while those segments' GPU time is in the forward's sum. So a paged MoE forward
+  reports too few dispatches for its time, the loop sees too much time per
+  dispatch, and the cap comes out lower than it should: more splitting, not
+  less. It predates this branch (both functions are on `main` as they are) and
+  was not changed.
+- **The timed window's first-sample rule was not run on a GPU.** Since the third
+  review the prior stands in for the samples a kernel does not have yet, so its
+  rate comes down only after `work::TIMED_WINDOW` fast readings. Host tests
+  cover it; the cut counts and throughputs recorded in plan 12 are from the
+  binary before it.
 - **`Recorder::free_transient`'s wait has no test.** It now waits for the
   buffers a cut dispatch already submitted before it destroys the profiling
   query pool they write to (a discarded recorder under `INFR_PROF_OPS`). It

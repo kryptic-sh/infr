@@ -606,12 +606,17 @@ table above (`main` at `7488e8fc`, two copies of each binary, `-r 3`):
 - **Cuts per forward on the RX 7900 XTX** (`RUST_LOG=infr_vulkan=debug`).
   SmolLM3-3B `-u 4096`: three work cuts in the first prefill forward (estimated
   1760 ms), two in every later one (estimated 1098 ms against 846 to 849 ms of
-  GPU time). The forward really runs longer than the budget, so one cut is owed;
-  the second comes from the estimate standing above the real time: only the
-  heaviest kernel is timed, at the bound (24576 GFLOP/s), and the others stay on
-  the prior because a segment mostly made of timed work corrects nothing. It
-  costs nothing measurable (the first row). Qwen3-1.7B `pp512`: none (estimated
-  117 ms, then 59 ms against 41 to 43). Qwen3-30B-A3B `-u 1024`: none.
+  GPU time). The 1760 ms is the same forward as the 1875 ms "by the prior" of
+  the first round: 1875 is every dispatch at its prior, and here the forward's
+  later submits were recorded after its first had completed and taught the model
+  its heaviest kernel, so part of it was already estimated lower [I: from the
+  order of events, not traced]. The forward really runs longer than the budget,
+  so one cut is owed; the second comes from the estimate standing above the real
+  time: only the heaviest kernel is timed, at the bound (24576 GFLOP/s), and the
+  others stay on the prior because a segment mostly made of timed work corrects
+  nothing. It costs nothing measurable (the first row). Qwen3-1.7B `pp512`: none
+  (estimated 117 ms, then 59 ms against 41 to 43). Qwen3-30B-A3B `-u 1024`:
+  none.
 - **Cuts per forward on the integrated GPU.** Qwen3-1.7B `pp512`: three by work
   in the first prefill forward, then four a forward by work or by the dispatch
   cap, where the cap alone made four before; estimates read about twice the GPU
@@ -637,6 +642,18 @@ table above (`main` at `7488e8fc`, two copies of each binary, `-r 3`):
   on a reset-prone device, one; no slow-side bound, one; the slowest sample
   ever, one; the latest sample only, two; an unmasked interval, one; the default
   budget back at 1000 ms, five.
+
+**After the third review (2026-11-22), one change of behaviour, not run on a
+GPU.** The comments said that lowering a timed rate takes a window of fast
+readings in a row; it took one, for a kernel's first sample. The prior now
+stands in for the samples a kernel does not have yet (`WorkModel::record`), so
+the claim holds from the first sample, and a first reading can no longer drop an
+estimate under the timing threshold for good. A kernel's first timed sample also
+puts it back at its prior until the window is full, whatever segments had made
+of it. The figures above are from the binary before this: the cut counts of a
+first forward may differ by the few dispatches it takes to fill a window. Host
+tests only (`a_first_fast_sample_does_not_lower_an_estimate_on_its_own` fails
+without it); the GPU tests and the A/B were not repeated.
 
 What it leaves out is in the backlog (B226): the budget as a starting point and
 not a ceiling, the kernels without an estimate (some prefill GEMMs and the

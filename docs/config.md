@@ -370,26 +370,34 @@ faster kernel families (8 times for an accelerated int8 dot, 16 for matrix
 units). The prior is meant to be pessimistic, so a device's first forward is cut
 more than it needs, not less, and only what the GPU measured replaces it, in two
 ways. A dispatch estimated at a thirty-second of the budget or more is timed,
-and the kernel's rate is the slowest of its last four such samples: one slow
-reading is forgotten after four more, and the rate only comes down when four in
-a row read faster. And the GPU time of every submit of a forward is set against
-the estimate of the kernels in it that have no timed dispatch, as if they had
-taken all of that time: when even so they ran faster than estimated, they are
-scaled to it, which can only err slow; a submit that ran slower changes nothing,
-and one made mostly of timed kernels corrects nothing.
+and the kernel's rate is the slowest of its last four such samples, with the
+prior counted for the ones it does not have yet: one slow reading is forgotten
+after four more, and the rate only comes down when four in a row read faster,
+from the first sample on. And the GPU time of every submit of a forward is set
+against the estimate of the kernels in it that have no timed dispatch, as if
+they had taken all of that time: when even so they ran faster than estimated,
+they are scaled to it by one shared factor. Taken together, in the mix that
+submit ran, those kernels are then never estimated under what was measured; one
+of them that is slower against its prior than the others can still come out too
+fast, within the bound below. A submit that ran slower changes nothing, and one
+made mostly of timed kernels corrects nothing.
 
 No measurement raises a kernel's throughput past a bound over its prior, so one
 bad reading cannot take a kernel out of the work bound. The bound follows from
 the budget: a submit holding twice the budget of work estimated at that floor
-must still run within the 2 s limit if the prior was exact, and within 1.5 s on
-an integrated or slow-class device. That is 3 times the prior at a budget of 250
-and 2 times at 500; a budget above 750 on those devices, or above 1000 on the
-others, gets no correction at all and keeps the prior. A sample is bounded on
-the slow side too, at 64 times slower than the prior. A kernel that cannot be
-cut the way it is tagged, and any dispatch recorded where no submit can be
-opened (a decode replay, or under `device.submit_dispatches = 0`), stays whole.
-Dispatches without an estimate (everything but the kernels above, and every
-single-row forward) count as free: the dispatch cap is what bounds those.
+must still run within 1.5 s on an integrated or slow-class device if the prior
+was exact, and within the 2 s limit itself, with no margin, on any other. That
+is 3 times the prior at a budget of 250 and 2 times at 500; from a budget of 750
+on the first kind, or 1000 on the others, no measurement lowers an estimate
+below the prior (a slow timed sample still raises it). The bound covers what the
+estimate covers: a submit holds more than twice the budget when work without an
+estimate, a tagged dispatch that stays whole, or a range held to one workgroup
+goes into it. A sample is bounded on the slow side too, at 64 times slower than
+the prior. A kernel that cannot be cut the way it is tagged, and any dispatch
+recorded where no submit can be opened (a decode replay, or under
+`device.submit_dispatches = 0`), stays whole. Dispatches without an estimate
+(everything but the kernels above, and every single-row forward) count as free:
+the dispatch cap is what bounds those.
 
 What that costs is in [plan 12](plan/12-low-capability-vulkan.md), with the
 runs: the bound holds a kernel's estimate above its real time wherever the
@@ -398,8 +406,10 @@ lost work. On the integrated GPU measured the int8 GEMMs and the flash attention
 are, so its estimates read about twice the GPU time and a `pp512` forward of
 Qwen3-1.7B is cut by work where the dispatch cap cut it before, at the same
 number of submits and the same throughput. On the RX 7900 XTX a small or
-mid-sized model's forward at the default batch takes no cut; one that really
-runs longer than the budget is cut on every pass, as it should be.
+mid-sized model's forward at the default batch takes no cut. SmolLM3-3B at
+`-u 4096`, which really runs longer than the budget, takes two cuts on every
+pass: one is owed, the other comes from its estimate standing above the real
+time.
 
 `kernels.vulkan.gfx_queue` decides which queue the submits go to, and with it
 which of the driver's watchdogs applies: a discrete card submits on a

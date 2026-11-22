@@ -311,13 +311,21 @@ On the integrated GPU the gate of 2026-11-22 ran the same filter with
 own. `infr-vulkan`'s bench and probe binaries stay out on purpose: some of them
 have lost the device on the integrated GPU.
 
-`INFR_FORCE_WAVE64=1` runs the wave64 path and `INFR_TUNE_NO_ROWS=1` the generic
-tuning defaults (both reach these tests through `infr_testkit::honour_env`).
-`measure_gpu_tolerance` (also ignored) prints the full comparison for the models
-named in `INFR_TOL_MODELS` (keys of `MODELS` in `tests/support/forced.rs`), with
-`INFR_TOL_ONLY` to pick configurations and `INFR_TOL_PROMPTS`,
-`INFR_TOL_SUBMIT`, `INFR_TOL_HEAD`, `INFR_TOL_UBATCH` and `INFR_TOL_NO_REPLAY`
-as diagnosis knobs; it is what the table was set from.
+`INFR_FORCE_WAVE64=1` runs the wave64 path, `INFR_TUNE_NO_ROWS=1` the generic
+tuning defaults, and `INFR_TUNE=family.param=value` one tuning parameter forced
+(all three reach these tests through `infr_testkit::honour_env`). The last is
+how a device here stands in for one it is not:
+`INFR_TUNE=gemv.kq_fma=true,attn_split.decode_min_chunk=16` scores every model
+on the decode kernels and the attention chunking an RX 580 gets by default. The
+capability masks (`INFR_NO_I8DOT`, `INFR_NO_COOPMAT`) do NOT reach the tests of
+`infr-llama`, which build their config from the shipped defaults: the tolerance
+tests run their own int8-free configurations (`GPU_CONFIGS`), and no whole-model
+test runs with the matrix units masked off. `measure_gpu_tolerance` (also
+ignored) prints the full comparison for the models named in `INFR_TOL_MODELS`
+(keys of `MODELS` in `tests/support/forced.rs`), with `INFR_TOL_ONLY` to pick
+configurations and `INFR_TOL_PROMPTS`, `INFR_TOL_SUBMIT`, `INFR_TOL_HEAD`,
+`INFR_TOL_UBATCH` and `INFR_TOL_NO_REPLAY` as diagnosis knobs; it is what the
+table was set from.
 
 **Results, 2026-11-18** (the ten `gpu_seam_tolerance_*` tests: seven model
 cases, the red path, the prefill-head check and the int8-free check). On the RX

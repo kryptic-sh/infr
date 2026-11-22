@@ -20,13 +20,21 @@ pub fn force_wave64() -> bool {
 }
 
 /// Apply the GPU-path knobs of the test environment to a config a helper built by hand: the forced
-/// wave64 path, and `INFR_TUNE_NO_ROWS` (`kernels.vulkan.tuning.rows`), which runs every tuning
+/// wave64 path; `INFR_TUNE_NO_ROWS` (`kernels.vulkan.tuning.rows`), which runs every tuning
 /// parameter at its generic default, so a run with it set tests the kernels a device with no table
-/// row gets.
+/// row gets; and `INFR_TUNE` (`kernels.vulkan.tune`), which forces single tuning parameters, so
+/// a run with `INFR_TUNE=gemv.kq_fma=true` tests the kernels a device without an accelerated int8
+/// dot gets. A test that pins a parameter itself adds its setting after this, at a higher level
+/// (see [`env_config_with_tune`]).
 pub fn honour_env(cfg: &mut Config) {
     let env = Config::load_from_layers(&[ConfigLayer::env().expect("test environment config")]);
     cfg.kernels.vulkan.force_wave64 = env.kernels.vulkan.force_wave64;
     cfg.kernels.vulkan.tuning.rows = env.kernels.vulkan.tuning.rows;
+    cfg.kernels
+        .vulkan
+        .tune
+        .entries
+        .extend(env.kernels.vulkan.tune.entries);
 }
 
 /// The Vulkan device `INFR_DEV` names (`device.dev`, `VulkanN`), if the test environment names

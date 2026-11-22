@@ -68,7 +68,9 @@ fn account_watched(shared: &crate::VulkanShared, w: &mut WatchStamps) {
             for (pair, &(kernel, family, flops)) in ticks.as_chunks::<2>().0.iter().zip(&w.covered)
             {
                 if pair[0][1] != 0 && pair[1][1] != 0 {
-                    let ns = (pair[1][0].wrapping_sub(pair[0][0]) as f64 * period as f64) as u64;
+                    let ticks =
+                        crate::work::ticks_between(pair[0][0], pair[1][0], shared.segment_ts_bits);
+                    let ns = (ticks as f64 * period as f64) as u64;
                     shared.work.record(kernel, family, flops, ns);
                 }
             }

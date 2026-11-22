@@ -448,6 +448,9 @@ struct VulkanShared {
     /// [`Recorder`] writes (a timestamp before its first command and after its last), or `None`
     /// when the compute queue family reports no timestamp bits. See [`ForwardClock`].
     segment_ts_period: Option<f32>,
+    /// The queue family's `timestampValidBits`: a timestamp counts modulo two to this power, so
+    /// an interval is the difference of two stamps under that mask (`work::ticks_between`).
+    segment_ts_bits: u32,
     /// `hostQueryReset` is enabled: query pools are reset from the host at creation, so a
     /// timestamp whose command buffer never ran reads as unavailable rather than undefined.
     host_query_reset: bool,
@@ -1941,7 +1944,8 @@ impl VulkanBackend {
         );
         // Per-segment GPU timing for the submit splitter (`ForwardClock`): usable only when the
         // chosen queue family writes timestamps at all.
-        let segment_ts_period = (qf_props[queue_family_index as usize].timestamp_valid_bits > 0)
+        let segment_ts_bits = qf_props[queue_family_index as usize].timestamp_valid_bits;
+        let segment_ts_period = (segment_ts_bits > 0)
             .then_some(dev_props.limits.timestamp_period)
             .filter(|p| *p > 0.0);
 
@@ -2823,6 +2827,7 @@ impl VulkanBackend {
             tuned.submit_budget_ms,
             tuned.submit_prior_gflops,
             facts.dot_accelerated,
+            facts.reset_prone(),
         );
         let submit_dispatch_cap = cfg
             .device
@@ -2993,6 +2998,7 @@ impl VulkanBackend {
                 split_prefill_only: AtomicBool::new(split_prefill_only),
                 submit_split_disabled,
                 segment_ts_period,
+                segment_ts_bits,
                 host_query_reset,
                 tuning: tuned,
                 tuning_report,

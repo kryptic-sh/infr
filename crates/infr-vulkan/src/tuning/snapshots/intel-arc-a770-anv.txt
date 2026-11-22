@@ -1,6 +1,6 @@
 device:  Intel(R) Arc(tm) A770 Graphics (DG2) (IntelXe1, INTEL_OPEN_SOURCE_MESA)
 match:   vendor=intel arch=IntelXe1 driver=INTEL_OPEN_SOURCE_MESA integrated=false device_id=0x56a0 cu=32 subgroup=8-32 driver_version=0x0
-hash:    b7f905b0
+hash:    d267cb4c
 rows: none
 
 device.sg_pref              16     default
@@ -48,7 +48,7 @@ attn_split.max_chunk        512    fixed
 mla.sg_width                32     fixed
 moe.small_m                 8      default
 submit.initial_dispatches   0      default
-submit.budget_ms            1000   default
+submit.budget_ms            500    default
 submit.prior_gflops         256    default
 split_k.fixed_grid          128    default
 split_k.fill_per_cu         4      default

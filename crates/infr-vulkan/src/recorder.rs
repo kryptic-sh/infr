@@ -11687,7 +11687,9 @@ fn account_segment(
     };
     match read {
         Ok(()) | Err(vk::Result::NOT_READY) if ticks[0][1] != 0 && ticks[1][1] != 0 => {
-            let ns = (ticks[1][0].wrapping_sub(ticks[0][0]) as f64 * period as f64) as u64;
+            let ticks =
+                crate::work::ticks_between(ticks[0][0], ticks[1][0], shared.segment_ts_bits);
+            let ns = (ticks as f64 * period as f64) as u64;
             shared.segment_gpu_ns.fetch_add(ns, Ordering::Relaxed);
             shared.note_segment_ran(recent, ns);
             Ok(Some(ns))

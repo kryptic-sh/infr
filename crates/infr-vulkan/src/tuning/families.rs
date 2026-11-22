@@ -631,11 +631,27 @@ pub(crate) static PARAMS: &[Param] = &[
         kind: Kind::Fixed,
         ty: uint(64, 64),
         axis: Axis::None,
-        doc: "decode split-K attention: fewest keys per chunk",
-        rule: "64 (fixed: attn_live.comp)",
+        doc: "split-K attention of a batched forward's rows: fewest keys per chunk (decode rows \
+              take attn_split.decode_min_chunk)",
+        rule: "64 (fixed: the host policy the small-batch prefill tiers were measured with)",
         default: |_, _| Value::Uint(crate::adapter::ATTN_SPLIT.min_chunk as u64),
         get: |_, _| Value::Uint(crate::adapter::ATTN_SPLIT.min_chunk as u64),
         set: fixed_set,
+    },
+    Param {
+        family: "attn_split",
+        name: "decode_min_chunk",
+        kind: Kind::Host,
+        ty: uint(1, crate::adapter::ATTN_SPLIT.max_chunk as u64),
+        axis: Axis::None,
+        doc: "decode split-K attention: fewest keys per chunk, for a decode row and for the MTP \
+              verify rows that must match it; it sets the chunk of every span under 32 times \
+              its value",
+        rule: "16 on a discrete device in the slow class (no matrix units and no accelerated \
+               int8 dot, or wave64-only), where it was measured; else 64",
+        default: |f, _| Value::Uint(if !f.integrated && f.slow_class() { 16 } else { 64 }),
+        get: |t, _| Value::Uint(t.attn_decode_min_chunk as u64),
+        set: |t, _, v| t.attn_decode_min_chunk = v.usize(),
     },
     Param {
         family: "attn_split",

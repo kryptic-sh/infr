@@ -1621,3 +1621,24 @@ fn compute_only_queue_follows_the_device_facts() {
     );
     assert!(r.tuning.queue_compute_only);
 }
+
+/// `attn_split.decode_min_chunk` keeps PR 105's 16 on the class it was measured on, a discrete
+/// device in the slow class, and the 64 every other device ran before it; `infr tune show` reads
+/// the same field the attention lowering does. A floor above the policy's ceiling is refused.
+#[test]
+fn decode_chunk_floor_follows_the_device_facts() {
+    let floor = |id: &str| fixture_tuning(id).attn_decode_min_chunk;
+    assert_eq!(floor("rx580-gcn-radv"), 16);
+    assert_eq!(floor("rx7900xtx-amdwin"), 64);
+    assert_eq!(floor("rx7900xtx-radv"), 64);
+    assert_eq!(floor("raphael-igpu-amdwin"), 64);
+    let r = resolve_fixture(
+        "rx7900xtx-amdwin",
+        &env_cfg(&[("INFR_TUNE", "attn_split.decode_min_chunk=16")]),
+    );
+    assert_eq!(r.tuning.attn_decode_min_chunk, 16);
+    assert_eq!(value_of(&r, "attn_split.decode_min_chunk").0, "16");
+    let cfg = env_cfg(&[("INFR_TUNE", "attn_split.decode_min_chunk=513")]);
+    let e = resolve_with(&fixture("rx7900xtx-amdwin"), &cfg, &[], None).unwrap_err();
+    assert!(e.contains("out of range"), "{e}");
+}

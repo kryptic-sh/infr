@@ -10,6 +10,7 @@
 #![allow(clippy::too_many_arguments)]
 
 mod adapter;
+mod attn_chunk;
 mod caps;
 pub mod ep;
 mod gemm;

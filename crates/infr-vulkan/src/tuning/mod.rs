@@ -236,6 +236,9 @@ pub(crate) struct Tuning {
     pub flash_force_bm32: bool,
     /// `attn_pv.*`: the non-flash coopmat attention's P·V split.
     pub pv: AttnSplit,
+    /// `attn_split.decode_min_chunk`: the chunk floor of decode split-K attention
+    /// (`crate::attn_chunk`).
+    pub attn_decode_min_chunk: usize,
     /// `attn_canvas.chunks`: the canvas-mask split-K chunk divisor.
     pub canvas_chunks: usize,
     /// `moe.small_m`: the small-batch MoE path's row ceiling.

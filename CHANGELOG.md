@@ -116,6 +116,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   the submit splitter, the dropped-work check and `INFR_PROF_OPS` read
   timestamps from the submit queue.
 
+- **Tuning parameter `attn_split.decode_min_chunk`: the chunk floor of decode
+  split-K attention.** Decode attention cuts each head's keys into chunks of
+  `max(keys / 32, floor)`, one workgroup per chunk. The floor is 16 on a
+  discrete device in the slow class (no matrix units and no accelerated int8
+  dot, or wave64-only): on an RX 580 under RADV that took
+  gemma-4-E4B-it-qat-UD-Q4_K_XL decode from 39.24 to 45.74 tok/s at depth 16 and
+  from 40.73 to 41.45 at depth 2048 (`docs/perf/vulkan-decode-attn-chunk.md`).
+  Every other device keeps 64, the floor before this, so its decode output is
+  unchanged. The floor sets the chunk of every span under 32 times its value, so
+  16 changes the last bits of decode attention up to 2047 keys of context, not
+  only under 512. MTP verify batches take the same floor as decode. The combine
+  pass (`attn_combine.comp`) now issues the partial loads of 8 chunks before
+  testing their weights, on every device, with the same sums in the same order.
+
 - **GPU logits held to the CPU reference within a tolerance.** New public module
   `infr_llama::tolerance`: `score_row` and `RunScore` (KL divergence, top-set
   probability cosine, centred logit deviation, top-1 agreement above a near-tie

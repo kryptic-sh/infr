@@ -1012,7 +1012,7 @@ enum RopeMode<'a> {
 /// dispatch with a larger chunk COUNT is an OOB shared-memory write. This is the device fact the
 /// shared [`infr_core::tier::cap_chunk_count`] / [`infr_core::tier::baked_chunk`] policy is
 /// parameterized by.
-const ATTN_MAX_CHUNKS: usize = 1024;
+pub(crate) const ATTN_MAX_CHUNKS: usize = 1024;
 
 /// `attn_partial.comp` stages one chunk's scores in `shared float sc[ATTN_PARTIAL_MAX_CHUNK]`, so a
 /// chunk of more keys is an OOB shared-memory write. Every chunk size the adapter hands that kernel
@@ -1025,23 +1025,11 @@ const ATTN_PARTIAL_MAX_CHUNK: usize = 1024;
 /// array sized by its `-DSC_MAX` build define (`build.rs`): its fixed chunk, and its bound.
 const ATTN_MROWS_CHUNK: usize = 256;
 
-/// Baked split-K chunk floor for DECODE rows. Shallow kv is latency-bound, not bandwidth-bound:
-/// a 64-key floor put one wave64 per (head, chunk) on the device and left a 42-layer chain of
-/// ~40us dispatches at kv < 200. Both decode paths re-derive `max(span/32, floor)` from the live
-/// span, so a lower floor only binds below span 512 and deep decode is unchanged.
-const ATTN_DECODE_MIN_CHUNK: usize = 16;
-
-/// Decode's [`ATTN_SPLIT`]: the same ~32 chunks/head shape with the decoder's lower floor.
-const ATTN_SPLIT_DECODE: infr_core::tier::AttnSplitCfg = infr_core::tier::AttnSplitCfg {
-    target_chunks: 32,
-    min_chunk: ATTN_DECODE_MIN_CHUNK,
-    max_chunk: 512,
-    rounding: infr_core::tier::ChunkRounding::Down,
-};
-
 /// Flash-decoding split-K chunk policy: ~32 chunks/head, each 64..512 keys, floor-rounded (the
 /// measured Vulkan `attn_partial` shape — see [`infr_core::tier::ChunkRounding`] for why the
-/// rounding is config and not a shared constant).
+/// rounding is config and not a shared constant). Decode rows, and the MTP verify rows that must
+/// match them, take the same shape with the floor of the tuning parameter
+/// `attn_split.decode_min_chunk` (`crate::attn_chunk`).
 pub(crate) const ATTN_SPLIT: infr_core::tier::AttnSplitCfg = infr_core::tier::AttnSplitCfg {
     target_chunks: 32,
     min_chunk: 64,
@@ -2608,8 +2596,10 @@ fn lower_op(
                 // Baked MIN chunk, rising only when the capacity would exceed the
                 // ATTN_MAX_CHUNKS scratch/combine cap; the kernel derives the effective adaptive
                 // chunk from the live kv_len each token, so one recorded plan serves every depth.
-                let chunk =
-                    infr_core::tier::baked_chunk(cap_rows, ATTN_MAX_CHUNKS, ATTN_DECODE_MIN_CHUNK);
+                let chunk = crate::attn_chunk::baked_min_chunk(
+                    cap_rows,
+                    be_.tuning().attn_decode_min_chunk,
+                );
                 let n_chunks = infr_core::tier::n_chunks(cap_rows, chunk);
                 // A cache past `ATTN_PARTIAL_MAX_CHUNK * ATTN_MAX_CHUNKS` rows bakes a chunk the
                 // partial kernel cannot stage; it takes the scalar decode instead.
@@ -2748,8 +2738,10 @@ fn lower_op(
                 // reads the compact block format INLINE in `attn_partial` (no dequant→f16 prepass,
                 // no f16 scratch — the ¼-traffic win at long context). Gate it to the case the
                 // split-K decode path definitely handles inline: rows==1, K==V one inline-decode
-                // format, hd%4≤512, and the split-K tier is the one that fires (this predicate is
-                // EXACTLY `split_ok` at rows==1 for a full-context causal/SWA cache — see below).
+                // format, hd%4≤512, and the split-K tier is the one that fires. `dec_chunk` below
+                // is the chunk the static decode arm computes for the same span, from the same
+                // function and floor (`attn_chunk::static_chunk`), so `dec_span > dec_chunk` is
+                // that arm's `span > chunk` before its chunk-count cap.
                 // Conservatively keep the prepass for ring / capacity-limited caches (`ring_past` /
                 // `cap_short`) and for `hd` the split path rejects — those still run correctly (if
                 // slower) through the f16 scratch. PREFILL (rows>1) always keeps the prepass (coopmat
@@ -2764,7 +2756,8 @@ fn lower_op(
                     0
                 };
                 let dec_span = kv_len - dec_swa_base;
-                let dec_chunk = infr_core::tier::adaptive_chunk(dec_span, &ATTN_SPLIT);
+                let dec_chunk =
+                    crate::attn_chunk::static_chunk(dec_span, be_.tuning().attn_decode_min_chunk);
                 // Only exclude a RING cache (SWA past its wrap) — its RROW-wrapped inline read is
                 // correct but out of the kv_addr_parity coverage, so keep the prepass there for now.
                 // (`cap_short` — the nonfa 256-row PREFILL tile-pad guard — is irrelevant to the
@@ -3099,10 +3092,12 @@ fn lower_op(
                     // rows for a ring, kv_len itself here), so a few big chunks keep the scratch
                     // ~100s of MB with plenty of workgroups (nh * n_chunks * rows).
                     512
-                } else if rows == 1 {
-                    // Decode: the shuffle-free scalar kernel is the only fallback below the split
-                    // floor, and at kv < 64 it costs more than the whole split pass.
-                    infr_core::tier::adaptive_chunk(span, &ATTN_SPLIT_DECODE)
+                } else if crate::attn_chunk::uses_decode_floor(rows, graph.mtp_verify) {
+                    // Decode, and an MTP verify batch: the floor is the tuning parameter
+                    // `attn_split.decode_min_chunk`. The verify rows share it because a chunk
+                    // boundary moves the result's last bits, and a verify row has to score its
+                    // position as the decode step would.
+                    crate::attn_chunk::static_chunk(span, be_.tuning().attn_decode_min_chunk)
                 } else {
                     infr_core::tier::adaptive_chunk(span, &ATTN_SPLIT)
                 };

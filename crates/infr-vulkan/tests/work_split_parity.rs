@@ -12,6 +12,11 @@
 //! cuts opened) and `split_kernels` (which kernels were cut), so a case that cut nothing fails
 //! instead of comparing two identical unsplit runs.
 //!
+//! A case skips, with a printed line, only on a machine with no Vulkan device and no `INFR_DEV`
+//! request. Where a device is present or was asked for, a backend that does not open fails the
+//! test: every backend here is opened with tuning keys of the work bound, and a key the backend
+//! rejects must not turn into a pass that compared nothing.
+//!
 //! Run: `INFR_DEV=Vulkan0 cargo test -p infr-vulkan --release --test work_split_parity --
 //! --ignored --nocapture` (also under `INFR_FORCE_WAVE64=1`).
 use infr_core::backend::{Backend, Bindings, Buffer, BufferUsage};
@@ -21,6 +26,8 @@ use infr_vulkan::VulkanBackend;
 use std::sync::Arc;
 
 /// A backend on the `INFR_DEV` device with the environment's settings, then `extra` over them.
+/// `None` only when the machine has no Vulkan device and none was requested (see the module doc);
+/// any other failure to open panics with the backend's error.
 fn backend(extra: &[(&str, &str)]) -> Option<VulkanBackend> {
     let mut pairs: Vec<(String, String)> = std::env::vars()
         .filter(|(k, _)| k.starts_with("INFR_") && k != "INFR_TUNE")
@@ -31,8 +38,18 @@ fn backend(extra: &[(&str, &str)]) -> Option<VulkanBackend> {
     }
     let get = |k: &str| pairs.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
     let layer = infr_core::config::env::parse(&get).expect("environment config");
-    let cfg = Config::load_from_layers(&[layer]);
-    infr_testkit::gpu_env::gpu_or_skip(VulkanBackend::new_with(Arc::new(cfg)))
+    let cfg = Arc::new(Config::load_from_layers(&[layer]));
+    let opened = VulkanBackend::new_with(Arc::clone(&cfg));
+    if let Err(e) = &opened {
+        let present = VulkanBackend::enumerate_devices(&cfg).is_ok_and(|devs| !devs.is_empty());
+        assert!(
+            !present && get("INFR_DEV").is_none(),
+            "the Vulkan backend did not open with {extra:?} (a Vulkan device is present: \
+             {present}; INFR_DEV: {:?}): {e}",
+            get("INFR_DEV")
+        );
+    }
+    infr_testkit::gpu_env::gpu_or_skip(opened)
 }
 
 /// What one run produced: the output, and what the work bound did.

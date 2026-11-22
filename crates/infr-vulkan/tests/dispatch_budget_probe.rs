@@ -1,7 +1,8 @@
-//! Measurement probe, not a test of correctness: how long ONE heavy dispatch, or one submit of
-//! several, may run on the `INFR_DEV` device before the driver's watchdog drops the work (plan 12
-//! section 0c). Every iteration executes one graph, one submit unless the work bound cuts it, and
-//! reports its wall time and whether it completed.
+//! Measurement probe: how long ONE heavy dispatch, or one submit of several, may run on the
+//! `INFR_DEV` device before the driver's watchdog drops the work (plan 12 section 0d, whose table
+//! it produced). Every iteration executes one graph, one submit unless the work bound cuts it,
+//! and reports its wall time; an iteration the backend reports as failed fails the test, so a
+//! point past the device's limit is a red run, not a line in a passing one.
 //!
 //! The heavy op is a Q4_K `Op::Linear` of `PROBE_ROWS` rows over a 2048 x 22016 weight (SmolLM3-3B's
 //! fused gate/up shape). With the int8 kernels off (`INFR_NO_I8DOT=1`) on a device without matrix
@@ -50,6 +51,7 @@ fn probe_heavy_dispatch_duration() {
         rows.is_multiple_of(pieces),
         "PROBE_ROWS must divide by PROBE_PIECES"
     );
+    assert!(iters > 0, "PROBE_ITERS=0 measures nothing");
     let env = ConfigLayer::env().expect("environment config");
     let cfg = Config::load_from_layers(&[env]);
     let be = VulkanBackend::new_with(Arc::new(cfg)).expect("Vulkan device");
@@ -109,7 +111,8 @@ fn probe_heavy_dispatch_duration() {
     println!(
         "probe: {rows} rows as {pieces} dispatch(es) of {part} rows (chained: {chain}), {iters} iterations"
     );
-    let mut failed = 0;
+    // The first failure ends the run: the backend is poisoned after it.
+    let mut failure = None;
     for i in 0..iters {
         let t = std::time::Instant::now();
         let r = be.execute(plan.as_ref(), &binds);
@@ -118,14 +121,19 @@ fn probe_heavy_dispatch_duration() {
             Ok(()) => println!("probe: iter {i}: completed in {ms:.0} ms"),
             Err(e) => {
                 println!("probe: iter {i}: FAILED after {ms:.0} ms: {e}");
-                failed += 1;
+                failure = Some((i, e));
                 break;
             }
         }
     }
     println!(
-        "probe: rows={rows} pieces={pieces}: {failed} failure(s); cuts {:?}; measured GFLOP/s {:?}",
+        "probe: rows={rows} pieces={pieces}: cuts {:?}; {} dispatch(es) cut into ranges; learned \
+         GFLOP/s {:?}",
         be.segment_cuts(),
+        be.work_splits(),
         be.work_measured_gflops()
     );
+    if let Some((i, e)) = failure {
+        panic!("probe: iteration {i} of {iters} did not complete: {e}");
+    }
 }

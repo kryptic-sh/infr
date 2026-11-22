@@ -259,22 +259,16 @@ Every test ends as a pass, a fail or a printed `skip:` line, never a hang:
   twice, so the worst case for the whole set is several hours, not 20 minutes;
   the watchdog ends the test process, so under plain `cargo test` (one process)
   the tests after it do not run;
-- on an integrated GPU the runs whose configuration turns every int8 kernel off
-  score the prefill on each chunk's last row only and run with a submit cap of 4
-  (`INTEGRATED_FLOAT_SUBMIT_CAP`), said in the log. This is a **harness
-  workaround for a production weakness**, not a fix: with every int8 kernel off,
-  the harness's prefill head is one vocabulary-wide dispatch of about 25 ms per
-  chunk row there (3.26 s at the default 128-row chunk), and with it in flight
-  Windows resets the engine in some runs, even with that dispatch alone in its
-  submit ([plan 12](plan/12-low-capability-vulkan.md) sections 0b and 0c; the
-  exact rule is not established). No submit cap shortens one dispatch, so the
-  workaround stays until the backend splits heavy ops (backlog B221). Such a run
-  now ends in a backend error instead of a hang. The prefill phase of those runs
-  scores one row per chunk, is not held to `MIN_TOP1_SCORED`, and does not score
-  positions 0 and 1 at all unless one ends a chunk. It is keyed on the device
-  being integrated: a slow discrete card (issue 94's class) gets no workaround
-  and would meet the same error; the float-weight models' shipped `gpu` runs and
-  the int8-free check keep the full head there too, and completed.
+- an integrated GPU scores the full prefill head like every other device. With
+  every int8 kernel off that head is one vocabulary-wide dispatch of about 25 ms
+  per chunk row there (3.26 s at the default 128-row chunk), and one submit of
+  more than about 2 s is what Windows resets
+  ([plan 12](plan/12-low-capability-vulkan.md) sections 0c and 0d). The backend
+  now cuts such a dispatch into ranges of its grid, each in a submit of its own
+  and bit-identical to the whole (`submit.budget_ms`, plan 12 S2), so the head
+  runs as it is. Until 2026-11-22 those runs scored the prefill on each chunk's
+  last row only, under a submit cap of 4: a harness workaround, removed with no
+  table row changed.
 
 `INFR_FORCE_WAVE64=1` runs the wave64 path and `INFR_TUNE_NO_ROWS=1` the generic
 tuning defaults (both reach these tests through `infr_testkit::honour_env`).
@@ -293,6 +287,12 @@ integrated GPU, native lanes, all ten passed with the workaround above in 637 s
 (Qwen3 80 s, Qwen3.5 82 s, gemma-3 133 s, LFM3 266 s, ERNIE 67 s); wave64 and
 rows off were not gate-run there. These GPU results predate the rebase onto the
 CPU's FMA-tier commits on `main`.
+
+**Results, 2026-11-22, integrated GPU, native lanes, workaround removed** (the
+full head scored on every prefill row of every run, the table untouched): all
+ten `gpu_seam_tolerance_*` tests passed, nine in the gate run (Qwen3 89 s,
+Qwen3.5 99 s, gemma-3 140 s, LFM3 239 s, the rest under 5 s each) and the ERNIE
+case, which the integrated GPU's gate filter leaves out, on its own in 69 s.
 
 The red-path tests scale `blk.1.ffn_down.weight` of the synthetic model by 1.02.
 On the CPU a 1.01 scale already trips the gate and 1.008 and below pass

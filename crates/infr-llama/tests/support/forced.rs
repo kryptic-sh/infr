@@ -583,36 +583,6 @@ pub fn watchdog(what: &str, limit: std::time::Duration) -> Watchdog {
     Watchdog(Some(tx))
 }
 
-/// What the harness changes for its int8-off runs on an integrated GPU: the prefill head on each
-/// chunk's last row only ([`PrefillHead::LastOfChunk`]) and a submit-splitter cap of this many
-/// dispatches (`device.submit_dispatches`). Keyed on the device being integrated and on the
-/// configuration having every int8 kernel off ([`int8_off`]); a slow DISCRETE device, issue 94's
-/// class, gets no workaround and would meet the same failure, which the backend now reports as an
-/// error (`device.gpu_wait_timeout_ms`, the lost device or the dropped segment), and float-weight
-/// models' shipped `gpu` runs keep the full head.
-///
-/// A HARNESS WORKAROUND for a production weakness, not a fix. The harness's prefill head is ONE
-/// vocabulary-wide float GEMM dispatch over every chunk row (`native_q6k` on Qwen3.5-0.8B), about
-/// 25 ms per row on the integrated GPU. With that dispatch in flight Windows resets the engine
-/// (a TDR engine timeout, in the event log), though not on every run: one run each lost the
-/// device at 96 and 128 rows with the dispatch alone in its submit, and completed at 32 and 64,
-/// while other runs at 128 completed. Whether the rule is a fixed limit on one dispatch or a
-/// preemption timeout is not established (`docs/plan/12-low-capability-vulkan.md` section 0c).
-/// No submit cap shortens one dispatch, and the head on each chunk's last row is one row's work
-/// and has never been reset; the cap of 4 is kept from before. The prefill phase of those
-/// runs then scores one row per chunk, too few for [`MIN_TOP1_SCORED`], which is not asked of it,
-/// and their first two positions are not scored at all unless one ends a chunk.
-pub const INTEGRATED_FLOAT_SUBMIT_CAP: usize = 4;
-
-/// Whether the [`GPU_CONFIGS`] entry `name` turns every int8-activation kernel knob off (see
-/// [`INTEGRATED_FLOAT_SUBMIT_CAP`]): read from the configuration its edit produces, not its name.
-fn int8_off(name: &str) -> bool {
-    let mut c = EngineConfig::default();
-    (gpu_config(name).1)(&mut c);
-    let v = &c.kernels.vulkan;
-    !(v.i8cm_kq || v.dp4a_kq || v.mmq || v.mrow || v.i8_dot) && v.mmv_mw == Some(false)
-}
-
 /// The [`GPU_CONFIGS`] entry named `name`.
 fn gpu_config(name: &str) -> &'static GpuConfig {
     GPU_CONFIGS
@@ -649,8 +619,7 @@ fn test_device() -> Option<(bool, String)> {
 /// decode rows each within its `steady` bound, and each of those two phases must score at least
 /// [`MIN_TOP1_SCORED`] positions above the near-tie margin. Skips, with a printed line, without
 /// the model (failing instead under `INFR_TEST_REQUIRE_MODELS`), without a Vulkan device, and on
-/// an integrated device without the host memory for the model. On an integrated device the int8-off
-/// runs take the [`INTEGRATED_FLOAT_SUBMIT_CAP`] workaround, said in the log. Fails a run that outlives
+/// an integrated device without the host memory for the model. Fails a run that outlives
 /// [`GATE_TIMEOUT`]. Prints every measured value, so a new device's numbers can be read off the
 /// log.
 pub fn gate(key: &str, runs: &[(&str, PathClass)]) {
@@ -683,15 +652,8 @@ pub fn gate(key: &str, runs: &[(&str, PathClass)]) {
             }
         }
     }
-    if integrated && runs.iter().any(|&(name, _)| int8_off(name)) {
-        eprintln!(
-            "note: {key} on {device}: the int8-off runs score the prefill on each chunk's last \
-             row only and take a submit cap of {INTEGRATED_FLOAT_SUBMIT_CAP} dispatches, a \
-             harness workaround (docs/backlog.md B207)"
-        );
-    }
     let t_case = std::time::Instant::now();
-    let failures = evaluate_on(key, &case, &case, ForcedOn::Vulkan, runs, integrated);
+    let failures = evaluate(key, &case, &case, ForcedOn::Vulkan, runs);
     eprintln!(
         "time {key}: {:.1}s on {device}",
         t_case.elapsed().as_secs_f64()
@@ -714,19 +676,6 @@ pub fn evaluate(
     on: ForcedOn,
     runs: &[(&str, PathClass)],
 ) -> Vec<String> {
-    evaluate_on(key, reference, test, on, runs, false)
-}
-
-/// [`evaluate`], with the int8-off runs on the [`INTEGRATED_FLOAT_SUBMIT_CAP`] workaround when
-/// `integrated`.
-fn evaluate_on(
-    key: &str,
-    reference: &Case,
-    test: &Case,
-    on: ForcedOn,
-    runs: &[(&str, PathClass)],
-    integrated: bool,
-) -> Vec<String> {
     let mut failures = Vec::new();
     // Per run, the steady phases merged over every prompt, for the top-1 count.
     let mut merged: Vec<[Option<RunScore>; 2]> = vec![[None, None]; runs.len()];
@@ -744,23 +693,7 @@ fn evaluate_on(
                     &r,
                 ),
             };
-            let capped = integrated && int8_off(name);
-            let g = forced_with(
-                &test.model,
-                on,
-                |c| {
-                    edit(c);
-                    if capped {
-                        c.device.submit_dispatches = Some(INTEGRATED_FLOAT_SUBMIT_CAP);
-                    }
-                },
-                if capped {
-                    PrefillHead::LastOfChunk
-                } else {
-                    PrefillHead::All
-                },
-                &r,
-            );
+            let g = forced_with(&test.model, on, edit, PrefillHead::All, &r);
             let s = score(
                 &reference_run,
                 &g,
@@ -796,8 +729,7 @@ fn evaluate_on(
     for (&(name, _), m) in runs.iter().zip(&merged) {
         for (phase, ps) in ["prefill", "decode"].iter().zip(m) {
             let ps = ps.as_ref().expect("every run scored");
-            let one_row_per_chunk = *phase == "prefill" && integrated && int8_off(name);
-            if ps.top1_scored < MIN_TOP1_SCORED && !one_row_per_chunk {
+            if ps.top1_scored < MIN_TOP1_SCORED {
                 failures.push(format!(
                     "{name} {phase}: only {} of {} positions clear the {}-nat near-tie margin \
                      (at least {MIN_TOP1_SCORED} needed, or the top-1 check is vacuous)",

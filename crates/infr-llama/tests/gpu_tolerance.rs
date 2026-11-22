@@ -112,7 +112,7 @@ fn gpu_seam_tolerance_goes_red_on_a_scaled_weight() {
 
 /// The prefill head the harness adds is a vocabulary-wide GEMM production never runs; it must not
 /// change anything else: the decode rows, which read the KV the prefill wrote, are bit-identical
-/// with the head on every row, on each chunk's last row (the integrated-GPU workaround) and off.
+/// with the head on every row, on each chunk's last row (`INFR_TOL_HEAD=last`) and off.
 /// The chunk height is forced to [`forced::SMALL_UBATCH`] so the prompt spans several chunks and
 /// the first decode row follows a multi-chunk prefill.
 #[test]

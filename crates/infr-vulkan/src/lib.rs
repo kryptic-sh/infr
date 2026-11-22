@@ -1907,48 +1907,6 @@ impl VulkanBackend {
             );
         }
 
-        // ── compute queue family ───────────────────────────────────────────────
-        // A COMPUTE-only family runs on the `comp` rings, a separate engine from the `gfx` ring
-        // the compositor submits its frames on, so a multi-second prefill delays KWin's frame
-        // instead of blocking it. Measured on the RX 580 with zeta-2.1 Q4_K_M: 130 fps through a
-        // prefill that used to drop glxgears to 7 (153 → 166 tok/s prefill, 31.2 → 30.7 tok/s
-        // decode). Integrated parts keep the universal family: there the `comp` ring's hang
-        // budget measured tighter than `gfx` (a deterministic device-lost where `gfx` is
-        // intermittent), and the submit splitter (`VulkanShared::submit_dispatch_cap`) already
-        // bounds the job.
-        let qf_props =
-            unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
-        let queue_family_index =
-            Self::pick_queue_family(&qf_props, dev_props.device_type, vkcfg.gfx_queue)
-                .ok_or_else(|| be("no compute queue family found"))?;
-        let on_graphics_ring = qf_props[queue_family_index as usize]
-            .queue_flags
-            .contains(vk::QueueFlags::GRAPHICS);
-        if dev_props.device_type == vk::PhysicalDeviceType::DISCRETE_GPU
-            && on_graphics_ring
-            && !vkcfg.gfx_queue
-        {
-            tracing::warn!(
-                "[infr] vulkan: no COMPUTE-only queue family on this device; inference shares \
-                 queue family {queue_family_index} with the compositor's graphics ring, so a \
-                 long forward stalls the desktop's frames"
-            );
-        }
-        tracing::info!(
-            "[infr] vulkan: queue family {queue_family_index} ({})",
-            if on_graphics_ring {
-                "graphics ring, shared with the compositor"
-            } else {
-                "compute-only ring"
-            }
-        );
-        // Per-segment GPU timing for the submit splitter (`ForwardClock`): usable only when the
-        // chosen queue family writes timestamps at all.
-        let segment_ts_bits = qf_props[queue_family_index as usize].timestamp_valid_bits;
-        let segment_ts_period = (segment_ts_bits > 0)
-            .then_some(dev_props.limits.timestamp_period)
-            .filter(|p| *p > 0.0);
-
         // ── probe device extensions ────────────────────────────────────────────
         let avail_exts = unsafe { instance.enumerate_device_extension_properties(physical_device) }
             .map_err(|e| be(format!("enumerate device extensions: {e}")))?;
@@ -2488,6 +2446,139 @@ impl VulkanBackend {
             ext_ptrs.push(ash::ext::device_fault::NAME.as_ptr());
         }
 
+        // ── capabilities ───────────────────────────────────────────────────────
+        // Query base limits + the subgroup-size range together via properties2 (the coopmat GEMM
+        // pins requiredSubgroupSize=32, so the fallback ladder needs to know whether 32 is in range).
+        let mut sgsize_props = vk::PhysicalDeviceSubgroupSizeControlProperties::default();
+        // Maintenance3 (core in Vulkan 1.1) carries `maxMemoryAllocationSize` — the weight arena
+        // splits its up-front reservation into blocks no larger than this.
+        let mut maint3_props = vk::PhysicalDeviceMaintenance3Properties::default();
+        // Float controls (core in Vulkan 1.2) say whether a shader may declare its f16 rounding.
+        let mut float_controls = vk::PhysicalDeviceFloatControlsProperties::default();
+        let mut props2 = vk::PhysicalDeviceProperties2::default()
+            .push_next(&mut sgsize_props)
+            .push_next(&mut maint3_props)
+            .push_next(&mut float_controls);
+        unsafe { instance.get_physical_device_properties2(physical_device, &mut props2) };
+        let props = props2.properties;
+        let rte_f16_supported = float_controls.shader_rounding_mode_rte_float16 == vk::TRUE;
+        // 0 = not reported → fall back to the Vulkan-guaranteed floor (2^30 = 1 GiB).
+        let max_mem_alloc_size = if maint3_props.max_memory_allocation_size == 0 {
+            1 << 30
+        } else {
+            maint3_props.max_memory_allocation_size
+        };
+        let device_name = unsafe { CStr::from_ptr(props.device_name.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+        // (0,0) when subgroup-size-control is unsupported: can't pin any size — the adapter treats
+        // that as "no 32-pin available" and uses the driver's default subgroup for the fallback.
+        // Under `kernels.vulkan.force_wave64` the range reads [64, 64], so every tier decision
+        // downstream sees what a wave64-only device would report.
+        let (subgroup_min, subgroup_max) = match sg_mode {
+            crate::caps::SubgroupMode::Wave64 { forced: true } => (64, 64),
+            _ if has_sgsize => (
+                sgsize_props.min_subgroup_size,
+                sgsize_props.max_subgroup_size,
+            ),
+            _ => (0, 0),
+        };
+        // The subgroup width itself was settled above (`sg_mode`), before the coopmat tiers.
+        check_required_features(has_int8, has_full_sg)?;
+        match sg_mode {
+            crate::caps::SubgroupMode::Native => {}
+            crate::caps::SubgroupMode::Wave64 { forced: false } => tracing::info!(
+                "[infr] wave64-only device: running the wave32 kernels on 32-lane virtual \
+                 subgroups; cooperative-matrix tiers off"
+            ),
+            crate::caps::SubgroupMode::Wave64 { forced: true } => tracing::warn!(
+                "[infr] kernels.vulkan.force_wave64: running the wave64 emulation on a device that \
+                 can pin 32 (testing only); cooperative-matrix tiers off"
+            ),
+        }
+
+        // ── integrated GPU + compute-unit count ───────────────────────────────────────────────
+        // An iGPU/APU is NOT just "a slow discrete card": it is forced onto the non-coopmat kernel
+        // tier (RDNA2/Raphael enumerates no cooperative matrix at all) AND carries ~1/50th the
+        // compute, so a prefill chunk sized for a 96-CU card becomes a single multi-SECOND command
+        // buffer — past the ~10 s `gfx`-ring watchdog it is a GPU reset, not merely slow. Detect the
+        // device class here and let the seam bound its per-submit work (`Capabilities::integrated`).
+        let integrated = props.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU;
+        // Shader-core count (0 = unknown), from whichever of the four per-vendor sources this
+        // device actually reports — see `caps::shader_core_count`, which owns that order. The
+        // property structs it reads were already chained by `probe_device_facts` above; nothing here
+        // queries the device again.
+        let compute_units = crate::caps::shader_core_count(&device_probe);
+
+        // ── tuning: every per-device kernel parameter, resolved once ──────────────────────────
+        // The table's generic defaults, its matching rows, then the user's tuning file, config,
+        // environment and command line (`tuning::resolve`). A value the user wrote that fails
+        // validation refuses the device here, naming where it came from.
+        let facts = tuning::DeviceFacts {
+            name: device_name.clone(),
+            vendor_id: device_probe.vendor_id,
+            device_id: device_probe.device_id,
+            driver: device_probe
+                .driver_id_reported
+                .then(|| tuning::driver_name(device_probe.driver_id)),
+            driver_version: props.driver_version,
+            arch: tuning::arch_name(device_arch),
+            integrated,
+            compute_units,
+            subgroup_min,
+            subgroup_max,
+            wave64: matches!(sg_mode, crate::caps::SubgroupMode::Wave64 { .. }),
+            max_shared_memory: props.limits.max_compute_shared_memory_size,
+            matrix_units: coopmat_f16 == Some(infr_core::COOPMAT_TILE_16),
+            dot_accelerated: device_probe.dot4x8_signed_accelerated,
+        };
+        let tuning::resolve::Resolved {
+            tuning: tuned,
+            report: tuning_report,
+        } = tuning::resolve::resolve(&facts, &cfg).map_err(be)?;
+
+        // ── compute queue family ───────────────────────────────────────────────
+        // A COMPUTE-only family runs on the `comp` rings, a separate engine from the `gfx` ring
+        // the compositor submits its frames on, so a multi-second prefill delays KWin's frame
+        // instead of blocking it. Measured on the RX 580 with zeta-2.1 Q4_K_M: 130 fps through a
+        // prefill that used to drop glxgears to 7 (153 → 166 tok/s prefill, 31.2 → 30.7 tok/s
+        // decode). Integrated parts keep the universal family: there the `comp` ring's hang
+        // budget measured tighter than `gfx` (a deterministic device-lost where `gfx` is
+        // intermittent), and the submit splitter (`VulkanShared::submit_dispatch_cap`) already
+        // bounds the job.
+        let qf_props =
+            unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
+        let queue_family_index =
+            Self::pick_queue_family(&qf_props, dev_props.device_type, vkcfg.gfx_queue)
+                .ok_or_else(|| be("no compute queue family found"))?;
+        let on_graphics_ring = qf_props[queue_family_index as usize]
+            .queue_flags
+            .contains(vk::QueueFlags::GRAPHICS);
+        if dev_props.device_type == vk::PhysicalDeviceType::DISCRETE_GPU
+            && on_graphics_ring
+            && !vkcfg.gfx_queue
+        {
+            tracing::warn!(
+                "[infr] vulkan: no COMPUTE-only queue family on this device; inference shares \
+                 queue family {queue_family_index} with the compositor's graphics ring, so a \
+                 long forward stalls the desktop's frames"
+            );
+        }
+        tracing::info!(
+            "[infr] vulkan: queue family {queue_family_index} ({})",
+            if on_graphics_ring {
+                "graphics ring, shared with the compositor"
+            } else {
+                "compute-only ring"
+            }
+        );
+        // Per-segment GPU timing for the submit splitter (`ForwardClock`): usable only when the
+        // chosen queue family writes timestamps at all.
+        let segment_ts_bits = qf_props[queue_family_index as usize].timestamp_valid_bits;
+        let segment_ts_period = (segment_ts_bits > 0)
+            .then_some(dev_props.limits.timestamp_period)
+            .filter(|p| *p > 0.0);
+
         // ── logical device ─────────────────────────────────────────────────────
         let priorities = [1.0f32];
         let queue_ci = vk::DeviceQueueCreateInfo::default()
@@ -2595,97 +2686,6 @@ impl VulkanBackend {
         .map_err(|e| be(format!("create_command_pool: {e}")))?;
         // Register the pool too, so a later Err frees it alongside the device.
         cleanup.pool = cmd_pool;
-
-        // ── capabilities ───────────────────────────────────────────────────────
-        // Query base limits + the subgroup-size range together via properties2 (the coopmat GEMM
-        // pins requiredSubgroupSize=32, so the fallback ladder needs to know whether 32 is in range).
-        let mut sgsize_props = vk::PhysicalDeviceSubgroupSizeControlProperties::default();
-        // Maintenance3 (core in Vulkan 1.1) carries `maxMemoryAllocationSize` — the weight arena
-        // splits its up-front reservation into blocks no larger than this.
-        let mut maint3_props = vk::PhysicalDeviceMaintenance3Properties::default();
-        // Float controls (core in Vulkan 1.2) say whether a shader may declare its f16 rounding.
-        let mut float_controls = vk::PhysicalDeviceFloatControlsProperties::default();
-        let mut props2 = vk::PhysicalDeviceProperties2::default()
-            .push_next(&mut sgsize_props)
-            .push_next(&mut maint3_props)
-            .push_next(&mut float_controls);
-        unsafe { instance.get_physical_device_properties2(physical_device, &mut props2) };
-        let props = props2.properties;
-        let rte_f16_supported = float_controls.shader_rounding_mode_rte_float16 == vk::TRUE;
-        // 0 = not reported → fall back to the Vulkan-guaranteed floor (2^30 = 1 GiB).
-        let max_mem_alloc_size = if maint3_props.max_memory_allocation_size == 0 {
-            1 << 30
-        } else {
-            maint3_props.max_memory_allocation_size
-        };
-        let device_name = unsafe { CStr::from_ptr(props.device_name.as_ptr()) }
-            .to_string_lossy()
-            .into_owned();
-        // (0,0) when subgroup-size-control is unsupported: can't pin any size — the adapter treats
-        // that as "no 32-pin available" and uses the driver's default subgroup for the fallback.
-        // Under `kernels.vulkan.force_wave64` the range reads [64, 64], so every tier decision
-        // downstream sees what a wave64-only device would report.
-        let (subgroup_min, subgroup_max) = match sg_mode {
-            crate::caps::SubgroupMode::Wave64 { forced: true } => (64, 64),
-            _ if has_sgsize => (
-                sgsize_props.min_subgroup_size,
-                sgsize_props.max_subgroup_size,
-            ),
-            _ => (0, 0),
-        };
-        // The subgroup width itself was settled above (`sg_mode`), before the coopmat tiers.
-        check_required_features(has_int8, has_full_sg)?;
-        match sg_mode {
-            crate::caps::SubgroupMode::Native => {}
-            crate::caps::SubgroupMode::Wave64 { forced: false } => tracing::info!(
-                "[infr] wave64-only device: running the wave32 kernels on 32-lane virtual \
-                 subgroups; cooperative-matrix tiers off"
-            ),
-            crate::caps::SubgroupMode::Wave64 { forced: true } => tracing::warn!(
-                "[infr] kernels.vulkan.force_wave64: running the wave64 emulation on a device that \
-                 can pin 32 (testing only); cooperative-matrix tiers off"
-            ),
-        }
-
-        // ── integrated GPU + compute-unit count ───────────────────────────────────────────────
-        // An iGPU/APU is NOT just "a slow discrete card": it is forced onto the non-coopmat kernel
-        // tier (RDNA2/Raphael enumerates no cooperative matrix at all) AND carries ~1/50th the
-        // compute, so a prefill chunk sized for a 96-CU card becomes a single multi-SECOND command
-        // buffer — past the ~10 s `gfx`-ring watchdog it is a GPU reset, not merely slow. Detect the
-        // device class here and let the seam bound its per-submit work (`Capabilities::integrated`).
-        let integrated = props.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU;
-        // Shader-core count (0 = unknown), from whichever of the four per-vendor sources this
-        // device actually reports — see `caps::shader_core_count`, which owns that order. The
-        // property structs it reads were already chained by `probe_device_facts` above; nothing here
-        // queries the device again.
-        let compute_units = crate::caps::shader_core_count(&device_probe);
-
-        // ── tuning: every per-device kernel parameter, resolved once ──────────────────────────
-        // The table's generic defaults, its matching rows, then the user's tuning file, config,
-        // environment and command line (`tuning::resolve`). A value the user wrote that fails
-        // validation refuses the device here, naming where it came from.
-        let facts = tuning::DeviceFacts {
-            name: device_name.clone(),
-            vendor_id: device_probe.vendor_id,
-            device_id: device_probe.device_id,
-            driver: device_probe
-                .driver_id_reported
-                .then(|| tuning::driver_name(device_probe.driver_id)),
-            driver_version: props.driver_version,
-            arch: tuning::arch_name(device_arch),
-            integrated,
-            compute_units,
-            subgroup_min,
-            subgroup_max,
-            wave64: matches!(sg_mode, crate::caps::SubgroupMode::Wave64 { .. }),
-            max_shared_memory: props.limits.max_compute_shared_memory_size,
-            matrix_units: coopmat_f16 == Some(infr_core::COOPMAT_TILE_16),
-            dot_accelerated: device_probe.dot4x8_signed_accelerated,
-        };
-        let tuning::resolve::Resolved {
-            tuning: tuned,
-            report: tuning_report,
-        } = tuning::resolve::resolve(&facts, &cfg).map_err(be)?;
 
         // ── sg_pref: pinned subgroup size for the decode GEMV/reduction family ────────────────
         // `device.sg_pref`: its generic default is the capability rule in `tuning::families`, and

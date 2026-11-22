@@ -448,6 +448,13 @@ compute-only one. `queue.family` says which of them infr submits its work to:
   more than the desktop, for example on a headless machine or a dedicated
   inference box.
 
+This is a trade-off, and the default sides with the desktop. On the compute-only
+queue the model can run a few percent slower and the desktop stays usable. On
+`graphics` the model gets that speed back, and on a machine whose GPU also draws
+the desktop, windows and video may stutter or freeze for as long as a forward
+runs. infr does not try to detect whether a GPU drives a display: if you want
+the speed and can live with a laggy desktop, set `graphics`.
+
 The difference in speed is measured, not assumed: on an RX 7900 XTX under the
 AMD Windows driver the compute-only queue cost 4.2% of decode speed and 1.1% of
 prefill speed, on a Ryzen integrated GPU under the same driver nothing

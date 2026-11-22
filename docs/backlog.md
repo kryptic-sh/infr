@@ -7630,7 +7630,7 @@ its grid); a wider one-row bf16 weight takes the generic GEMV.
   `elementwise_ops_split_wide_grids`, which lowers the split point; the
   vocabulary test fails when the kernel's flat-index recovery is removed.
 
-### B228 — the compute-only queue on Linux: what to measure, and the follow-up it decides (2026-11-22)
+### B228 — the compute-only queue on Linux: what to measure; display detection declined (2026-11-22)
 
 **Tag:** vulkan · submit · tuning · linux · **Kind:** measurement to run,
 decision
@@ -7675,11 +7675,11 @@ contributor's glxgears figure.
 during those runs was not recorded. The owner's reading is that the integrated
 GPU showed no cost because it was not driving any display, while the RX 7900
 XTX, which was, showed 4.2%. If that is right, the cost follows the display, not
-the device: it supports the display-detection follow-up below, and it means the
-tuning row that sets `queue.family = auto` for AMD integrated GPUs on the
-proprietary driver rests on a measurement of an integrated GPU with no display
-attached. To settle it on Windows: repeat the A/B with the monitor on the
-integrated GPU's output, and again with the RX 7900 XTX driving nothing.
+the device: it is one more reason the default is the compute-only queue (below),
+and it means the tuning row that sets `queue.family = auto` for AMD integrated
+GPUs on the proprietary driver rests on a measurement of an integrated GPU with
+no display attached. To settle it on Windows: repeat the A/B with the monitor on
+the integrated GPU's output, and again with the RX 7900 XTX driving nothing.
 
 **Commands.** Build `infr` in release. The model is `Qwen3-1.7B-Q4_K_M.gguf`
 from the `unsloth/Qwen3-1.7B-GGUF` repository (`$M` below). Pick the device with
@@ -7750,25 +7750,26 @@ benchmark is labelled with that load or retaken.
   submit had run is the missing number (a failure lists the last forward
   segments with their GPU times).
 
-**The follow-up this decides (not built).** IF the compute-only queue measures
-slower than the universal one, add detection of whether the GPU is driving a
-display: use the compute-only queue when it is, so the desktop stays responsive,
-and the faster universal queue when it is not (headless). This is only worth
-building if the measurement shows performance to be gained; if the two queues
-measure the same, keep the single default.
+**Decided (owner, 2026-11-22): no display detection.** The compute-only queue is
+the default, and a user who wants the last of the throughput at the desktop's
+expense sets `queue.family = graphics` (the model runs faster, the desktop may
+lag while it does). `docs/config.md` states that trade-off. Detecting whether a
+GPU drives a display, and switching queues on it, was **considered and
+declined**: the setting already gives the choice to the one person who knows
+which they want, and detection would be per-platform code (Vulkan has no direct
+query; `VK_KHR_display`, DRM connector status and DXGI outputs were the
+candidates, none researched) for a queue family that is chosen once, at device
+creation. The measurements above are still worth taking, as figures for the
+docs, not to decide a mechanism.
 
-Open questions under it, none researched; every item is a candidate, unverified:
-
-- **How to tell that this physical device drives a display.** Vulkan has no
-  direct query. Candidates: `VK_KHR_display` plane and display enumeration; the
-  DRM connector status under `/sys/class/drm` on Linux; DXGI output enumeration
-  on Windows, which might need a new dependency and is then the owner's
-  decision.
-- **A session environment variable is not the answer on its own.** `DISPLAY` or
-  `WAYLAND_DISPLAY` says that a session exists, not which GPU drives it.
-- Whether the answer can change while a backend is alive (a monitor plugged in,
-  a session started later), and what the backend does then, is not thought
-  through either: the queue family is chosen once, at device creation.
+**Left to do, code, not started:** the integrated-GPU rule. By rule an
+integrated GPU still defaults to `graphics` (the contributor's reason: under
+RADV the compute ring's hang budget measured tighter on one), with a table row
+setting `auto` for the AMD proprietary driver. The decision above reads as
+`auto` everywhere a usable compute-only family exists. Before changing the rule
+(`queue.family`'s default in `tuning/families.rs`, the snapshots and
+`queue_family_follows_the_device_facts`), check the contributor's hang-budget
+finding on an integrated GPU under RADV, since the work bound assumes 2 s.
 
 ### B222 — what the bounded GPU waits did not verify (2026-11-18)
 

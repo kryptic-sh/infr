@@ -1030,6 +1030,9 @@ pub struct Recorder<'a> {
     /// ranges puts each range in its own submit ([`Self::rollover`]). Finishing the recorder waits
     /// for them before anything that could free what they use.
     flushed: RefCell<std::collections::VecDeque<PendingSegment>>,
+    /// Dispatches in every command buffer this recorder submitted itself, whether still in
+    /// `flushed` or already waited for.
+    flushed_dispatches: std::cell::Cell<usize>,
 }
 
 /// Timestamp pairs around the dispatches a recorder times for the work estimate, and what each
@@ -1249,6 +1252,7 @@ impl<'a> Recorder<'a> {
             watch: RefCell::new(WatchStamps::default()),
             failed: RefCell::new(None),
             flushed: RefCell::new(std::collections::VecDeque::new()),
+            flushed_dispatches: std::cell::Cell::new(0),
         })
     }
 
@@ -1981,6 +1985,8 @@ impl<'a> Recorder<'a> {
             .seg_query_pool
             .replace(Self::open_segment_stamps(self.be, fresh));
         let mut old_watch = std::mem::take(&mut *self.watch.borrow_mut());
+        self.flushed_dispatches
+            .set(self.flushed_dispatches.get() + desc.dispatches);
         self.dispatches.set(0);
         self.first_op.set(Some(k.name));
         self.last_op.set(Some(k.name));
@@ -2031,6 +2037,7 @@ impl<'a> Recorder<'a> {
             seg_query_pool: old_stamps,
             watch: old_watch,
             earlier: Vec::new(),
+            earlier_dispatches: 0,
             desc,
             recent: shared.note_segment_submitted(desc),
         });
@@ -11413,6 +11420,13 @@ impl<'a> Recorder<'a> {
     /// recorder.
     fn free_transient(&self) {
         let device = &self.be.shared.device;
+        // A command buffer this recorder already submitted may still read its descriptor pools
+        // and write its profiling timestamps (`query_pool`, shared by every buffer of the
+        // recorder): wait for those before anything is destroyed. A failed wait poisoned the
+        // backend, and then nothing is freed, as after any failed wait (see `gpu_wait`).
+        if self.drain_flushed().is_err() {
+            return;
+        }
         unsafe {
             // query_pool is null unless prof_ops created one; the null check is equivalent to `prof_ops`.
             if self.query_pool != vk::QueryPool::null() {
@@ -11422,12 +11436,6 @@ impl<'a> Recorder<'a> {
                 device.destroy_query_pool(self.seg_query_pool.get(), None);
             }
             self.watch.borrow_mut().destroy(device);
-            // A command buffer this recorder already submitted may still read its descriptor
-            // pools: wait for those first. A failed wait poisoned the backend, and then nothing is
-            // freed, as after any failed wait (see `gpu_wait`).
-            if self.drain_flushed().is_err() {
-                return;
-            }
             let cmd_pool = *self.be.shared.cmd_pool.lock().unwrap();
             device.free_command_buffers(cmd_pool, &[self.cmd.get()]);
             for p in self.pools.borrow().iter() {
@@ -11545,6 +11553,7 @@ impl<'a> Recorder<'a> {
             return Err(e);
         }
         let desc = self.submit_desc();
+        let earlier_dispatches = self.flushed_dispatches.get();
         if self.stages || self.prof_ops {
             let shared = std::sync::Arc::clone(&self.be.shared);
             self.finish()?;
@@ -11556,6 +11565,7 @@ impl<'a> Recorder<'a> {
                 seg_query_pool: vk::QueryPool::null(),
                 watch: WatchStamps::default(),
                 earlier: Vec::new(),
+                earlier_dispatches,
                 desc,
                 recent: 0,
             });
@@ -11605,6 +11615,7 @@ impl<'a> Recorder<'a> {
             seg_query_pool: self.seg_query_pool.get(),
             watch: std::mem::take(&mut *self.watch.borrow_mut()),
             earlier: self.flushed.borrow_mut().drain(..).collect(),
+            earlier_dispatches,
             desc,
             recent: self.be.shared.note_segment_submitted(desc),
         })
@@ -11977,9 +11988,13 @@ pub struct PendingSegment {
     seg_query_pool: vk::QueryPool,
     /// The recorder's timed dispatches, read into the work estimate once the fence signals.
     watch: WatchStamps,
-    /// Command buffers the same recorder submitted before this one ([`Recorder::rollover`]),
-    /// oldest first: waited before this one, which holds the descriptor pools they use.
+    /// Command buffers the same recorder submitted before this one ([`Recorder::rollover`]) and
+    /// has not waited for, oldest first: waited before this one, which holds the descriptor pools
+    /// they use.
     earlier: Vec<PendingSegment>,
+    /// Dispatches in every command buffer the same recorder submitted before this one, waited
+    /// for or not.
+    earlier_dispatches: usize,
     /// Dispatches this segment carried — the submit splitter sums them across a forward to feed
     /// `VulkanBackend::observe_forward` — and its first and last kernel, for a failed wait.
     desc: SubmitDesc,
@@ -11991,7 +12006,7 @@ impl PendingSegment {
     /// Dispatches recorded into this segment's command buffer, and into those the same recorder
     /// submitted before it.
     pub fn dispatches(&self) -> usize {
-        self.desc.dispatches + self.earlier.iter().map(Self::dispatches).sum::<usize>()
+        self.desc.dispatches + self.earlier_dispatches
     }
 }
 

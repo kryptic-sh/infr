@@ -7750,6 +7750,44 @@ benchmark is labelled with that load or retaken.
   submit had run is the missing number (a failure lists the last forward
   segments with their GPU times).
 
+**Measured on Linux, headless (2026-11-23).** infr at `a66f3d06`, RADV (Mesa
+26.3.1, kernel 7.3.5), no display server running (Hyprland closed; the monitor
+is cabled to the RX 7900 XTX and nothing drew to it), Qwen3-1.7B Q4_K_M, context
+8192, 6 interleaved rounds with the first arm alternating, one process per
+sample, `graphics` against `compute`. Each cell is the mean with the lowest and
+highest sample. The machine was between 95.4% and 96.6% idle over 3 s before
+each sample, the remainder being other sessions' own idle load (no build, test
+or GPU work was running).
+
+| Device                                    | What, t/s | `graphics`                      | `compute`                       | Change |
+| ----------------------------------------- | --------- | ------------------------------- | ------------------------------- | ------ |
+| RX 7900 XTX (RADV NAVI31)                 | tg128     | 476.53 (476.07 to 477.22)       | 466.97 (466.56 to 467.36)       | -2.0%  |
+| RX 7900 XTX (RADV NAVI31)                 | pp512     | 15155.32 (15106.65 to 15308.38) | 15122.66 (14917.06 to 15278.53) | -0.2%  |
+| Ryzen integrated (RADV RAPHAEL_MENDOCINO) | tg128     | 28.84 (28.68 to 28.88)          | 28.86 (28.85 to 28.87)          | +0.1%  |
+| Ryzen integrated (RADV RAPHAEL_MENDOCINO) | pp512     | 240.44 (240.03 to 240.61)       | 240.28 (240.02 to 240.36)       | -0.1%  |
+
+So the owner's hypothesis, that the compute-only queue costs nothing headless,
+does not hold on the RX 7900 XTX: decode is 2.0% slower with samples that do not
+overlap, so part of the cost is the ring and not contention with a compositor.
+Prefill and the integrated GPU show nothing beyond the samples' spread. On both
+devices `compute` picked queue family 1 (compute-only, `timestampValidBits` 64),
+read from the startup line. A profiled pp512 (`INFR_PROF_OPS=1`) reported a
+device total of 31.8 ms on the universal family and 33.1 ms on the compute-only
+one on the RX 7900 XTX, and 2.12 s on both on the integrated GPU, so timestamps
+work on the compute-only family under RADV. `lockup_timeout` reads empty in
+`/sys/module/amdgpu/parameters`, and `modinfo amdgpu` gives its default as 2000
+ms with the format `[GFX,Compute,SDMA,Video]`: on this kernel one default covers
+every ring.
+
+**Still not measured on Linux:** the same loop inside a desktop session (the
+script and the pinned binary are in `~/.cache/infr-queue-ab` on the Linux
+machine, `run.sh desktop`), any measure of desktop responsiveness, and the work
+bound's tests on the compute-only family. llama.cpp makes the same default
+choice (`ggml-vulkan.cpp`, `ggml_vk_find_queue_family_index` avoiding the
+graphics bit) and has the same escape hatch, `GGML_VK_ALLOW_GRAPHICS_QUEUE`,
+commented "it can increase performance on RADV"; it does nothing else about the
+cost.
+
 **Decided (owner, 2026-11-22): no display detection.** The compute-only queue is
 the default, and a user who wants the last of the throughput at the desktop's
 expense sets `queue.family = graphics` (the model runs faster, the desktop may
@@ -7770,6 +7808,43 @@ setting `auto` for the AMD proprietary driver. The decision above reads as
 (`queue.family`'s default in `tuning/families.rs`, the snapshots and
 `queue_family_follows_the_device_facts`), check the contributor's hang-budget
 finding on an integrated GPU under RADV, since the work bound assumes 2 s.
+
+### B230 — a second queue for transfers, as llama.cpp has: a candidate for the streaming work (2026-11-23)
+
+**Tag:** vulkan · streaming · pager · submit · **Kind:** candidate, not
+researched past the reference
+
+infr submits everything on one queue. llama.cpp's Vulkan backend (checkout at
+`57291f2`) also creates a transfer queue: `ggml_vk_find_queue_family_index`
+looks for a family with the transfer bit that has neither the compute nor the
+graphics bit, falls back to any other family than the compute one, and its
+copies can then go out on that queue (`async_use_transfer_queue`, on by default
+only for AMD discrete, non-GCN devices when the graphics queue is avoided, else
+by `GGML_VK_ASYNC_USE_TRANSFER_QUEUE`).
+
+**Where it could matter here.** Not decode: infr's pipeline is GPU-resident and
+a decode step moves almost nothing between host and device, so a transfer queue
+would not touch the compute-only queue's decode cost (B228). The candidate is
+streaming (plans 05, 06 and 08): the pager's weight uploads on a queue of their
+own while a forward runs on the compute queue, where today they share one submit
+stream.
+
+**What is known.** Read with `vulkaninfo` on the Linux machine under RADV (Mesa
+26.3.1): neither the RX 7900 XTX nor the Ryzen integrated GPU has a
+transfer-only family. Each has a universal family (1 queue), a compute and
+transfer family (4 queues), video decode, video encode, and a sparse-binding
+family with no timestamp bits. So on RADV the choices are a second queue of the
+compute-only family, or the universal family, which is where llama.cpp's
+fallback lands there.
+
+**Not known, needed before building anything:** whether the AMD Windows driver,
+NVIDIA or Intel expose a transfer-only family (not read); whether uploads on a
+second queue overlap a running forward at all on one device, or the hardware
+serialises them; what the cross-queue synchronisation costs (a buffer written on
+one queue and read on another needs a semaphore or a fence between the two); and
+how it sits with the work bound, which times and cuts one queue's submits. The
+measurement that decides it: a streamed model that does not fit, uploads on one
+queue against two, tokens per second and the pager's upload time.
 
 ### B222 — what the bounded GPU waits did not verify (2026-11-18)
 

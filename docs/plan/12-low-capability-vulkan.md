@@ -326,14 +326,15 @@ not run here:
   `kq_fma` prefill GEMM (S4).
 
 Since then `main` took the fork's compute-ring change (PR 106), now the tuning
-parameter `queue.compute_only`: on by default on a discrete device in the slow
-class, which is this card, and off everywhere else (`kernels.vulkan.gfx_queue`
-turns it off). amdgpu documents a longer job timeout for compute rings than for
-the graphics ring [R: the kernel's `lockup_timeout` parameter], so the 2 s above
-may no longer be the limit that applies to that card by default. **The work
-bound's 2 s assumption is unverified on the compute ring**: no reset was ever
-provoked there, on any driver. The bound keeps assuming 2 s, the tighter figure,
-which also covers the universal family and Windows (B227).
+parameter `queue.family`: `auto`, which takes a compute-only family, on every
+discrete device by default, this card included, and on an integrated GPU under
+the AMD Windows driver (`kernels.vulkan.gfx_queue` turns it off). amdgpu
+documents a longer job timeout for compute rings than for the graphics ring [R:
+the kernel's `lockup_timeout` parameter], so the 2 s above may no longer be the
+limit that applies to that card by default. **The work bound's 2 s assumption is
+unverified on the compute ring**: no reset was ever provoked there, on any
+driver. The bound keeps assuming 2 s, the tighter figure, which also covers the
+universal family and Windows (B227, and B228 for what to measure on Linux).
 
 ## 1. Slices
 
@@ -662,6 +663,34 @@ not a ceiling, the kernels without an estimate (some prefill GEMMs and the
 batched MoE expert GEMM among them), how a segment's time is shared among its
 kernels, the thin margin of the prior for one GEMV shape, the two states of the
 integrated GPU's SmolLM3 run, and the RX 580's limit on the compute ring.
+
+**S3, S5 and S7 arrived as PRs 105 to 107 and are now tuning parameters (branch
+`fix/pr-followups`, 2026-11-22).** The fork's author opened the three as pull
+requests and they were merged as written; on top of them each choice became a
+parameter. For S3 and S5 the default is what was measured on the RX 580, on that
+class of device only, so "must not change" (section 3) holds again for the RX
+7900 XTX and the integrated GPU; S7 changes the queue they submit on, which
+changes no output bit:
+
+- **S3** (PR 107): `gemv.kq_fma`, on where the driver does not report an
+  accelerated packed int8 dot. It selects the fp32 K-quant decode GEMV and its
+  verify twin, `linear_f32_mo` and the one-row bf16 reduction GEMV. Decode and
+  MTP verify take the K-quant kernels from one predicate ahead of every int8
+  route (`kq_fma_choice`), and the kernels' sums are `precise`, without which
+  the verify twin was one ulp off its decode kernel on the RX 7900 XTX.
+- **S5** (PR 105): `attn_split.decode_min_chunk`, 16 on a discrete slow-class
+  device and 64 elsewhere. The floor moves every span under 32 times its value,
+  so 16 changed decode up to 2047 keys and moved a GPU golden on the RX 7900
+  XTX; with the parameter at 64 there the golden passes unchanged.
+- **S7** (PR 106): `queue.family` (`auto`, `compute` or `graphics`), with `auto`
+  taking a compute-only family by default wherever the device has a compute-only
+  family that writes timestamps, by the project owner's decision (it keeps the
+  desktop responsive): every discrete device, and an integrated GPU under the
+  AMD Windows driver. On the RX 7900 XTX that costs 4.2% of decode and 1.1% of
+  prefill. A compute-only family that writes no timestamps is refused.
+
+The measurements on the two GPUs here, the decisions they leave open and what
+was not verified (the RX 580 above all) are in the backlog (B227).
 
 Declined: the fork's opt-in SSBO weight binding, which its own config doc marks
 as producing wrong output in a model on the RX 580, and its GQA decode pass,

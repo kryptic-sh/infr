@@ -7393,6 +7393,303 @@ op boundary once its estimated work reaches the budget. Plan 12 sections 0d and
   cooperative-matrix prefill on a device slow enough to cut it (the RX 7900 XTX
   cuts those kernels only under the tests' forced budget of 1 ms).
 
+### B227 — PRs 105 to 107 as tuning parameters: what was measured here, and what was not (2026-11-22)
+
+**Tag:** vulkan · tuning · attention · gemv · submit · **Kind:** decisions,
+coverage gaps
+
+Three pull requests from the fork of plan 12, written and measured on an RX 580
+under RADV, were merged as they stood and each changed a default on every
+device. On top of them (branch `fix/pr-followups`) each choice is a tuning
+parameter. `gemv.kq_fma` (PR 107: the fp32 decode GEMVs) and
+`attn_split.decode_min_chunk` (PR 105: 16 against 64) default to the contributed
+behaviour on that class of device only, so on the RX 7900 XTX and the integrated
+GPU they resolve to what ran before the merges, and `gpu_seam_golden_qwen3`,
+which PR 105's floor had moved, passes unchanged. `queue.family` (PR 106) is
+`auto` by default on every discrete device and, by a table row, on an integrated
+GPU under the AMD Windows driver, and `auto` takes a compute-only queue family:
+the project owner's decision, for a responsive desktop.
+
+**Measured here.** `infr bench` of Qwen3-1.7B Q4_K_M, the parameter forced each
+way with `INFR_TUNE`, 6 interleaved rounds, one process per sample, two copies
+of one binary rotated between the arms, context 8192. Each cell is the mean with
+the lowest and highest sample; the load column is the machine's total CPU over 3
+s before and after the row. `Vulkan0` is the RX 7900 XTX and `Vulkan1` the Ryzen
+integrated GPU, both under the AMD Windows driver, with the Windows desktop
+running on the machine.
+
+| Device    | What, t/s                  | First value                               | Second value                             | Change | Load before / after |
+| --------- | -------------------------- | ----------------------------------------- | ---------------------------------------- | ------ | ------------------- |
+| `Vulkan0` | floor, tg128 at depth 16   | 64: 469.06 (465.46 to 471.96)             | 16: 488.36 (485.96 to 492.29)            | +4.1%  | 0.7% / 2.0%         |
+| `Vulkan0` | floor, tg128 at depth 64   | 64: 464.17 (461.33 to 465.64)             | 16: 485.65 (479.86 to 489.07)            | +4.6%  | 1.7% / 1.1%         |
+| `Vulkan0` | floor, tg128 at depth 256  | 64: 458.27 (456.26 to 459.51)             | 16: 474.52 (471.32 to 476.39)            | +3.5%  | 1.7% / 0.7%         |
+| `Vulkan0` | floor, tg128 at depth 1024 | 64: 449.79 (447.41 to 451.51)             | 16: 449.33 (445.67 to 451.13)            | -0.1%  | 2.2% / 1.5%         |
+| `Vulkan0` | floor, tg128 at depth 4096 | 64: 379.85 (379.24 to 380.52)             | 16: 379.20 (377.64 to 380.88)            | -0.2%  | 1.7% / 0.8%         |
+| `Vulkan0` | `gemv.kq_fma`, tg128       | off: 473.20 (467.43 to 475.37)            | on: 428.54 (425.17 to 434.90)            | -9.4%  | 1.9% / 1.8%         |
+| `Vulkan0` | `queue.family`, tg128      | graphics: 474.86 (474.34 to 475.66)       | compute: 454.79 (454.20 to 455.17)       | -4.2%  | 1.7% / 2.2%         |
+| `Vulkan0` | `queue.family`, pp512      | graphics: 11611.42 (11508.54 to 11743.71) | compute: 11482.28 (11426.91 to 11527.87) | -1.1%  | 1.5% / 2.4%         |
+| `Vulkan1` | floor, tg128 at depth 16   | 64: 27.07 (26.92 to 27.31)                | 16: 26.93 (26.80 to 27.02)               | -0.5%  | 1.2% / 1.7%         |
+| `Vulkan1` | floor, tg128 at depth 64   | 64: 26.84 (26.76 to 26.92)                | 16: 26.72 (26.49 to 26.94)               | -0.4%  | 2.0% / 0.9%         |
+| `Vulkan1` | floor, tg128 at depth 256  | 64: 26.30 (26.26 to 26.34)                | 16: 25.87 (25.76 to 25.94)               | -1.6%  | 1.2% / 1.4%         |
+| `Vulkan1` | floor, tg128 at depth 1024 | 64: 24.44 (24.36 to 24.58)                | 16: 23.95 (23.92 to 23.97)               | -2.0%  | 0.6% / 2.7%         |
+| `Vulkan1` | floor, tg128 at depth 4096 | 64: 19.08 (18.98 to 19.18)                | 16: 19.13 (19.05 to 19.19)               | +0.3%  | 1.6% / 2.0%         |
+| `Vulkan1` | `gemv.kq_fma`, tg128       | off: 27.15 (27.06 to 27.36)               | on: 22.75 (22.64 to 22.80)               | -16.2% | 2.6% / 3.9%         |
+| `Vulkan1` | `queue.family`, tg128      | graphics: 27.12 (26.98 to 27.22)          | compute: 27.12 (27.07 to 27.15)          | +0.0%  | 3.6% / 1.3%         |
+| `Vulkan1` | `queue.family`, pp512      | graphics: 230.94 (230.67 to 231.16)       | compute: 230.84 (230.58 to 231.25)       | -0.0%  | 0.6% / 1.8%         |
+
+**The compute-only family here.** Both devices have one (queue family 1) and it
+reports 64 valid timestamp bits, read from the startup log. The `queue.family`
+rows above compare `graphics` with `compute`; they were taken while the
+parameter was still a switch, whose two positions are those two families. On the
+compute-only family, on each device, `first_forward_split`, `work_split_parity`,
+`gpu_seam_golden_qwen3` (the hash unchanged, so the queue does not change
+generated output) and `gpu_seam_tolerance_qwen3` / `_qwen35` passed. Timestamps
+work on it: a profiled `pp512` on `Vulkan0` (`INFR_PROF_OPS=1`) reported a
+device total of 42.1 ms for a forward of 47.0 ms wall on the compute-only
+family, against 41.3 ms of 46.7 ms on the universal one. The integrated GPU's
+row in `table.toml` (`amd-proprietary-integrated-compute-queue`) rests on the
+two `Vulkan1` rows above. Not measured: how long a submit may run on that family
+before Windows resets the device (the `Vulkan1` figures of plan 12 section 0d
+are from the universal family).
+
+**Forced configurations, `Vulkan0`.** The slice's GPU test set (49 tests: the
+golden, `gpu_seam_tolerance_*`, the split and parity binaries, the new kernel
+tests) passed whole at the defaults on both devices and under `INFR_NO_I8DOT=1`,
+`INFR_NO_COOPMAT=1`, both together and `INFR_FORCE_WAVE64=1`. The two capability
+masks do not reach the whole-model tests of `infr-llama`
+(`docs/gpu-tolerance.md`), so those runs exercise them in `infr-vulkan`'s tests
+only. Under `INFR_TUNE=gemv.kq_fma=true`, which does reach them, 48 passed and
+`gpu_seam_golden_qwen3` did not: the fp32 decode kernels give the continuation
+`0x94f246b09d34db5d`, the same one the 16-key floor gives, where the blessed
+hash is of the int8 decode path. Every tolerance test passed with it on, so the
+fp32 path is inside the CPU-reference tolerance; the golden is a hash of one
+device's default path and is not expected to hold under a forced kernel.
+
+**Decisions that need a call:**
+
+- **The decode floor on the RX 7900 XTX.** 16 measured faster there at depths
+  16, 64 and 256 and the same at 1024 and 4096 (table above), so by speed alone
+  it should be 16. It stays 64 because 16 changes decode's attention sums for
+  every context under 2048 keys, and `gpu_seam_golden_qwen3` then generates a
+  different continuation (hash `0x94f246b09d34db5d` where the blessed one is
+  `0xcf56ba8c4bb5c455`, from the test's failure message; the text it printed
+  reads as a normal answer). Taking the gain means re-blessing that golden and
+  running the whole GPU gate at 16 to see which others move; that was not done.
+  To try it: `INFR_TUNE=attn_split.decode_min_chunk=16`, which reaches the tests
+  too. If it is taken, a class row in `table.toml` for
+  `vendor = "amd", driver = "AMD_PROPRIETARY", integrated = false` is the place,
+  with these figures as its source.
+- **The decode floor on the integrated GPU** stays 64: 16 measured slower there
+  at depths 256 and 1024 and within the samples' spread elsewhere.
+- **The compute-only family on the RX 7900 XTX** is the default
+  (`queue.family = auto`) by the owner's decision and costs 4.2% of decode
+  there; whether that buys a more responsive desktop on Windows was not measured
+  (no frame-time or compositor statistic was taken while a forward ran). B228
+  has the conditional follow-up.
+- **`gemv.kq_fma` on devices with an accelerated dot** stays off: the table
+  above has what on costs.
+
+**Left inline, measured on Polaris only (PR 107):** the rows-per-workgroup
+picker `Recorder::kq_fma_gemv_rows` (8 rows only when that fills the last pass
+at least 1.1 times better and still leaves 4 workgroups per compute unit) and
+`Recorder::linear_f32_at`'s threads-per-output choice for `linear_f32_mo` (64,
+or 32 when a row has under 128 vec4s). Both are hardware-shaped numbers of the
+kind plan 10 makes tuning parameters; neither was swept here, because on both
+devices here the kernels they shape are off by default.
+`Recorder::linear_native_routed_at`'s bf16 arm also still requires
+`out_f <= MAX_GROUP_COUNT_X`, which `linear_bf16_at` no longer needs (it splits
+its grid); a wider one-row bf16 weight takes the generic GEMV.
+
+**Changed on top of the PRs without the RX 580 to check them:**
+
+- **`precise` in `native_gemv_kq_fma.comp` and its `_mrow` twin.** It was needed
+  for the verify twin to be bit-identical to the decode kernel on the RX 7900
+  XTX. It can only cost speed where the compiler was contracting multiply-adds.
+  `kq_fma_gemv_bw` on the RX 7900 XTX: one run before and three after, single
+  shapes between 15% lower and 36% higher, which is that bench's own spread from
+  run to run, so no cost was established and none excluded. Not measured on GCN,
+  the class the kernels are on for.
+- **Decode takes the fp32 K-quant kernel ahead of the int8 GEMV at the plain
+  (non-fused) `Linear` site.** As merged, `mmv_mw_choice` ran first there, so on
+  a device with an int8 dot a plain decode `Linear` of 2M elements or more kept
+  the int8 kernel (the fused-residual site already had the fp32 one first). PR
+  107's commit message describes the order now in the tree, and its figures were
+  taken in the fork; whether the merged order was ever what ran on the RX 580 is
+  not known here.
+- **A device that reports no facts** (the `unknown` fixture: no matrix units, no
+  accelerated dot, not integrated) gets all three contributed defaults:
+  `gemv.kq_fma` on, floor 16, compute-only queue. That follows the class rule;
+  nothing was run on such a device.
+
+**Not verified:**
+
+- **`mtp_spec_matches_target_only_greedy` and `mtp_head_cpu_vulkan_parity` did
+  not run.** Both need Qwen3.5-4B-MTP, which is not in the cache here and is
+  over the download limit of the session that did this; they return at once
+  without it. What stands in: `kq_fma_verify_rows_match_decode_rows` (each
+  verify row against its decode row, bit for bit, through the adapter, for the
+  `Linear`s) and the host test that a verify batch takes the decode floor. No
+  whole-model MTP run was made at either floor or with `gemv.kq_fma` on.
+- **The work bound's 2 s on the compute ring.** `crate::work` assumes a submit
+  is reset after about 2 s (plan 12 section 0d), measured on the universal
+  family of the integrated GPU under Windows. No reset was provoked on a
+  compute-only family on any device or driver, so whether the limit there is the
+  same, longer (amdgpu's documented compute-ring timeout) or tighter (what
+  `docs/igpu.md` records for an integrated part under RADV) is unknown. The
+  dispatch-budget probe (`tests/dispatch_budget_probe.rs`) with
+  `INFR_TUNE=queue.family=compute` would measure it here; on Linux it needs the
+  RX 580.
+- **The compute-only family on other drivers.** NVIDIA, Intel, and RDNA under
+  RADV were not run. `VulkanBackend::pick_queue_family` refuses a family with no
+  valid timestamp bits; both devices here report 64 for theirs, so the refusal
+  is covered by its unit test only.
+- **A verify batch and decode agree bit for bit only where the chunk is the
+  floor.** Past 32 times the floor the chunk is `span / 32`, and a batch's rows
+  share the batch's span while each decode step has its own, so the two cut
+  differently. That was so before the PRs (from 2048 keys); at floor 16 it
+  starts at 512 keys.
+- **Static and replay decode cut differently past `floor * 1024` rows of cache
+  capacity.** The replay path bakes a floor that rises with the capacity
+  (`attn_chunk::baked_min_chunk`), the static path (`INFR_SEAM_NO_REPLAY`, and
+  every verify batch) does not. Before the PRs that began at 65537 rows; at
+  floor 16 it begins at 16385, so a slow-class device with a context past 16384
+  is in it. `replay_cuts_a_span_like_the_static_path` pins where the two agree.
+- **`linear_f32_mo_covers_a_vocabulary_wide_output` does not fail without the
+  grid split on the RX 7900 XTX**: with the kernel put back on a one-dimensional
+  dispatch the driver ran 65536 workgroups anyway. The split is held by
+  `elementwise_ops_split_wide_grids`, which lowers the split point; the
+  vocabulary test fails when the kernel's flat-index recovery is removed.
+
+### B228 — the compute-only queue on Linux: what to measure, and the follow-up it decides (2026-11-22)
+
+**Tag:** vulkan · submit · tuning · linux · **Kind:** measurement to run,
+decision
+
+infr submits on a COMPUTE-only queue family by default where a device has one
+(tuning parameter `queue.family`, default `auto`;
+`VulkanBackend::pick_queue_family`). The reason is a responsive desktop: the
+compositor renders on the universal family's ring, and a long forward on that
+ring stalls its frames. Nothing about it has been measured on Linux by the
+project. The owner has a Linux machine and will run this.
+
+**What is unmeasured.** The cost or gain of the compute-only queue on Linux
+under RADV (amdgpu), on whatever GPU that machine has, in two states:
+**headless** (no compositor or display server running) and **with a desktop
+session running**. The owner's hypothesis is that headless it costs nothing. The
+only Linux figure is the contributor's, on an RX 580 under RADV (Polaris10), in
+the description of pull request 106 under "Cost": qwen2.5-0.5b Q4_K_M, pp512
+1311.6 to 1299.9 t/s and tg256 161.6 to 152.2 t/s, "about 6% decode", prefill
+unchanged; and in the same description and the changelog, zeta-2.1 Q4_K_M,
+prefill 153 to 166 tok/s and decode 31.2 to 30.7 tok/s while glxgears held 130
+fps where it had dropped to 7. Whether a desktop was running during the qwen2.5
+re-measurement is not stated (glxgears implies one for the zeta run).
+
+**Measured on Windows** (this slice; AMD proprietary driver, desktop running,
+Qwen3-1.7B Q4_K_M, 6 interleaved rounds, the universal family against the
+compute-only one):
+
+| Device                  | tg128, t/s       | pp512, t/s           |
+| ----------------------- | ---------------- | -------------------- |
+| RX 7900 XTX             | 474.86 to 454.79 | 11611.42 to 11482.28 |
+| Ryzen integrated, RDNA2 | 27.12 to 27.12   | 230.94 to 230.84     |
+
+So on Windows it costs 4.2% of decode and 1.1% of prefill on the discrete card
+and nothing measurable on the integrated one (B227 has the samples' ranges and
+the load). **Desktop responsiveness was not measured there**: no objective
+method was found in that session (no frame-time or compositor statistic was
+taken while a forward ran), so on Windows the benefit the default is for is
+unmeasured, and with a desktop running on Linux it is too, beyond the
+contributor's glxgears figure.
+
+**Commands.** Build `infr` in release. The model is `Qwen3-1.7B-Q4_K_M.gguf`
+from the `unsloth/Qwen3-1.7B-GGUF` repository (`$M` below). Pick the device with
+`infr devices` and put its name in `$DEV` (`Vulkan0`, ...).
+
+```sh
+infr devices
+infr tune show --dev $DEV    # the queue.family line: value, source, family picked
+
+# The same setting from each of its three places (use any one):
+#   config file:   [kernels.vulkan.tune]
+#                  "queue.family" = "graphics"     # auto | compute | graphics
+#   environment:   INFR_TUNE=queue.family=graphics
+#   command line:  --set kernels.vulkan.tune.queue.family=graphics
+infr tune show --dev $DEV --set kernels.vulkan.tune.queue.family=compute  | grep queue.family
+infr tune show --dev $DEV --set kernels.vulkan.tune.queue.family=graphics | grep queue.family
+
+# Interleave the two arms, at least 6 rounds, one process per sample.
+for r in 1 2 3 4 5 6; do
+  for q in graphics compute; do
+    echo "round $r queue.family=$q"
+    INFR_TUNE=queue.family=$q infr bench $M --dev $DEV -p 512 -n 0 -r 1 --json
+    INFR_TUNE=queue.family=$q infr bench $M --dev $DEV -p 0 -n 128 -r 1 --json
+  done
+done
+```
+
+Run the whole loop twice: once headless (stop the display manager, or boot to a
+text console, and check that no compositor is running) and once inside a desktop
+session. Alternate which arm goes first between rounds if the samples drift.
+Record with the numbers: the GPU, the Mesa version and the kernel version
+(`uname -r`), whether a display server was running and which, whether the
+measured GPU is the one driving the display, and the machine's load
+(`top -b -n 2 -d 3`) before and after. A figure taken beside another build or
+benchmark is labelled with that load or retaken.
+
+**What else to check there.**
+
+- **The family in use.** The startup log line
+  `[infr] vulkan: queue.family = auto, picked queue family N (compute-only, timestampValidBits B): ...`
+  names it and says why, and the `queue.family` line of `infr tune show` carries
+  the same text after the value's source. Use `compute` for the measured arm,
+  not `auto`, so that a fallback to the universal family is a warning and not a
+  silent second `graphics` arm. `B` must not be 0: a compute-only family with no
+  valid timestamp bits is refused with a warning that says so, and the universal
+  family is used.
+- **Timestamps on it.**
+  `INFR_PROF_OPS=1 infr bench $M --dev $DEV -p 512 -n 0 -r 1` prints a per-op
+  device report; its `device total` should be a little under the forward's wall
+  time (512 divided by the reported t/s). On the RX 7900 XTX under Windows it
+  was 42.1 ms of 47.0 ms on the compute-only family and 41.3 ms of 46.7 ms on
+  the universal one. A total far off the wall time, or zero, means the segment
+  timing the submit splitter and the work bound (`crate::work`) rely on is wrong
+  on that family.
+- **The work bound's times.** `crates/infr-vulkan/tests/work_split_parity.rs`
+  and `first_forward_split.rs` pass on that family
+  (`INFR_DEV=$DEV cargo nextest run --release --run-ignored all -E 'binary(work_split_parity) | binary(first_forward_split)'`;
+  the first builds its config from the environment without `INFR_TUNE`, so it
+  follows the device's default, which is `auto` on a discrete card).
+- **The watchdog that applies.** amdgpu's `lockup_timeout` module parameter
+  takes per-ring values (graphics, compute, and others; `modinfo amdgpu`
+  describes the order, and `/sys/module/amdgpu/parameters/lockup_timeout` holds
+  what is set; neither was read in the session that wrote this). The work bound
+  assumes a submit is reset after about 2 s (`submit.budget_ms`, plan 12 section
+  0d), which was measured on a graphics ring. Record the value that applies to
+  the compute ring on that kernel. If it is longer, the bound is merely
+  conservative there; if a reset is ever seen on the compute ring, the time the
+  submit had run is the missing number (a failure lists the last forward
+  segments with their GPU times).
+
+**The follow-up this decides (not built).** IF the compute-only queue measures
+slower than the universal one, add detection of whether the GPU is driving a
+display: use the compute-only queue when it is, so the desktop stays responsive,
+and the faster universal queue when it is not (headless). This is only worth
+building if the measurement shows performance to be gained; if the two queues
+measure the same, keep the single default.
+
+Open questions under it, none researched; every item is a candidate, unverified:
+
+- **How to tell that this physical device drives a display.** Vulkan has no
+  direct query. Candidates: `VK_KHR_display` plane and display enumeration; the
+  DRM connector status under `/sys/class/drm` on Linux; DXGI output enumeration
+  on Windows, which might need a new dependency and is then the owner's
+  decision.
+- **A session environment variable is not the answer on its own.** `DISPLAY` or
+  `WAYLAND_DISPLAY` says that a session exists, not which GPU drives it.
+- Whether the answer can change while a backend is alive (a monitor plugged in,
+  a session started later), and what the backend does then, is not thought
+  through either: the queue family is chosen once, at device creation.
+
 ### B222 — what the bounded GPU waits did not verify (2026-11-18)
 
 **Tag:** vulkan · tests · **Kind:** coverage gaps

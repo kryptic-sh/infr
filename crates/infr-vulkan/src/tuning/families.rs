@@ -706,8 +706,9 @@ pub(crate) static PARAMS: &[Param] = &[
               at the next op boundary once its estimated work reaches it, so a submit can hold \
               up to about twice this (0 = no work bound; the dispatch-count splitter still \
               applies)",
-        rule: "250 on an integrated or slow-class device (an eighth of the 2 s after which a \
-               driver's watchdog resets a submit); else 500, a quarter of it",
+        rule: "on an integrated or slow-class device, the dispatch-count splitter's target for \
+               one submit (SUBMIT_BUDGET_NS); else the time from which that splitter treats a \
+               forward as dangerous (SUBMIT_DANGER_NS) over the budgets one submit can hold",
         default: |f, _| Value::Uint(u64::from(crate::work::default_budget_ms(f.reset_prone()))),
         get: |t, _| Value::Uint(u64::from(t.submit_budget_ms)),
         set: |t, _, v| t.submit_budget_ms = v.u32(),

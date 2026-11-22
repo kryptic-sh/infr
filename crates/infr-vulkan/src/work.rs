@@ -24,7 +24,8 @@
 //!
 //! - a dispatch whose estimate is a noticeable part of the budget is bracketed by two timestamps
 //!   ([`WorkModel::watch`]), and the kernel's time per FLOP becomes the slowest of its last
-//!   [`TIMED_WINDOW`] such samples;
+//!   [`TIMED_WINDOW`] such samples, the prior standing in for the samples it does not have
+//!   yet;
 //! - a whole segment's GPU time, which every forward segment already measures, corrects the
 //!   kernels in it that have no timed dispatch ([`WorkModel::calibrate`]), as if they had taken
 //!   all of it. Without it a device whose dispatches all stay under the timing threshold would
@@ -32,9 +33,12 @@
 //!   however fast it ran.
 //!
 //! So a kernel's estimate goes down only on what the GPU measured, and never by more than the
-//! model's gain bound ([`max_prior_gain`]) from its prior: a submit whose every estimate a bad
-//! reading took to that floor still runs under [`floor_submit_ceiling_ns`] if the priors were
-//! right. Until a segment has completed, a device's first forward runs on the prior alone.
+//! model's gain bound ([`max_prior_gain`]) from its prior: a submit of [`SUBMIT_BUDGETS`]
+//! budgets whose every estimate a bad reading took to that floor still runs under
+//! [`floor_submit_ceiling_ns`] if the priors were right. That holds for what the bound sees:
+//! work without an estimate, a tagged dispatch that stays whole, and a range held to one
+//! workgroup can each put more into a submit than [`SUBMIT_BUDGETS`] budgets. Until a segment
+//! has completed, a device's first forward runs on the prior alone.
 //! Dispatches with no estimate (every other kernel) count as free, as do single-row ones: a
 //! decode step is never split, timed or cut by this, and the dispatch cap is what bounds a
 //! submit of those.
@@ -47,14 +51,15 @@ use std::sync::Mutex;
 ///
 /// The watchdogs measured so far reset a submit after about 2 s (Windows' default `TdrDelay`;
 /// amdgpu's default `lockup_timeout` on the RX 580 of issue 94), and Vulkan reports neither limit,
-/// so the defaults assume it. A reset-prone device gets the submit splitter's own target
-/// ([`infr_core::SUBMIT_BUDGET_NS`]), an eighth of that: its estimate is a prior until a kernel
-/// has been timed, and another program on the GPU stretches a submit. Any other device gets
+/// so the defaults assume it ([`WATCHDOG_NS`]). A reset-prone device gets the submit splitter's
+/// own target ([`infr_core::SUBMIT_BUDGET_NS`]), a small part of that: its estimate is a prior
+/// until a kernel has been timed, and another program on the GPU stretches a submit. Any other
+/// device gets
 /// [`infr_core::SUBMIT_DANGER_NS`] over [`SUBMIT_BUDGETS`]: Windows' `TdrDelay` is not per
 /// adapter, so a fast discrete card is under the same limit, and once its estimates have been
 /// corrected to what its submits measure, a submit of [`SUBMIT_BUDGETS`] budgets is that much
 /// real time. This keeps such a submit at the time from which the dispatch-count splitter
-/// treats a forward as dangerous on any device, half the limit.
+/// treats a forward as dangerous on any device.
 pub(crate) fn default_budget_ms(reset_prone: bool) -> u32 {
     let ns = if reset_prone {
         infr_core::SUBMIT_BUDGET_NS
@@ -68,17 +73,26 @@ pub(crate) fn default_budget_ms(reset_prone: bool) -> u32 {
 /// after its work reaches the budget (`crate::segment_cut`), and the op that takes it there
 /// records at most one tagged dispatch, itself at most a budget (a heavier one is cut and opens
 /// submits of its own).
+///
+/// That counts estimated work only, and only where the cut can act. A submit also holds
+/// whatever was recorded without an estimate; a tagged dispatch that cannot be cut, or is
+/// recorded where no submit can be opened, goes in whole however heavy; and a dispatch has no
+/// more ranges than workgroups along the dimension that is cut, so one range can pass a budget.
 const SUBMIT_BUDGETS: u64 = 2;
 
 /// The watchdog's limit the defaults assume (see [`default_budget_ms`]).
 const WATCHDOG_NS: u64 = 2 * infr_core::SUBMIT_DANGER_NS;
 
+/// What [`floor_submit_ceiling_ns`] keeps free under [`WATCHDOG_NS`] on a reset-prone device.
+const RESET_PRONE_MARGIN_NS: u64 = WATCHDOG_NS / 4;
+
 /// The real GPU time a submit may take when a bad reading has put every estimate in it at the
-/// gain floor and the priors were exact: the watchdog's limit, less a quarter of it on a
-/// reset-prone device, where a reset is known to follow. [`max_prior_gain`] is derived from it.
+/// gain floor and the priors were exact. On a reset-prone device, where a reset is known to
+/// follow, [`WATCHDOG_NS`] less [`RESET_PRONE_MARGIN_NS`]; on any other, [`WATCHDOG_NS`] itself,
+/// with no margin. [`max_prior_gain`] is derived from it.
 pub(crate) fn floor_submit_ceiling_ns(reset_prone: bool) -> u64 {
     if reset_prone {
-        WATCHDOG_NS - WATCHDOG_NS / 4
+        WATCHDOG_NS - RESET_PRONE_MARGIN_NS
     } else {
         WATCHDOG_NS
     }
@@ -86,8 +100,12 @@ pub(crate) fn floor_submit_ceiling_ns(reset_prone: bool) -> u64 {
 
 /// The most a measurement may raise a kernel's throughput over its prior under a budget of
 /// `budget_ns`: what keeps [`SUBMIT_BUDGETS`] budgets of work estimated at that floor within
-/// [`floor_submit_ceiling_ns`] of real time when the prior was exact. Never under 1: a budget
-/// too large for the ceiling gets no correction at all, and its estimates stay the prior.
+/// [`floor_submit_ceiling_ns`] of real time when the prior was exact. Never under 1: under a
+/// budget too large for the ceiling no measurement lowers an estimate below the prior. A slow
+/// timed sample still raises one.
+///
+/// It bounds what [`SUBMIT_BUDGETS`] describes and no more (see there for what a submit can
+/// hold beyond it).
 ///
 /// A timed dispatch is bracketed by two timestamps with no barrier before the first, so it can
 /// read short when it overlaps earlier work, and a segment's time is shared out among its
@@ -107,8 +125,9 @@ pub(crate) fn max_prior_gain(budget_ns: u64, reset_prone: bool) -> f64 {
 const MAX_PRIOR_SLOWDOWN: f64 = 64.0;
 
 /// How many of a kernel's latest timed samples its rate is taken from (the slowest of them).
-/// One slow outlier is forgotten after this many more samples; lowering the rate takes this many
-/// fast readings in a row, each within the gain bound.
+/// One slow outlier is forgotten after this many more samples. Until a kernel has this many, the
+/// prior stands in for the ones it lacks, so lowering the rate takes this many fast readings in
+/// a row, each within the gain bound, from the first sample on.
 pub(crate) const TIMED_WINDOW: usize = 4;
 
 /// The ticks from timestamp `start` to timestamp `end` on a queue whose timestamps have
@@ -304,11 +323,14 @@ impl WorkModel {
 
     /// Feed one timed dispatch back: `flops` of `kernel`, a `family` kernel, took `ns`. The
     /// kernel's rate becomes the slowest of its last [`TIMED_WINDOW`] samples, this one included,
-    /// in place of its prior or of what segments had made of it: one slow reading is forgotten
-    /// once that many others have followed, and the rate only comes down when that many in a
-    /// row read faster. A sample of no time or no work says nothing and is dropped; any other is
-    /// held between the gain bound ([`max_prior_gain`]) on the fast side of the kernel's prior
-    /// and [`MAX_PRIOR_SLOWDOWN`] on the slow side.
+    /// with the prior counted for every sample it does not have yet: one slow reading is
+    /// forgotten once that many others have followed, and the rate only comes down when that
+    /// many in a row read faster. So a kernel's first sample cannot lower its estimate on its
+    /// own (and take it under the [`WorkModel::watch`] threshold, never to be timed again); it
+    /// can raise it. It also ends what segments had made of the kernel: until the window is
+    /// full the estimate is back at the prior or above. A sample of no time or no work says
+    /// nothing and is dropped; any other is held between the gain bound ([`max_prior_gain`]) on
+    /// the fast side of the kernel's prior and [`MAX_PRIOR_SLOWDOWN`] on the slow side.
     pub(crate) fn record(&self, kernel: &'static str, family: Family, flops: u64, ns: u64) {
         if flops == 0 || ns == 0 {
             return;
@@ -323,7 +345,11 @@ impl WorkModel {
         });
         e.timed.rotate_left(1);
         e.timed[TIMED_WINDOW - 1] = Some(rate);
-        e.ns_per_flop = e.timed.iter().flatten().copied().fold(rate, f64::max);
+        e.ns_per_flop = e
+            .timed
+            .iter()
+            .map(|sample| sample.unwrap_or(prior))
+            .fold(rate, f64::max);
     }
 
     /// Set a completed segment's estimated work against the GPU time it measured, `gpu_ns`. The
@@ -333,9 +359,14 @@ impl WorkModel {
     /// prior. Their estimate for this segment is then the time the whole segment measured, or
     /// more where the bound held a kernel back.
     ///
-    /// So this errs slow, and only slow: the untimed kernels cannot have taken more than the
-    /// segment did, whatever the timed kernels and the work without an estimate took of it. The
-    /// timed kernels' share is deliberately not subtracted. Their rate is the slowest of a few
+    /// So for the untimed kernels of this segment TAKEN TOGETHER, in the mix the segment ran,
+    /// this errs slow and only slow: together they cannot have taken more than the segment did,
+    /// whatever the timed kernels and the work without an estimate took of it. It says nothing
+    /// of each one. They share one factor, so a kernel slower against its prior than its
+    /// neighbours comes out too fast, by at most the gain bound, and only a timed dispatch
+    /// raises it again.
+    ///
+    /// The timed kernels' share is deliberately not subtracted. Their rate is the slowest of a few
     /// samples, so it overstates them, and taking that out of the measured time would hand the
     /// overstatement to the untimed kernels as speed nothing measured, again with every segment.
     /// The price is that a segment mostly made of timed work corrects nothing.
@@ -372,11 +403,16 @@ impl WorkModel {
                 continue;
             }
             let floor = self.prior_rate(family) / self.max_gain;
-            let learned = Learned {
-                ns_per_flop: (rate(&m, kernel, family) * scale).max(floor),
-                timed: [None; TIMED_WINDOW],
-            };
-            m.insert(kernel, learned);
+            let current = rate(&m, kernel, family);
+            let corrected = (current * scale).max(floor);
+            // Held at the floor already, or under a gain bound of 1: nothing to learn.
+            if corrected < current {
+                let learned = Learned {
+                    ns_per_flop: corrected,
+                    timed: [None; TIMED_WINDOW],
+                };
+                m.insert(kernel, learned);
+            }
         }
     }
 
@@ -425,8 +461,10 @@ mod tests {
 
     const MS: u64 = 1_000_000;
 
-    /// The watchdog's limit the defaults assume (see [`default_budget_ms`]).
-    const WATCHDOG_NS: u64 = 2 * infr_core::SUBMIT_DANGER_NS;
+    /// The limit the watchdogs were measured at, about 2 s (plan 12 sections 0d and 0e), written
+    /// out here and not taken from the module's constants: these tests are what says the
+    /// constants respect it.
+    const MEASURED_LIMIT_NS: u64 = 2_000 * MS;
 
     /// The integrated GPU here (2 CUs): its per-row GEMV over the SmolLM3 gate/up weight at 512
     /// rows measured about 1.57 s, the reproduction's heaviest dispatch.
@@ -456,7 +494,7 @@ mod tests {
         for reset_prone in [true, false] {
             let budget = u64::from(default_budget_ms(reset_prone)) * MS;
             assert!(
-                SUBMIT_BUDGETS * budget <= WATCHDOG_NS / 2,
+                SUBMIT_BUDGETS * budget <= MEASURED_LIMIT_NS / 2,
                 "reset_prone {reset_prone}: a full submit is {} ms",
                 SUBMIT_BUDGETS * budget / MS
             );
@@ -631,9 +669,16 @@ mod tests {
         m.calibrate(&work, tenths(7));
         assert!(est(&m).abs_diff(tenths(6)) <= 1, "{}", est(&m));
 
-        // A timed dispatch replaces what the segments made of it, faster or slower, and from
-        // then on segments leave the kernel alone.
+        // A timed dispatch ends what the segments made of the kernel: with one sample the
+        // estimate is back at the prior, and a faster segment no longer moves it.
         m.record("dp4a", Family::Int8, flops, tenths(5));
+        assert_eq!(est(&m), prior);
+        m.calibrate(&work, tenths(4));
+        assert_eq!(est(&m), prior);
+        // A full window of timed samples settles it, and segments still leave it alone.
+        for _ in 1..TIMED_WINDOW {
+            m.record("dp4a", Family::Int8, flops, tenths(5));
+        }
         assert!(est(&m).abs_diff(tenths(5)) <= 1, "{}", est(&m));
         m.calibrate(&work, tenths(4));
         assert!(est(&m).abs_diff(tenths(5)) <= 1, "{}", est(&m));
@@ -739,7 +784,9 @@ mod tests {
         assert_eq!(zero.estimate("gemv", Family::Gemv, flops), prior);
 
         let short = igpu();
-        short.record("gemv", Family::Gemv, flops, 1);
+        for _ in 0..TIMED_WINDOW {
+            short.record("gemv", Family::Gemv, flops, 1);
+        }
         let est = short.estimate("gemv", Family::Gemv, flops);
         assert!(
             est.abs_diff(floor) <= 1,
@@ -801,9 +848,9 @@ mod tests {
                 let held = (SUBMIT_BUDGETS * m.budget_ns()).div_ceil(floor_unit);
                 let real = held * real_unit;
                 let ceiling = if reset_prone {
-                    WATCHDOG_NS - WATCHDOG_NS / 4
+                    MEASURED_LIMIT_NS * 3 / 4
                 } else {
-                    WATCHDOG_NS
+                    MEASURED_LIMIT_NS
                 };
                 // One dispatch of rounding: `held` rounds up to a whole dispatch.
                 assert!(
@@ -814,24 +861,66 @@ mod tests {
                 );
             }
         }
-        // A budget too large for any gain to be safe gets none: its estimates stay the prior.
+        // Under a budget too large for any gain to be safe, nothing lowers an estimate: a fast
+        // timed window leaves it at the prior, and a segment does not even list the kernel as
+        // learned. A slow sample still raises it.
         let m = WorkModel::new(1500, prior_gflops(2), true, true);
         let unit = gemm_flops(64, 2048, 2048);
         let prior = m.estimate("k", Family::Gemv, unit);
-        m.record("k", Family::Gemv, unit, 1);
+        let mut work = SegmentWork::default();
+        work.add("k", Family::Gemv, unit);
+        m.calibrate(&work, 1);
+        assert!(
+            !learned(&m, "k"),
+            "a kernel that did not move is listed as learned"
+        );
+        for _ in 0..TIMED_WINDOW {
+            m.record("k", Family::Gemv, unit, 1);
+        }
         assert_eq!(m.estimate("k", Family::Gemv, unit), prior);
+        m.record("k", Family::Gemv, unit, 2 * prior);
+        assert!(m.estimate("k", Family::Gemv, unit) > prior);
     }
 
-    /// A timed kernel's rate is the slowest of its last `TIMED_WINDOW` samples: the first sample
-    /// replaces the prior, a slower one raises the rate at once, and a faster one lowers it only
-    /// when the slower ones have left the window.
+    /// Lowering a kernel's rate takes `TIMED_WINDOW` fast readings in a row from its very first
+    /// sample: the prior stands in for the samples it does not have yet. One fast reading alone
+    /// would otherwise take the estimate to the gain floor, and where that is under the timing
+    /// threshold the kernel would never be timed again. A first reading slower than the prior
+    /// raises the estimate at once.
+    #[test]
+    fn a_first_fast_sample_does_not_lower_an_estimate_on_its_own() {
+        let flops = gemm_flops(512, 2048, 22016);
+        let est = |m: &WorkModel| m.estimate("dp4a", Family::Int8, flops);
+        let m = igpu();
+        let prior = est(&m);
+        for sample in 1..TIMED_WINDOW {
+            m.record("dp4a", Family::Int8, flops, 1);
+            assert_eq!(est(&m), prior, "lowered after {sample} sample(s)");
+            assert!(m.watch(est(&m)), "no longer timed after {sample} sample(s)");
+        }
+        m.record("dp4a", Family::Int8, flops, 1);
+        assert!(
+            est(&m) < prior,
+            "a full window of fast readings changed nothing"
+        );
+
+        let slow = igpu();
+        slow.record("dp4a", Family::Int8, flops, 2 * prior);
+        assert!(est(&slow).abs_diff(2 * prior) <= 2, "{}", est(&slow));
+    }
+
+    /// A timed kernel's rate is the slowest of its last `TIMED_WINDOW` samples: a slower one
+    /// raises the rate at once, and a faster one lowers it only when the slower ones have left
+    /// the window.
     #[test]
     fn a_timed_rate_is_the_slowest_of_the_last_few_samples() {
         let m = igpu();
         let flops = gemm_flops(512, 2048, 22016);
         let prior = m.estimate("dp4a", Family::Int8, flops);
         let est = |m: &WorkModel| m.estimate("dp4a", Family::Int8, flops);
-        m.record("dp4a", Family::Int8, flops, 150 * MS);
+        for _ in 0..TIMED_WINDOW {
+            m.record("dp4a", Family::Int8, flops, 150 * MS);
+        }
         assert!(learned(&m, "dp4a"));
         assert!(est(&m) < prior);
         assert!(est(&m).abs_diff(150 * MS) < MS);

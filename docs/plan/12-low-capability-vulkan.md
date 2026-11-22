@@ -218,20 +218,133 @@ prompt 2, `gpu-float`; each is listed with its run count.
 Either way, keeping every dispatch well under 2 s on this GPU avoids it, and no
 submit boundary shortens a dispatch. The RX 580's limit under Linux is amdgpu's
 per-job `lockup_timeout`, a different watchdog: what it counts is the reporter's
-to measure (S0).
+to measure (S0). _(Both measured since: sections 0d and 0e. It is a submit that
+is counted, at about 2 s, on both.)_
+
+## 0d. Which work is reset: a submit, at about 2 s (2026-11-19 and 2026-11-22)
+
+Section 0c's open question, one dispatch or one submit, measured on `Vulkan1`.
+The probe is `crates/infr-vulkan/tests/dispatch_budget_probe.rs`: one Q4_K
+`Op::Linear` over SmolLM3-3B's fused gate/up shape (2048 x 22016) with the int8
+kernels off, which lowers to the per-row GEMV (`native_q4k`), about 3.0 ms per
+row, so the row count sets the duration; each iteration is one execute, ten per
+point unless a failure ends it (the backend is then poisoned). The registry
+still sets no `TdrDelay`, `TdrDdiDelay` or `TdrLevel` under
+`HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers` (read 2026-11-19), so
+Windows' defaults apply (`TdrDelay` 2 s).
+
+**Established [ran]:**
+
+| One submit holding                        | Quiet machine                                                                      | Second GPU client (a Qwen3-0.6B decode bench on `Vulkan1`) |
+| ----------------------------------------- | ---------------------------------------------------------------------------------- | ---------------------------------------------------------- |
+| 1 dispatch, 256 rows (0.79 s)             | not run                                                                            | 10 of 10                                                   |
+| 1 dispatch, 512 rows (1.55 s)             | 10 of 10                                                                           | 10 of 10 (2.57 s wall)                                     |
+| 1 dispatch, 640 rows (1.93 s)             | 10 of 10                                                                           | not run                                                    |
+| 1 dispatch, 768 rows (2.3 to 2.4 s)       | lost the device after its 1st iteration, and after the 4th in a repeat (see below) | 10 of 10 (3.33 s wall)                                     |
+| 1 dispatch, 896 rows (2.7 s)              | reset in its 3rd iteration                                                         | not run                                                    |
+| 1 dispatch, 1024 rows (3.1 s)             | reset in its 1st iteration                                                         | not run                                                    |
+| 8 independent dispatches of 128 rows      | reset in its 1st iteration                                                         | reset in its 2nd iteration                                 |
+| 8 dispatches of 128 rows, barrier between | 6 completed, reset in its 7th iteration                                            | not run                                                    |
+| 16 dispatches of 64 rows, barrier between | 10 of 10 (4.1 s wall)                                                              | not run                                                    |
+| the same 8 x 128 rows, one submit EACH    | 10 of 10 (3.1 s)                                                                   | not run                                                    |
+
+The quiet 512, 640 and 768 points are from 2026-11-22 (the first sweep's log of
+them was not kept, and its note for 768 rows, ten of ten, did not repeat); the
+rest are from 2026-11-19.
+
+- **The watchdog counts a submit, not a dispatch.** Eight dispatches of 0.39 s
+  in one submit were reset like one 3.1 s dispatch; the same eight in eight
+  submits completed every time. Cutting a heavy dispatch into ranges therefore
+  only helps when each range gets its own submit.
+- **The limit for one submit here lies between 1.93 s (ten of ten) and 2.3 s
+  (lost).** That is the default `TdrDelay` of 2 s plus whatever the driver takes
+  to act on it.
+- **A submit just past the limit can complete and still lose the device.** At
+  768 rows the iteration that crossed the limit returned normally, with its
+  closing timestamp written, after 2.3 to 2.4 s; the NEXT submit failed with a
+  lost device (`LiveKernelEvent` 0x141 entries followed). So the error names the
+  submit after the guilty one, which is the shape issue 94's reporter saw on the
+  RX 580 (section 0e); a failure now also lists the forward segments submitted
+  last with their GPU times (`gpu_wait::RecentSegment`), and here it read
+  `1 dispatch (native_q4k) submitted 2.4 s earlier, ran 2.3 s on the GPU`.
+- **A second GPU client did not make resets easier.** At 512 and 768 rows the
+  probe completed ten times of ten with a decode bench running on the same GPU;
+  the client took its share (wall time up by about a second) and the long
+  dispatch was not reset, 768 rows included, which lost the device on a quiet
+  machine. The preemption model of section 0c predicted the opposite.
+
+**Not established [I]:** why barriers between dispatches inside one submit
+helped (16 chained ranges completed ten times, 8 chained ones were reset once in
+seven), which fits a driver that can preempt at a barrier and not inside a
+dispatch, but nothing here observed preemption itself; why the second client's
+presence let a 2.3 s submit through; what the 0xA1000001 entries (live dumps by
+AMD's `amdfendr`, logged in runs that completed) are; and two 0x141 entries
+logged during runs all of whose segments wrote their closing timestamps (the
+eight-submit run, and a ten-of-ten run of 1024 rows as ranges in one submit), so
+a 0x141 entry alone does not mean work was dropped.
+
+**Heaviest dispatches by configuration** (`INFR_PROF_OPS=1` with
+`INFR_PROF_OP_SHAPES=1`, one profiled forward, `infr bench -p N -u N -r 1`;
+per-dispatch figures only from runs with `INFR_FULLBARRIER=1`, since without
+barriers a dispatch's time lands on the next label):
+
+| Device, model, `-u`, int8       | Heaviest single dispatches                                                                     | Largest submits        |
+| ------------------------------- | ---------------------------------------------------------------------------------------------- | ---------------------- |
+| `Vulkan1`, SmolLM3-3B, 128, off | per-row GEMV gate/up 2048x22016 391 ms, down 11008x2048 223 ms, 2048x2048 36 ms                | 880 ms (16 dispatches) |
+| `Vulkan1`, SmolLM3-3B, 512, on  | `native_gemm_dp4a_q4k` gate/up 65 ms, down (q4_k / q6_k) 30 / 29 ms, `attn_nc_fa_hd128` 9.3 ms | 264 ms (38 dispatches) |
+| `Vulkan1`, Qwen3-1.7B, 512, on  | `native_gemm_dp4a_q4k` gate/up 35 ms, down 19 / 17 ms, `attn_nc_fa_hd128` 9.2 ms (no barrier)  | 257 ms (55 dispatches) |
+
+The per-row GEMV is the family behind the production reproduction: about 3.0 ms
+per row for the SmolLM3 gate/up weight, so 1.55 s at `-u 512` and about 6.2 s at
+`-u 2048` [I: linear in the rows, as the probe's points are]. In GFLOP/s, as the
+work bound measures them on this GPU: the per-row GEMV 19 to 30 depending on the
+weight's shape, the dp4a GEMMs about 670 to 780, the flash prefill attention
+about 170.
+
+## 0e. The RX 580 on `main`, reported (2026-11-19)
+
+From the issue reporter's comment on issue 94 (korewaChino, RX 580, RADV on
+Linux, `main` at `9151fbd2`, empty config, Qwen3-1.7B Q4_K_M). Their numbers,
+not run here:
+
+- `submit.initial_dispatches` reads 64, `matrix_units` and `dot_accelerated`
+  both false. pp512 COMPLETES with the split: 238.8 t/s (`submit split/62`);
+  tg128 113.2 t/s, unchanged from 112.7 on `bc9077b7`; pp2048 with `-u 2048`
+  213.7 t/s (`submit split/16`).
+- With `INFR_SUBMIT_DISPATCHES=0` pp512 dies every time after about 2.4 s:
+  `radv/amdgpu: The CS has been cancelled because the context is lost. This context is guilty of a soft recovery`,
+  and `dmesg` shows `ring gfx timeout, but soft recovered`. `modinfo -p amdgpu`
+  gives `lockup_timeout` a default of 2000 ms. So on Linux the limit is amdgpu's
+  job timeout, about 2 s per submit: a time limit, like the one measured in
+  section 0d.
+- `INFR_SUBMIT_DISPATCHES=128` and `=256` still end on `submit split/62` with
+  the same throughput: the measured loop chooses the cap, and the setting only
+  moves where it starts. The docs said "cap"; they now say what it does.
+- The lost device surfaced on a one-shot copy after the forward and did not name
+  the forward. Fixed here: see section 0d's third point.
+- Their fork's prefill is 1136.1 t/s against 238.8 on the same card, from its
+  `kq_fma` prefill GEMM (S4).
+
+Since then `main` took the fork's compute-ring change
+(`kernels.vulkan.gfx_queue`, PR 106): a discrete card submits on a compute-only
+queue family. amdgpu documents a longer job timeout for compute rings than for
+the graphics ring [R: the kernel's `lockup_timeout` parameter], so the 2 s above
+may no longer be the limit that applies to that card by default; it is not
+measured, and the work bound keeps assuming 2 s, the tighter figure, which also
+covers `gfx_queue = true` and Windows.
 
 ## 1. Slices
 
-| #   | Slice                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | Verified here                                                                                                                                                                                                                                       | Needs the RX 580                             |
-| --- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------- |
-| S0  | Diagnosis on `main`, no code: the reporter runs the commands asked for on issue 94 (submit cap 64 and 16, `INFR_NO_DP4A_KQ`, a per-op profile, `lockup_timeout`, dmesg). A stall or lost device reproduced locally on the integrated GPU with a heavy harness dispatch, limit and mechanism not yet established: section 0b                                                                                                                                            | n/a                                                                                                                                                                                                                                                 | yes; decides whether S1 alone fixes the hang |
-| S1  | Protect the first forward on slow discrete devices: a device fact for accelerated int8 dot; a capability-derived initial submit cap for discrete devices without coopmat and without accelerated dot, and for wave64-only devices; reported in `infr tune show`. Port the fork's `a35dac2f` (author kept), re-expressed against `initial_submit_dispatch_cap`. Section 0b's local stall, which already had a cap, says S1 alone does not close every case of the class | the cap function's unit test goes red on the old rule; only the `rx580-gcn-radv` snapshot changes; `INFR_FORCE_WAVE64=1` on both GPUs shows cuts on the first forward with goldens unchanged; default runs show no cuts                             | pp512 completes on Q4_K_M                    |
-| S2  | Work-bounded submits: also cut on an estimated work budget per submit scaled by compute-unit count (llama.cpp's rule, which a code comment already names as worth adopting)                                                                                                                                                                                                                                                                                            | unit tests on the budget; per-submit GPU time stays under `SUBMIT_BUDGET_NS` with a forced large ubatch on the integrated GPU                                                                                                                       | a 3B or larger pp2048 completes              |
-| S3  | The dot-accelerated capability and the fork's fp32-dequant K-quant decode GEMV and verify GEMV (`e600b702 23cda86d d90b1c97 688fdbca 26d639d6 ad2256df a6929cd1 67582783`: apply as text, unbuilt) plus the Vulkan hunks of `244cd37c` and `6c0293a1`; not `ca67e1ee`. The default becomes a tuning parameter derived from the dot fact                                                                                                                                | the fork's `kq_fma_gemv_parity`, `kq_fma_mrow_parity`, `kq_fma_mtp_verify_tight` on both GPUs; `subgroup_kernels_are_wave64_safe`; forced on, with and without forced wave64, the whole-model GPU-vs-CPU tests; default kernel-name lists unchanged | tg128 against `main`, profile                |
-| S4  | The fork's fp32 K-quant prefill GEMM (`29f9c317`, with its split-K twin): manual resolution or a PR from the fork; selected ahead of the int8 GEMM when dot is not accelerated, as a derived tuning parameter                                                                                                                                                                                                                                                          | the fork's `nc_kq_fma_gemm_parity_and_determinism` on both GPUs; forced on, the GPU gate; forced pp512 against the int8 kernel on the RX 7900 XTX recorded (no default change)                                                                      | pp512 against llama.cpp, profile             |
-| S5  | Decode attention with a 16-key split floor (`6b63767b`) and the `attn_combine` load overlap (`a8e0977d`), both apply as text; the floor becomes a tuning parameter (ahead of plan 10's S11). Upstream already has split-K decode attention; the difference is the floor                                                                                                                                                                                                | the fork's `attn_decode_parity` bitwise; tg128 at depth 0, 128 and 4096 on both GPUs under plan 10's measurement protocol; kept only if neither regresses                                                                                           | tg128                                        |
-| S6  | Q4_K packed metadata in the row-tiled decode MMV (`ea3008ca`, `7a6147b3`), re-measured against current `main`                                                                                                                                                                                                                                                                                                                                                          | the fork's exact-match test; tg128 on both GPUs                                                                                                                                                                                                     | optional                                     |
-| S7  | Decision, not code: submitting on a compute-only queue (`a9c50bce`); it changes which amdgpu ring and timeout apply                                                                                                                                                                                                                                                                                                                                                    | A/B desktop responsiveness and throughput on both GPUs                                                                                                                                                                                              | yes                                          |
+| #   | Slice                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | Verified here                                                                                                                                                                                                                                                                                                              | Needs the RX 580                                                                  |
+| --- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------- |
+| S0  | Diagnosis on `main`, no code: the reporter runs the commands asked for on issue 94 (submit cap 64 and 16, `INFR_NO_DP4A_KQ`, a per-op profile, `lockup_timeout`, dmesg). A stall or lost device reproduced locally on the integrated GPU with a heavy harness dispatch, limit and mechanism not yet established: section 0b                                                                                                                                            | n/a                                                                                                                                                                                                                                                                                                                        | yes; decides whether S1 alone fixes the hang                                      |
+| S1  | Protect the first forward on slow discrete devices: a device fact for accelerated int8 dot; a capability-derived initial submit cap for discrete devices without coopmat and without accelerated dot, and for wave64-only devices; reported in `infr tune show`. Port the fork's `a35dac2f` (author kept), re-expressed against `initial_submit_dispatch_cap`. Section 0b's local stall, which already had a cap, says S1 alone does not close every case of the class | the cap function's unit test goes red on the old rule; only the `rx580-gcn-radv` snapshot changes; `INFR_FORCE_WAVE64=1` on both GPUs shows cuts on the first forward with goldens unchanged; default runs show no cuts                                                                                                    | pp512 completes on Q4_K_M                                                         |
+| S2  | Work-bounded submits: an estimated GPU time per prefill dispatch (FLOPs over a measured or prior throughput), a submit closed once its estimated work reaches a time budget, and a dispatch past the budget cut into ranges of its grid, each in its own submit. **Done**, see the status below                                                                                                                                                                        | unit tests on the estimate and the cut rule that fail on the old rule; bit-identity of every cut kernel family under a forced 1 ms budget on both GPUs, native and forced wave64; the integrated GPU's production reproduction completing at default settings; no measurable change on the RX 7900 XTX at default settings | pp512 with the dispatch cap off and only the work bound on; a 3B or larger pp2048 |
+| S3  | The dot-accelerated capability and the fork's fp32-dequant K-quant decode GEMV and verify GEMV (`e600b702 23cda86d d90b1c97 688fdbca 26d639d6 ad2256df a6929cd1 67582783`: apply as text, unbuilt) plus the Vulkan hunks of `244cd37c` and `6c0293a1`; not `ca67e1ee`. The default becomes a tuning parameter derived from the dot fact                                                                                                                                | the fork's `kq_fma_gemv_parity`, `kq_fma_mrow_parity`, `kq_fma_mtp_verify_tight` on both GPUs; `subgroup_kernels_are_wave64_safe`; forced on, with and without forced wave64, the whole-model GPU-vs-CPU tests; default kernel-name lists unchanged                                                                        | tg128 against `main`, profile                                                     |
+| S4  | The fork's fp32 K-quant prefill GEMM (`29f9c317`, with its split-K twin): manual resolution or a PR from the fork; selected ahead of the int8 GEMM when dot is not accelerated, as a derived tuning parameter                                                                                                                                                                                                                                                          | the fork's `nc_kq_fma_gemm_parity_and_determinism` on both GPUs; forced on, the GPU gate; forced pp512 against the int8 kernel on the RX 7900 XTX recorded (no default change)                                                                                                                                             | pp512 against llama.cpp, profile                                                  |
+| S5  | Decode attention with a 16-key split floor (`6b63767b`) and the `attn_combine` load overlap (`a8e0977d`), both apply as text; the floor becomes a tuning parameter (ahead of plan 10's S11). Upstream already has split-K decode attention; the difference is the floor                                                                                                                                                                                                | the fork's `attn_decode_parity` bitwise; tg128 at depth 0, 128 and 4096 on both GPUs under plan 10's measurement protocol; kept only if neither regresses                                                                                                                                                                  | tg128                                                                             |
+| S6  | Q4_K packed metadata in the row-tiled decode MMV (`ea3008ca`, `7a6147b3`), re-measured against current `main`                                                                                                                                                                                                                                                                                                                                                          | the fork's exact-match test; tg128 on both GPUs                                                                                                                                                                                                                                                                            | optional                                                                          |
+| S7  | Decision, not code: submitting on a compute-only queue (`a9c50bce`); it changes which amdgpu ring and timeout apply                                                                                                                                                                                                                                                                                                                                                    | A/B desktop responsiveness and throughput on both GPUs                                                                                                                                                                                                                                                                     | yes                                                                               |
 
 **Status (branch `fix/vulkan-submit-bounds`, 2026-11-19).** Done beside the
 slices: every host wait is bounded and a failure poisons the backend with an
@@ -263,17 +376,88 @@ branch (2026-11-19, the filter of `docs/gpu-tolerance.md` plus
 integrated GPU (`main` at `086ebff0`: 643 and 582); with `INFR_FORCE_WAVE64=1`
 on the XTX 590 passed and 1 failed, the native-device half of
 `first_forward_split`, which forcing makes slow-class and which now skips under
-it (re-run: both pass). **S2 not done:** section 0c shows a per-submit budget is
-not enough on its own, because a long dispatch is what is reset, and no submit
-boundary shortens it. What it needs, from the measurements: a per-op cost
-estimate (FLOPs from the op's shape) over a throughput that is per device AND
-per kernel family (on the integrated GPU the dp4a GEMMs and the scalar-dequant
-ones differ by about an order of magnitude, estimated from segment times, not
-measured per op [I]), refined from measured segment times; cutting submits on
-the estimate; and SPLITTING an op whose own estimate passes the budget into row
-ranges, or refusing it with a message (B221). Until then a large `-u` on a slow
-device fails with an error instead of a hang. The RX 580 still needs the
-reporter: S1 is the fork's measured fix for that card, untested here on GCN.
+it (re-run: both pass). The RX 580's reporter has since confirmed S1 on the card
+(section 0e).
+
+**S2 done (branch `fix/vulkan-work-budget`, 2026-11-22).** `crate::work`: every
+prefill GEMM and multi-row GEMV, and the non-coopmat flash prefill attention,
+estimates its GPU time before it is recorded (FLOPs over the throughput measured
+for that kernel in the process, else the prior `submit.prior_gflops`, 8 GFLOP/s
+per compute unit, times 8 for an accelerated int8 dot and 16 for matrix units);
+a dispatch estimated past `submit.budget_ms` is cut into ranges of its workgroup
+grid through a `DISPATCH_BASE` twin of its pipeline, each range in a submit of
+its own; and `segment_cut` closes a submit at the next op boundary once its
+estimated work reaches the budget, after the dispatch cap and before the paged
+cadence. The budget is a time because the limit is (sections 0d and 0e): 250 ms,
+an eighth of the 2 s, on an integrated or slow-class device, and 1000 ms
+elsewhere. Decisions are made when a forward is recorded; a decode replay tape
+and a single-row forward are never cut or timed.
+
+What ran, all on 2026-11-22 with the final binary unless said:
+
+- **The production reproduction completes** on `Vulkan1` at default settings,
+  `infr bench` SmolLM3-3B Q4_K_M, one run per process: `-u 512` with
+  `INFR_NO_I8DOT=1` five of five (5.1 t/s each; 144 dispatches cut into ranges
+  and 869 to 1041 work cuts in a run), `-u 2048 -p 2048` five of five (91.3 to
+  91.9 t/s; 143 dispatches cut, 364 or 365 work cuts), and `-u 2048` with
+  `INFR_NO_I8DOT=1`, whose gate/up GEMV is about 6 s whole, once (5.1 t/s, 811
+  s; 361 dispatches cut, 3675 work cuts). No `LiveKernelEvent` entry of any code
+  was logged during the three batches, and `infr devices` listed both GPUs after
+  every run. An earlier build of the branch, before the last changes, had done
+  the first two batches five of five as well. On `main` the first was reset in
+  every run (section 0c).
+- **Bit-identity under a forced budget of 1 ms** (`tests/work_split_parity.rs`
+  and `attention_prefill_nc_fa_cut_is_bit_identical`), each case against the
+  same graph with the bound off, on both GPUs, natively and with
+  `INFR_FORCE_WAVE64=1`: the per-row GEMV on a two-dimensional and on a one-row
+  grid, the dp4a K-quant and the mmq int8 GEMMs, each device's default tier
+  (`native_gemm_i8cm_q4k_m`, `native_gemm_warp_q8_0_sk_ag` and
+  `native_gemm_warp_f16_sk` on the RX 7900 XTX; `native_gemm_dp4a_q4k`,
+  `native_gemm_mmq_q8_0` and `native_gemm_fma_f16` on the integrated GPU and
+  under forced wave64) and the flash prefill attention. Running the second range
+  over the first one's workgroups failed five of the six parity tests on the RX
+  7900 XTX, and shortening the first range failed four.
+- **Issue 94's class, simulated**
+  (`..._slow_class_forward_under_the_default_budget`: wave64, no matrix kernels,
+  no int8 dot, the RX 580's own prior of 288 GFLOP/s, the default budget): a
+  1024-row forward over SmolLM3's feed-forward shapes on the RX 7900 XTX had two
+  dispatches cut into ranges and three submits opened by the work bound in its
+  first forward, bit-identical to the same forward in one submit. The GEMV there
+  measured about 410 GFLOP/s, so that prior is pessimistic for the XTX; what it
+  is on GCN is the reporter's to measure.
+- **Defaults on the fast path.** `infr tune show` against `main` differs on both
+  GPUs only by the two new lines and the hash (`submit.budget_ms` 1000 and
+  `submit.prior_gflops` 768 on the RX 7900 XTX, 250 and 16 on the integrated
+  GPU). Qwen3-1.7B Q4_K_M at default settings on the RX 7900 XTX: no cut and no
+  timed dispatch in any forward. On the integrated GPU: the dispatch cap's cuts
+  as before, plus three work cuts in the first prefill forward and none after.
+- **No measurable change at default settings.** `infr bench` Qwen3-1.7B Q4_K_M
+  against `main` (`86f90c95`), interleaved, two file copies of each binary, the
+  first copy rotating each round, nothing else running. RX 7900 XTX, twelve
+  rounds: pp512 11538.68 against 11542.07 t/s (-0.03%; the two copies of one
+  binary differ by 0.12% and 0.19%), tg128 469.18 against 469.28 (-0.02%; copies
+  0.01% and 0.00%). A first set of six rounds read -0.21% and -0.06% with copies
+  up to 0.27% and 0.10% apart. Integrated GPU, six rounds: pp512 231.03 against
+  231.06 (-0.01%; copies 0.02% and 0.04%), tg128 27.02 against 27.02 (copies
+  0.06% and 0.19%).
+- **The unit tests fail on the old rule**: with the work arm removed from
+  `segment_cut`, `the_work_cut_closes_a_heavy_segment_of_few_dispatches` fails;
+  with a dispatch never cut, three of `work::tests` fail; with a prior ten times
+  faster, three; with a measurement allowed to lower an estimate twice, one.
+- **Gates.** The GPU gate (the filter of `docs/gpu-tolerance.md` plus
+  `mtp_head_cpu_vulkan_parity` and `work_split_parity`): 616 passed on the
+  integrated GPU, the tolerance tests among them with the harness workaround
+  removed and no table row changed; on the RX 7900 XTX 676 passed and 1 failed,
+  `gpu_seam_golden_qwen3`. It fails with the same hash on `main` at `86f90c95`
+  (the three fork PRs merged), which the gate of 2026-11-19, before them, did
+  not report, so one of those PRs moved that golden on native lanes (the
+  decode-attention change is the likely one [I]), not this slice; left for the
+  slice that reviews those PRs. With `INFR_FORCE_WAVE64=1` on the RX 7900 XTX
+  616 passed.
+
+What it leaves out is in the backlog (B226): kernels without an estimate, the
+thin margin of the prior for one GEMV shape, the cuts a large model takes on a
+fast card by estimate, and the RX 580's limit on the compute ring.
 
 Declined: the fork's opt-in SSBO weight binding, which its own config doc marks
 as producing wrong output in a model on the RX 580, and its GQA decode pass,

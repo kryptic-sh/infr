@@ -43,10 +43,10 @@ reference to judge tuned values against.
 
 ## Vulkan backend
 
-| Phase | What                                                                                            | Status                                         |
-| ----- | ----------------------------------------------------------------------------------------------- | ---------------------------------------------- |
-| 10    | [Kernels with per-device tunable parameters](10-tunable-kernels.md), one tuning table           | S1 done                                        |
-| 12    | [Vulkan devices without matrix units or fast int8 dot (GCN class)](12-low-capability-vulkan.md) | not started; S0 waits on the issue 94 reporter |
+| Phase | What                                                                                            | Status                                                                                                                                              |
+| ----- | ----------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 10    | [Kernels with per-device tunable parameters](10-tunable-kernels.md), one tuning table           | S1 done                                                                                                                                             |
+| 12    | [Vulkan devices without matrix units or fast int8 dot (GCN class)](12-low-capability-vulkan.md) | S0 answered by the reporter; S1 and S2 done; the fork's PRs 105 to 107 (the subjects of S5, S3 and S7) merged, their review pending; S4 and S6 open |
 
 ## Caps, refusals and open decisions
 

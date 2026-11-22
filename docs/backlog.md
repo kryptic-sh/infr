@@ -6807,27 +6807,17 @@ values. What it leaves:
   goldens and exact-token tests cover them today, and G4 must not drop those
   without a replacement. A forced chain would need the chain to read back every
   step's logits. The static per-token path is gated (`gpu-float-static`).
-- **The int8-off runs lose the integrated GPU; the workaround stays.** On
-  `Vulkan1` with every int8 kernel off, the harness's prefill head is one
-  vocabulary-wide `native_q6k` dispatch of about 25 ms per chunk row (3.26 s at
-  the default 128-row chunk). With it in flight Windows resets the engine (TDR
-  engine-timeout entries in the event log) in some runs and not others: one run
-  each was reset at 96 and 128 rows with the dispatch alone in its submit, and
-  other runs at 128 completed. Whether the rule is a fixed per-dispatch limit or
-  a preemption timeout is not established (plan 12 section 0c has both models,
-  the run counts, the registry and event-log readings). Before the bounded waits
-  a reset ended in a hang (a timestamp read waiting forever after the driver
-  signalled the dropped work's fence) or a lost device; now it is an error
-  within seconds. The tolerance tests keep their workaround on integrated
-  devices for configurations with every int8 knob off (head on each chunk's last
-  row, cap 4, `INTEGRATED_FLOAT_SUBMIT_CAP`), because nothing in production
-  splits one dispatch (B221). Scoring every prefill row there needs either that
-  split or 32-row chunks for those runs (0.83 s per head dispatch measured), and
-  the second changes the measured graph, so its rows would be re-derived under
-  the no-ratchet rule; not done. The `Vulkan1` table data is partial: native
-  lanes with the tuning rows on only, and gemma-3's and Qwen3.5's full-head
-  int8-off runs there did not complete (their int8-off rows there come from the
-  workaround runs).
+- **The `Vulkan1` table data predates the full prefill head there.** Until
+  2026-11-22 the integrated GPU's int8-off runs scored the prefill on each
+  chunk's last row only, under a submit cap of 4, because the full head (one
+  vocabulary-wide `native_q6k` dispatch, 3.26 s at the default 128-row chunk)
+  was reset by Windows. The backend now cuts that dispatch into ranges, each in
+  its own submit (plan 12 S2, B226), the workaround is gone, and the tolerance
+  tests pass there with every prefill row scored and no table row changed. What
+  is left: the `Vulkan1` rows were SET from the workaround runs (native lanes,
+  tuning rows on only; gemma-3's and Qwen3.5's full-head int8-off runs had not
+  completed), so `measure_gpu_tolerance` has not been re-run there to see how
+  much room the full head leaves under them.
 - **gemma-3-1b's int8 distance is ten times larger on the integrated GPU than on
   the RX 7900 XTX, unexplained.** Worst KL from position 2 on, configuration
   `gpu`: 0.26 on `Vulkan1` (prompt 2, position 115; 0.87 at position 1), 2.6e-2
@@ -6960,8 +6950,8 @@ taken on 2026-11-19 (`docs/math.md`, `docs/cpu-activations.md`). What is left:
   into `docs/math.md`, and the families still scalar on aarch64 (B206); plan
   11's G3 and G4 (commit the planted-bug tests; convert the exact GPU goldens
   and wire `infr tune check`); plan 10's tuning slices S2 onward; plan 12's
-  kernel ports from the fork; plan 12 S2, work-bounded submits and split heavy
-  ops (B221); the activation split's sparse dot on the grid formats (B223).
+  kernel ports from the fork; the activation split's sparse dot on the grid
+  formats (B223).
 
 ### B209 — gemma-3-1b's mid-sequence CPU distance is int8 noise, not outliers (2026-11-18)
 
@@ -7160,39 +7150,100 @@ tasks).
   to 14 GB through the VM's file reads; the two in one process were not
   attempted.
 
-### B221 — work-bounded submits and split heavy ops (plan 12 S2), not done (2026-11-18)
+### B226 — the work bound (plan 12 S2): what it leaves out, and what was not verified (2026-11-22)
 
-**Tag:** vulkan · submit · watchdog · **Kind:** deferred work, measured
+**Tag:** vulkan · submit · watchdog · **Kind:** coverage gaps, decisions
 
-A GPU engine reset by the driver's watchdog now ends in an error (`gpu_wait`: a
-bounded wait, a lost device, or a segment whose fence signalled without its
-closing timestamp) instead of a hang, but nothing avoids it. What met it,
-measured on the Ryzen integrated GPU (`Vulkan1`, AMD Windows driver, default TDR
-settings; plan 12 section 0c, where the exact rule, a fixed per-dispatch limit
-or a preemption timeout, is left open):
+`crate::work` bounds the estimated GPU time of every submit and of every single
+dispatch (`submit.budget_ms`), by cutting a heavy dispatch into ranges of its
+grid, each in its own submit, and closing a submit once its estimated work
+reaches the budget. Plan 12 sections 0d and 0e have the measurements behind it.
+What it does not do:
 
-- **A dispatch of more than about 2 s in flight**, whatever submit it is in: the
-  tolerance harness's vocabulary-wide head at 96 or more rows with int8 kernels
-  off (reset in some runs, not all). No submit boundary shortens it; the op
-  itself must be split into row ranges (or refused with a message before it is
-  submitted).
-- **Submits of many heavy dispatches**: `infr bench` SmolLM3-3B Q4_K_M with
-  `-u 2048` submitted 128-dispatch segments of 4.9 and 5.2 s with the default
-  int8 kernels, and `-u 512` with `INFR_NO_I8DOT=1` failed too. The dispatch cap
-  (`submit.initial_dispatches`, then the measured loop) counts dispatches, not
-  work, so a larger chunk makes each one heavier at the same count.
-
-What it would take: a cost estimate per op from its shape (FLOPs for
-`Op::Linear`, attention by its key count), divided by a throughput that is per
-device AND per kernel family (on the integrated GPU the dp4a GEMMs and the
-scalar-dequant float GEMMs differ by about an order of magnitude, estimated from
-segment times, not measured per op), refined from measured segment times; a cut
-whenever the next op would push the open segment past the budget
-(`SUBMIT_BUDGET_NS`); and row-range splitting of an op whose own estimate passes
-it. llama.cpp's form is a per-submit FLOP cap scaled by CU count for small AMD
-parts (`ggml-vulkan.cpp`, `flops_per_submit`), which caps submits but not single
-dispatches. Not started because the estimate's per-kernel throughput needs
-measurements per family first, and splitting ops touches every GEMM lowering.
+- **Kernels that carry no estimate count as free.** Only these say what they
+  cost (`Recorder::work_next`), and only over more than one row: every prefill
+  GEMM (`tag_gemm`'s call sites: the cooperative-matrix, int8-dot, dp4a K-quant
+  and float tiled kernels), the per-row GEMV (`linear_native_at`'s multi-row
+  dispatch), the fork's multi-row `native_gemv_kq_fma_mrow`, and the non-coopmat
+  flash prefill attention (`attention_prefill_nc_fa`). Everything else is
+  bounded by the dispatch cap alone: the multi-row GEMVs of the 2-to-16 row band
+  (`native_mmv_mrow*`), every other attention kernel (the cooperative-matrix
+  flash prefill, `attention_kv*`, MLA, the split-K decode kernels),
+  convolutions, the DeltaNet and hyper kernels, MoE routing and scatter,
+  embedding gathers, norms and activations. None of those was seen heavy in the
+  profiles of plan 12 section 0d (the heaviest untagged dispatch there is under
+  4 ms, `rope_f16`); a model family whose prefill is dominated by one of them on
+  a slow device would get no cut from the work bound. To add one: tag it where
+  it is recorded, with its FLOPs and `work::Split` (`Flat` only if the shader
+  does not read `gl_NumWorkGroups`, which `record_dispatch` checks against the
+  SPIR-V).
+- **No estimated kernel is uncuttable today, so the refusal has no GPU test.** A
+  dispatch whose kernel cannot be cut (`work::Split::No`, or a `WideGrid` kernel
+  on a three-dimensional grid) and that was MEASURED at more than eight times
+  the budget is refused on a reset-prone device with an error naming the kernel.
+  Nothing produces such a dispatch, so only `WorkModel::refuse`'s unit test
+  covers it.
+- **A recording that cannot open submits keeps heavy dispatches whole.** A
+  persistent recording (the decode replay tape, replayed whole) and every
+  recording under `device.submit_dispatches = 0` record a tagged dispatch as
+  one, whatever its estimate. No decode recording carries a multi-row GEMM heavy
+  enough to matter in what was measured; a batched decode over many sequences on
+  a slow device is the case to look at.
+- **The estimate follows timestamps around one dispatch, which other dispatches
+  can overlap.** A timed dispatch is bracketed by two timestamps with no barrier
+  before the first, so a dispatch that started while earlier work was still
+  running can read short. The model keeps the SLOWEST sample per kernel, which
+  the first dispatch of an overlapping group always is, and on the integrated
+  GPU eight independent GEMV dispatches in one submit read the same throughput
+  as one alone (29.2 to 29.9 GFLOP/s over the four probe points). Not shown: a
+  kernel whose every dispatch overlaps a heavier one of another kernel. A
+  barrier before the opening stamp would make the reading exact at the cost of
+  serialising those dispatches; not done, since it would change what a slow
+  device runs.
+- **The prior's margin is thin for one shape.** `submit.prior_gflops` is 16 on
+  the 2-CU integrated GPU; its per-row GEMV measured 29.9 GFLOP/s on a 2048 x
+  22016 weight and 18.8 on 22016 x 2048 (the slow-class test's shapes). The
+  budget's eighth of 2 s is what absorbs a prior that is wrong.
+- **A fast card keeps the prior for most of its dispatches.** Only a dispatch
+  estimated at a thirty-second of the budget or more is timed, which on the RX
+  7900 XTX (budget 1000 ms, prior 768 GFLOP/s times 16 for matrix units) leaves
+  every GEMM of a model up to about 14B at 1024 rows untimed. A large model's
+  forward can therefore reach the budget by estimate and take a cut that a
+  measurement would not ask for (by the prior, a 14B model at 1024 rows is about
+  2.3 s of estimated work: two cuts a forward [I: computed from the prior, not
+  run]). Each cut is a submit and a barrier; Qwen3-1.7B at default settings
+  takes none. Calibrating from whole-segment times would remove them.
+- **The measured dispatch-cap loop double-counts.** `observe_forward` divides a
+  forward's whole GPU time by its dispatch count, tagged dispatches included, so
+  at a large batch the cap ratchets to its floor of 16 although the work bound
+  already cuts the heavy dispatches (`submit split/16` on the integrated GPU at
+  `-u 512` with int8 off and at `-u 2048`). More submits than needed, no
+  failure. Subtracting the estimated work from the loop's sample would fix it.
+- **The integrated GPU's first prefill forward takes three more submits** at
+  default settings than before (the pessimistic prior), then none: Qwen3-1.7B,
+  `pp512`, counted from the `RUST_LOG=infr_vulkan=debug` forward lines.
+- **`device.submit_dispatches = N` moves where the cap starts, not where it
+  ends** (issue 94: 128 and 256 both ended on 62). The docs now say so. A
+  DECISION for the owner: whether an explicit N should instead pin the cap,
+  which would let a user raise it past what the measured loop allows, at their
+  own risk now that the work bound holds the heavy dispatches. Not changed.
+- **The RX 580's limit on the compute ring is not known.** PR 106 moved a
+  discrete card's submits to a compute-only queue family, and amdgpu's
+  `lockup_timeout` gives compute jobs a longer default than the 2 s the reporter
+  measured on the graphics ring. The budget still assumes 2 s. Asked on
+  issue 94.
+- **The ordering barrier of a cut dispatch's later submits is not covered by a
+  test.** `Recorder::rollover` opens each fresh command buffer with
+  `seed_barrier`; removing it left every parity test green on the RX 7900 XTX,
+  whose queue runs submits in order anyway. It is kept because Vulkan requires
+  it.
+- **A `LiveKernelEvent` 0x141 entry does not always mean dropped work.** Two
+  were logged during runs all of whose segments wrote their closing timestamps
+  (plan 12 section 0d), so counting those entries over-reports.
+- **Not run:** GCN itself (the reporter's card); `INFR_FORCE_WAVE64` on the
+  integrated GPU beyond the work-split parity tests; a model with a
+  cooperative-matrix prefill on a device slow enough to cut it (the RX 7900 XTX
+  cuts those kernels only under the tests' forced budget of 1 ms).
 
 ### B222 — what the bounded GPU waits did not verify (2026-11-18)
 
@@ -7211,13 +7262,16 @@ measurements per family first, and splitting ops touches every GEMM lowering.
   After such a wait returns, the decode reads its logits from mapped memory, so
   a reset during a replay can hand back wrong logits; the lost device is
   reported only by the next submit (in every harness run of section 0c the next
-  submit did report it). A general detector was considered and not built: a
-  completion marker the last command of every submit writes (the host clears a
-  mapped word before the submit and checks it after the fence) would cover every
-  path, at a transfer write and a barrier per submit, and on the persistent
-  replays the value must change per replay, which the recorded command buffer
-  cannot do without re-recording or a host-side reset per token. Worth doing
-  with a decode A/B to show its cost; until then this is the gap.
+  submit did report it). That error now also lists the last forward segments
+  submitted, with their GPU times (`gpu_wait::RecentSegment`), so the forward
+  that was cut can be told from it; it still cannot say that a decode replay was
+  the one. A general detector was considered and not built: a completion marker
+  the last command of every submit writes (the host clears a mapped word before
+  the submit and checks it after the fence) would cover every path, at a
+  transfer write and a barrier per submit, and on the persistent replays the
+  value must change per replay, which the recorded command buffer cannot do
+  without re-recording or a host-side reset per token. Worth doing with a decode
+  A/B to show its cost; until then this is the gap.
 - **The bounded wait costs decode about 0.4%; accepted for now (2026-11-19).** A
   returned error is a better failure than a hang or a killed process.
   Interleaved A/B against `main` (`086ebff0`), Qwen3-1.7B Q4_K_M, six rounds
@@ -7274,7 +7328,3 @@ measurements per family first, and splitting ops touches every GEMM lowering.
   long-lived embedder that recreates backends after a failure would keep the
   leaked one.
 - **Metal's waits were not reviewed** for the same unbounded-wait pattern.
-- **Windows dispatch versus command-buffer preemption is open:** whether a
-  submit of many short dispatches is also reset at 2 s on the integrated GPU
-  (`infr_core::SUBMIT_BUDGET_NS`'s comment says a 2.06 s submit was), see plan
-  12 section 0c.

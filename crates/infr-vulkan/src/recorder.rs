@@ -2115,9 +2115,14 @@ impl<'a> Recorder<'a> {
         );
     }
 
-    /// Which `linear_f32r` build [`Self::linear_f32_at`] dispatches for `rows` × `in_f` — public
-    /// so the parity test can assert the shape it meant to cover actually reached that kernel.
+    /// Which f32 GEMV build [`Self::linear_f32_at`] dispatches for `rows` × `in_f` when the
+    /// weight's address is 16-byte aligned — public so the parity test can assert the shape it
+    /// meant to cover actually reached that kernel. (`linear_f32_mo` reads the weight as aligned
+    /// vec4s; at an unaligned address [`Self::linear_f32_at`] takes the `linear_f32r` build this
+    /// would name with `gemv.kq_fma` off.)
     ///
+    /// One row with a vec4-wide `in_f` takes `linear_f32_mo` where the tuning parameter
+    /// `gemv.kq_fma` is on (devices without an accelerated int8 dot), else `linear_f32r_v4`.
     /// The two escapes govern different things: `INFR_NO_F32_MROW` (`f32_mrow`) turns off the
     /// ROW-TILED builds (several rows per workgroup, `rows > 1`), `INFR_NO_F32_V4` (`f32_v4`) the
     /// vec4 K stream. The one-row vec4 build has no row tiling, so only the vec4 escape reaches it.
@@ -2128,7 +2133,9 @@ impl<'a> Recorder<'a> {
     pub fn linear_f32_kernel(&self, rows: usize, in_f: usize) -> &'static str {
         let v4 = in_f.is_multiple_of(4) && self.vk().f32_v4;
         let mrow = rows > 1 && self.vk().f32_mrow;
-        if rows == 1 && v4 {
+        if rows == 1 && v4 && self.tuning().gemv_kq_fma {
+            "linear_f32_mo"
+        } else if rows == 1 && v4 {
             "linear_f32r_v4"
         } else if mrow && v4 && rows <= 4 {
             "linear_f32r_mrow4_v4"
@@ -2186,15 +2193,18 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
     ) {
-        if rows == 1 && in_f.is_multiple_of(4) && arena_addr.is_multiple_of(16) && self.vk().f32_v4
-        {
-            // 64 threads per output, 32 when a row is too short to give each thread two vec4s.
-            let tpo_log2 = if in_f / 4 >= 128 { 6 } else { 5 };
-            self.linear_f32_mo_at(arena_addr, x, y, in_f, out_f, tpo_log2);
-            return;
+        let mut name = self.linear_f32_kernel(rows, in_f);
+        if name == "linear_f32_mo" {
+            if arena_addr.is_multiple_of(16) {
+                // 64 threads per output, 32 when a row is too short to give each thread two
+                // vec4s.
+                let tpo_log2 = if in_f / 4 >= 128 { 6 } else { 5 };
+                self.linear_f32_mo_at(arena_addr, x, y, in_f, out_f, tpo_log2);
+                return;
+            }
+            name = "linear_f32r_v4";
         }
         self.label_gemv("lin_f32_streamed", rows, in_f, out_f);
-        let name = self.linear_f32_kernel(rows, in_f);
         let (spv, groups) = match name {
             "linear_f32r_v4" => (crate::gemm::linear_f32r_v4_spv(), out_f as u32),
             "linear_f32r_mrow4_v4" => (
@@ -3788,8 +3798,10 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
     ) {
-        // bf16 decode: the dedicated reduction GEMV is ~5x the generic dequant GEMV's bandwidth.
+        // bf16 decode where `gemv.kq_fma` is on: the dedicated reduction GEMV measured about 5x
+        // the generic dequant GEMV's bandwidth on the device that parameter defaults on for.
         if rows == 1
+            && self.tuning().gemv_kq_fma
             && dtype == infr_core::DType::Bf16
             && w_base.is_multiple_of(2)
             && out_f <= Self::MAX_GROUP_COUNT_X as usize

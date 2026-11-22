@@ -214,6 +214,9 @@ pub(crate) struct Tuning {
     pub sg_pref: u32,
     /// `gemv.variant`: the multi-row decode GEMV build (`None` = the plain RM path).
     pub gemv_variant: Option<String>,
+    /// `gemv.kq_fma`: the fp32 decode GEMVs for devices without an accelerated int8 dot
+    /// (`native_gemv_kq_fma` and its verify twin, `linear_f32_mo`, one-row `linear_bf16`).
+    pub gemv_kq_fma: bool,
     /// `gemv_rm.*`: the multi-output-row decode GEMV.
     pub gemv_rm_enabled: bool,
     pub gemv_rm_rows: u32,

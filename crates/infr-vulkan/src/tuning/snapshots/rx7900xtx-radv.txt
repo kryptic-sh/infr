@@ -1,10 +1,11 @@
 device:  AMD Radeon RX 7900 XTX (RADV NAVI31) (AmdRdna3, MESA_RADV)
 match:   vendor=amd arch=AmdRdna3 driver=MESA_RADV integrated=false device_id=0x744c cu=96 subgroup=32-64 driver_version=0x0
-hash:    5e711176
+hash:    4901599c
 rows: none
 
 device.sg_pref               32     default
 gemv.variant                 reg    default
+gemv.kq_fma                  false  default
 gemv_rm.enabled              true   default
 gemv_rm.rows                 2      default
 gemv_rm.min_out              2048   default

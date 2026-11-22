@@ -280,6 +280,22 @@ pub(crate) static PARAMS: &[Param] = &[
         },
     },
     Param {
+        family: "gemv",
+        name: "kq_fma",
+        kind: Kind::Variant,
+        ty: Ty::Bool,
+        axis: Axis::None,
+        doc: "the fp32 decode GEMVs written for devices without an accelerated int8 dot: the \
+              Q4_K/Q6_K GEMV on f32 activations (native_gemv_kq_fma, and its multi-row twin for \
+              MTP verify batches), the multi-output f32 GEMV (linear_f32_mo) and the bf16 \
+              reduction GEMV for one-row bf16 weights",
+        rule: "true where the driver does not report the packed int8 dot as accelerated, where \
+               they were measured; else false",
+        default: |f, _| Value::Bool(!f.dot_accelerated),
+        get: |t, _| Value::Bool(t.gemv_kq_fma),
+        set: |t, _, v| t.gemv_kq_fma = v.flag(),
+    },
+    Param {
         family: "gemv_rm",
         name: "enabled",
         kind: Kind::Variant,
@@ -1039,6 +1055,16 @@ pub(crate) static ALIASES: &[Alias] = &[
         // Only OFF ever meant anything: `true` (the default) left the driver gate in charge.
         read: |c, _| {
             (!c.kernels.vulkan.i8cm_kq).then(|| vec![("gemm_i8cm_kq.enabled", Value::Bool(false))])
+        },
+    },
+    Alias {
+        path: "kernels.vulkan.kq_fma_gemv",
+        params: &["gemv.kq_fma"],
+        read: |c, _| {
+            c.kernels
+                .vulkan
+                .kq_fma_gemv
+                .map(|v| vec![("gemv.kq_fma", Value::Bool(v))])
         },
     },
     Alias {

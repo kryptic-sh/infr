@@ -298,7 +298,8 @@ cfg_struct! {
     ///
     /// The fields listed in [`tune::TUNE_ALIASES`] (`flash_splits`, `pv_splits`,
     /// `flash_min_rows`, `flash_bm32`, `mmv_mw_warps`, `moe_small_m`, `canvas_chunk_n`,
-    /// `i8cm_kq`, the `gemv` group) are aliases of Vulkan tuning parameters: they keep their
+    /// `i8cm_kq`, `kq_fma_gemv`, `gfx_queue`, the `gemv` group) are aliases of Vulkan tuning
+    /// parameters: they keep their
     /// spelling and meaning, and the backend's tuning resolver turns them into the parameter.
     VulkanCfg / PartialVulkanCfg {
         subs {
@@ -360,13 +361,9 @@ cfg_struct! {
         mmq: bool = true,
         /// `INFR_NO_MMQ_FALLBACK` (inverted).
         mmq_fallback: bool = true,
-        /// `INFR_KQ_FMA_TIER`, TRI-state: the fp32 K-quant prefill GEMM tier
-        /// (`native_gemm_kq_fma`) for older Vulkan GPUs without fast int8 dot
-        /// (GCN4/Polaris and other pre-coopmat parts). `None` = auto (on when
-        /// int8 dot is emulated).
-        kq_fma_tier: Option<bool> = None,
-        /// `INFR_KQ_FMA_GEMV`, TRI-state: the fp32 K-quant decode GEMV (`native_gemv_kq_fma`) in
-        /// place of quant_q8 + the dp4a GEMV. `None` = auto (on when int8 dot is emulated).
+        /// `INFR_KQ_FMA_GEMV`, TRI-state: an alias of the Vulkan tuning parameter `gemv.kq_fma`
+        /// (the fp32 decode GEMVs for devices without an accelerated int8 dot). `Some` sets the
+        /// parameter, `None` leaves the device rule in charge.
         kq_fma_gemv: Option<bool> = None,
         /// `INFR_NO_MMV` (inverted). NOT a presence knob — both sites are `is_err()`. Getting
         /// this backwards disables the mmv tier for everyone.

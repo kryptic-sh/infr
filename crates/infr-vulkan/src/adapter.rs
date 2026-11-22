@@ -829,21 +829,72 @@ fn unified_mmv_row1(_caps: &infr_core::backend::Capabilities) -> bool {
     true
 }
 
-/// Does an m=1 Linear take the fp32 K-quant decode GEMV (`Recorder::linear_kq_fma`) instead of
-/// quant_q8 + the dp4a GEMV? Auto-on where int8 dot is emulated (`kernels.vulkan.kq_fma_gemv`).
-fn kq_fma_gemv_ok(
-    be_: &VulkanBackend,
+/// Which fp32 K-quant GEMV a resident `Linear` takes ([`kq_fma_choice`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KqFma {
+    /// One row: `Recorder::linear_kq_fma`.
+    Decode,
+    /// An MTP verify batch: `Recorder::linear_kq_fma_mrow`, bit-identical to [`KqFma::Decode`]
+    /// row for row.
+    Verify,
+}
+
+/// Whether a resident `Linear` of `m` rows takes an fp32 K-quant GEMV instead of the int8 path,
+/// and which one. `on` is the tuning parameter `gemv.kq_fma`; `breaches` says the weight is past
+/// the u32 addressing cap (`recorder::bda_weight_breaches`).
+///
+/// Decode and MTP verify are decided HERE, together, because a verify row must score its position
+/// as the decode step would (`Graph::mtp_verify`): every shape whose decode row takes the fp32
+/// kernel takes its multi-row twin for a verify batch of up to the multi-row bands' row count,
+/// at any output width and whatever the int8 kernels' own gates say. A larger verify batch (a
+/// whole-prompt verify) has no decode partner at its rows and keeps the prefill tiers, as does
+/// every batch that is not a verify.
+fn kq_fma_choice(
+    on: bool,
     dt: infr_core::DType,
+    m: usize,
+    in_f: usize,
+    w_off: usize,
+    mtp_verify: bool,
+    breaches: bool,
+) -> Option<KqFma> {
+    let shape_ok = on
+        && crate::gemm::native_gemv_kq_fma_spv(dt, false, 8).is_some()
+        && crate::gemm::native_gemv_kq_fma_mrow_spv(dt, 8).is_some()
+        && in_f.is_multiple_of(256)
+        && w_off.is_multiple_of(256)
+        && !breaches;
+    if !shape_ok {
+        None
+    } else if m == 1 {
+        Some(KqFma::Decode)
+    } else if mtp_verify && m <= MROW_BANDS[MROW16_BAND].max_m {
+        Some(KqFma::Verify)
+    } else {
+        None
+    }
+}
+
+/// [`kq_fma_choice`] for a `Linear` on `be_`.
+fn kq_fma_gemv(
+    be_: &VulkanBackend,
+    graph: &Graph,
+    dt: infr_core::DType,
+    m: usize,
     in_f: usize,
     out_f: usize,
     w_off: usize,
-) -> bool {
-    let vk = &be_.cfg().kernels.vulkan;
-    vk.kq_fma_gemv.unwrap_or(!be_.caps().i8_dot_fast)
-        && crate::gemm::native_gemv_kq_fma_spv(dt, false, 8).is_some()
-        && in_f.is_multiple_of(256)
-        && w_off.is_multiple_of(256)
-        && !crate::recorder::bda_weight_breaches(dt, in_f, out_f, vk)
+) -> Option<KqFma> {
+    let breaches = crate::recorder::bda_weight_breaches(dt, in_f, out_f, &be_.cfg().kernels.vulkan);
+    kq_fma_choice(
+        be_.tuning().gemv_kq_fma,
+        dt,
+        m,
+        in_f,
+        w_off,
+        graph.mtp_verify,
+        breaches,
+    )
 }
 
 fn mmv_mw_choice(
@@ -1548,7 +1599,7 @@ fn lower_op(
                 }
                 let (rr, yf) = (r(*residual)?, r(*final_dst)?);
                 if native_dense_supported(dt) {
-                    if kq_fma_gemv_ok(be_, dt, in_f, out_f, 0) {
+                    if kq_fma_gemv(be_, graph, dt, 1, in_f, out_f, 0) == Some(KqFma::Decode) {
                         rec.linear_kq_fma(dt, w, 0, xb, Some(rr), yf, in_f, out_f);
                         return Ok(());
                     }
@@ -6171,6 +6222,26 @@ fn quant_linear(
         && mmv_gate
         && crate::gemm::native_mmv_mrow_m16_kernel_name(dt).is_some()
         && be_.cfg().kernels.vulkan.mrow16;
+    // The fp32 K-quant GEMVs (`gemv.kq_fma`): the decode row and the MTP verify batch are
+    // dispatched HERE, from one predicate and ahead of every int8 route, so the two cannot land
+    // on different numerics. The verify twin is bit-identical to the decode kernel row for row;
+    // an int8 decode tier taken first for the same weight (as `mmv_mw_choice` below would, for
+    // every weight of 2M elements up on a device with an int8 dot) would leave verify fp32 and
+    // decode int8-quantized. The int8 bands' own gates (an accelerated dot, a weight size
+    // floor, an output width cutoff) likewise say nothing about what decode took.
+    if let Some(wb) = w.buffer {
+        match kq_fma_gemv(be_, graph, dt, m, in_f, out_f, w_off) {
+            Some(KqFma::Decode) => {
+                rec.linear_kq_fma(dt, wb, w_off, xb, None, y, in_f, out_f);
+                return Ok(());
+            }
+            Some(KqFma::Verify) => {
+                rec.linear_kq_fma_mrow(dt, wb, w_off, xb, y, m, in_f, out_f);
+                return Ok(());
+            }
+            None => {}
+        }
+    }
     // The multi-row GEMVs index the weight in u32 and are not chunked, so a weight past the
     // addressing cap leaves this tier for the chunked per-row GEMV (see `tiled_gemm_fits` below).
     if (in_band(MROW_BAND) || mrow16)
@@ -6179,21 +6250,6 @@ fn quant_linear(
         && be_.cfg().kernels.vulkan.mrow
         && !crate::recorder::bda_weight_breaches(dt, in_f, out_f, &be_.cfg().kernels.vulkan)
     {
-        // fp32 K-quant multi-row GEMV for an MTP-VERIFY batch on the emulated-dot tier (GCN4):
-        // decode runs fp32 here (`linear_kq_fma`), and the int8 mrow would both run ALU-bound on
-        // emulated dp4a and score differently from the fp32 decode stream. Same per-row math as
-        // decode, bit-identical row-for-row, keyed off the DECODE knob.
-        if graph.mtp_verify
-            && w.buffer.is_some()
-            && kq_fma_gemv_ok(be_, dt, in_f, out_f, w_off)
-            && crate::gemm::native_gemv_kq_fma_mrow_spv(dt, 8).is_some()
-        {
-            let Some(wb) = w.buffer else {
-                unreachable!("kq_fma_gemv_ok implies a resident weight buffer")
-            };
-            rec.linear_kq_fma_mrow(dt, wb, w_off, xb, y, m, in_f, out_f);
-            return Ok(());
-        }
         // Int8 dp4a multi-row GEMV: quantize the m activation rows once (`quant_q8`), then
         // integer-dot the raw weight blocks against ALL rows — the dequant mrow's
         // per-sub-block scalar byte-extract dequant is the m-batch GEMV cost on ALU-bound
@@ -6713,11 +6769,6 @@ fn quant_linear(
                     out_f,
                 );
             }
-        } else if let Some(wb) = w
-            .buffer
-            .filter(|_| m == 1 && kq_fma_gemv_ok(be_, dt, in_f, out_f, w_off))
-        {
-            rec.linear_kq_fma(dt, wb, w_off, xb, None, y, in_f, out_f);
         } else if m == 1
             && mmv_decode_enabled(&be_.cfg().kernels.vulkan)
             && be_.caps().i8_dot
@@ -8278,6 +8329,58 @@ mod tests {
             include_str!("../build.rs").contains(&format!("\"-DSC_MAX={ATTN_MROWS_CHUNK}u\"")),
             "attn_partial_mrows_c256's SC_MAX drifted from ATTN_MROWS_CHUNK"
         );
+    }
+
+    /// The fp32 K-quant GEMV is chosen for decode and for an MTP verify batch by ONE predicate,
+    /// so a verify row and the decode row at its position cannot land on different numerics:
+    /// wherever the decode row takes the fp32 kernel, a verify batch of every row count up to the
+    /// multi-row bands' takes the twin, at every output width; and where decode does not, neither
+    /// does verify. An ordinary prefill batch, a verify batch past the bands and a device with
+    /// the parameter off take neither.
+    #[test]
+    fn kq_fma_decode_and_verify_share_one_choice() {
+        use infr_core::DType::{Q4K, Q5K, Q6K, Q8_0};
+        let max_verify = MROW_BANDS[MROW16_BAND].max_m;
+        for dt in [Q4K, Q6K, Q5K, Q8_0] {
+            for in_f in [256usize, 768, 2560, 100, 288] {
+                for w_off in [0usize, 256, 96] {
+                    for breaches in [false, true] {
+                        let decode = kq_fma_choice(true, dt, 1, in_f, w_off, false, breaches);
+                        let takes = matches!(dt, Q4K | Q6K)
+                            && in_f.is_multiple_of(256)
+                            && w_off.is_multiple_of(256)
+                            && !breaches;
+                        let what = format!("{dt:?} in_f {in_f} w_off {w_off} breach {breaches}");
+                        assert_eq!(decode, takes.then_some(KqFma::Decode), "{what}");
+                        // The flag does not change what a decode row takes.
+                        assert_eq!(
+                            kq_fma_choice(true, dt, 1, in_f, w_off, true, breaches),
+                            decode,
+                            "{what}"
+                        );
+                        for m in 2..=max_verify + 2 {
+                            let verify = kq_fma_choice(true, dt, m, in_f, w_off, true, breaches);
+                            let want = (takes && m <= max_verify).then_some(KqFma::Verify);
+                            assert_eq!(verify, want, "{what} m {m}");
+                            assert_eq!(
+                                kq_fma_choice(true, dt, m, in_f, w_off, false, breaches),
+                                None,
+                                "{what} m {m}: an ordinary batch took the verify kernel"
+                            );
+                        }
+                        for m in 1..=max_verify {
+                            for verify in [false, true] {
+                                assert_eq!(
+                                    kq_fma_choice(false, dt, m, in_f, w_off, verify, breaches),
+                                    None,
+                                    "{what} m {m}: taken with the parameter off"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// The rows-batched tier covers at most `ATTN_MROWS_CHUNK * ATTN_MAX_CHUNKS` keys; one key

@@ -1061,10 +1061,6 @@ pub(crate) fn native_gemv_kq_fma_mrow_spv(
         _ => return None,
     })
 }
-/// Whether `native_gemm_kq_fma` has a build for `dtype`.
-pub(crate) fn native_gemm_kq_fma_supported(dtype: infr_core::DType) -> bool {
-    matches!(dtype, infr_core::DType::Q4K | infr_core::DType::Q6K)
-}
 /// SPIR-V for the non-coopmat float-weight prefill GEMM (the "fma-warp" tier, see
 /// `native_gemm_fma.comp`): shared-memory fma warptile for f16/bf16/f32 weights on devices
 /// without a usable f16 coopmat (adapter.rs `nc_fma`). Returns the kernel-cache NAME (SPIR-V via

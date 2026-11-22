@@ -697,6 +697,8 @@ fn every_alias_writes_the_old_value() {
             &[("INFR_GFX_QUEUE", "1")],
             &[("queue.compute_only", "false")],
         ),
+        (&[("INFR_KQ_FMA_GEMV", "1")], &[("gemv.kq_fma", "true")]),
+        (&[("INFR_KQ_FMA_GEMV", "0")], &[("gemv.kq_fma", "false")]),
         (&[("INFR_MOE_SMALL_M", "16")], &[("moe.small_m", "16")]),
         (&[("INFR_MOE_SMALL_M", "100000")], &[("moe.small_m", "64")]),
         (
@@ -1641,4 +1643,40 @@ fn decode_chunk_floor_follows_the_device_facts() {
     let cfg = env_cfg(&[("INFR_TUNE", "attn_split.decode_min_chunk=513")]);
     let e = resolve_with(&fixture("rx7900xtx-amdwin"), &cfg, &[], None).unwrap_err();
     assert!(e.contains("out of range"), "{e}");
+}
+
+/// `gemv.kq_fma` is on only where the driver does not report an accelerated packed int8 dot,
+/// which is where the fp32 decode GEMVs were measured (an RX 580 under RADV). The RX 7900 XTX and
+/// the integrated GPU keep the kernels they were tuned with; `INFR_KQ_FMA_GEMV` and `INFR_TUNE`
+/// set it either way.
+#[test]
+fn kq_fma_follows_the_dot_fact() {
+    let on = |id: &str| fixture_tuning(id).gemv_kq_fma;
+    assert!(on("rx580-gcn-radv"));
+    assert!(!on("rx7900xtx-amdwin"));
+    assert!(!on("rx7900xtx-radv"));
+    assert!(!on("raphael-igpu-amdwin"));
+    // The dot fact alone decides: matrix units do not turn it on or off.
+    let mut f = fixture("rx7900xtx-amdwin");
+    f.matrix_units = false;
+    assert!(
+        !resolve_with(&f, &Config::default(), &[], None)
+            .unwrap()
+            .tuning
+            .gemv_kq_fma
+    );
+    f.dot_accelerated = false;
+    assert!(
+        resolve_with(&f, &Config::default(), &[], None)
+            .unwrap()
+            .tuning
+            .gemv_kq_fma
+    );
+    let r = resolve_fixture("rx7900xtx-amdwin", &env_cfg(&[("INFR_KQ_FMA_GEMV", "1")]));
+    assert!(r.tuning.gemv_kq_fma);
+    let r = resolve_fixture(
+        "rx580-gcn-radv",
+        &env_cfg(&[("INFR_TUNE", "gemv.kq_fma=false")]),
+    );
+    assert!(!r.tuning.gemv_kq_fma);
 }

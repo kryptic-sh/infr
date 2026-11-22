@@ -116,6 +116,28 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   the submit splitter, the dropped-work check and `INFR_PROF_OPS` read
   timestamps from the submit queue.
 
+- **Tuning parameter `gemv.kq_fma`: fp32 decode GEMVs for GPUs without an
+  accelerated int8 dot.** Three decode (one-row) kernels, on by default where
+  the driver does not report the packed int8 dot as accelerated (AMD GCN under
+  RADV), where it is emulated in ALU and they were measured:
+  `native_gemv_kq_fma` reads Q4_K/Q6_K blocks against the f32 activations
+  directly, in place of the activation quantize plus the int8 GEMV, with a
+  multi-row twin (`native_gemv_kq_fma_mrow`) for MTP verify batches;
+  `linear_f32_mo` is a multi-output f32 GEMV; and one-row bf16 weights take the
+  bf16 reduction GEMV. On an RX 580 the K-quant kernel took tg128 of
+  Qwen2.5-Coder-3B from 55.4 to 62.9 t/s and of Gemma 4 E4B at depth 4096 from
+  30.9 to 36.8 t/s (the contributor's figures, PR 107). Devices with an
+  accelerated dot keep the kernels they were tuned with, so their output is
+  unchanged; `INFR_TUNE=gemv.kq_fma=true|false` sets it either way,
+  `kernels.vulkan.kq_fma_gemv` (`INFR_KQ_FMA_GEMV=0|1`) is an alias, and
+  `infr tune show` says which a device runs. A verify batch takes the multi-row
+  twin wherever the decode row takes the fp32 kernel, at any output width, so a
+  verify row is bit-identical to its decode row; the Q6_K kernels' accumulators
+  are `precise` so that this holds on drivers that contract the two shaders
+  differently (the AMD Windows driver on RDNA3 did, by one ulp).
+  `linear_f32_mo`'s grid splits past 65535 workgroups, which a 262144-wide f32
+  output reaches.
+
 - **Tuning parameter `attn_split.decode_min_chunk`: the chunk floor of decode
   split-K attention.** Decode attention cuts each head's keys into chunks of
   `max(keys / 32, floor)`, one workgroup per chunk. The floor is 16 on a

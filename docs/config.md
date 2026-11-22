@@ -313,6 +313,23 @@ gemv_sg.rows                2      default
 `--json` prints the same as a document. The `hash` is also in the device banner
 (`tune:7751091e`), so a log says whether two runs tuned alike.
 
+Three parameters carry kernels and choices contributed from an RX 580 under RADV
+(PRs 105 to 107), and default to what was measured there on that class of device
+only, so every other device runs what it ran before them:
+
+- `gemv.kq_fma` turns on the fp32 decode GEMVs (`native_gemv_kq_fma` for
+  Q4_K/Q6_K with its MTP verify twin, `linear_f32_mo`, one-row bf16). Default:
+  on where the driver does not report an accelerated packed int8 dot
+  (`dot_accelerated` in `infr tune show --json`). `kernels.vulkan.kq_fma_gemv`
+  (`INFR_KQ_FMA_GEMV=0|1`) is its alias.
+- `attn_split.decode_min_chunk` is the fewest keys per chunk of decode split-K
+  attention. Default: 16 on a discrete device in the slow class (wave64-only, or
+  neither matrix units nor an accelerated int8 dot), 64 elsewhere. It changes
+  the last bits of decode attention for every context under 32 times its value.
+- `queue.compute_only` submits on a compute-only queue family. Default: on for
+  the same slow discrete class, off elsewhere; described with the submit
+  parameters below.
+
 Three parameters are not kernel choices; they decide how a forward is cut into
 submits, so that no submit runs long enough for a driver's watchdog to reset the
 GPU and drop the work. That limit is a time, about 2 s by default on both
@@ -478,10 +495,11 @@ on a device that cannot pin a 16-wide subgroup runs at 32, as it always has;
 
 **The older knobs are aliases.** `device.subgroup_pref` (`INFR_SG`),
 `kernels.vulkan.flash_splits`, `pv_splits`, `flash_min_rows`, `flash_bm32`,
-`mmv_mw_warps`, `moe_small_m`, `canvas_chunk_n`, `i8cm_kq` (`INFR_NO_I8CM_KQ`)
-and the whole `[kernels.vulkan.gemv]` group keep their names, grammars and
-meanings — including their old clamps and fallbacks — and write the matching
-parameter at the level that set them (`infr tune show` labels it, e.g.
+`mmv_mw_warps`, `moe_small_m`, `canvas_chunk_n`, `i8cm_kq` (`INFR_NO_I8CM_KQ`),
+`kq_fma_gemv` (`INFR_KQ_FMA_GEMV`), `gfx_queue` (`INFR_GFX_QUEUE`) and the whole
+`[kernels.vulkan.gemv]` group keep their names, grammars and meanings —
+including their old clamps and fallbacks — and write the matching parameter at
+the level that set them (`infr tune show` labels it, e.g.
 `env alias INFR_FLASH_SPLITS`). At the same level the new `tune` key wins over
 the alias; across levels the higher level wins whichever spelling it uses. An
 alias set to a value that has no effect — its unset spelling

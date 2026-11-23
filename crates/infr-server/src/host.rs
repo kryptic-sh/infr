@@ -13,6 +13,16 @@ use infr_core::config::Config;
 
 use crate::{configured_api_key, invalid_request, AppState};
 
+/// The listening socket a request arrived on, as far as the `Host` check needs to know.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Bind {
+    /// A bound TCP address.
+    Tcp(SocketAddr),
+    /// A Unix-domain socket: no browser reaches one, and no `Host` name refers to it.
+    #[cfg(unix)]
+    Unix,
+}
+
 /// The loopback names a keyless loopback server answers to, whatever loopback address it is bound
 /// to, beside every `*.localhost` name (RFC 6761 reserves those for loopback). IPv6 literals keep
 /// the brackets a `Host` header spells them with.
@@ -85,19 +95,21 @@ pub(crate) fn check_allowed_hosts(cfg: &Config) -> anyhow::Result<()> {
 /// set, which always turns the check on and allows the listed names beside the loopback ones;
 /// `*` turns it off.
 ///
+/// A Unix-domain socket is not guarded by default: a browser cannot open one, so there is no page
+/// from which to launch the attack. An explicit `serve.allowed_hosts` still applies there.
+///
 /// Ports are not compared: the attacker picks the name a page resolves, never the port it
 /// reaches — and a client behind `ssh -L` or a container port mapping names a port the server
 /// did not bind. A request with no `Host` at all passes: a browser always sends one (and a
 /// rebinding page cannot drop it), so its absence means an HTTP/1.0 tool, not the attack.
-fn host_allowed(cfg: &Config, bind: Option<SocketAddr>, host: Option<&str>) -> bool {
+fn host_allowed(cfg: &Config, bind: Option<Bind>, host: Option<&str>) -> bool {
     let listed = allowed_hosts(cfg);
     match listed {
         Some(list) if list.iter().any(|h| h.trim() == "*") => return true,
         Some(_) => {}
         None => {
-            let exposed =
-                configured_api_key(cfg).is_some() || !bind.is_some_and(|a| a.ip().is_loopback());
-            if exposed {
+            let loopback_tcp = matches!(bind, Some(Bind::Tcp(addr)) if addr.ip().is_loopback());
+            if configured_api_key(cfg).is_some() || !loopback_tcp {
                 return true;
             }
         }
@@ -113,7 +125,7 @@ fn host_allowed(cfg: &Config, bind: Option<SocketAddr>, host: Option<&str>) -> b
         // such a name to DNS instead would let a domain owner point it elsewhere — and rebind it
         // to this server; the check cannot see the resolver, so that residual stays.
         || name.ends_with(".localhost")
-        || bind.is_some_and(|b| name == bind_host(b))
+        || matches!(bind, Some(Bind::Tcp(addr)) if name == bind_host(addr))
         || listed.is_some_and(|list| {
             list.iter()
                 .filter_map(|h| split_host(h))
@@ -156,8 +168,8 @@ mod tests {
         c
     }
 
-    fn addr(s: &str) -> Option<SocketAddr> {
-        Some(s.parse().unwrap())
+    fn addr(s: &str) -> Option<Bind> {
+        Some(Bind::Tcp(s.parse().unwrap()))
     }
 
     /// The default policy guards a keyless loopback server: the loopback names, `*.localhost`
@@ -230,6 +242,20 @@ mod tests {
             addr("127.0.0.1:8080"),
             Some("evil.example")
         ));
+    }
+
+    /// A Unix-domain listener is reachable only by a local process, and no browser sends an HTTP
+    /// request to one, so the default policy does not apply; an explicit allow list still does.
+    #[cfg(unix)]
+    #[test]
+    fn a_unix_listener_is_not_guarded_by_default() {
+        let unix = Some(Bind::Unix);
+        assert!(host_allowed(&cfg(None, None), unix, Some("evil.example")));
+        assert!(host_allowed(&cfg(None, None), unix, Some("localhost")));
+        assert!(host_allowed(&cfg(None, None), unix, None));
+        let listed = cfg(None, Some(&["llm.example.com"]));
+        assert!(host_allowed(&listed, unix, Some("llm.example.com")));
+        assert!(!host_allowed(&listed, unix, Some("evil.example")));
     }
 
     /// An explicit `serve.allowed_hosts` always applies — key or not, loopback or not — and adds

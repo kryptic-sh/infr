@@ -1,17 +1,29 @@
-//! Inherited systemd TCP listeners.
+//! Inherited systemd listeners: a TCP port or a Unix-domain socket.
 
+#[cfg(unix)]
+use std::os::unix::net::UnixListener;
 use std::{io, net::TcpListener};
 
-/// Duplicate systemd's sole inherited TCP listener on Linux; elsewhere return `None`.
-pub fn activated_tcp_listener() -> io::Result<Option<TcpListener>> {
-    platform::activated_tcp_listener()
+/// The single listening socket systemd passed in.
+#[derive(Debug)]
+pub enum ActivatedListener {
+    /// An IPv4 or IPv6 TCP listener.
+    Tcp(TcpListener),
+    /// A Unix-domain stream listener.
+    #[cfg(unix)]
+    Unix(UnixListener),
+}
+
+/// Duplicate systemd's sole inherited listener on Linux; elsewhere return `None`.
+pub fn activated_listener() -> io::Result<Option<ActivatedListener>> {
+    platform::activated_listener()
 }
 
 #[cfg(not(target_os = "linux"))]
 mod platform {
     use super::*;
 
-    pub(super) fn activated_tcp_listener() -> io::Result<Option<TcpListener>> {
+    pub(super) fn activated_listener() -> io::Result<Option<ActivatedListener>> {
         Ok(None)
     }
 }
@@ -45,7 +57,7 @@ mod platform {
         match fds {
             0 => Ok(false),
             1 => Ok(true),
-            _ => Err(invalid("infr requires exactly one systemd TCP listener")),
+            _ => Err(invalid("infr requires exactly one systemd listener")),
         }
     }
 
@@ -71,7 +83,7 @@ mod platform {
         Ok(value)
     }
 
-    fn duplicate_listener(fd: RawFd) -> io::Result<TcpListener> {
+    fn duplicate_listener(fd: RawFd) -> io::Result<ActivatedListener> {
         // F_DUPFD_CLOEXEC creates a new descriptor without taking ownership of the supplied fd.
         let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
         if duplicate < 0 {
@@ -80,18 +92,28 @@ mod platform {
         // The successful duplication returned a fresh descriptor owned exclusively by this call.
         let owned = unsafe { OwnedFd::from_raw_fd(duplicate) };
         let fd = owned.as_raw_fd();
-        if !matches!(
-            socket_option(fd, libc::SO_DOMAIN)?,
-            libc::AF_INET | libc::AF_INET6
-        ) || socket_option(fd, libc::SO_TYPE)? != libc::SOCK_STREAM
-            || socket_option(fd, libc::SO_PROTOCOL)? != libc::IPPROTO_TCP
+        let domain = socket_option(fd, libc::SO_DOMAIN)?;
+        let protocol = socket_option(fd, libc::SO_PROTOCOL)?;
+        if socket_option(fd, libc::SO_TYPE)? != libc::SOCK_STREAM
             || socket_option(fd, libc::SO_ACCEPTCONN)? == 0
         {
-            return Err(invalid("systemd fd 3 is not a listening TCP socket"));
+            return Err(invalid("systemd fd 3 is not a listening stream socket"));
         }
-        let listener = TcpListener::from(owned);
-        listener.set_nonblocking(true)?;
-        Ok(listener)
+        match (domain, protocol) {
+            (libc::AF_INET | libc::AF_INET6, libc::IPPROTO_TCP) => {
+                let listener = TcpListener::from(owned);
+                listener.set_nonblocking(true)?;
+                Ok(ActivatedListener::Tcp(listener))
+            }
+            (libc::AF_UNIX, 0) => {
+                let listener = UnixListener::from(owned);
+                listener.set_nonblocking(true)?;
+                Ok(ActivatedListener::Unix(listener))
+            }
+            _ => Err(invalid(
+                "systemd fd 3 is not a listening TCP or Unix stream socket",
+            )),
+        }
     }
 
     fn check_pidfd_identity(value: &str) -> io::Result<()> {
@@ -123,7 +145,7 @@ mod platform {
         }
     }
 
-    pub(super) fn activated_tcp_listener() -> io::Result<Option<TcpListener>> {
+    pub(super) fn activated_listener() -> io::Result<Option<ActivatedListener>> {
         let pid = environment("LISTEN_PID")?;
         let fds = environment("LISTEN_FDS")?;
         if !activation_count(pid.as_deref(), fds.as_deref(), std::process::id())? {
@@ -148,7 +170,15 @@ mod platform {
     mod tests {
         use super::*;
         use std::net::{TcpStream, UdpSocket};
-        use std::os::unix::net::UnixListener;
+        use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
+
+        /// The duplicated TCP listener, panicking on the Unix variant.
+        fn expect_tcp(listener: ActivatedListener) -> TcpListener {
+            match listener {
+                ActivatedListener::Tcp(listener) => listener,
+                other => panic!("expected a TCP listener, got {other:?}"),
+            }
+        }
 
         #[test]
         fn metadata_requires_one_fd_for_this_process() {
@@ -175,10 +205,39 @@ mod platform {
         #[test]
         fn duplicates_listener_with_nonblocking_and_cloexec() {
             let original = TcpListener::bind("127.0.0.1:0").unwrap();
-            let listener = duplicate_listener(original.as_raw_fd()).unwrap();
+            let listener = expect_tcp(duplicate_listener(original.as_raw_fd()).unwrap());
             assert_eq!(
                 listener.local_addr().unwrap(),
                 original.local_addr().unwrap()
+            );
+            assert_ne!(listener.as_raw_fd(), original.as_raw_fd());
+            // Both fcntl calls inspect open descriptors without changing ownership.
+            unsafe {
+                assert_ne!(
+                    libc::fcntl(listener.as_raw_fd(), libc::F_GETFD) & libc::FD_CLOEXEC,
+                    0
+                );
+                assert_ne!(
+                    libc::fcntl(listener.as_raw_fd(), libc::F_GETFL) & libc::O_NONBLOCK,
+                    0
+                );
+            }
+            drop(listener);
+            assert!(original.local_addr().is_ok());
+        }
+
+        #[test]
+        fn duplicates_unix_listener_with_nonblocking_and_cloexec() {
+            let dir = tempfile::tempdir().unwrap();
+            let original = UnixListener::bind(dir.path().join("socket")).unwrap();
+            let ActivatedListener::Unix(listener) =
+                duplicate_listener(original.as_raw_fd()).unwrap()
+            else {
+                panic!("expected a Unix listener");
+            };
+            assert_eq!(
+                listener.local_addr().unwrap().as_pathname(),
+                original.local_addr().unwrap().as_pathname()
             );
             assert_ne!(listener.as_raw_fd(), original.as_raw_fd());
             // Both fcntl calls inspect open descriptors without changing ownership.
@@ -202,8 +261,7 @@ mod platform {
                 return;
             };
             assert_eq!(
-                duplicate_listener(original.as_raw_fd())
-                    .unwrap()
+                expect_tcp(duplicate_listener(original.as_raw_fd()).unwrap())
                     .local_addr()
                     .unwrap(),
                 original.local_addr().unwrap()
@@ -215,13 +273,15 @@ mod platform {
             let file = tempfile::tempfile().unwrap();
             let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
             let dir = tempfile::tempdir().unwrap();
-            let unix = UnixListener::bind(dir.path().join("socket")).unwrap();
+            let datagram = UnixDatagram::bind(dir.path().join("datagram")).unwrap();
+            let (unix_stream, _peer) = UnixStream::pair().unwrap();
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
             for fd in [
                 file.as_raw_fd(),
                 udp.as_raw_fd(),
-                unix.as_raw_fd(),
+                datagram.as_raw_fd(),
+                unix_stream.as_raw_fd(),
                 stream.as_raw_fd(),
                 -1,
             ] {
@@ -229,7 +289,8 @@ mod platform {
             }
             assert!(file.metadata().is_ok());
             assert!(udp.local_addr().is_ok());
-            assert!(unix.local_addr().is_ok());
+            assert!(datagram.local_addr().is_ok());
+            assert!(unix_stream.peer_addr().is_ok());
             assert!(stream.peer_addr().is_ok());
         }
 

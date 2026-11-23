@@ -313,9 +313,9 @@ idle_timeout_secs = 0
 # nothing, so an idle server leaves a clean log.
 stats_interval_secs = 5
 
-# Host names a request's `Host` header may carry. Unset, only a keyless loopback
-# server is checked, and it accepts the loopback names on any port. Set, these
-# names are allowed as well and the check always applies. ["*"] turns it off.
+# Host names a request's `Host` header may carry. Unset, only a keyless TCP
+# loopback server is checked, and it accepts the loopback names on any port. Set,
+# these names are allowed as well and the check always applies. ["*"] turns it off.
 # allowed_hosts = ["llm.example.com"]
 
 # Seconds a streamed reply may stay silent before an SSE comment line is sent,

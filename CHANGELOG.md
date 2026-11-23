@@ -63,7 +63,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   and its `n` and `top_logprobs` are raw JSON values validated by
   `GenParams::from_request`.
 
+- **`infr_server` builds on axum 0.8.** `build_router` returns an axum 0.8
+  `Router`, so an embedder that mounts it must take axum 0.8 as well.
+
+- **`infr_plat::socket::activated_tcp_listener` is now `activated_listener`**,
+  returning an `ActivatedListener` enum because the inherited systemd socket may
+  be a Unix-domain listener as well as a TCP one.
+
 ### Added
+
+- **systemd socket activation accepts a Unix-domain socket.** Point
+  `infr.socket`'s `ListenStream=` at a path (`%t/infr.sock` in a user unit) and
+  `infr serve` serves the same routes over it; `serve --addr` is ignored, as with
+  an inherited TCP socket. The default `Host` check does not guard a Unix
+  listener, because no browser can open one; an explicit `serve.allowed_hosts`
+  still applies. See `docs/systemd.md`.
 
 - **`infr serve` returns OpenAI log probabilities.** `/v1/chat/completions` and
   `/v1/completions` accept `logprobs` and `top_logprobs` and return the chosen

@@ -650,11 +650,13 @@ address: it accepts `localhost`, any `*.localhost` name, `127.0.0.1`, `[::1]`
 and the bind host, on any port (so an SSH or container port forward works), and
 a request with no `Host` at all, which no browser sends. Anything else is a
 `403` whose body names this key. A server with an API key, or one bound to a
-non-loopback address, is not checked unless the key is set; once set, the listed
-names are allowed in addition to the loopback ones and the check always applies,
-which is the reverse-proxy and custom-hostname case. An entry that could never
-match (a URL, a path, a `*.x` pattern) stops the server at startup. `/health` is
-never checked.
+non-loopback address, chose its exposure and is not checked; setting
+`allowed_hosts` turns the check on for any server, allows the listed names in
+addition to the loopback ones, and always applies — the reverse-proxy and
+custom-hostname case. An entry that could never
+match (a URL, a path, a `*.x` pattern) stops the server at startup. A
+Unix-domain listener is not checked by default, because no browser can open one;
+an explicit `allowed_hosts` still applies there. `/health` is never checked.
 
 **`response_format`** is enforced, not ignored: `json_object` constrains the
 reply to a JSON object and `json_schema` to the given schema, streamed or not,

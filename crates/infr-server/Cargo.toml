@@ -25,4 +25,5 @@ http-body = "1"
 tokio = { workspace = true, features = ["test-util"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+tempfile = "3"
 infr-chat.workspace = true

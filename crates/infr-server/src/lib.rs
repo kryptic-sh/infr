@@ -46,6 +46,7 @@ use axum::{
 };
 use infr_core::config::Config;
 use infr_engine::{ChatMessage, Delta, ToolCall};
+use infr_plat::socket::ActivatedListener;
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use tokio::sync::Semaphore;
@@ -57,6 +58,8 @@ mod idle;
 mod idle_tests;
 mod metrics;
 mod status;
+#[cfg(all(test, unix))]
+mod uds_tests;
 
 pub use status::{DeviceMemory, GeneratorStatus};
 
@@ -1938,10 +1941,10 @@ pub struct AppState {
     activity: Arc<idle::Activity>,
     /// When this state was built, for `/status`'s uptime.
     started: Instant,
-    /// The address the listener is bound to, which the `Host` check (`host::host_gate`) reads.
-    /// `None` for a router served some other way, which is then checked only when
-    /// `serve.allowed_hosts` is set.
-    bind: Option<SocketAddr>,
+    /// The listener this server serves, which the `Host` check (`host::host_gate`) reads. `None`
+    /// for a router served some other way, which is then checked only when `serve.allowed_hosts`
+    /// is set.
+    bind: Option<host::Bind>,
 }
 
 impl AppState {
@@ -2107,23 +2110,40 @@ pub async fn serve_multi(
     serve_state(AppState::multi(entries, cfg), addr).await
 }
 
-/// Serve an inherited TCP listener or bind `addr`, draining requests on shutdown.
+/// Serve an inherited systemd listener (TCP or Unix) or bind `addr`, draining requests on
+/// shutdown.
 async fn serve_state(mut state: AppState, addr: SocketAddr) -> anyhow::Result<()> {
     host::check_allowed_hosts(&state.cfg)?;
-    let listener = match infr_plat::socket::activated_tcp_listener()? {
-        Some(listener) => {
-            tracing::info!(addr = %listener.local_addr()?, "using systemd socket");
-            tokio::net::TcpListener::from_std(listener)?
+    match infr_plat::socket::activated_listener()? {
+        Some(ActivatedListener::Tcp(listener)) => {
+            let listener = tokio::net::TcpListener::from_std(listener)?;
+            let addr = listener.local_addr()?;
+            tracing::info!(%addr, "using systemd TCP socket");
+            state.bind = Some(host::Bind::Tcp(addr));
+            serve_listener(state, listener).await
         }
-        None => tokio::net::TcpListener::bind(addr).await?,
-    };
-    // The bound address, not the requested one: with port 0 only the listener knows the port a
-    // client's `Host` will name.
-    state.bind = Some(listener.local_addr()?);
-    serve_listener(state, listener).await
+        #[cfg(unix)]
+        Some(ActivatedListener::Unix(listener)) => {
+            let listener = tokio::net::UnixListener::from_std(listener)?;
+            tracing::info!(addr = ?listener.local_addr()?, "using systemd Unix socket");
+            state.bind = Some(host::Bind::Unix);
+            serve_listener(state, listener).await
+        }
+        None => {
+            let listener = tokio::net::TcpListener::bind(addr).await?;
+            // The bound address, not the requested one: with port 0 only the listener knows the
+            // port a client's `Host` will name.
+            state.bind = Some(host::Bind::Tcp(listener.local_addr()?));
+            serve_listener(state, listener).await
+        }
+    }
 }
 
-async fn serve_listener(state: AppState, listener: tokio::net::TcpListener) -> anyhow::Result<()> {
+async fn serve_listener<L>(state: AppState, listener: L) -> anyhow::Result<()>
+where
+    L: axum::serve::Listener,
+    L::Addr: std::fmt::Debug,
+{
     let addr = listener.local_addr()?;
     let n_models = state.models.len();
     let activity = state.activity.clone();
@@ -2135,7 +2155,7 @@ async fn serve_listener(state: AppState, listener: tokio::net::TcpListener) -> a
     let reporter = stats_interval(&state.cfg)
         .map(|period| tokio::spawn(stats_reporter(state.clone(), period)));
     let router = build_router(state);
-    tracing::info!(%addr, %n_models, %idle_secs, "infr-server listening");
+    tracing::info!(?addr, %n_models, %idle_secs, "infr-server listening");
     let served = axum::serve(listener, router)
         .with_graceful_shutdown(server_shutdown(activity, idle_secs))
         .await;

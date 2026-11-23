@@ -1,9 +1,10 @@
 # systemd socket activation
 
-On Linux, systemd can keep infr's TCP port open while the inference process is
-stopped. A new connection starts `infr serve`; the first request waits for the
-model to load. After an idle timeout, infr exits successfully and releases its
-model memory. The socket stays open for the next connection.
+On Linux, systemd can keep infr's listening socket open while the inference
+process is stopped. The socket may be a TCP port or a Unix-domain socket. A new
+connection starts `infr serve`; the first request waits for the model to load.
+After an idle timeout, infr exits successfully and releases its model memory.
+The socket stays open for the next connection.
 
 ## Install user units
 
@@ -37,10 +38,10 @@ systemctl --user status infr.socket infr.service
 journalctl --user -u infr.service -f
 ```
 
-Stop any existing server using the same port first. Change `ListenStream=` in
-`infr.socket` to use another port; the inherited socket takes precedence over
-`serve --addr`. Apply a port change by stopping the service and restarting the
-socket after `daemon-reload`.
+Stop any existing server using the same port or path first. Change
+`ListenStream=` in `infr.socket` to use another port or a socket path; the
+inherited socket takes precedence over `serve --addr`. Apply the change by
+stopping the service and restarting the socket after `daemon-reload`.
 
 User units normally stop when the user manager exits. If the server must remain
 available while you are logged out, enable lingering for your user:
@@ -56,6 +57,28 @@ able to activate it again:
 systemctl --user disable --now infr.socket
 systemctl --user stop infr.service
 ```
+
+## Listen on a Unix socket
+
+`ListenStream=` also accepts a Unix-domain socket path. In a user unit `%t` is
+`$XDG_RUNTIME_DIR`, the per-user runtime directory:
+
+```ini
+# infr.socket
+ListenStream=%t/infr.sock
+```
+
+`infr.service` needs no change, and `infr serve` still ignores `--addr` when a
+socket is inherited. Point the client at the path instead of a port:
+
+```bash
+curl --unix-socket "$XDG_RUNTIME_DIR/infr.sock" http://localhost/v1/models
+```
+
+The socket is owned by your user. To let another user or a group connect, set
+`SocketMode=` and `SocketGroup=` in the socket unit. The `Host` header is not
+checked on a Unix socket by default, because a browser cannot open one; an
+explicit `serve.allowed_hosts` still applies.
 
 ## Idle behavior
 
@@ -81,15 +104,16 @@ process awake. Idle shutdown closes it; clients must reconnect. A request racing
 with shutdown may receive HTTP 503 and should retry on a new connection.
 
 The first request after activation pays model-loading time. Give clients enough
-time to wait, especially for large models. systemd buffers new TCP connections;
-it is not an HTTP reverse proxy and does not migrate established connections to
-the next process.
+time to wait, especially for large models. systemd queues new connections on the
+inherited socket; it is not an HTTP reverse proxy and does not migrate
+established connections to the next process.
 
 ## Unit requirements
 
 - Use `Accept=no`: infr serves all requests through one shared listener and model.
-- Pass exactly one listening TCP socket, IPv4 or IPv6. Multiple listeners and
-  Unix-domain sockets are rejected; use a reverse proxy if you need them.
+- Pass exactly one listening stream socket: TCP on IPv4 or IPv6, or a
+  Unix-domain socket. Multiple listeners are rejected; use a reverse proxy if you
+  need them.
 - `NonBlocking=yes` belongs in the service. infr also sets nonblocking mode when
   importing the listener.
 - Use `Restart=on-failure`, not `always` or `on-success`. A clean idle exit must

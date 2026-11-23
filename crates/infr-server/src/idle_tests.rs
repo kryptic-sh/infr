@@ -301,13 +301,11 @@ impl Drop for ChildGuard {
     }
 }
 
-#[tokio::test]
-async fn systemd_socket_activation_serves_and_exits() {
-    let reserve = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = reserve.local_addr().unwrap();
-    drop(reserve);
-    let child = std::process::Command::new("systemd-socket-activate")
-        .arg(format!("--listen={addr}"))
+/// Launch the test binary under `systemd-socket-activate` on `listen`, with only the activation
+/// child selected.
+fn socket_activate(listen: &str) -> std::io::Result<std::process::Child> {
+    std::process::Command::new("systemd-socket-activate")
+        .arg(format!("--listen={listen}"))
         .arg(std::env::current_exe().unwrap())
         .args([
             "--exact",
@@ -316,7 +314,19 @@ async fn systemd_socket_activation_serves_and_exits() {
         ])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .spawn();
+        .spawn()
+}
+
+/// Wait for the activated socket, drive one `/health` request through the activated server, then
+/// wait for it to exit on its one-second idle timeout.
+async fn activation_serves_and_exits<S, F, Fut>(
+    child: std::io::Result<std::process::Child>,
+    connect: F,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<S>>,
+{
     let mut child = match child {
         Ok(child) => ChildGuard(child),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
@@ -324,7 +334,7 @@ async fn systemd_socket_activation_serves_and_exits() {
     };
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut stream = loop {
-        if let Ok(stream) = tokio::net::TcpStream::connect(addr).await {
+        if let Ok(stream) = connect().await {
             break stream;
         }
         assert!(
@@ -363,4 +373,28 @@ async fn systemd_socket_activation_serves_and_exits() {
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+}
+
+#[tokio::test]
+async fn systemd_socket_activation_serves_and_exits() {
+    let reserve = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = reserve.local_addr().unwrap();
+    drop(reserve);
+    activation_serves_and_exits(socket_activate(&addr.to_string()), || {
+        tokio::net::TcpStream::connect(addr)
+    })
+    .await;
+}
+
+/// The same activation path where `ListenStream=` names a Unix-domain socket: `infr-plat` must
+/// import it as a Unix listener and the server must serve it.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn systemd_socket_activation_serves_a_unix_socket_and_exits() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("infr.sock");
+    activation_serves_and_exits(socket_activate(&path.to_string_lossy()), || {
+        tokio::net::UnixStream::connect(&path)
+    })
+    .await;
 }

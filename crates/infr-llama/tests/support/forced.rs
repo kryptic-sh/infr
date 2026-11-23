@@ -368,6 +368,35 @@ pub fn try_score(
     Ok(s)
 }
 
+/// One line for the measurement log with every scored position's KL, in position order, as
+/// `position:KL`; a position whose top-1 differs from the reference's carries `!` and the
+/// reference's margin between the two tokens in nats. For asking whether one row stands out, and
+/// whether it moves with the prompt's end (`INFR_TOL_SPLIT`).
+pub fn rows_line(tag: &str, reference: &ForcedLogits, test: &ForcedLogits) -> String {
+    let v = reference.vocab;
+    let mut line = format!("ROWS {tag} prefill_rows={}", test.prefill_rows);
+    for (r, &pos) in test.positions.iter().enumerate() {
+        let k = reference
+            .positions
+            .iter()
+            .position(|&q| q == pos)
+            .unwrap_or_else(|| panic!("the reference has no row at position {pos}"));
+        let (want, got) = (
+            &reference.logits[k * v..(k + 1) * v],
+            &test.logits[r * v..(r + 1) * v],
+        );
+        match infr_llama::tolerance::score_row(want, got) {
+            Ok(s) => line.push_str(&format!(" {pos}:{:.3e}", s.kl)),
+            Err(e) => line.push_str(&format!(" {pos}:unscored({e})")),
+        }
+        let (a, b) = (argmax(want) as usize, argmax(got) as usize);
+        if a != b {
+            line.push_str(&format!("!{:.3}", want[a] - want[b]));
+        }
+    }
+    line
+}
+
 /// One machine-readable line per phase, for the measurement log.
 pub fn line(tag: &str, s: &Scored) -> String {
     let one = |phase: &str, r: &RunScore| {
@@ -474,10 +503,33 @@ pub const GPU_CONFIGS: &[GpuConfig] = &[
     ),
 ];
 
+/// Configurations for diagnosis, run by [`measure`] only when `INFR_TOL_ONLY` names them and
+/// scored by no gate.
+pub const DIAGNOSIS_CONFIGS: &[GpuConfig] = &[
+    // The shipped configuration without the dp4a K-quant prefill GEMM (`kernels.vulkan.dp4a_kq`):
+    // its weights then take the `mmq` GEMM, still on int8 activations.
+    ("gpu-no-dp4a-kq", |c| c.kernels.vulkan.dp4a_kq = false, None),
+    // The Float class with the whole cooperative-matrix tier off (`kernels.vulkan.coopmat`, what
+    // `INFR_NO_COOPMAT` sets): the prefill GEMMs then take f32 operands.
+    (
+        "gpu-float-nocoopmat",
+        |c| {
+            vulkan_float(c);
+            c.kernels.vulkan.coopmat = false;
+        },
+        None,
+    ),
+];
+
 /// The three-way measurement on one model: CPU production against the CPU reference, then each
 /// [`GPU_CONFIGS`] entry against the CPU reference (run with the configuration's KV format) and
 /// against CPU production. `INFR_TOL_NO_REPLAY` runs the Vulkan decode on the per-token static
-/// path (what the scratch mutations need).
+/// path (what the scratch mutations need). `INFR_TOL_SPLIT` (a token count) moves the end of the
+/// prompt: the reference's greedy sequence is kept, its first that-many tokens are fed as the
+/// prompt and the rest forced, so the same positions are scored with the prefill-to-decode
+/// boundary elsewhere; the forced run refuses a prompt shorter than its batched prefill needs (the
+/// check at the top of `seam::forced_run`). `INFR_TOL_ROWS` adds a [`rows_line`] per comparison and
+/// the kernels the run built.
 pub fn measure(key: &str) {
     let Some(case) = open_case(key) else {
         eprintln!("skip: {key} not in the HF cache");
@@ -502,13 +554,32 @@ pub fn measure(key: &str) {
             .map(|i| i.parse().expect("prompt index"))
             .collect()
     });
+    let split = env_usize("INFR_TOL_SPLIT");
+    let rows = std::env::var_os("INFR_TOL_ROWS").is_some();
     let model = &case.model;
     for (pi, ids) in case.prompts.iter().enumerate() {
         if prompts.as_ref().is_some_and(|p| !p.contains(&pi)) {
             continue;
         }
         let t0 = std::time::Instant::now();
-        let r = forced_reference(model, ids, N_DECODE);
+        let mut r = forced_reference(model, ids, N_DECODE);
+        if let Some(p) = split {
+            // The same sequence with the prompt ending at `p`: on the CPU reference the rows are
+            // the greedy run's (`forced_run_reproduces_the_cpu_reference_on_every_path`); only
+            // which of them the batched prefill produced changes.
+            let seq = r.seq;
+            assert!(p < seq.len(), "INFR_TOL_SPLIT is past the sequence's end");
+            r = model
+                .forced_logits(
+                    ForcedOn::CpuReference,
+                    |_| {},
+                    &seq[..p],
+                    seq.len() - p,
+                    PrefillHead::All,
+                    |s, _| seq[p + s],
+                )
+                .expect("cpu reference run at the moved prompt end");
+        }
         let t_ref = t0.elapsed();
         let t0 = std::time::Instant::now();
         let prod = forced(model, ForcedOn::Cpu, |_| {}, &r);
@@ -518,10 +589,10 @@ pub fn measure(key: &str) {
             "{}",
             line(&tag("pair=cpuprod-ref"), &score(&r, &prod, 0.0, 0.0))
         );
-        for &(name, edit, kv) in GPU_CONFIGS {
-            if only.as_ref().is_some_and(|o| !o.iter().any(|n| n == name)) {
-                continue;
-            }
+        let named = |name: &str| only.as_ref().is_some_and(|o| o.iter().any(|n| n == name));
+        let diagnosis = DIAGNOSIS_CONFIGS.iter().filter(|c| named(c.0));
+        let gated = GPU_CONFIGS.iter().filter(|c| only.is_none() || named(c.0));
+        for &(name, edit, kv) in gated.chain(diagnosis) {
             let reference = match kv {
                 None => r.clone(),
                 Some((k, v)) => forced(model, ForcedOn::CpuReference, |c| kv_types(c, k, v), &r),
@@ -558,6 +629,13 @@ pub fn measure(key: &str) {
                     &score(&prod, &g, 0.0, 0.0)
                 )
             );
+            if rows {
+                println!(
+                    "{}",
+                    rows_line(&tag(&format!("pair={name}-ref")), &reference, &g)
+                );
+                println!("KERNELS {} {:?}", tag(&format!("pair={name}")), g.kernels);
+            }
             eprintln!("time {key} prompt {pi} {name}: {:.1}s", t_gpu.as_secs_f64());
         }
         eprintln!(

@@ -6816,54 +6816,228 @@ values. What it leaves:
     4.43e-3 against 3.9e-3), and (d) only on mean KL, at 1.43x (worst KL 0.73x).
     They are the first to turn into misses if the synthetic model or its row
     changes.
-- **The clean synthetic MoE has one outlying row on the GPU, unexplained.** On
-  `Vulkan0`, its clean run's worst KL is at most 1.03e-4 on prompts 0 and 1; on
-  prompt 2 it is 2.87e-3 at position 179, the first decode row after the
-  180-token prompt, with a logit deviation of 2.49e-2 there against that
-  prompt's mean of 1.66e-3. Prompt 2's mean KL (1.05e-4 over 32 rows) puts the
-  other 31 rows at about 1.6e-5 on average, so it is one row. `Vulkan1` gives
-  the same values to seven digits. A reviewer probed `Vulkan0` and found the
-  Vulkan logits differ from the production CPU's in every logit while the
-  production CPU equals the CPU reference bit for bit: the distance is the GPU's
-  own, possibly a Vulkan MoE defect. Not investigated; an MoE row should not be
-  set from these runs until it is explained. Unverified lead: gemma-3's top-1
-  flip on `Vulkan1` (below) is at the same row, prompt 2, position 179.
+- **An MoE run may pick another expert at a router near tie, and the table has
+  no rule for it** (2026-11-23; the clean synthetic MoE's outlying row,
+  explained). On both RADV GPUs the clean run's worst KL is at most 1.03e-4 on
+  prompts 0 and 1 and 2.87e-3 on prompt 2 at position 179, the first decode row
+  after the 180-token prompt, the other 31 rows averaging about 1.6e-5. It is
+  not a prefill-to-decode defect. **[ran, `Vulkan0`, headless]** With the same
+  sequence and the prompt ended at 100, 150, 170, 178 or 179 tokens, position
+  179 still measures 2.87e-3 (replayed and static decode alike) and the row at
+  each new boundary is at most 1.3e-5; position 179 was only the first row the
+  test scores, because this model takes no batched prefill. With the earlier
+  rows scored, position 107 measures 0.371 and positions 110, 137, 138, 143 and
+  173 are raised too. The CPU reference's layer-0 router at position 107
+  separates its second and third expert by 2.14e-4 of selection probability, the
+  smallest of the sequence's 422 router calls (median 6.3e-2). Flipping that one
+  pick in the CPU reference (router call 214 of the run, counting from 0 in
+  execution order: position 107, layer 0, expert 4 taken in place of expert 6
+  beside expert 2; a scratch hook in `infr-cpu`'s `Op::MoeFfn`, not committed)
+  gives the GPU's profile against the unflipped reference (107: 0.371, 110:
+  4.65e-3, 138: 2.31e-2, 143: 5.62e-2, 179: 2.79e-3), and against the flipped
+  reference no GPU row is above 2.4e-4. So the GPU's rows are those of a run
+  that took the other expert at that near tie (inferred from the match: the
+  GPU's own expert ids were not read back, which needs a readback in the Vulkan
+  MoE arm that does not exist), position 107's layer-1 keys and values differ
+  from then on, and later rows that attend to it inherit the difference. **Needs
+  a decision before any MoE row is set:** (a) teacher-force the routing as well
+  as the tokens (`Op::MoeFfn` already takes a selection through `expert_ids` for
+  hash routing): the two backends cannot fork at a router tie, so a row can be
+  as tight as a dense one and sees a wrong expert kernel; the cost is a harness
+  and runner change to feed the reference's ids, and the router itself then goes
+  unscored by these rows and needs its own check (the picks agree wherever the
+  reference's margin is clear). (b) Leave every row after a near tie out of the
+  score: no change to what runs, but it needs the reference's router margins out
+  of the CPU backend (a tap like `linear_tap`), a threshold to defend, and on a
+  long prompt one early tie discards the rest. (c) A loose MoE row: nothing to
+  build, and it cannot tell a wrong expert from a legitimate one, which is the
+  bug class an MoE row exists for. **Recommended: (a)**, with the router's picks
+  compared separately; it is the only one that leaves the row able to fail on an
+  expert bug. Not done: the same question on a real MoE model (ERNIE-4.5-21B-A3B
+  and Qwen3-30B-A3B are cached now), and on `Vulkan1`, where only the unshifted
+  run was made.
 - **Gate and up swapped (e) gives NaN logits on the RX 7900 XTX and finite ones
   on the integrated GPU** (both RADV, Qwen3-0.6B, both classes; KL 620x and
   3.3e5x its bound on the integrated GPU). The gate fails either way; why the
   two devices handle the same overflow differently is not looked into.
-- **Two clean gate failures on RADV, the first run of the table on a third
-  driver** (2026-11-23, Linux 7.3.5-arch1-1, Mesa `mesa` and `vulkan-radeon`
-  26.3.1-2, headless, no compositor running). Each is a single run, and the
-  cause of neither was investigated. The table was not changed (no ratchet);
-  both are for the row's owner.
-  - `gpu_seam_tolerance_gemma3` on `Vulkan0` (RX 7900 XTX, `RADV NAVI31`): the
-    three Float configurations on prompt 1 land outside gemma-3's Float row:
-    prefill worst KL 1.02e-2 at position 13 (bound 6.4e-3), mean 4.93e-4 (bound
-    4.9e-4), top-k cosine 0.98979 (bound 0.995); decode worst KL 7.87e-3 at
-    position 40 (7.67e-3 static), logit deviation 2.72e-2 (bound 2.6e-2).
-    Prompts 0 and 2 are at most 1.2e-4 from position 2 on. The Int8
-    configurations pass, but their prefill on prompt 1 measures the identical
-    value (KL 1.022885e-2 at position 13, mean 4.927662e-4), so the failing
-    prefill rows are the same with the int8 kernels on and off. Position 13 of
-    prompt 1 is also the worst prefill row on `Vulkan1` (Float 7.1e-4, Int8
-    0.31) and the row where this entry's table above has the production CPU at a
-    KL of 1.35 from the reference. This entry already records gemma-3's Float
-    distance on the 7900 XTX at native lanes as ten to twenty times its wave64
-    and integrated-GPU distance (on Windows); here it crosses the bound.
-  - `gpu_seam_tolerance_gemma3` on `Vulkan1` (Ryzen 9950X3D integrated,
-    `RADV RAPHAEL_MENDOCINO`): configuration `gpu` (Int8, the smoke row), prompt
-    2, decode position 179 flips its top-1 at a 1.185-nat reference margin (the
-    row's near tie is 1 nat); worst KL there 0.18, inside the bound. Every Float
-    configuration passes.
+- **gemma-3-1b is outside its rows on both RADV GPUs. Neither is a driver
+  defect: each is an accuracy cost of a prefill GEMM family, and the rows are
+  their owner's call** (2026-11-23, Linux 7.3.5-arch1-1, Mesa `mesa` and
+  `vulkan-radeon` 26.3.1-2, headless, no compositor running). With every model
+  the tests name cached, nine of the ten `gpu_seam_tolerance_*` tests pass on
+  each GPU (LFM3 and both ERNIE files included) and `gpu_seam_tolerance_gemma3`
+  fails on each, with the same values in three runs on `Vulkan0` and two on
+  `Vulkan1`. The table was not changed (no ratchet).
+  - **`Vulkan0` (RX 7900 XTX, `RADV NAVI31`), Float row.** The three Float
+    configurations on prompt 1 (33 tokens): prefill worst KL 1.02e-2 at position
+    13 (bound 6.4e-3), mean 4.93e-4 (bound 4.9e-4), top-k cosine 0.98979 (bound
+    0.995); decode worst KL 7.87e-3 at position 40 (7.67e-3 static), logit
+    deviation 2.72e-2 (bound 2.6e-2). Prompts 0 and 2 are at most 1.2e-4 from
+    position 2 on.
+    - _Which kernels **[ran]**: the cooperative-matrix f16 prefill GEMM path._
+      With `kernels.vulkan.coopmat` off (`gpu-float-nocoopmat`, the whole
+      cooperative-matrix tier) position 13 measures 7.14e-4 and position 40
+      4.22e-4, what `Vulkan1`, which has no cooperative matrices, measures. The
+      two runs build the same kernels except `native_gemm_warp_q4k_sk_ag`,
+      `_q6k_sk_ag`, `_q8_0_sk_ag`, `_q8_0_n128_ag` (or its `_bm16` build),
+      `_q5_0_n128`, `splitk_reduce` and `store_f16` on one side and `native_q4k`
+      on the other; every decode and attention kernel is in both lists, so
+      decode runs the same kernels in both. (Forced wave64 selects the same f32
+      prefill kernels and is not a second sample.) Turning off the attention
+      warp kernels, `nc_fa`, the small row tiles, or staging A directly, and
+      prefill chunks of 8, 16 or 32 rows, change no digit.
+    - _Where it enters **[ran]**: through the KV of the first few positions, not
+      through row 13's own prefill._ `INFR_TOL_SPLIT` ends the prompt early, so
+      later positions are decode rows on kernels both configurations share.
+      Position 13 / position 40 with the cooperative-matrix GEMMs on, by the
+      number of rows the batched prefill ran: 3 rows 8.73e-3 / 6.55e-3; 4 rows
+      7.42e-3 / 6.37e-3; 5 rows 1.03e-2 / 6.91e-3; 7 rows 5.86e-3 / 4.67e-3; 9
+      rows 7.09e-3 / 6.13e-3; 11 rows 6.30e-3 / 5.23e-3; 13 rows 5.87e-3 /
+      5.12e-3; 15 rows 1.02e-2 / 8.13e-3; 19, 23 and 27 rows 1.02e-2 / 7.85e-3,
+      7.45e-3, 7.69e-3; all 32 rows 1.02e-2 / 7.87e-3. With only positions 0 to
+      2 through those GEMMs the distance is already most of the whole, and from
+      15 rows on position 40 stays within a tenth of its final value. The same
+      splits with the tier off: 4.11e-4 / 2.90e-4 (3 rows), 6.19e-4, 8.07e-5,
+      3.27e-4, 4.27e-4, 8.81e-4, 7.36e-4, then 7.14e-4 from 15 rows on (position
+      13), so the f32 path's own value at that row moves elevenfold with where
+      the prompt ends.
+    - _Mechanism: f16 operand rounding, inferred, with a simulation that
+      supports it **[ran, CPU]**._ The swap above changes kernel, tiling,
+      summation structure and operand type together, and no f32-operand build of
+      the cooperative-matrix kernel exists to hold the rest fixed (its operand
+      type is a shader define with f16 and bf16 values only; whether the device
+      enumerates an f32 cooperative matrix was not checked). What was run
+      instead holds the kernel and changes only the operands, on the CPU: the
+      reference backend with a scratch hook (not committed) that rounds the
+      activations and the decoded weights of every batched-prefill `Op::Linear`
+      to f16, to nearest even, and still takes its exact f32 dot. Against the
+      unmodified reference that run measures 3.44e-3 at position 13 and 2.04e-3
+      at position 40 (weights alone 5.08e-3 / 4.13e-3, activations alone 2.17e-3
+      / 1.79e-3). The GPU's Float run scored against it measures 1.82e-3 and
+      1.89e-3, where against the unmodified reference it measures 1.02e-2 and
+      7.87e-3. So operand rounding alone produces a distance of this order on
+      these rows and accounts for most of the GPU's; it is not shown to be all
+      of it.
+    - _How few rows matter **[ran, the same simulation]**._ Rounding one
+      position's rows only: position 0, 2.14e-3 / 1.11e-3; position 1, 2.25e-3 /
+      1.41e-3; position 2, 3.3e-4 / 1.8e-4; positions 3, 5, 8 and 12, at most
+      3.6e-4 / 1.6e-4; position 13 itself, 6.6e-4 / 4.9e-4; positions 14, 15, 16
+      and 20, at most 2.9e-5 at position 40. Keeping the first N positions exact
+      and rounding the rest: N=1 2.35e-3 / 1.60e-3; N=2 4.48e-3 / 3.06e-3; N=3
+      1.84e-4 / 2.68e-4; N=4 1.27e-3 / 1.26e-3; N=6 3.09e-3 / 2.08e-3; N=8
+      2.31e-3 / 1.90e-3; N=10 4.6e-5 / 5.5e-5; N=12 3.4e-4 / 2.8e-4; N=14, 15
+      and 16 at most 6.5e-5 at position 40. Positions 0 and 1 each carry about
+      as much as the whole, the effects do not add, and no N under 10 holds the
+      distance down reliably (N=3 does, N=4 to 8 do not). One prompt of one
+      model; on the GPU only the complement was run (the split curve above).
+    - _What the driver computes, as far as it was probed **[ran]**._ One
+      variant, `native_gemm_warp_q4k_n128_ag`, at one shape (64 x 512 x 256) on
+      synthetic operands, against host models: weights rounded to f16 to nearest
+      even, exact products, summed: relative L2 1.66e-6; weights truncated to
+      f16: 3.6e-4; products rounded to f16: 6.6e-5. gemma's failing value comes
+      through the `_sk_ag` builds with `splitk_reduce`, `q5_0_n128` and
+      `q8_0_n128_ag`, which were not modelled. In the gate on this device
+      `recorder::tests::matmul_native_splitk_f16_matches_cpu` (a split-K build
+      within its own 5e-2 absolute bound) and
+      `gemm::tests::warp_gemm_matches_cpu` (the generic `gemm_warp` kernel, not
+      a native-block one) pass; neither bounds rounding.
+    - _The value moves with the summation **[ran, one reordering]**._
+      `INFR_TUNE=split_k.fixed_grid=0` turns split-K off (the `n128_ag` builds
+      run in place of `sk_ag` and `splitk_reduce`): position 13 measures 4.18e-3
+      and position 40 1.98e-3, inside the row, and under the shipped int8 decode
+      position 62 goes from 2.29e-2 to 0.112 with three top-1 flips. That is one
+      sample (the other `split_k` settings tried changed no digit), and it does
+      not exclude that the split-K path is the less accurate of the two. Read
+      from the shader, the two builds differ in the order of the f32 sums over
+      the same f16 operands; that a difference of that size moves this row by
+      2.4 times is an inference, supported by the split curve, where position 13
+      ranges from 5.86e-3 to 1.03e-2 with split-K unchanged.
+    - _Why int8 on and off agree._ No row of `tuning/table.toml` matches RADV
+      (B231), so the int8 cooperative-matrix GEMM is off and the Int8
+      configurations prefill on the same f16 GEMMs as Float: the identical
+      1.022885e-2.
+    - _Against Windows._ The same card and kernel family measured a Float worst
+      of 3.2e-3 there (position 40), against 3.0e-4 with wave64 forced and
+      1.6e-3 on the integrated GPU, and it set the bound. Why that run is lower
+      than this one was not established.
+  - **`Vulkan1` (Ryzen 9950X3D integrated, `RADV RAPHAEL_MENDOCINO`), Int8 smoke
+    row.** Configuration `gpu`, prompt 2 (180 tokens), position 179, the first
+    decode row, flips its top-1 at a 1.185-nat reference margin against the
+    row's 1-nat near tie; KL there 0.18, inside the bound. Every Float
+    configuration passes (3.1e-6 at that position).
+    - _It does not follow the end of the prompt **[ran]**._ Ended at 150 tokens
+      (position 179 a decode row 30 past the boundary) it measures 0.200 and
+      flips; at 170, 0.170 and does not; at 183 and 190 (position 179 a
+      batched-prefill row) 0.166 and does not.
+    - _It is the KV the dp4a K-quant prefill GEMM wrote **[ran]**._ With
+      `kernels.vulkan.dp4a_kq` off (`gpu-no-dp4a-kq`: `native_gemm_dp4a_q4k` and
+      `_q6k` are the only kernels that drop out, their weights then taking
+      `native_gemm_mmq_q4k_streamed` / `_q6k_streamed`, still int8 activations,
+      and the int8 decode GEMVs unchanged) position 179 measures 2.17e-2 and
+      does not flip, the decode phase's worst KL goes from 0.180 to 2.17e-2 and
+      the prefill's mean from 1.53e-2 to 5.9e-3. Positions 0 to 2 keep their
+      values to every digit (0.68, 0.81, 0.18), which was not explained. This is
+      a lead for the entry below on gemma's int8 distance on this GPU: the far
+      kernel is the dp4a K-quant GEMM, not the `mmq` one.
+    - Position 179 is the last token of the prompt, where the reference's top
+      two candidates are 1.185 nats apart; a KL of 0.17 to 0.20 is enough to
+      swap them in some runs.
+  - **The decisions, with what each costs.**
+    - _gemma's Float row._ (a) Loosen it to this measurement by the table's
+      rule. Cheapest, but it is gemma's only real check and the looser value's
+      gap to a bug is unmeasured: no bug has been planted in gemma-3 in any
+      class, which the no-ratchet rule asks for, so it first needs a gemma
+      target in `gpu_planted_*`. (b) Split the check: a tight row scored with
+      the cooperative-matrix tier off (worst KL 7.2e-4 on both GPUs here, a
+      ninth of today's bound, though 8.1e-5 to 8.8e-4 across prompt ends) and a
+      loose one on the f16 GEMMs. Keeps a sharp check on everything but those
+      GEMMs at the cost of one more configuration per run, and leaves the f16
+      GEMMs on gemma to a smoke row plus their op-level tests, which bound
+      nothing as tight. (c) Remove the cost in the product: run the first
+      positions of a prefill through f32-operand kernels. It would help every
+      cooperative-matrix device, Windows included, not only the gate; but the
+      simulation says a handful of rows is not reliably enough (three held, four
+      to eight did not, of this prompt's 32), so it is a kernel-selection change
+      with a prefill-speed cost on short prompts, unmeasured on any GPU, in code
+      another session owns. **Recommended: (b) now, (c) as a measured slice of
+      its own.** (b) is the only option that tightens what the gate sees instead
+      of loosening it, needs no planted-bug evidence to be safe, and does not
+      wait on a kernel change; (c) is the real fix but its size is not known
+      until the first-rows curve is taken on a GPU and on more than one prompt.
+    - _gemma's Int8 smoke row._ (a) Raise its near tie by the table's rule (1.5
+      times the widest legitimate miss, 1.78 nats): one number, but fewer
+      positions then count toward the top-1 check, and the row is already
+      labelled a smoke check. (b) Leave it and accept a known failure on this
+      device until the dp4a K-quant GEMM's distance on gemma is understood:
+      honest, but a red test in every RADV gate run hides the next one. (c)
+      Score gemma's Int8 row with `dp4a_kq` off: it passes here, and stops
+      testing the kernel that ships. **Recommended: (a)**, with the dp4a lead
+      above kept open: the Float rows are what hold gemma, and a smoke row
+      should not fail on a draw.
+    - _A rule for MoE rows_: see the entry above on the router near tie.
+  - **Not done:** `gpu-float-nocoopmat` over the whole tolerance set; the
+    first-rows curve on a GPU; any of this on Windows; the split-K builds
+    against a host model.
 
-  The other `gpu_seam_tolerance_*` tests passed on both GPUs (ERNIE F16,
-  Qwen3-0.6B, Qwen3.5-0.8B, both synthetic models, the red path, the
-  prefill-head and int8-free checks); the LFM3 test and the ERNIE Q4_K_M half of
-  the ERNIE test skipped, their files not being cached at the time. Every model
-  the tolerance tests name is cached on the Linux machine since; the skipped
-  cases have not been re-run.
-
+- **`gpu_seam_golden_qwen3` fails on the integrated GPU under RADV; the blessed
+  hash is one device's path.** In the full GPU gate of 2026-11-23 (Linux, Mesa
+  26.3.1, headless) its first prompt hashes to `0xe91c03c96815974c` where
+  `0xfd63781ea3bfa785` is blessed; the same test passes on the RX 7900 XTX under
+  RADV, and `gpu_seam_tolerance_qwen3` passes on both. The same hash is on
+  record for this GPU under Windows ("Considered and declined", the int8 decode
+  GEMV for the small k/v projections): the hash is of the generated text, and
+  both runs print the same text ("Okay, the user is asking about the capital of
+  France. Let me think. I know that France…"), so it marks the other branch of
+  one near tie, not one cause. That lead was checked and does not explain this
+  run: `mmv_mw_choice` still returns `None` under its element floor (read in
+  `adapter.rs`), and the kernels a shipped Qwen3-0.6B run builds on this GPU
+  hold the same decode GEMVs as the RX 7900 XTX's (the f32 `native_q4k_rm2_reg`
+  and `native_q6k`, the int8 `native_mmv_mrow_*`), differing in the prefill
+  GEMMs (`native_gemm_mmq_*_streamed` for `native_gemm_warp_*`) and in the
+  residual builds of the int8 GEMV. Which op takes the other branch under RADV
+  where the Windows driver did not (B227) was not found. What it means for the
+  golden: one text hash cannot hold across drivers on a prompt with a near tie
+  in its first tokens, which is the case for retiring it in G4.
 - **The decode the forced runs exercise is the per-token path.** Each forced
   step records and executes a fresh replay plan once, so record-once-replay-many
   (one recording replayed with advancing parameters) and the chained decode
@@ -6892,7 +7066,11 @@ values. What it leaves:
   (`native_gemm_i8cm_*`); with wave64 forced, and on the integrated GPU, the
   dp4a `native_gemm_mmq_*` runs instead (the int8-free check's kernel lists, on
   Qwen3 **[ran]**; on gemma **[I]**). Those are the two far paths, so the mmq
-  GEMM on gemma's large activations is the first guess. Not looked into; it is
+  GEMM on gemma's large activations was the first guess. A later run on
+  `Vulkan1` under RADV points at the dp4a K-quant GEMM instead
+  (`native_gemm_dp4a_q4k` / `_q6k`: with `kernels.vulkan.dp4a_kq` off, prompt
+  2's decode worst KL goes from 0.180 to 2.17e-2 and its prefill mean from
+  1.53e-2 to 5.9e-3; the entry above on RADV). Not looked into further; it is
   what makes gemma's Int8 row a smoke check.
 - **The int8-free check's marker list is typed by hand** (`INT8_KERNEL_MARKERS`
   in `tests/gpu_tolerance.rs`): the Vulkan crate has no central list of
@@ -6936,15 +7114,40 @@ values. What it leaves:
 - **Qwen2.5-0.5B's float prefill is twenty times further than the other Qwens'**
   (worst KL 8.1e-4, one top-1 flip; decode is normal). It carries q/k/v biases,
   which the others do not. Not looked into; Qwen2.5 has no gate row.
-- **gemma-3's Float distance on the 7900 XTX at native lanes is ten to twenty
-  times its wave64 and integrated-GPU distance** (worst KL 3.2e-3 against 3.0e-4
-  and 1.6e-3). The f16 coopmat GEMM rounds activations to f16, and gemma's
-  residual stream is large; not looked into. It is why gemma's Float row is
-  loose, and its Int8 row is a smoke check only.
 - **Not covered by the gate:** MoE (ERNIE-4.5-21B-A3B, Qwen3-30B-A3B: not run,
   for time), KV formats other than f16 and q8_0, models not cached here (B60's
   Qwen3.5-MoE and DiffusionGemma), Metal (no Apple hardware: the doc says how a
   Mac owner would add it), and every device but these two.
+
+### B231 — RADV runs on the generic Vulkan tuning: no table row matches it (2026-11-23)
+
+**Tag:** vulkan · tuning · linux · perf · tests · **Kind:** coverage gap,
+measurement to run
+
+Every row of `crates/infr-vulkan/src/tuning/table.toml` names
+`driver = "AMD_PROPRIETARY"`, so under Mesa RADV neither AMD GPU matches one:
+the RX 7900 XTX gets the generic defaults (`split_k.scale_by_cu` off,
+`gemm_i8cm_kq.enabled` off) and the integrated GPU the generic `queue.family`.
+**[read]** the table; **[ran]** the kernels a shipped run builds on the RX 7900
+XTX under RADV 26.3.1 hold `native_gemm_warp_*` and no `native_gemm_i8cm_*`
+(Qwen3-0.6B and gemma-3-1b, 2026-11-23).
+
+- **Coverage.** The Linux GPU gate never runs `native_gemm_i8cm_kq` through a
+  model: on the RX 7900 XTX under RADV the Int8 tolerance configurations prefill
+  on the f16 cooperative-matrix GEMMs, as the Float ones do (gemma-3's prefill
+  rows are identical in both, B207), so the table's Int8 rows are scored there
+  on int8 decode only. The kernel's own tests in `infr-vulkan` still run.
+- **Performance.** The rows were measured on the Windows driver; their evidence
+  fields give `attn_output` 458 to 302 us for the split-K row and pp512 of
+  Qwen3-1.7B from 7580.6 to 11901.5 t/s for the int8 K-quant row. Whether either
+  pays under RADV is unmeasured, and the int8 row's source notes that int8
+  cooperative matrices hung an older Mesa.
+- **What a tuning pass on RADV needs:** a quiet window; `infr bench` pp512 and
+  tg128 on the models the rows cite, each parameter forced both ways with
+  `INFR_TUNE`, interleaved; `i8cm_kq_matches_its_decomposition` and the int8
+  cooperative-matrix layout check passing on Mesa 26.3.1 before anything is
+  timed; the GPU gate with the candidate values forced; then rows keyed on the
+  RADV driver name with those figures as their source.
 
 ### B208 — what the FMA tier (plan 11 S6) left (2026-11-18)
 
@@ -7008,10 +7211,11 @@ machine as well as on the Windows box.
 
 - **G3 is done** (2026-11-23): the planted-bug demonstrations are committed
   behind `infr-llama`'s `mutations` feature and ran on both GPUs of the Linux
-  machine (`docs/gpu-tolerance.md`, Mutations). What they leave is in B207. The
-  same session's first run of the table on RADV failed
-  `gpu_seam_tolerance_gemma3` on both GPUs (B207); that is for the table's owner
-  before G4 leans on it.
+  machine (`docs/gpu-tolerance.md`, Mutations). What they leave is in B207. On
+  RADV `gpu_seam_tolerance_gemma3` fails on both GPUs, neither a driver defect,
+  each an accuracy cost of a prefill GEMM family (B207); what to do with gemma's
+  rows, and the rule an MoE row needs, are the table owner's decisions before G4
+  leans on it.
 - **G4, what it converts:** the whole-vocabulary cosine tests and the exact-hash
   GPU goldens in `crates/infr-llama/tests/cpu_backend.rs` (`gpu_seam_golden_*`)
   move to the tolerance test, and `infr tune check --against cpu-reference` is
@@ -7025,9 +7229,9 @@ machine as well as on the Windows box.
   about 4% faster decode at shallow depth (B227). After G4 that default can
   change on a tolerance pass alone, with no hash to bless.
 - **What the Linux machine adds:** the tolerance table is set from two GPUs on
-  one Windows box; a run there is a third driver. The first run (2026-11-23) is
-  in B207: gemma-3 failed on both RADV GPUs; the LFM3 and ERNIE-4.5-0.3B Q4_K_M
-  cases skipped, their files not cached until afterwards, and are still to run.
+  one Windows box; a run there is a third driver. It is in B207: every model
+  cached, nine of ten tests pass on each GPU and gemma-3 is outside its rows on
+  both.
 
 Then:
 
@@ -7657,13 +7861,17 @@ its grid); a wider one-row bf16 weight takes the generic GEMV.
 
 **Not verified:**
 
-- **`mtp_spec_matches_target_only_greedy` and `mtp_head_cpu_vulkan_parity` did
-  not run.** Both need Qwen3.5-4B-MTP, which is not in the cache here and is
-  over the download limit of the session that did this; they return at once
-  without it. What stands in: `kq_fma_verify_rows_match_decode_rows` (each
-  verify row against its decode row, bit for bit, through the adapter, for the
-  `Linear`s) and the host test that a verify batch takes the decode floor. No
-  whole-model MTP run was made at either floor or with `gemv.kq_fma` on.
+- **No whole-model MTP run with a parameter forced.** At the defaults, on RADV
+  (2026-11-23, Linux, Mesa 26.3.1, headless, Qwen3.5-4B-MTP),
+  `mtp_head_cpu_vulkan_parity` passes on the RX 7900 XTX and the integrated GPU.
+  `mtp_spec_matches_target_only_greedy`, ignored as "MTP parked", passes on the
+  RX 7900 XTX and fails on the integrated GPU, where the speculative stream
+  differs from plain greedy from its first words; its doc comment expects a
+  failure while MTP is parked, and it was not looked into. No term of the GPU
+  gate's filter (`docs/gpu-tolerance.md`) selects that test, so a gate run never
+  shows its state on either device. Neither was run with
+  `attn_split.decode_min_chunk=16` or `gemv.kq_fma=true` forced, the two
+  settings the PRs brought, nor on Windows.
 - **The work bound's 2 s on the compute ring.** `crate::work` assumes a submit
   is reset after about 2 s (plan 12 section 0d), measured on the universal
   family of the integrated GPU under Windows. No reset was provoked on a

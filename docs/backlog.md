@@ -8549,14 +8549,26 @@ queue against two, tokens per second and the pager's upload time.
   leaked one.
 - **Metal's waits were not reviewed** for the same unbounded-wait pattern.
 
-### B235 — `kv.paged` can never build at the clamp it is sized for (2026-11-24)
+### B236 — the first request after a start pays the pipeline builds (2026-11-24)
 
-**Tag:** kv · vram · **Plan:** `docs/plan/14-kv-paged-boot.md`
+**Tag:** serve · startup · **Found:** the reuse probe on LFM3-1.7B
 
-`ParallelSeam::init_slots` builds slot 0's linear KV, resets it, then builds the
-page pool on top, so boot needs `n_slots + 1` caches while the clamp priced
-`n_slots`. On kikuri (RX 580 8 GB, Qwen3.5-4B Q4_K_M, q8): `--parallel 2` clamps
-to 103559/slot and the pool is refused (215.7 MiB requested + 7.62 GiB in use >
-7.75 GiB); slots stay linear. One slot with q8 builds at `--ctx 81920` and is
-refused at 98304 — the boundary is the transient, not the pool. Fix: allocate
-the pool in the cold KV init and skip it entirely at `n_slots == 1`.
+A 4,027-token request took 32.5 s on the first call after the unit started and
+4.7 s (855 t/s) on the next one with the same prompt size. The gap is Vulkan
+pipeline creation inside the first prefill; the load-time warmup does not build
+the variants that request uses. Warm the request path's pipelines at load (or
+compile them while the socket is idle), and measure first-request TTFT at 4k
+before and after.
+
+### B237 — prefill on GCN is two-thirds the non-coopmat flash attention kernel (2026-11-24)
+
+**Tag:** vulkan · perf · **Plan:** none yet
+
+`INFR_PROF_OPS=1` on kikuri (RX 580, LFM3-1.7B Q4_K_M, q8 KV, 58,728 tokens,
+chunk 1024): 132.3 s device time, of which 89.1 s (67.4%) in
+`attn_nc_fa_hd128` over 638 dispatches, 32.4 s (24.5%) in
+`native_gemm_kq_fma_q4k_t128`, and 5.9 s (4.5%) in Q6_K. The attention kernel
+runs at about 1 TFLOP/s effective on a card that sustains much more in the
+GEMMs, so the prefill ceiling is the kernel's tile and wave scheme. A
+wave64-native or retiled hd128 flash prefill is the slice; measure at 58k
+against 440 t/s. The KV dtype and the host store do not move this number.

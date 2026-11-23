@@ -84,8 +84,15 @@ path, which writes at `row_base + pos` and never consults the table**.
   snapshot exists.
 - **P3 — Recurrent snapshots at prefix boundaries.** For qwen35 and other
   unrewindable models, capture the recurrent state at page boundaries (the
-  store's per-block capture, extended) so a shared prefix can restore it. This
-  is what makes the speed slice apply to the 4B.
+  store's per-block capture, extended) so a shared prefix can restore it. The
+  same snapshot closes the two reuse gaps LFM3 has today. An exact extension
+  already works — a 4,047-token second turn reused 4,026 tokens and prefilled
+  21 — but any earlier divergence (an edited message, a regeneration, a
+  different chat-template render) zeroes the state and re-prefills the whole
+  prompt, and a restart or idle stop does the same because the host store skips
+  recurrent models. Capture at every page boundary and in the store, then
+  restore the newest snapshot at or before the common prefix and prefill only
+  the tail. This is what makes the speed slice apply to the 4B.
 - **P4 — Shared budget and admission.** `KvPool` pages from a budget;
   reservation at admission; `/status` reports pages used/free. Test: two
   concurrent requests share the budget, a small request holds few pages, an
@@ -133,3 +140,7 @@ path, which writes at `row_base + pos` and never consults the table**.
 - Two concurrent requests share a prefix; `in_use` returns to zero after both
   finish.
 - TTFT at 4k does not regress against today's small-window server.
+- A divergent follow-up on an unrewindable model (an edited last turn)
+  restores a snapshot and prefills from the divergence, not from token zero.
+- After a restart, the same thread restores from the host store and prefills
+  only its tail.

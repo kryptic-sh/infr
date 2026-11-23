@@ -153,6 +153,13 @@ cfg_struct! {
         /// `INFR_KV_POOL_MB`: device-RAM budget for the `kv.paged` page pool, in MiB. `None` =
         /// auto, which sizes the pool at `slots` full windows (today's linear allocation).
         pool_mb: Option<u64> = None,
+        /// `INFR_KV_STORE_FILE`: file the cross-conversation prefix store saves to as it captures
+        /// and loads at startup, so a restart keeps its reusable prefixes. `None` keeps the store
+        /// in RAM only.
+        store_file: Option<std::path::PathBuf> = None,
+        /// `INFR_KV_STORE_URL`: a shared cold tier (`redis://`, `rediss://`, `valkey://`), which
+        /// wins over `store_file`. One cache then serves every server pointed at it.
+        store_url: Option<String> = None,
         /// `INFR_KV_PAGED`: forward PagedAttention — one page pool shared by the slots, with
         /// copy-on-write for a shared prefix. `None`/`false` = every slot owns a contiguous cache.
         /// The pool is built at the session's first fork (see `docs/perf/kv-prefix.md`), so a

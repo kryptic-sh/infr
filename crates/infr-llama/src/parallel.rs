@@ -246,6 +246,8 @@ impl ParallelSeam {
             .store_mb
             .map(|mb| (mb as usize).saturating_mul(1024 * 1024))
             .unwrap_or(0);
+        let store_tier = crate::seam::cold_tier_for(model.cfg());
+        let store_key = crate::seam::store_key(model.config());
         let mut engine = Self {
             model,
             vk,
@@ -254,7 +256,11 @@ impl ParallelSeam {
                 tick: 0,
             }),
             freed: Condvar::new(),
-            store: Mutex::new(crate::seam::KvPrefixStore::new(store_bytes)),
+            store: Mutex::new(crate::seam::KvPrefixStore::with_tier(
+                store_bytes,
+                store_tier,
+                store_key,
+            )),
             // A 1-slot server has nothing to take turns with — keep it on the exact uncontended
             // path `infr run` takes (see `RequestCtx::gate_pass`: `None` constructs nothing).
             gate: (n_slots > 1).then(|| Arc::new(StepGate::new())),

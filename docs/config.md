@@ -236,7 +236,14 @@ cross-conversation prefix store (reverse PagedAttention, see
 `docs/perf/kv-prefix.md`): the K/V rows of a prompt stay in host RAM after
 its slot is recycled, and a later request sharing that prefix uploads them
 instead of re-prefilling, with LRU eviction once the budget is full. It is
-off by default because those rows are derived from the prompt. `paged`
+off by default because those rows are derived from the prompt. `store_file`
+(`INFR_KV_STORE_FILE`) points the store at a file it appends new blocks to as
+they are captured and reloads at startup, so a restart keeps its prefixes; a
+torn tail is discarded record by record. `store_url` (`INFR_KV_STORE_URL`,
+`redis://` / `rediss://` / `valkey://`) puts the same blocks in Redis or
+Valkey instead and wins over the file, so several servers can share one prefix
+cache; use TLS and a dedicated database, since these rows are model input.
+`paged`
 (`INFR_KV_PAGED`) turns on forward PagedAttention instead: the session's slots
 share one pool of physical pages, built with the session's KV in the cold init;
 a slot allocates pages as its sequence grows and returns them when it resets, a

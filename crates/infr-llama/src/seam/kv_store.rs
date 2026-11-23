@@ -19,8 +19,8 @@ use anyhow::Result;
 use infr_core::backend::{Backend, Buffer};
 use infr_core::budget::kv_fmt_bytes;
 use infr_core::DType;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
+use std::io::{BufReader, BufWriter, Read, Write};
+use std::path::PathBuf;
 
 use super::{
     kv_row_elems, kv_rows_at, ubatch_rows,
@@ -36,19 +36,268 @@ pub(crate) const MIN_PREFIX_TOKENS: usize = 256;
 
 /// Chain id of a block: the previous block's id mixed with this block's tokens.
 ///
-/// A collision only costs a wasted comparison — every lookup also compares the token ids.
+/// FNV-1a, not `DefaultHasher`: the ids are written to a cold tier, so they must not change
+/// with the toolchain. A collision only costs a wasted comparison, since every lookup also
+/// compares the token ids.
 fn block_id(prev: u64, tokens: &[u32]) -> u64 {
-    let mut h = DefaultHasher::new();
-    prev.hash(&mut h);
-    tokens.hash(&mut h);
-    h.finish()
+    let mut h = Fnv::new();
+    h.bytes(&prev.to_le_bytes());
+    for t in tokens {
+        h.bytes(&t.to_le_bytes());
+    }
+    h.0
+}
+
+const STORE_MAGIC: &[u8; 8] = b"INFRKV02";
+const STORE_VERSION: u32 = 2;
+
+/// Identity of the model a cold tier's blocks belong to: the geometry that shapes every row, plus
+/// the context and vocabulary. Blocks under another key are never loaded.
+pub(crate) fn store_key(cfg: &Config) -> u64 {
+    let mut h = Fnv::new();
+    for v in [
+        cfg.n_layer,
+        cfg.n_embd,
+        cfg.n_head,
+        cfg.n_kv,
+        cfg.head_dim,
+        cfg.rope_dim,
+        cfg.n_ctx_train,
+        cfg.vocab,
+        cfg.n_ff,
+    ] {
+        h.bytes(&(v as u64).to_le_bytes());
+    }
+    h.0
+}
+
+/// FNV-1a over the bytes the store writes, so a truncated or damaged file is discarded at load.
+struct Fnv(u64);
+
+impl Fnv {
+    fn new() -> Self {
+        Self(0xcbf2_9ce4_8422_2325)
+    }
+
+    fn bytes(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 ^= u64::from(b);
+            self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+}
+
+fn put_u32(w: &mut impl Write, h: &mut Fnv, v: u32) -> std::io::Result<()> {
+    let b = v.to_le_bytes();
+    w.write_all(&b)?;
+    h.bytes(&b);
+    Ok(())
+}
+
+fn put_u64(w: &mut impl Write, h: &mut Fnv, v: u64) -> std::io::Result<()> {
+    let b = v.to_le_bytes();
+    w.write_all(&b)?;
+    h.bytes(&b);
+    Ok(())
+}
+
+fn put_bytes(w: &mut impl Write, h: &mut Fnv, bytes: &[u8]) -> std::io::Result<()> {
+    put_u32(w, h, bytes.len() as u32)?;
+    w.write_all(bytes)?;
+    h.bytes(bytes);
+    Ok(())
+}
+
+fn get_u32(r: &mut impl Read, h: &mut Fnv) -> std::io::Result<u32> {
+    let mut b = [0u8; 4];
+    r.read_exact(&mut b)?;
+    h.bytes(&b);
+    Ok(u32::from_le_bytes(b))
+}
+
+fn get_u64(r: &mut impl Read, h: &mut Fnv) -> std::io::Result<u64> {
+    let mut b = [0u8; 8];
+    r.read_exact(&mut b)?;
+    h.bytes(&b);
+    Ok(u64::from_le_bytes(b))
+}
+
+fn get_bytes(r: &mut impl Read, h: &mut Fnv) -> std::io::Result<Vec<u8>> {
+    let n = get_u32(r, h)? as usize;
+    if n > (1 << 31) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "kv-prefix store claims a huge buffer",
+        ));
+    }
+    let mut b = vec![0u8; n];
+    r.read_exact(&mut b)?;
+    h.bytes(&b);
+    Ok(b)
+}
+
+fn dtype_name(d: DType) -> Option<&'static str> {
+    Some(match d {
+        DType::F32 => "f32",
+        DType::F16 => "f16",
+        DType::Bf16 => "bf16",
+        DType::Q8_0 => "q8_0",
+        DType::Q4_0 => "q4_0",
+        DType::Q4_1 => "q4_1",
+        DType::Q5_0 => "q5_0",
+        DType::Q5_1 => "q5_1",
+        DType::Iq4Nl => "iq4_nl",
+        DType::Turbo2 => "turbo2",
+        DType::Turbo3 => "turbo3",
+        DType::Turbo4 => "turbo4",
+        _ => return None,
+    })
+}
+
+fn put_name(w: &mut impl Write, h: &mut Fnv, d: DType) -> std::io::Result<()> {
+    let name = dtype_name(d).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "kv-prefix store cannot name this KV dtype",
+        )
+    })?;
+    put_bytes(w, h, name.as_bytes())
+}
+
+fn get_name(r: &mut impl Read, h: &mut Fnv) -> Result<DType> {
+    let bytes = get_bytes(r, h)?;
+    let name = std::str::from_utf8(&bytes)?;
+    infr_core::budget::parse_kv_dtype(name)
+        .ok_or_else(|| anyhow::anyhow!("kv-prefix store names an unknown KV dtype {name:?}"))
+}
+
+fn write_header(w: &mut impl Write, key: u64, k_fmt: DType, v_fmt: DType) -> std::io::Result<()> {
+    w.write_all(STORE_MAGIC)?;
+    let mut h = Fnv::new();
+    put_u32(w, &mut h, STORE_VERSION)?;
+    put_u64(w, &mut h, key)?;
+    put_name(w, &mut h, k_fmt)?;
+    put_name(w, &mut h, v_fmt)
+}
+
+fn read_header(r: &mut impl Read) -> Result<(u64, DType, DType)> {
+    let mut magic = [0u8; 8];
+    r.read_exact(&mut magic)?;
+    if &magic != STORE_MAGIC {
+        anyhow::bail!("not a kv-prefix store file");
+    }
+    let mut h = Fnv::new();
+    if get_u32(r, &mut h)? != STORE_VERSION {
+        anyhow::bail!("kv-prefix store version mismatch");
+    }
+    let key = get_u64(r, &mut h)?;
+    let k_fmt = get_name(r, &mut h)?;
+    let v_fmt = get_name(r, &mut h)?;
+    Ok((key, k_fmt, v_fmt))
+}
+
+fn write_block(w: &mut impl Write, h: &mut Fnv, b: &Block) -> std::io::Result<()> {
+    put_u64(w, h, b.id)?;
+    put_u32(w, h, b.len as u32)?;
+    for &t in &b.tokens {
+        put_u32(w, h, t)?;
+    }
+    for side in [&b.k, &b.v] {
+        put_u32(w, h, side.len() as u32)?;
+        for bytes in side {
+            put_bytes(w, h, bytes)?;
+        }
+    }
+    match &b.snap {
+        None => w.write_all(&[0])?,
+        Some(s) => {
+            w.write_all(&[1])?;
+            put_u32(w, h, s.pos as u32)?;
+            for side in [&s.k, &s.v] {
+                put_u32(w, h, side.len() as u32)?;
+                for (l, bytes) in side {
+                    put_u32(w, h, *l as u32)?;
+                    put_bytes(w, h, bytes)?;
+                }
+            }
+        }
+    }
+    put_u64(w, h, b.used)
+}
+
+fn read_block(r: &mut impl Read, h: &mut Fnv) -> Result<Block> {
+    let id = get_u64(r, h)?;
+    let len = get_u32(r, h)? as usize;
+    if len > BLOCK_TOKENS {
+        anyhow::bail!("kv-prefix block claims {len} tokens");
+    }
+    let mut tokens = Vec::with_capacity(len);
+    for _ in 0..len {
+        tokens.push(get_u32(r, h)?);
+    }
+    let mut sides = Vec::new();
+    for _ in 0..2 {
+        let layers = get_u32(r, h)? as usize;
+        if layers > 4096 {
+            anyhow::bail!("kv-prefix block claims {layers} layers");
+        }
+        let mut side = Vec::with_capacity(layers);
+        let mut bytes = 0usize;
+        for _ in 0..layers {
+            let b = get_bytes(r, h)?;
+            bytes += b.len();
+            side.push(b);
+        }
+        sides.push((side, bytes));
+    }
+    let mut present = [0u8; 1];
+    r.read_exact(&mut present)?;
+    let snap = if present[0] == 1 {
+        let pos = get_u32(r, h)? as usize;
+        let mut snap_sides = Vec::new();
+        let mut bytes = 0usize;
+        for _ in 0..2 {
+            let entries = get_u32(r, h)? as usize;
+            if entries > 4096 {
+                anyhow::bail!("kv-prefix snapshot claims {entries} layers");
+            }
+            let mut side = Vec::with_capacity(entries);
+            for _ in 0..entries {
+                let l = get_u32(r, h)? as usize;
+                let b = get_bytes(r, h)?;
+                bytes += b.len();
+                side.push((l, b));
+            }
+            snap_sides.push(side);
+        }
+        let v = snap_sides.pop().expect("two sides");
+        let k = snap_sides.pop().expect("two sides");
+        Some(RecurrentSnap { pos, k, v, bytes })
+    } else {
+        None
+    };
+    let used = get_u64(r, h)?;
+    let (k, kb) = sides.remove(0);
+    let (v, vb) = sides.remove(0);
+    let snap_bytes = snap.as_ref().map_or(0, |s| s.bytes);
+    Ok(Block {
+        id,
+        len,
+        tokens,
+        k,
+        v,
+        snap,
+        bytes: kb + vb + snap_bytes,
+        used,
+        dirty: false,
+    })
 }
 
 /// One stored block: `len` token ids and the raw K/V rows for that token range.
 ///
 /// `len` is `BLOCK_TOKENS` except for the tail of a captured prefix, which may be short; a short
 /// block only ever matches at the end of a prompt.
-struct Block {
+pub(crate) struct Block {
     id: u64,
     len: usize,
     tokens: Vec<u32>,
@@ -60,6 +309,8 @@ struct Block {
     snap: Option<RecurrentSnap>,
     bytes: usize,
     used: u64,
+    /// Changed since the last save/append.
+    dirty: bool,
 }
 
 /// Host-RAM LRU store of captured prompt blocks.
@@ -74,13 +325,407 @@ pub(crate) struct KvPrefixStore {
     pub(crate) restores: u64,
     pub(crate) restored_tokens: u64,
     pub(crate) captures: u64,
+    /// Where blocks outlive this process, when one is configured.
+    tier: Option<Box<dyn KvColdTier>>,
+    /// Model identity the tier's blocks are keyed under.
+    key: u64,
+    /// Blocks changed since the last write to the tier.
+    dirty: bool,
+    /// The KV formats the tier last saw; a change forces a rewrite.
+    tier_fmt: Option<(DType, DType)>,
+}
+
+impl Drop for KvPrefixStore {
+    fn drop(&mut self) {
+        if self.dirty {
+            if let Err(e) = self.rewrite_tier() {
+                tracing::warn!(error = %e, "kv store: final save to the cold tier failed");
+            }
+        }
+    }
+}
+
+/// What a cold tier hands back at startup: the formats its blocks were captured with, and the
+/// blocks in the order they were written (a later copy of a block replaces an earlier one).
+pub(crate) struct TierContents {
+    k_fmt: DType,
+    v_fmt: DType,
+    blocks: Vec<Block>,
+}
+
+/// Where the host store's blocks live beyond this process: a local file today, and a shared
+/// key-value cache such as Redis or Valkey later. The store keeps its RAM index and LRU in front;
+/// a tier only persists blocks and hands them back at startup.
+pub(crate) trait KvColdTier: Send {
+    /// A name for logs: the path or the endpoint.
+    fn describe(&self) -> String;
+    /// The blocks stored under `key`, or `None` when the tier holds nothing for it.
+    fn load(&mut self, key: u64) -> Result<Option<TierContents>>;
+    /// Add `blocks` captured with `k_fmt`/`v_fmt`, which match what the tier already holds.
+    fn append(&mut self, key: u64, k_fmt: DType, v_fmt: DType, blocks: &[&Block]) -> Result<()>;
+    /// Replace everything stored under `key` with `blocks`.
+    fn rewrite(&mut self, key: u64, k_fmt: DType, v_fmt: DType, blocks: &[&Block]) -> Result<()>;
+}
+
+/// A [`KvColdTier`] in one local file: a header, then checksummed records appended as blocks are
+/// captured. A crash leaves the file valid up to its last whole record.
+pub(crate) struct FileTier {
+    path: PathBuf,
+}
+
+impl FileTier {
+    pub(crate) fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    fn write_record(w: &mut impl Write, blocks: &[&Block]) -> std::io::Result<()> {
+        let mut h = Fnv::new();
+        put_u32(w, &mut h, blocks.len().min(u32::MAX as usize) as u32)?;
+        for b in blocks {
+            write_block(w, &mut h, b)?;
+        }
+        w.write_all(&h.0.to_le_bytes())
+    }
+
+    /// One appended record, or `None` at a clean end of file or a torn tail.
+    fn read_record(r: &mut impl Read) -> Option<Vec<Block>> {
+        let mut h = Fnv::new();
+        let count = get_u32(r, &mut h).ok()? as usize;
+        if count > (1 << 20) {
+            return None;
+        }
+        let mut record = Vec::with_capacity(count);
+        for _ in 0..count {
+            record.push(read_block(r, &mut h).ok()?);
+        }
+        let mut stored = [0u8; 8];
+        r.read_exact(&mut stored).ok()?;
+        (u64::from_le_bytes(stored) == h.0).then_some(record)
+    }
+}
+
+impl KvColdTier for FileTier {
+    fn describe(&self) -> String {
+        self.path.display().to_string()
+    }
+
+    fn load(&mut self, key: u64) -> Result<Option<TierContents>> {
+        let file = match std::fs::File::open(&self.path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let len = file.metadata()?.len();
+        let mut r = BufReader::new(file);
+        let (file_key, k_fmt, v_fmt) = read_header(&mut r)?;
+        if file_key != key {
+            anyhow::bail!("the file holds another model's prefixes");
+        }
+        let mut blocks: Vec<Block> = Vec::new();
+        let mut read = 0u64;
+        loop {
+            if std::io::BufRead::fill_buf(&mut r)?.is_empty() {
+                break;
+            }
+            let Some(record) = Self::read_record(&mut r) else {
+                tracing::warn!(
+                    path = %self.path.display(),
+                    file_bytes = len,
+                    "kv store: the journal tail is torn; keeping the whole records before it"
+                );
+                break;
+            };
+            read += 1;
+            for b in record {
+                match blocks
+                    .iter_mut()
+                    .find(|old| old.id == b.id && old.tokens == b.tokens)
+                {
+                    Some(old) => *old = b,
+                    None => blocks.push(b),
+                }
+            }
+        }
+        tracing::debug!(
+            records = read,
+            blocks = blocks.len(),
+            "kv store: file tier read"
+        );
+        Ok(Some(TierContents {
+            k_fmt,
+            v_fmt,
+            blocks,
+        }))
+    }
+
+    fn append(&mut self, key: u64, k_fmt: DType, v_fmt: DType, blocks: &[&Block]) -> Result<()> {
+        if let Some(dir) = self.path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+        if f.metadata()?.len() == 0 {
+            write_header(&mut f, key, k_fmt, v_fmt)?;
+        }
+        let mut w = BufWriter::new(&mut f);
+        Self::write_record(&mut w, blocks)?;
+        w.flush()?;
+        drop(w);
+        f.sync_data()?;
+        Ok(())
+    }
+
+    fn rewrite(&mut self, key: u64, k_fmt: DType, v_fmt: DType, blocks: &[&Block]) -> Result<()> {
+        if let Some(dir) = self.path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let tmp = self
+            .path
+            .with_extension(format!("tmp.{}", std::process::id()));
+        let mut w = BufWriter::new(std::fs::File::create(&tmp)?);
+        write_header(&mut w, key, k_fmt, v_fmt)?;
+        Self::write_record(&mut w, blocks)?;
+        w.flush()?;
+        let f = w.into_inner().map_err(|e| e.into_error())?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, &self.path)?;
+        Ok(())
+    }
+}
+
+/// A [`KvColdTier`] in Redis or Valkey: one hash-free key per block under a model prefix, an
+/// index set of the live block ids, and a meta key naming the KV formats. A shared server then
+/// serves every box pointed at it, and its own `maxmemory` policy trims what nobody asked for.
+pub(crate) struct RedisTier {
+    conn: redis::Connection,
+    endpoint: String,
+}
+
+impl RedisTier {
+    fn connect(url: &str) -> Result<Self> {
+        let client = redis::Client::open(url)?;
+        let conn = client.get_connection()?;
+        conn.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
+        conn.set_write_timeout(Some(std::time::Duration::from_secs(30)))?;
+        Ok(Self {
+            conn,
+            endpoint: redact(url),
+        })
+    }
+
+    fn prefix(key: u64) -> String {
+        format!("infr:kv:{key:016x}")
+    }
+
+    fn key_block(key: u64, id: u64) -> String {
+        format!("{}:b{id:016x}", Self::prefix(key))
+    }
+
+    fn key_index(key: u64) -> String {
+        format!("{}:idx", Self::prefix(key))
+    }
+
+    fn key_meta(key: u64) -> String {
+        format!("{}:meta", Self::prefix(key))
+    }
+
+    fn encode(b: &Block) -> Vec<u8> {
+        let mut v = Vec::with_capacity(b.bytes + 16);
+        let mut h = Fnv::new();
+        write_block(&mut v, &mut h, b).expect("writing to a Vec cannot fail");
+        v.extend_from_slice(&h.0.to_le_bytes());
+        v
+    }
+
+    fn decode(v: &[u8]) -> Result<Block> {
+        if v.len() < 8 {
+            anyhow::bail!("kv store: a Redis block is too short");
+        }
+        let (payload, hash) = v.split_at(v.len() - 8);
+        let stored = u64::from_le_bytes(hash.try_into().expect("eight bytes"));
+        let mut r = payload;
+        let mut h = Fnv::new();
+        let b = read_block(&mut r, &mut h)?;
+        if !r.is_empty() || h.0 != stored {
+            anyhow::bail!("kv store: a Redis block failed its checksum");
+        }
+        Ok(b)
+    }
+
+    fn meta(k_fmt: DType, v_fmt: DType) -> String {
+        format!(
+            "{} {}",
+            dtype_name(k_fmt).unwrap_or("f16"),
+            dtype_name(v_fmt).unwrap_or("f16")
+        )
+    }
+}
+
+impl KvColdTier for RedisTier {
+    fn describe(&self) -> String {
+        self.endpoint.clone()
+    }
+
+    fn load(&mut self, key: u64) -> Result<Option<TierContents>> {
+        let Some(meta): Option<String> = redis::cmd("GET")
+            .arg(Self::key_meta(key))
+            .query(&mut self.conn)?
+        else {
+            return Ok(None);
+        };
+        let mut parts = meta.split_whitespace();
+        let k_fmt = parts
+            .next()
+            .and_then(infr_core::budget::parse_kv_dtype)
+            .ok_or_else(|| anyhow::anyhow!("kv store: Redis meta names no K format"))?;
+        let v_fmt = parts
+            .next()
+            .and_then(infr_core::budget::parse_kv_dtype)
+            .ok_or_else(|| anyhow::anyhow!("kv store: Redis meta names no V format"))?;
+        let ids: Vec<String> = redis::cmd("SMEMBERS")
+            .arg(Self::key_index(key))
+            .query(&mut self.conn)?;
+        let mut blocks: Vec<Block> = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(64) {
+            let keys: Vec<String> = chunk
+                .iter()
+                .filter_map(|id| u64::from_str_radix(id, 16).ok())
+                .map(|id| Self::key_block(key, id))
+                .collect();
+            if keys.is_empty() {
+                continue;
+            }
+            let vals: Vec<Option<Vec<u8>>> = redis::cmd("MGET").arg(&keys).query(&mut self.conn)?;
+            for v in vals.into_iter().flatten() {
+                match Self::decode(&v) {
+                    Ok(b) => match blocks
+                        .iter_mut()
+                        .find(|old| old.id == b.id && old.tokens == b.tokens)
+                    {
+                        Some(old) => *old = b,
+                        None => blocks.push(b),
+                    },
+                    Err(e) => {
+                        tracing::warn!(error = %e, "kv store: dropped an unreadable Redis block")
+                    }
+                }
+            }
+        }
+        Ok(Some(TierContents {
+            k_fmt,
+            v_fmt,
+            blocks,
+        }))
+    }
+
+    fn append(&mut self, key: u64, k_fmt: DType, v_fmt: DType, blocks: &[&Block]) -> Result<()> {
+        if blocks.is_empty() {
+            return Ok(());
+        }
+        let mut pipe = redis::pipe();
+        pipe.cmd("SET")
+            .arg(Self::key_meta(key))
+            .arg(Self::meta(k_fmt, v_fmt))
+            .ignore();
+        let mut ids = Vec::with_capacity(blocks.len());
+        for b in blocks {
+            ids.push(format!("{:016x}", b.id));
+            pipe.cmd("SET")
+                .arg(Self::key_block(key, b.id))
+                .arg(Self::encode(b))
+                .ignore();
+        }
+        pipe.cmd("SADD").arg(Self::key_index(key)).arg(ids).ignore();
+        let _: () = pipe.query(&mut self.conn)?;
+        Ok(())
+    }
+
+    fn rewrite(&mut self, key: u64, k_fmt: DType, v_fmt: DType, blocks: &[&Block]) -> Result<()> {
+        let old: Vec<String> = redis::cmd("SMEMBERS")
+            .arg(Self::key_index(key))
+            .query(&mut self.conn)?;
+        if !old.is_empty() {
+            let keys: Vec<String> = old
+                .iter()
+                .filter_map(|id| u64::from_str_radix(id, 16).ok())
+                .map(|id| Self::key_block(key, id))
+                .collect();
+            let mut pipe = redis::pipe();
+            pipe.cmd("DEL").arg(keys).ignore();
+            pipe.cmd("DEL")
+                .arg(Self::key_index(key))
+                .arg(Self::key_meta(key))
+                .ignore();
+            let _: () = pipe.query(&mut self.conn)?;
+        } else {
+            let mut pipe = redis::pipe();
+            pipe.cmd("DEL")
+                .arg(Self::key_index(key))
+                .arg(Self::key_meta(key))
+                .ignore();
+            let _: () = pipe.query(&mut self.conn)?;
+        }
+        if blocks.is_empty() {
+            return Ok(());
+        }
+        self.append(key, k_fmt, v_fmt, blocks)
+    }
+}
+
+/// Strip credentials from a URL before it reaches a log line.
+fn redact(url: &str) -> String {
+    match url.split_once("://") {
+        Some((scheme, rest)) => match rest.rsplit_once('@') {
+            Some((_, host)) => format!("{scheme}://{host}"),
+            None => url.to_string(),
+        },
+        None => url.to_string(),
+    }
+}
+
+/// The cold tier `kv.store_url` / `kv.store_file` select. A URL wins; an unreachable URL falls
+/// back to the file when one is set, and a missing/broken tier only costs persistence.
+pub(crate) fn cold_tier_for(kv: &crate::EngineConfig) -> Option<Box<dyn KvColdTier>> {
+    if let Some(url) = kv
+        .kv
+        .store_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+    {
+        match RedisTier::connect(url) {
+            Ok(tier) => {
+                tracing::info!(endpoint = %tier.endpoint, "kv store: sharing the cold tier over Redis");
+                return Some(Box::new(tier));
+            }
+            Err(e) => tracing::warn!(
+                endpoint = %redact(url),
+                error = %e,
+                "kv store: cannot reach the Redis cold tier; falling back to the file"
+            ),
+        }
+    }
+    kv.kv
+        .store_file
+        .as_ref()
+        .map(|p| Box::new(FileTier::new(p.clone())) as Box<dyn KvColdTier>)
 }
 
 impl KvPrefixStore {
     /// Build a store with `cap_bytes` of host memory. A zero cap is a disabled store: every call
     /// returns immediately, so the engine pays nothing for a feature nobody asked for.
+    #[cfg(test)]
     pub(crate) fn new(cap_bytes: usize) -> Self {
-        Self {
+        Self::with_tier(cap_bytes, None, 0)
+    }
+
+    /// [`new`](Self::new), backed by a cold `tier`: the store loads what the tier holds for `key`
+    /// now, writes each capture through to it, and compacts it on drop. `key` identifies the
+    /// model geometry the blocks belong to.
+    pub(crate) fn with_tier(cap_bytes: usize, tier: Option<Box<dyn KvColdTier>>, key: u64) -> Self {
+        let mut store = Self {
             blocks: Vec::new(),
             cap_bytes,
             clock: 0,
@@ -89,6 +734,42 @@ impl KvPrefixStore {
             restores: 0,
             restored_tokens: 0,
             captures: 0,
+            tier: tier.filter(|_| cap_bytes > 0),
+            key,
+            dirty: false,
+            tier_fmt: None,
+        };
+        store.load_tier();
+        store
+    }
+
+    /// Fill the RAM index from the tier. A tier that fails or holds another model's blocks leaves
+    /// the store empty; it never fails startup.
+    fn load_tier(&mut self) {
+        let Some(tier) = self.tier.as_mut() else {
+            return;
+        };
+        let name = tier.describe();
+        match tier.load(self.key) {
+            Ok(Some(c)) => {
+                self.k_fmt = c.k_fmt;
+                self.v_fmt = c.v_fmt;
+                self.tier_fmt = Some((c.k_fmt, c.v_fmt));
+                self.clock = c.blocks.iter().map(|b| b.used).max().unwrap_or(0);
+                self.blocks = c.blocks;
+                self.trim();
+                tracing::info!(
+                    tier = %name,
+                    blocks = self.blocks.len(),
+                    "kv store: loaded the saved prefixes"
+                );
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!(
+                tier = %name,
+                error = %e,
+                "kv store: the saved prefixes are unusable; starting empty"
+            ),
         }
     }
 
@@ -99,6 +780,48 @@ impl KvPrefixStore {
     /// `(blocks, bytes)` currently resident, for the capture log.
     pub(crate) fn stats(&self) -> (usize, usize) {
         (self.blocks.len(), self.blocks.iter().map(|b| b.bytes).sum())
+    }
+
+    /// Replace the tier's contents with the store's current blocks, which drops what the LRU
+    /// evicted and any superseded copies.
+    fn rewrite_tier(&mut self) -> Result<()> {
+        let Some(tier) = self.tier.as_mut() else {
+            self.dirty = false;
+            return Ok(());
+        };
+        let all: Vec<&Block> = self.blocks.iter().collect();
+        tier.rewrite(self.key, self.k_fmt, self.v_fmt, &all)?;
+        for b in &mut self.blocks {
+            b.dirty = false;
+        }
+        self.dirty = false;
+        self.tier_fmt = Some((self.k_fmt, self.v_fmt));
+        Ok(())
+    }
+
+    /// Write the blocks changed since the last write through to the tier, so a crash or a signal
+    /// exit still leaves the next start with them.
+    fn append_dirty(&mut self) -> Result<()> {
+        if self.tier.is_none() {
+            return Ok(());
+        }
+        if self.tier_fmt != Some((self.k_fmt, self.v_fmt)) {
+            return self.rewrite_tier();
+        }
+        let dirty: Vec<usize> = (0..self.blocks.len())
+            .filter(|&i| self.blocks[i].dirty)
+            .collect();
+        if dirty.is_empty() {
+            return Ok(());
+        }
+        let batch: Vec<&Block> = dirty.iter().map(|&i| &self.blocks[i]).collect();
+        let tier = self.tier.as_mut().expect("checked above");
+        tier.append(self.key, self.k_fmt, self.v_fmt, &batch)?;
+        for i in dirty {
+            self.blocks[i].dirty = false;
+        }
+        self.dirty = false;
+        Ok(())
     }
 
     fn find(&self, id: u64, tokens: &[u32]) -> Option<usize> {
@@ -308,6 +1031,7 @@ impl KvPrefixStore {
         if missing.is_empty() {
             self.attach_snapshots(&kv.recurrent_snaps, &kv.cached, p);
             self.trim();
+            self.persist();
             return Ok(0);
         }
         let base = self.blocks.len();
@@ -322,6 +1046,7 @@ impl KvPrefixStore {
                 snap: None,
                 bytes: 0,
                 used: self.clock,
+                dirty: true,
             });
         }
         let filled = self.fill_from_device(be, cfg, kv, p, &missing, base);
@@ -332,7 +1057,20 @@ impl KvPrefixStore {
         self.attach_snapshots(&kv.recurrent_snaps, &kv.cached, p);
         self.captures += 1;
         self.trim();
+        self.persist();
         Ok(p)
+    }
+
+    /// Append the changed blocks to the configured file; a failure keeps them dirty for the drop
+    /// compaction and never fails the request.
+    fn persist(&mut self) {
+        if self.tier.is_none() {
+            return;
+        }
+        if let Err(e) = self.append_dirty() {
+            self.dirty = true;
+            tracing::warn!(error = %e, "kv store: write-through to the cold tier failed");
+        }
     }
 
     /// Attach the slot's recurrent-state snapshots to the blocks that end at their positions.
@@ -349,6 +1087,7 @@ impl KvPrefixStore {
             if self.blocks[i].snap.is_none() {
                 self.blocks[i].bytes += snap.bytes;
                 self.blocks[i].snap = Some(snap.clone());
+                self.blocks[i].dirty = true;
             }
         }
     }
@@ -546,6 +1285,7 @@ mod tests {
                 snap: None,
                 bytes,
                 used: s.clock,
+                dirty: false,
             });
             n += len;
         }
@@ -633,5 +1373,142 @@ mod tests {
         tight.blocks.push(snap_block);
         tight.trim();
         assert!(tight.blocks.is_empty());
+    }
+
+    /// The chain id must not move with the toolchain: it is the key of every block in a cold
+    /// tier, so a hash change would silently turn every stored prefix into a miss.
+    #[test]
+    fn block_ids_are_stable_across_releases() {
+        assert_eq!(block_id(0, &[1, 2, 3]), 0x973d_5966_9a25_a835);
+    }
+
+    fn mk_block(id: u64, tokens: Vec<u32>) -> Block {
+        let len = tokens.len();
+        Block {
+            id,
+            len,
+            tokens,
+            k: vec![vec![1, 2, 3]],
+            v: vec![vec![4, 5]],
+            snap: None,
+            bytes: 5,
+            used: 1,
+            dirty: false,
+        }
+    }
+
+    #[test]
+    #[ignore = "needs a throwaway Redis/Valkey in INFR_TEST_REDIS_URL"]
+    fn a_redis_tier_round_trips_blocks_and_snapshots() {
+        let url = std::env::var("INFR_TEST_REDIS_URL").expect("set INFR_TEST_REDIS_URL");
+        let key = 0x1234_5678_9abc_def0 ^ u64::from(std::process::id());
+        let mut tier = RedisTier::connect(&url).expect("connect");
+        tier.rewrite(key, DType::F16, DType::F16, &[])
+            .expect("clear");
+        let a = mk_block(11, vec![1, 2, 3]);
+        let mut b = mk_block(22, vec![4, 5, 6]);
+        b.snap = Some(RecurrentSnap {
+            pos: 6,
+            k: vec![(0, vec![7; 8])],
+            v: vec![(1, vec![9; 4])],
+            bytes: 12,
+        });
+        tier.append(key, DType::F16, DType::F16, &[&a, &b])
+            .expect("append");
+        let loaded = tier.load(key).expect("load").expect("meta");
+        assert_eq!((loaded.k_fmt, loaded.v_fmt), (DType::F16, DType::F16));
+        assert_eq!(loaded.blocks.len(), 2);
+        let got = loaded
+            .blocks
+            .iter()
+            .find(|x| x.id == 22)
+            .expect("the snapshot block");
+        assert_eq!(got.tokens, vec![4, 5, 6]);
+        assert_eq!(got.snap.as_ref().expect("snapshot").pos, 6);
+
+        // A rewrite drops what the LRU no longer holds.
+        tier.rewrite(key, DType::F16, DType::F16, &[&a])
+            .expect("rewrite");
+        let loaded = tier.load(key).expect("load").expect("meta");
+        assert_eq!(loaded.blocks.len(), 1);
+        assert_eq!(loaded.blocks[0].id, 11);
+
+        tier.rewrite(key, DType::F16, DType::F16, &[])
+            .expect("clear");
+        assert!(tier.load(key).expect("load").is_none(), "nothing left");
+    }
+
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("infr-kv-{}-{name}.bin", std::process::id()))
+    }
+
+    #[test]
+    fn a_saved_store_loads_its_blocks_and_snapshots() {
+        let path = temp_path("roundtrip");
+        std::fs::remove_file(&path).ok();
+        let key = 42u64;
+        let file = |p: &std::path::PathBuf| -> Option<Box<dyn KvColdTier>> {
+            Some(Box::new(FileTier::new(p.clone())))
+        };
+        {
+            let mut s = KvPrefixStore::with_tier(1 << 20, file(&path), key);
+            seed(&mut s, &tokens(1, 300), 7);
+            s.blocks[2].snap = Some(RecurrentSnap {
+                pos: 300,
+                k: vec![(0, vec![7u8; 64])],
+                v: vec![(0, vec![9u8; 32])],
+                bytes: 96,
+            });
+            for b in &mut s.blocks {
+                b.dirty = true;
+            }
+            s.tier_fmt = Some((s.k_fmt, s.v_fmt));
+            s.persist();
+            assert!(!s.dirty, "the append went through");
+        }
+        let journal_one = std::fs::metadata(&path).expect("journal").len();
+        {
+            // A second conversation appends a record of its own.
+            let mut s = KvPrefixStore::with_tier(1 << 20, file(&path), key);
+            seed(&mut s, &tokens(2, 128), 5);
+            s.blocks.last_mut().expect("seeded").dirty = true;
+            s.persist();
+            s.dirty = false;
+        }
+        let loaded = KvPrefixStore::with_tier(1 << 20, file(&path), key);
+        assert_eq!(loaded.blocks.len(), 4, "both records came back");
+        drop(loaded);
+
+        // A torn second record keeps the first record whole.
+        let bytes = std::fs::read(&path).expect("read");
+        std::fs::write(&path, &bytes[..bytes.len() - 3]).expect("write torn");
+        assert!(bytes.len() as u64 > journal_one);
+        let loaded = KvPrefixStore::with_tier(1 << 20, file(&path), key);
+        assert_eq!(loaded.blocks.len(), 3);
+        assert_eq!(loaded.blocks[2].tokens, tokens(1, 300)[256..]);
+        assert_eq!(
+            loaded.blocks[2].bytes, 96,
+            "the snapshot's bytes, recomputed"
+        );
+        let snap = loaded.blocks[2]
+            .snap
+            .as_ref()
+            .expect("the snapshot survived");
+        assert_eq!((snap.pos, snap.k[0].1.len()), (300, 64));
+
+        drop(loaded);
+
+        // Another model's key discards the file whole.
+        let wrong = KvPrefixStore::with_tier(1 << 20, file(&path), key + 1);
+        assert!(wrong.blocks.is_empty());
+        drop(wrong);
+
+        // A first record torn mid-way leaves nothing to load, and never a half-read block.
+        let bytes = std::fs::read(&path).expect("read");
+        std::fs::write(&path, &bytes[..journal_one as usize - 3]).expect("write torn");
+        let broken = KvPrefixStore::with_tier(1 << 20, file(&path), key);
+        assert!(broken.blocks.is_empty());
+        drop(broken);
+        std::fs::remove_file(path).ok();
     }
 }

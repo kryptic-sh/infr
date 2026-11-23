@@ -23,6 +23,7 @@ infr-gguf.workspace = true
 infr-cpu.workspace = true
 infr-safetensors.workspace = true
 serde_json.workspace = true
+redis.workspace = true
 llguidance.workspace = true
 toktrie_hf_tokenizers.workspace = true
 half.workspace = true

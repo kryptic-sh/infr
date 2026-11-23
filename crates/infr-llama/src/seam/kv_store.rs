@@ -22,7 +22,10 @@ use infr_core::DType;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-use super::{kv_row_elems, kv_rows_at, ubatch_rows, weights::SeamKv};
+use super::{
+    kv_row_elems, kv_rows_at, ubatch_rows,
+    weights::{RecurrentSnap, SeamKv},
+};
 
 /// Tokens per stored block. Smaller blocks share more (a 600-token system prompt with two
 /// different tails stores each half once) at the price of one download per new block.
@@ -49,9 +52,12 @@ struct Block {
     id: u64,
     len: usize,
     tokens: Vec<u32>,
-    /// Per layer, in `SeamKv::kbufs` order. `v[l]` is empty for an MLA layer (no V side).
+    /// Per layer, in `SeamKv::kbufs` order. `v[l]` is empty for an MLA layer (no V side) and both
+    /// are empty for a recurrent layer, whose state a `snap` carries instead.
     k: Vec<Vec<u8>>,
     v: Vec<Vec<u8>>,
+    /// The recurrent state at this block's end, when one was captured there.
+    snap: Option<RecurrentSnap>,
     bytes: usize,
     used: u64,
 }
@@ -136,7 +142,7 @@ impl KvPrefixStore {
         kv: &mut SeamKv,
         prompt: &[u32],
     ) -> Result<usize> {
-        if !self.enabled() || cfg.has_recurrent_state() {
+        if !self.enabled() {
             return Ok(0);
         }
         let (mut p, hits) = self.matched(prompt);
@@ -166,10 +172,22 @@ impl KvPrefixStore {
             n += len;
             keep.push(i);
         }
+        // A recurrent model's rows are useless without the state they were written beside: only a
+        // block carrying a snapshot can seed it, and everything after that block must be prefilled.
+        if cfg.has_recurrent_state() {
+            let Some(at) = keep.iter().rposition(|&i| self.blocks[i].snap.is_some()) else {
+                return Ok(0);
+            };
+            keep.truncate(at + 1);
+            n = keep.iter().map(|&i| self.blocks[i].len).sum();
+        }
         if n < MIN_PREFIX_TOKENS {
             return Ok(0);
         }
         for l in 0..cfg.n_layer {
+            if cfg.is_recurrent_layer(l) {
+                continue;
+            }
             let (k_row, v_row) = kv_row_elems(cfg, l);
             let kb = kv_fmt_bytes(kv.k_fmt, n * k_row);
             let mut buf = Vec::with_capacity(kb);
@@ -190,6 +208,19 @@ impl KvPrefixStore {
                 be.upload_at(kv.vbufs[l].as_ref(), off, &buf)?;
             }
         }
+        if cfg.has_recurrent_state() {
+            let snap = self.blocks[*keep.last().expect("the snapshot block")]
+                .snap
+                .as_ref()
+                .expect("the truncation kept the snapshot block");
+            for (l, bytes) in &snap.k {
+                be.upload(kv.kbufs[*l].as_ref(), bytes)?;
+            }
+            for (l, bytes) in &snap.v {
+                be.upload(kv.vbufs[*l].as_ref(), bytes)?;
+            }
+            kv.written_end = n;
+        }
         kv.cached = prompt[..n].to_vec();
         self.restores += 1;
         self.restored_tokens += n as u64;
@@ -199,9 +230,8 @@ impl KvPrefixStore {
     /// Capture `kv`'s first `upto` rows as reusable blocks. Returns the token count kept.
     ///
     /// Blocks already stored are skipped, so a conversation that extends its own prefix keeps only
-    /// the new suffix. Skipped entirely when the rows are not reusable: a recurrent state (qwen35
-    /// DeltaNet, LFM short convolution) has no prefix to restore from pages, so the store does not
-    /// apply to that model at all.
+    /// the new suffix. A recurrent layer has no per-position rows: its state rides along as a
+    /// snapshot on the block that ends where the state was captured, and a restore needs one.
     pub(crate) fn capture(
         &mut self,
         be: &dyn Backend,
@@ -210,7 +240,7 @@ impl KvPrefixStore {
         kv: &SeamKv,
         upto: usize,
     ) -> Result<usize> {
-        if !self.enabled() || cfg.has_recurrent_state() {
+        if !self.enabled() {
             return Ok(0);
         }
         let p = upto.min(kv.cached.len()).min(kv.max_ctx);
@@ -255,6 +285,8 @@ impl KvPrefixStore {
             start += len;
         }
         if missing.is_empty() {
+            self.attach_snapshots(&kv.recurrent_snaps, &kv.cached, p);
+            self.trim();
             return Ok(0);
         }
         let base = self.blocks.len();
@@ -266,6 +298,7 @@ impl KvPrefixStore {
                 tokens: tokens[*start..*start + *len].to_vec(),
                 k: vec![Vec::new(); cfg.n_layer],
                 v: vec![Vec::new(); cfg.n_layer],
+                snap: None,
                 bytes: 0,
                 used: self.clock,
             });
@@ -275,9 +308,43 @@ impl KvPrefixStore {
             self.blocks.truncate(base);
             return Err(e);
         }
+        self.attach_snapshots(&kv.recurrent_snaps, &kv.cached, p);
         self.captures += 1;
         self.trim();
         Ok(p)
+    }
+
+    /// Attach the slot's recurrent-state snapshots to the blocks that end at their positions.
+    /// Only snapshots whose whole chain is present can ever restore, and a block's state is the
+    /// same whichever turn wrote it, so an already-attached snapshot is kept.
+    fn attach_snapshots(&mut self, snaps: &[RecurrentSnap], tokens: &[u32], p: usize) {
+        for snap in snaps {
+            if snap.pos == 0 || snap.pos > p {
+                continue;
+            }
+            let Some(i) = self.block_at(tokens, snap.pos) else {
+                continue;
+            };
+            if self.blocks[i].snap.is_none() {
+                self.blocks[i].bytes += snap.bytes;
+                self.blocks[i].snap = Some(snap.clone());
+            }
+        }
+    }
+
+    /// The stored block ending at token `pos`, when the chain covers it exactly.
+    fn block_at(&self, tokens: &[u32], pos: usize) -> Option<usize> {
+        if pos == 0 || !pos.is_multiple_of(BLOCK_TOKENS) || pos > tokens.len() {
+            return None;
+        }
+        let mut id = 0u64;
+        let mut start = 0usize;
+        while start < pos {
+            let len = BLOCK_TOKENS.min(pos - start);
+            id = block_id(id, &tokens[start..start + len]);
+            start += len;
+        }
+        self.find(id, &tokens[pos - BLOCK_TOKENS..pos])
     }
 
     /// Download each new block's rows into the blocks pushed at `base .. base + missing.len()`.
@@ -291,6 +358,9 @@ impl KvPrefixStore {
         base: usize,
     ) -> Result<()> {
         for l in 0..cfg.n_layer {
+            if cfg.is_recurrent_layer(l) {
+                continue;
+            }
             let (k_row, v_row) = kv_row_elems(cfg, l);
             let mut kbuf = vec![0u8; kv_fmt_bytes(kv.k_fmt, p * k_row)];
             let koff = kv_fmt_bytes(kv.k_fmt, kv.paged_row_base_at(cfg, l) * k_row);
@@ -361,6 +431,7 @@ mod tests {
                 tokens: block.to_vec(),
                 k: Vec::new(),
                 v: Vec::new(),
+                snap: None,
                 bytes,
                 used: s.clock,
             });
@@ -408,5 +479,47 @@ mod tests {
         // One block fits; it is the most recently used, i.e. the second prompt's tail.
         assert_eq!(s.blocks.len(), 1);
         assert_eq!(s.blocks[0].tokens, tokens(2, 300)[256..]);
+    }
+
+    #[test]
+    fn block_at_names_only_a_complete_chain_position() {
+        let a = tokens(1, 300);
+        let mut s = KvPrefixStore::new(1 << 20);
+        seed(&mut s, &a, 1);
+        assert!(s.block_at(&a, 0).is_none());
+        assert!(s.block_at(&a, 128).is_some());
+        assert!(s.block_at(&a, 256).is_some());
+        // The short tail block only answers for its own end.
+        assert!(s.block_at(&a, 300).is_none());
+        // A different token at the position breaks the chain hash.
+        let mut b = a.clone();
+        b[128] ^= 1;
+        assert!(s.block_at(&b, 256).is_none());
+    }
+
+    #[test]
+    fn a_snapshot_rides_the_block_that_ends_at_it() {
+        let a = tokens(1, 512);
+        let mut s = KvPrefixStore::new(1 << 20);
+        seed(&mut s, &a, 1);
+        let snap = RecurrentSnap {
+            pos: 512,
+            k: vec![(0, vec![7u8; 64])],
+            v: vec![(0, vec![9u8; 32])],
+            bytes: 96,
+        };
+        let kv_snaps = vec![snap];
+        s.attach_snapshots(&kv_snaps, &a, 512);
+        let i = s.block_at(&a, 512).expect("block at 512");
+        assert_eq!(s.blocks[i].bytes, 1 + 96);
+        assert!(s.blocks[i].snap.is_some());
+        assert_eq!(s.block_at(&a, 512), Some(i));
+        // A row-only budget fits the block; counting the snapshot pushes it over and drops it.
+        let snap_block = s.blocks.pop().expect("the block at 512");
+        assert_eq!(snap_block.bytes, 97);
+        let mut tight = KvPrefixStore::new(96);
+        tight.blocks.push(snap_block);
+        tight.trim();
+        assert!(tight.blocks.is_empty());
     }
 }

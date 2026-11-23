@@ -1749,6 +1749,7 @@ pub(crate) fn generate_dense_backend_bound(
             cached: Vec::new(),
             written_end: 0,
             delta_snapshot_refused: false,
+            recurrent_snaps: Vec::new(),
             paged: match &pool {
                 Some(pool) => Some(crate::seam::PagedSlot::new(pool, be)?),
                 None => None,
@@ -1788,6 +1789,7 @@ pub(crate) fn generate_dense_backend_bound(
         sc_temp_inv_buf,
         mtp_delta_ckpt,
         delta_snapshot_refused,
+        recurrent_snaps,
         // The env-derived local `kv_ring` above is this same value on every call (stable env),
         // so the struct field is only read by fork/seed (which have no backend caps at hand).
         kv_ring: _,
@@ -1886,9 +1888,16 @@ pub(crate) fn generate_dense_backend_bound(
         // from it, and a zeroed state invalidates it.
         // The ring check runs here, against the high-water mark the restore below resets: once
         // restored, `written_end` no longer says how far past the snapshot the ring was written.
-        let resume = super::weights::delta_snapshot_len(mtp_delta_ckpt)
+        let snap_resume = super::weights::snap_at_or_before(recurrent_snaps, pfx)
+            .filter(|&p| p < prompt.len())
+            .filter(|&p| ring_keeps(p, *written_end));
+        let delta_resume = super::weights::delta_snapshot_len(mtp_delta_ckpt)
             .filter(|&p| p > 0 && p <= pfx && p < prompt.len())
             .filter(|&p| ring_keeps(p, *written_end));
+        let resume = match (delta_resume, snap_resume) {
+            (Some(d), Some(s)) => Some(d.max(s)),
+            (d, s) => d.or(s),
+        };
         if !cached.is_empty()
             && pfx == cached.len()
             && pfx < prompt.len()
@@ -1904,9 +1913,22 @@ pub(crate) fn generate_dense_backend_bound(
             cached.truncate(p);
             let kept = std::mem::take(cached);
             *written_end = 0;
-            if let Err(e) =
-                super::weights::restore_delta(be, &kbufs[..], &vbufs[..], mtp_delta_ckpt)
-            {
+            let restored = if super::weights::delta_snapshot_len(mtp_delta_ckpt) == Some(p) {
+                super::weights::restore_delta(be, &kbufs[..], &vbufs[..], mtp_delta_ckpt).map(|_| p)
+            } else {
+                let r = super::weights::restore_recurrent(
+                    be,
+                    recurrent_snaps,
+                    &kbufs[..],
+                    &vbufs[..],
+                    p,
+                );
+                if r.is_err() {
+                    recurrent_snaps.retain(|s| s.pos != p);
+                }
+                r.map(|_| p)
+            };
+            if let Err(e) = restored {
                 super::weights::invalidate_delta(mtp_delta_ckpt);
                 return Err(e);
             }
@@ -6495,6 +6517,26 @@ pub(crate) fn generate_dense_backend_bound(
                     // Last span for this chunk: its uploads and its residual stream are dead.
                     if si + 1 == spans.len() {
                         live[ci] = None;
+                        if c.has_recurrent_state()
+                            && cend > 0
+                            && cend % infr_vulkan::paged::PAGE_ROWS == 0
+                        {
+                            let _gp = req.and_then(|r| r.gate_pass());
+                            if let Err(e) = super::weights::snapshot_recurrent(
+                                be,
+                                c,
+                                &kbufs[..],
+                                &vbufs[..],
+                                recurrent_snaps,
+                                cend,
+                            ) {
+                                tracing::warn!(
+                                    pos = cend,
+                                    error = %e,
+                                    "recurrent-state snapshot failed; this boundary re-prefills"
+                                );
+                            }
+                        }
                         if cend >= prefill_next_report && prompt.len().saturating_sub(start) >= 4096
                         {
                             prefill_next_report = cend + prefill_report_step;
@@ -7581,21 +7623,33 @@ mod tests {
         state: &mut Option<SeamKv>,
     ) -> Vec<f32> {
         let ec = EngineConfig::default();
+        q35_logits_in(g, cfg, embd, prompt, state, &ec, 32).0
+    }
+
+    fn q35_logits_in(
+        g: &dyn WeightSource,
+        cfg: &Config,
+        embd: &std::sync::OnceLock<Vec<f32>>,
+        prompt: &[u32],
+        state: &mut Option<SeamKv>,
+        ec: &EngineConfig,
+        max_ctx: usize,
+    ) -> (Vec<f32>, crate::GenStats) {
         let be = infr_cpu::CpuBackend::new();
         let mut logits = Vec::new();
-        super::generate_dense_backend(
+        let stats = super::generate_dense_backend(
             &be,
             &crate::seam::cpu_upload_bind(&be),
             g,
             cfg,
-            &ec,
+            ec,
             TokenEmbd::new(embd, g),
             None,
             prompt,
             1,
             |_| {},
             state,
-            32,
+            max_ctx,
             None,
             None,
             None,
@@ -7606,8 +7660,8 @@ mod tests {
             None, // paged_blocks
             1,    // slot_copies
         )
-        .expect("qwen35 synthetic generation");
-        logits
+        .expect("synthetic generation");
+        (logits, stats.1)
     }
 
     /// `INFR_DELTA_STRIDED` makes the decode read DeltaNet's q/k/v as slices of the conv output.
@@ -7825,6 +7879,50 @@ mod tests {
         assert_eq!(
             after, fresh,
             "a divergent turn reused the short convolution's history"
+        );
+    }
+
+    /// A divergence inside a page's worth of tokens resumes from the newest page-boundary snapshot:
+    /// the slot reuses 1024 tokens and prefills the rest, landing on a fresh full prefill's logits.
+    #[test]
+    fn lfm3_divergence_inside_a_page_resumes_from_a_snapshot() {
+        let (g, cfg) = open_synthetic("lfm3-snap", &lfm3_gguf());
+        let embd = std::sync::OnceLock::new();
+        let mut ec = EngineConfig::default();
+        ec.device.ubatch = Some(512);
+        let first: Vec<u32> = (0..1400).map(|i| ((i * 37) % 7 + 1) as u32).collect();
+        let mut second = first[..1024].to_vec();
+        second.extend((0..300).map(|i| ((i * 11) % 7 + 1) as u32));
+        let (fresh, _) = q35_logits_in(&g, &cfg, &embd, &second, &mut None, &ec, 2048);
+        let mut slot = None;
+        q35_logits_in(&g, &cfg, &embd, &first, &mut slot, &ec, 2048);
+        assert!(
+            slot.as_ref()
+                .expect("a slot")
+                .recurrent_snaps
+                .iter()
+                .any(|s| s.pos == 1024),
+            "the 1024-token boundary was not snapshotted"
+        );
+        let (after, stats) = q35_logits_in(&g, &cfg, &embd, &second, &mut slot, &ec, 2048);
+        assert_eq!(
+            stats.n_cached, 1024,
+            "a divergent turn did not resume from its page snapshot"
+        );
+        let err = fresh
+            .iter()
+            .zip(&after)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, |m, d| {
+                if m.is_nan() || d.is_nan() {
+                    f32::NAN
+                } else {
+                    m.max(d)
+                }
+            });
+        assert!(
+            err < 1e-4,
+            "the resumed turn misses a fresh prefill by {err}"
         );
     }
 

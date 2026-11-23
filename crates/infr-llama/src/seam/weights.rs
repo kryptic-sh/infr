@@ -430,6 +430,97 @@ pub(crate) struct SeamKv {
     /// The decode loop's prefill-boundary snapshot failed once on this slot (no room for a second
     /// copy of the state), so it is not attempted again.
     pub(super) delta_snapshot_refused: bool,
+    /// Host copies of every recurrent layer's state at page boundaries of the last prefill(s),
+    /// oldest first. A divergent prompt resumes from the newest boundary at or before its common
+    /// prefix instead of re-prefilling from zero. Capped by
+    /// [`RECURRENT_SNAP_CAP_BYTES`], oldest evicted first.
+    pub(super) recurrent_snaps: Vec<RecurrentSnap>,
+}
+
+/// Host memory one slot may spend on [`SeamKv::recurrent_snaps`]. The store keeps its own copies
+/// under `kv.store_mb`; this budget only covers the live slot's resume points.
+pub(super) const RECURRENT_SNAP_CAP_BYTES: usize = 512 << 20;
+
+/// One host copy of every recurrent layer's state at token position `pos`.
+#[derive(Clone)]
+pub(super) struct RecurrentSnap {
+    pub(super) pos: usize,
+    /// `(layer, bytes)` per recurrent layer, in `SeamKv::kbufs`/`vbufs` order.
+    pub(super) k: Vec<(usize, Vec<u8>)>,
+    pub(super) v: Vec<(usize, Vec<u8>)>,
+    pub(super) bytes: usize,
+}
+
+/// The newest snapshot at or before `limit`, ignoring position 0 (a freshly reset state).
+pub(super) fn snap_at_or_before(snaps: &[RecurrentSnap], limit: usize) -> Option<usize> {
+    snaps
+        .iter()
+        .filter(|s| s.pos > 0 && s.pos <= limit)
+        .map(|s| s.pos)
+        .max()
+}
+
+/// Copy every recurrent layer's live state to host RAM as a snapshot at `pos`.
+pub(super) fn snapshot_recurrent(
+    be: &dyn Backend,
+    cfg: &Config,
+    kbufs: &[std::sync::Arc<dyn Buffer>],
+    vbufs: &[std::sync::Arc<dyn Buffer>],
+    snaps: &mut Vec<RecurrentSnap>,
+    pos: usize,
+) -> AResult<()> {
+    let mut k = Vec::new();
+    let mut v = Vec::new();
+    let mut bytes = 0usize;
+    for l in 0..cfg.n_layer {
+        if !cfg.is_recurrent_layer(l) {
+            continue;
+        }
+        let mut kb = vec![0u8; kbufs[l].len_bytes()];
+        be.download(kbufs[l].as_ref(), &mut kb)
+            .map_err(|e| anyhow!("{e}"))?;
+        bytes += kb.len();
+        k.push((l, kb));
+        let mut vb = vec![0u8; vbufs[l].len_bytes()];
+        be.download(vbufs[l].as_ref(), &mut vb)
+            .map_err(|e| anyhow!("{e}"))?;
+        bytes += vb.len();
+        v.push((l, vb));
+    }
+    if k.is_empty() {
+        return Ok(());
+    }
+    snaps.retain(|s| s.pos != pos);
+    snaps.push(RecurrentSnap { pos, k, v, bytes });
+    snaps.sort_by_key(|s| s.pos);
+    let mut total: usize = snaps.iter().map(|s| s.bytes).sum();
+    while total > RECURRENT_SNAP_CAP_BYTES && snaps.len() > 1 {
+        total -= snaps.remove(0).bytes;
+    }
+    Ok(())
+}
+
+/// Upload the snapshot at `pos` over every recurrent layer's live state. Returns the position,
+/// or `None` when there is no snapshot there.
+pub(super) fn restore_recurrent(
+    be: &dyn Backend,
+    snaps: &[RecurrentSnap],
+    kbufs: &[std::sync::Arc<dyn Buffer>],
+    vbufs: &[std::sync::Arc<dyn Buffer>],
+    pos: usize,
+) -> AResult<Option<usize>> {
+    let Some(s) = snaps.iter().find(|s| s.pos == pos) else {
+        return Ok(None);
+    };
+    for (l, bytes) in &s.k {
+        be.upload(kbufs[*l].as_ref(), bytes)
+            .map_err(|e| anyhow!("{e}"))?;
+    }
+    for (l, bytes) in &s.v {
+        be.upload(vbufs[*l].as_ref(), bytes)
+            .map_err(|e| anyhow!("{e}"))?;
+    }
+    Ok(Some(s.pos))
 }
 
 /// The device-resident recurrent-state snapshot backing [`snapshot_delta`] — a copy of both state
@@ -638,6 +729,7 @@ impl SeamKv {
     #[cfg(target_os = "macos")]
     pub(crate) fn reset_tokens(&mut self) {
         self.cached.clear();
+        self.recurrent_snaps.clear();
         invalidate_delta(&mut self.mtp_delta_ckpt);
     }
 
@@ -684,6 +776,7 @@ impl SeamKv {
     /// row 0). Used to discard a warmup generation without dropping the slot's buffers.
     pub(crate) fn reset(&mut self) {
         self.cached.clear();
+        self.recurrent_snaps.clear();
         if let Some(p) = &mut self.paged {
             p.release_pages();
         }
@@ -924,6 +1017,7 @@ impl SeamKv {
             sc_temp_inv_buf: None,
             mtp_delta_ckpt: None,
             delta_snapshot_refused: false,
+            recurrent_snaps: Vec::new(),
         };
         if let Some(p) = &child.paged {
             tracing::info!(
@@ -1265,6 +1359,21 @@ mod tests {
             bad.is_empty(),
             "seeded prefix differs from the source: {bad:?}"
         );
+    }
+
+    #[test]
+    fn snapshots_resume_from_the_newest_boundary_not_past_the_prefix() {
+        let snap = |pos| super::RecurrentSnap {
+            pos,
+            k: Vec::new(),
+            v: Vec::new(),
+            bytes: 0,
+        };
+        let snaps = vec![snap(512), snap(1024), snap(1536)];
+        assert_eq!(super::snap_at_or_before(&snaps, 0), None);
+        assert_eq!(super::snap_at_or_before(&snaps, 700), Some(512));
+        assert_eq!(super::snap_at_or_before(&snaps, 1536), Some(1536));
+        assert_eq!(super::snap_at_or_before(&snaps, 99_999), Some(1536));
     }
 
     #[test]

@@ -6892,16 +6892,71 @@ impl<'a> Recorder<'a> {
         off: usize,
         src_off: usize,
     ) {
-        let k = self
-            .be
-            .kernel("store_f16_bda", crate::gemm::store_f16_bda_spv(), 2, 24);
-        let mut push = [0u8; 24];
+        self.store_f16_off_at_impl(src, dst, dst_addr, n, off, 0, 0, src_off, None, false);
+    }
+
+    /// [`Self::store_f16_off_at`] with logical rows `row..row+n/rs` resolved through a page table.
+    #[allow(clippy::too_many_arguments)]
+    pub fn store_f16_off_paged_at(
+        &self,
+        src: &dyn Buffer,
+        dst: &dyn Buffer,
+        dst_addr: u64,
+        n: usize,
+        row: usize,
+        rs: usize,
+        src_off: usize,
+        table: u64,
+        page_rows: u32,
+        src_f16: bool,
+    ) {
+        self.store_f16_off_at_impl(
+            src,
+            dst,
+            dst_addr,
+            n,
+            0,
+            row,
+            rs,
+            src_off,
+            Some((table, page_rows)),
+            src_f16,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn store_f16_off_at_impl(
+        &self,
+        src: &dyn Buffer,
+        dst: &dyn Buffer,
+        dst_addr: u64,
+        n: usize,
+        off: usize,
+        row: usize,
+        rs: usize,
+        src_off: usize,
+        pages: Option<(u64, u32)>,
+        src_f16: bool,
+    ) {
+        let (table, page_rows) = pages.unwrap_or((0, 0));
+        let (name, spv) = if src_f16 {
+            ("store_f16_f16_bda", crate::gemm::store_f16_f16_bda_spv())
+        } else {
+            ("store_f16_bda", crate::gemm::store_f16_bda_spv())
+        };
+        let k = self.be.kernel(name, spv, 2, 44);
+        let mut push = [0u8; 44];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(off as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(src_off as u32).to_ne_bytes());
         // [12..16] cap: dyn-only, zero here.
         push[16..20].copy_from_slice(&(dst_addr as u32).to_ne_bytes());
         push[20..24].copy_from_slice(&((dst_addr >> 32) as u32).to_ne_bytes());
+        push[24..28].copy_from_slice(&(row as u32).to_ne_bytes());
+        push[28..32].copy_from_slice(&(rs as u32).to_ne_bytes());
+        push[32..36].copy_from_slice(&page_rows.to_ne_bytes());
+        push[36..40].copy_from_slice(&(table as u32).to_ne_bytes());
+        push[40..44].copy_from_slice(&((table >> 32) as u32).to_ne_bytes());
         self.dispatch_wide(
             k,
             &[Self::vkb(src), Self::vkb(dst)],
@@ -6922,17 +6977,47 @@ impl<'a> Recorder<'a> {
         n: usize,
         cap_rows: usize,
     ) {
+        self.store_f16_dyn_at_impl(src, params, dst, dst_addr, n, cap_rows, 0);
+    }
+
+    /// [`Self::store_f16_dyn_at`] with the row resolved through the params page table.
+    #[allow(clippy::too_many_arguments)]
+    pub fn store_f16_dyn_paged_at(
+        &self,
+        src: &dyn Buffer,
+        params: &dyn Buffer,
+        dst: &dyn Buffer,
+        dst_addr: u64,
+        n: usize,
+        page_rows: u32,
+    ) {
+        let cap_rows = n.max(1);
+        self.store_f16_dyn_at_impl(src, params, dst, dst_addr, n, cap_rows, page_rows);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn store_f16_dyn_at_impl(
+        &self,
+        src: &dyn Buffer,
+        params: &dyn Buffer,
+        dst: &dyn Buffer,
+        dst_addr: u64,
+        n: usize,
+        cap_rows: usize,
+        page_rows: u32,
+    ) {
         let k = self.be.kernel(
             "store_f16_dyn_bda",
             crate::gemm::store_f16_dyn_bda_spv(),
             3,
-            24,
+            44,
         );
-        let mut push = [0u8; 24];
+        let mut push = [0u8; 44];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&(cap_rows as u32).to_ne_bytes());
         push[16..20].copy_from_slice(&(dst_addr as u32).to_ne_bytes());
         push[20..24].copy_from_slice(&((dst_addr >> 32) as u32).to_ne_bytes());
+        push[32..36].copy_from_slice(&page_rows.to_ne_bytes());
         self.dispatch_wide(
             k,
             &[Self::vkb(src), Self::vkb(params), Self::vkb(dst)],
@@ -6958,8 +7043,10 @@ impl<'a> Recorder<'a> {
         pos_offset: usize,
         out_base: usize,
         freq_factors: Option<&dyn Buffer>,
+        pages: Option<(u64, u32)>,
     ) {
-        let mut push = [0u8; 36];
+        let (table, page_rows) = pages.unwrap_or((0, 0));
+        let mut push = [0u8; 48];
         push[0..4].copy_from_slice(&(t as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(n_heads as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(hd as u32).to_ne_bytes());
@@ -6969,11 +7056,14 @@ impl<'a> Recorder<'a> {
         push[24..28].copy_from_slice(&(out_base as u32).to_ne_bytes());
         push[28..32].copy_from_slice(&(y_addr as u32).to_ne_bytes());
         push[32..36].copy_from_slice(&((y_addr >> 32) as u32).to_ne_bytes());
+        push[36..40].copy_from_slice(&page_rows.to_ne_bytes());
+        push[40..44].copy_from_slice(&(table as u32).to_ne_bytes());
+        push[44..48].copy_from_slice(&((table >> 32) as u32).to_ne_bytes());
         match freq_factors {
             Some(ff) => {
                 let k =
                     self.be
-                        .kernel("rope_f16_ff_bda", crate::gemm::rope_f16_ff_bda_spv(), 3, 36);
+                        .kernel("rope_f16_ff_bda", crate::gemm::rope_f16_ff_bda_spv(), 3, 48);
                 self.dispatch_wide(
                     k,
                     &[Self::vkb(x), Self::vkb(ff), Self::vkb(y)],
@@ -6985,7 +7075,7 @@ impl<'a> Recorder<'a> {
             None => {
                 let k = self
                     .be
-                    .kernel("rope_f16_bda", crate::gemm::rope_f16_bda_spv(), 2, 36);
+                    .kernel("rope_f16_bda", crate::gemm::rope_f16_bda_spv(), 2, 48);
                 self.dispatch_wide(
                     k,
                     &[Self::vkb(x), Self::vkb(y)],
@@ -7013,8 +7103,10 @@ impl<'a> Recorder<'a> {
         theta: f32,
         out_base_mul: usize,
         freq_factors: Option<&dyn Buffer>,
+        pages: Option<(u64, u32)>,
     ) {
-        let mut push = [0u8; 36];
+        let (table, page_rows) = pages.unwrap_or((0, 0));
+        let mut push = [0u8; 48];
         push[0..4].copy_from_slice(&(t as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(n_heads as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(hd as u32).to_ne_bytes());
@@ -7024,13 +7116,16 @@ impl<'a> Recorder<'a> {
         push[24..28].copy_from_slice(&(out_base_mul as u32).to_ne_bytes());
         push[28..32].copy_from_slice(&(y_addr as u32).to_ne_bytes());
         push[32..36].copy_from_slice(&((y_addr >> 32) as u32).to_ne_bytes());
+        push[36..40].copy_from_slice(&page_rows.to_ne_bytes());
+        push[40..44].copy_from_slice(&(table as u32).to_ne_bytes());
+        push[44..48].copy_from_slice(&((table >> 32) as u32).to_ne_bytes());
         match freq_factors {
             Some(ff) => {
                 let k = self.be.kernel(
                     "rope_f16_dyn_ff_bda",
                     crate::gemm::rope_f16_dyn_ff_bda_spv(),
                     4,
-                    36,
+                    48,
                 );
                 self.dispatch_wide(
                     k,
@@ -7045,7 +7140,7 @@ impl<'a> Recorder<'a> {
                     "rope_f16_dyn_bda",
                     crate::gemm::rope_f16_dyn_bda_spv(),
                     3,
-                    36,
+                    48,
                 );
                 self.dispatch_wide(
                     k,
@@ -7076,8 +7171,10 @@ impl<'a> Recorder<'a> {
         out_base: usize,
         eps: f32,
         freq_factors: Option<&dyn Buffer>,
+        pages: Option<(u64, u32)>,
     ) {
-        let mut push = [0u8; 44];
+        let (table, page_rows) = pages.unwrap_or((0, 0));
+        let mut push = [0u8; 56];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(nheads as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(hd as u32).to_ne_bytes());
@@ -7089,13 +7186,16 @@ impl<'a> Recorder<'a> {
         // [32..36] kcap: dyn-only, zero here.
         push[36..40].copy_from_slice(&(y_addr as u32).to_ne_bytes());
         push[40..44].copy_from_slice(&((y_addr >> 32) as u32).to_ne_bytes());
+        push[44..48].copy_from_slice(&page_rows.to_ne_bytes());
+        push[48..52].copy_from_slice(&(table as u32).to_ne_bytes());
+        push[52..56].copy_from_slice(&((table >> 32) as u32).to_ne_bytes());
         match freq_factors {
             Some(ff) => {
                 let k = self.be.kernel(
                     "qk_norm_rope_ff_bda",
                     crate::gemm::qk_norm_rope_ff_bda_spv(),
                     4,
-                    44,
+                    56,
                 );
                 self.dispatch_wide(
                     k,
@@ -7110,7 +7210,7 @@ impl<'a> Recorder<'a> {
                     "qk_norm_rope_bda",
                     crate::gemm::qk_norm_rope_bda_spv(),
                     3,
-                    44,
+                    56,
                 );
                 self.dispatch_wide(
                     k,
@@ -7141,14 +7241,16 @@ impl<'a> Recorder<'a> {
         out_base: usize,
         eps: f32,
         src_stride: usize,
+        pages: Option<(u64, u32)>,
     ) {
+        let (table, page_rows) = pages.unwrap_or((0, 0));
         let k = self.be.kernel(
             "qk_norm_rope_interleaved_bda",
             crate::gemm::qk_norm_rope_interleaved_bda_spv(),
             3,
-            44,
+            56,
         );
-        let mut push = [0u8; 44];
+        let mut push = [0u8; 56];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(nheads as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(hd as u32).to_ne_bytes());
@@ -7160,6 +7262,9 @@ impl<'a> Recorder<'a> {
         push[32..36].copy_from_slice(&(src_stride as u32).to_ne_bytes());
         push[36..40].copy_from_slice(&(y_addr as u32).to_ne_bytes());
         push[40..44].copy_from_slice(&((y_addr >> 32) as u32).to_ne_bytes());
+        push[44..48].copy_from_slice(&page_rows.to_ne_bytes());
+        push[48..52].copy_from_slice(&(table as u32).to_ne_bytes());
+        push[52..56].copy_from_slice(&((table >> 32) as u32).to_ne_bytes());
         self.dispatch_wide(
             k,
             &[Self::vkb(qg), Self::vkb(nw), Self::vkb(y)],
@@ -7188,22 +7293,24 @@ impl<'a> Recorder<'a> {
         out_base_mul: usize,
         eps: f32,
         kcap: usize,
+        pages: Option<(u64, u32)>,
     ) {
+        let (table, page_rows) = pages.unwrap_or((0, 0));
         let k = match ff {
             Some(_) => self.be.kernel(
                 "qk_norm_rope_dyn_ff_bda",
                 crate::gemm::qk_norm_rope_dyn_ff_bda_spv(),
                 5,
-                44,
+                56,
             ),
             None => self.be.kernel(
                 "qk_norm_rope_dyn_bda",
                 crate::gemm::qk_norm_rope_dyn_bda_spv(),
                 4,
-                44,
+                56,
             ),
         };
-        let mut push = [0u8; 44];
+        let mut push = [0u8; 56];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(nheads as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(hd as u32).to_ne_bytes());
@@ -7215,6 +7322,9 @@ impl<'a> Recorder<'a> {
         push[32..36].copy_from_slice(&(kcap as u32).to_ne_bytes());
         push[36..40].copy_from_slice(&(y_addr as u32).to_ne_bytes());
         push[40..44].copy_from_slice(&((y_addr >> 32) as u32).to_ne_bytes());
+        push[44..48].copy_from_slice(&page_rows.to_ne_bytes());
+        push[48..52].copy_from_slice(&(table as u32).to_ne_bytes());
+        push[52..56].copy_from_slice(&((table >> 32) as u32).to_ne_bytes());
         match ff {
             Some(f) => self.dispatch_wide(
                 k,
@@ -7257,14 +7367,16 @@ impl<'a> Recorder<'a> {
         out_base_mul: usize,
         eps: f32,
         src_stride: usize,
+        pages: Option<(u64, u32)>,
     ) {
+        let (table, page_rows) = pages.unwrap_or((0, 0));
         let k = self.be.kernel(
             "qk_norm_rope_interleaved_dyn_bda",
             crate::gemm::qk_norm_rope_interleaved_dyn_bda_spv(),
             4,
-            44,
+            56,
         );
-        let mut push = [0u8; 44];
+        let mut push = [0u8; 56];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(nheads as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(hd as u32).to_ne_bytes());
@@ -7276,6 +7388,9 @@ impl<'a> Recorder<'a> {
         push[32..36].copy_from_slice(&(src_stride as u32).to_ne_bytes());
         push[36..40].copy_from_slice(&(y_addr as u32).to_ne_bytes());
         push[40..44].copy_from_slice(&((y_addr >> 32) as u32).to_ne_bytes());
+        push[44..48].copy_from_slice(&page_rows.to_ne_bytes());
+        push[48..52].copy_from_slice(&(table as u32).to_ne_bytes());
+        push[52..56].copy_from_slice(&((table >> 32) as u32).to_ne_bytes());
         self.dispatch_wide(
             k,
             &[
@@ -7306,6 +7421,52 @@ impl<'a> Recorder<'a> {
         src_f16: bool,
         src_off: usize,
     ) {
+        self.store_q8_impl(src, dst, n, off, cap, src_f16, src_off, 0, 0, None);
+    }
+
+    /// [`Self::store_q8`] with logical rows `row..row+n/rs` resolved through a page table.
+    #[allow(clippy::too_many_arguments)]
+    pub fn store_q8_paged(
+        &self,
+        src: &dyn Buffer,
+        dst: &dyn Buffer,
+        n: usize,
+        row: usize,
+        rs: usize,
+        cap: usize,
+        src_f16: bool,
+        src_off: usize,
+        table: u64,
+        page_rows: u32,
+    ) {
+        self.store_q8_impl(
+            src,
+            dst,
+            n,
+            0,
+            cap,
+            src_f16,
+            src_off,
+            row,
+            rs,
+            Some((table, page_rows)),
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn store_q8_impl(
+        &self,
+        src: &dyn Buffer,
+        dst: &dyn Buffer,
+        n: usize,
+        off: usize,
+        cap: usize,
+        src_f16: bool,
+        src_off: usize,
+        row: usize,
+        rs: usize,
+        pages: Option<(u64, u32)>,
+    ) {
         // #74 (slice 5): BDA-only. `dst` (the planar-Q8 KV cache) is written by device address; it
         // stays bound at slot 1 as an inert descriptor so Recorder::sync keeps the store→read barrier.
         let dst_addr = dst
@@ -7316,15 +7477,21 @@ impl<'a> Recorder<'a> {
         } else {
             ("store_q8", crate::gemm::store_q8_spv())
         };
+        let (table, page_rows) = pages.unwrap_or((0, 0));
         // Pinned like `quant_q8`: the block scale is one `subgroupMax` over the 32-lane workgroup.
-        let k = self.be.kernel_sg(name, spv, 2, 24, 32);
-        let mut push = [0u8; 24];
+        let k = self.be.kernel_sg(name, spv, 2, 44, 32);
+        let mut push = [0u8; 44];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(off as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(cap as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&(src_off as u32).to_ne_bytes());
         push[16..20].copy_from_slice(&(dst_addr as u32).to_ne_bytes());
         push[20..24].copy_from_slice(&((dst_addr >> 32) as u32).to_ne_bytes());
+        push[24..28].copy_from_slice(&(row as u32).to_ne_bytes());
+        push[28..32].copy_from_slice(&(rs as u32).to_ne_bytes());
+        push[32..36].copy_from_slice(&page_rows.to_ne_bytes());
+        push[36..40].copy_from_slice(&(table as u32).to_ne_bytes());
+        push[40..44].copy_from_slice(&((table >> 32) as u32).to_ne_bytes());
         // One workgroup (32 lanes) per 32-element block.
         self.dispatch_wide(
             k,
@@ -7346,6 +7513,33 @@ impl<'a> Recorder<'a> {
         cap: usize,
         src_f16: bool,
     ) {
+        self.store_q8_dyn_impl(src, params, dst, n, cap, src_f16, 0);
+    }
+
+    /// [`Self::store_q8_dyn`] with the row resolved through the params page table.
+    pub fn store_q8_dyn_paged(
+        &self,
+        src: &dyn Buffer,
+        params: &dyn Buffer,
+        dst: &dyn Buffer,
+        n: usize,
+        cap: usize,
+        src_f16: bool,
+        page_rows: u32,
+    ) {
+        self.store_q8_dyn_impl(src, params, dst, n, cap, src_f16, page_rows);
+    }
+
+    fn store_q8_dyn_impl(
+        &self,
+        src: &dyn Buffer,
+        params: &dyn Buffer,
+        dst: &dyn Buffer,
+        n: usize,
+        cap: usize,
+        src_f16: bool,
+        page_rows: u32,
+    ) {
         // #74 (slice 5): BDA-only. `dst` (the planar-Q8 KV cache) is written by device address; it
         // stays bound at slot 2 as an inert descriptor so Recorder::sync keeps the store→read barrier.
         let dst_addr = dst
@@ -7356,14 +7550,15 @@ impl<'a> Recorder<'a> {
         } else {
             ("store_q8_dyn", crate::gemm::store_q8_dyn_spv())
         };
-        let k = self.be.kernel_sg(name, spv, 3, 24, 32);
-        let mut push = [0u8; 24];
+        let k = self.be.kernel_sg(name, spv, 3, 44, 32);
+        let mut push = [0u8; 44];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
         // [4..8] off: unused (from params). [12..16] src_off: always 0 here (a single decode row
         // never crosses the ring wrap). The kernel derives the ring row capacity from cap/n.
         push[8..12].copy_from_slice(&(cap as u32).to_ne_bytes());
         push[16..20].copy_from_slice(&(dst_addr as u32).to_ne_bytes());
         push[20..24].copy_from_slice(&((dst_addr >> 32) as u32).to_ne_bytes());
+        push[32..36].copy_from_slice(&page_rows.to_ne_bytes());
         self.dispatch_wide(
             k,
             &[Self::vkb(src), Self::vkb(params), Self::vkb(dst)],
@@ -7410,18 +7605,67 @@ impl<'a> Recorder<'a> {
         off: usize,
         src_f16: bool,
     ) {
+        self.quant_kv_impl(dt, src, dst, n, off, 0, 0, src_f16, None);
+    }
+
+    /// [`Self::quant_kv`] with logical rows `row..row+n/rs` resolved through a page table.
+    #[allow(clippy::too_many_arguments)]
+    pub fn quant_kv_paged(
+        &self,
+        dt: infr_core::DType,
+        src: &dyn Buffer,
+        dst: &dyn Buffer,
+        n: usize,
+        row: usize,
+        rs: usize,
+        src_f16: bool,
+        table: u64,
+        page_rows: u32,
+    ) {
+        self.quant_kv_impl(
+            dt,
+            src,
+            dst,
+            n,
+            0,
+            row,
+            rs,
+            src_f16,
+            Some((table, page_rows)),
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn quant_kv_impl(
+        &self,
+        dt: infr_core::DType,
+        src: &dyn Buffer,
+        dst: &dyn Buffer,
+        n: usize,
+        off: usize,
+        row: usize,
+        rs: usize,
+        src_f16: bool,
+        pages: Option<(u64, u32)>,
+    ) {
         // #74 (slice 5): BDA-only. `dst` (the GGUF-block KV cache) is written by device address; it
         // stays bound at slot 1 as an inert descriptor so Recorder::sync keeps the store→read barrier.
         let dst_addr = dst
             .device_addr()
             .expect("quant_kv: KV cache dst must have a device address (BufferUsage::KvCache)");
         let (name, spv) = crate::gemm::quant_kv_kernel(dt, src_f16);
-        let k = self.be.kernel(name, spv, 2, 16);
-        let mut push = [0u8; 16];
+        let (table, page_rows) = pages.unwrap_or((0, 0));
+        let k = self.be.kernel(name, spv, 2, 36);
+        let mut push = [0u8; 36];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(off as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(dst_addr as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&((dst_addr >> 32) as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&(row as u32).to_ne_bytes());
+        push[20..24].copy_from_slice(&(rs as u32).to_ne_bytes());
+        push[24..28].copy_from_slice(&page_rows.to_ne_bytes());
+        push[28..32].copy_from_slice(&(table as u32).to_ne_bytes());
+        push[32..36].copy_from_slice(&((table >> 32) as u32).to_ne_bytes());
         self.dispatch_wide(
             k,
             &[Self::vkb(src), Self::vkb(dst)],
@@ -7489,18 +7733,67 @@ impl<'a> Recorder<'a> {
         off: usize,
         src_f16: bool,
     ) {
+        self.store_kv_dense_impl(dst_dt, src, dst, n, off, 0, 0, src_f16, None);
+    }
+
+    /// [`Self::store_kv_dense`] with logical rows `row..row+n/rs` resolved through a page table.
+    #[allow(clippy::too_many_arguments)]
+    pub fn store_kv_dense_paged(
+        &self,
+        dst_dt: infr_core::DType,
+        src: &dyn Buffer,
+        dst: &dyn Buffer,
+        n: usize,
+        row: usize,
+        rs: usize,
+        src_f16: bool,
+        table: u64,
+        page_rows: u32,
+    ) {
+        self.store_kv_dense_impl(
+            dst_dt,
+            src,
+            dst,
+            n,
+            0,
+            row,
+            rs,
+            src_f16,
+            Some((table, page_rows)),
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn store_kv_dense_impl(
+        &self,
+        dst_dt: infr_core::DType,
+        src: &dyn Buffer,
+        dst: &dyn Buffer,
+        n: usize,
+        off: usize,
+        row: usize,
+        rs: usize,
+        src_f16: bool,
+        pages: Option<(u64, u32)>,
+    ) {
         // #74 (slice 5): BDA-only. `dst` (the dense KV cache) is written by device address; it stays
         // bound at slot 1 as an inert descriptor so Recorder::sync keeps the store→read barrier.
         let dst_addr = dst.device_addr().expect(
             "store_kv_dense: KV cache dst must have a device address (BufferUsage::KvCache)",
         );
         let (name, spv) = crate::gemm::store_kv_dense_kernel(dst_dt, src_f16);
-        let k = self.be.kernel(name, spv, 2, 16);
-        let mut push = [0u8; 16];
+        let (table, page_rows) = pages.unwrap_or((0, 0));
+        let k = self.be.kernel(name, spv, 2, 36);
+        let mut push = [0u8; 36];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(off as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(dst_addr as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&((dst_addr >> 32) as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&(row as u32).to_ne_bytes());
+        push[20..24].copy_from_slice(&(rs as u32).to_ne_bytes());
+        push[24..28].copy_from_slice(&page_rows.to_ne_bytes());
+        push[28..32].copy_from_slice(&(table as u32).to_ne_bytes());
+        push[32..36].copy_from_slice(&((table >> 32) as u32).to_ne_bytes());
         self.dispatch_wide(
             k,
             &[Self::vkb(src), Self::vkb(dst)],
@@ -12837,7 +13130,7 @@ mod tests {
                 "store_q8_dyn",
                 vec![
                     f(NQ8),
-                    (8, Fill::Zero, Act),
+                    (16, Fill::Zero, Act),
                     (NQ8 * 17 / 16, Fill::Data, Kv),
                 ],
                 Box::new(|r, b| r.store_q8_dyn(b[0], b[1], b[2], NQ8, NQ8, false)),
@@ -12852,7 +13145,7 @@ mod tests {
             ),
             (
                 "store_f16_dyn_at",
-                vec![f(N), (8, Fill::Zero, Act), (N * 2, Fill::Data, Kv)],
+                vec![f(N), (16, Fill::Zero, Act), (N * 2, Fill::Data, Kv)],
                 Box::new(|r, b| {
                     let a = b[2].device_addr().unwrap();
                     r.store_f16_dyn_at(b[0], b[1], b[2], a, N, 1)
@@ -12987,7 +13280,7 @@ mod tests {
                 vec![f(N * 16), (N * 32, Fill::Data, Kv)],
                 Box::new(|r, b| {
                     let a = b[1].device_addr().unwrap();
-                    r.rope_f16_at(b[0], b[1], a, ROWS, W, 16, 16, 1e4, 0, 0, None)
+                    r.rope_f16_at(b[0], b[1], a, ROWS, W, 16, 16, 1e4, 0, 0, None, None)
                 }),
             ),
             (
@@ -12995,28 +13288,41 @@ mod tests {
                 vec![f(N * 16), f(8), (N * 32, Fill::Data, Kv)],
                 Box::new(|r, b| {
                     let a = b[2].device_addr().unwrap();
-                    r.rope_f16_at(b[0], b[2], a, ROWS, W, 16, 16, 1e4, 0, 0, Some(b[1]))
+                    r.rope_f16_at(b[0], b[2], a, ROWS, W, 16, 16, 1e4, 0, 0, Some(b[1]), None)
                 }),
             ),
             (
                 "rope_f16_dyn_at",
-                vec![f(N * 16), (8, Fill::Zero, Act), (N * 32, Fill::Data, Kv)],
+                vec![f(N * 16), (16, Fill::Zero, Act), (N * 32, Fill::Data, Kv)],
                 Box::new(|r, b| {
                     let a = b[2].device_addr().unwrap();
-                    r.rope_f16_dyn_at(b[0], b[1], b[2], a, ROWS, W, 16, 16, 1e4, 0, None)
+                    r.rope_f16_dyn_at(b[0], b[1], b[2], a, ROWS, W, 16, 16, 1e4, 0, None, None)
                 }),
             ),
             (
                 "rope_f16_dyn_ff_at",
                 vec![
                     f(N * 16),
-                    (8, Fill::Zero, Act),
+                    (16, Fill::Zero, Act),
                     f(8),
                     (N * 32, Fill::Data, Kv),
                 ],
                 Box::new(|r, b| {
                     let a = b[3].device_addr().unwrap();
-                    r.rope_f16_dyn_at(b[0], b[1], b[3], a, ROWS, W, 16, 16, 1e4, 0, Some(b[2]))
+                    r.rope_f16_dyn_at(
+                        b[0],
+                        b[1],
+                        b[3],
+                        a,
+                        ROWS,
+                        W,
+                        16,
+                        16,
+                        1e4,
+                        0,
+                        Some(b[2]),
+                        None,
+                    )
                 }),
             ),
             (
@@ -13070,7 +13376,9 @@ mod tests {
                 vec![f(UNITS * HD), f(HD), (UNITS * HD * 2, Fill::Data, Kv)],
                 Box::new(|r, b| {
                     let a = b[2].device_addr().unwrap();
-                    r.qk_norm_rope_at(b[0], b[1], b[2], a, UNITS, 1, HD, HD, 1e4, 0, 0, 1e-6, None)
+                    r.qk_norm_rope_at(
+                        b[0], b[1], b[2], a, UNITS, 1, HD, HD, 1e4, 0, 0, 1e-6, None, None,
+                    )
                 }),
             ),
             (

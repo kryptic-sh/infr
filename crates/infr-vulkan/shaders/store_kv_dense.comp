@@ -15,6 +15,8 @@ layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 // as an inert descriptor for the store→read barrier (see Recorder::store_kv_dense).
 layout(push_constant) uniform PC { uint n; uint off;
     uint d_lo; uint d_hi;
+    // Paged cache store: logical rows resolve through the table. `page_rows == 0` is linear.
+    uint row; uint rs; uint page_rows; uint page_lo; uint page_hi;
 } pc;
 #ifdef SRC_F16
 layout(binding = 0) readonly buffer SB { float16_t src[]; };
@@ -28,18 +30,24 @@ layout(binding = 0) readonly buffer SB { float src[]; };
 
 void main() {
     k_addr = kv_base(pc.d_lo, pc.d_hi);
+    uint64_t pt = kv_base(pc.page_lo, pc.page_hi);
     // Flat index across `Recorder::dispatch_wide`'s 2-D split of a grid wider than
     // `maxComputeWorkGroupCount[0]`; equal to `gl_GlobalInvocationID.x` when unsplit.
     uint i = (gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x) * gl_WorkGroupSize.x
         + gl_LocalInvocationID.x;
     if (i >= pc.n) { return; }
+    uint off = pc.off;
+    if (pc.page_rows > 0u) {
+        uint r = i / pc.rs;
+        off = kv_paged_row(pt, pc.page_rows, pc.row + r) * pc.rs - r * pc.rs;
+    }
     float v = float(src[i]);
 #ifdef DST_BF16
     // bf16 = top 16 bits of f32, round-to-nearest-even.
     uint b = floatBitsToUint(v);
     uint bf = (b + 0x7FFFu + ((b >> 16) & 1u)) >> 16;
-    kv_store_u16(k_addr, pc.off + i, bf);
+    kv_store_u16(k_addr, off + i, bf);
 #else
-    kv_store_f32(k_addr, pc.off + i, v);
+    kv_store_f32(k_addr, off + i, v);
 #endif
 }

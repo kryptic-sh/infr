@@ -1021,6 +1021,7 @@ fn main() {
         // unconditional) BDA shader and their bound twins were deleted — always-KV-cache, no scratch
         // caller. See adapter.rs (the `device_addr()`-driven fork) and tests/kv_addr_parity.rs.
         ("store_f16", "store_f16_bda", &["-DKV_BDA"]),
+        ("store_f16", "store_f16_f16_bda", &["-DSRC_F16", "-DKV_BDA"]),
         (
             "store_f16",
             "store_f16_dyn_bda",

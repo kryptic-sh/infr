@@ -13,15 +13,25 @@ layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 layout(push_constant) uniform PC { uint n; uint off; uint src_off; uint cap;
 #ifdef KV_BDA
     uint d_lo; uint d_hi; // K/V cache dst base device address (uvec2-split)
+    // Paged cache store: logical rows resolve through the table. `page_rows == 0` is linear.
+    uint row; uint rs; uint page_rows; uint page_lo; uint page_hi;
 #endif
 } pc;
+#ifdef SRC_F16
+layout(binding = 0) readonly buffer SB { float16_t src[]; };
+#else
 layout(binding = 0) readonly buffer SB { float src[]; };
+#endif
 #ifdef USE_PARAMS
 // Record-once decode: the write offset is row*n (one KV row at position pos), pos from a host-updated
 // params SSBO instead of the `pc.off` push constant. `dst` moves to binding 2 (params takes 1).
 // `cap` is the cache's ROW capacity: an SWA ring cache recycles rows the window mask already
 // excludes, so the row is pos % cap (identity on a full-context cache, where pos < cap always).
-layout(binding = 1) readonly buffer PB { uint p_pos; uint p_kvlen; };
+layout(binding = 1) readonly buffer PB { uint p_pos; uint p_kvlen;
+#ifdef KV_BDA
+    uint p_pagelo; uint p_pagehi;
+#endif
+};
 #ifndef KV_BDA
 layout(binding = 2) buffer DB { float16_t dst[]; };
 #endif
@@ -35,6 +45,11 @@ layout(binding = 1) buffer DB { float16_t dst[]; };
 void main() {
 #ifdef KV_BDA
     k_addr = kv_base(pc.d_lo, pc.d_hi);
+#ifdef USE_PARAMS
+    uint64_t pt = kv_base(p_pagelo, p_pagehi);
+#else
+    uint64_t pt = kv_base(pc.page_lo, pc.page_hi);
+#endif
 #endif
     // Flat index across `Recorder::dispatch_wide`'s 2-D split of a grid wider than
     // `maxComputeWorkGroupCount[0]`; equal to `gl_GlobalInvocationID.x` when unsplit.
@@ -43,12 +58,21 @@ void main() {
     if (i >= pc.n) { return; }
 #ifdef USE_PARAMS
     uint row = (pc.cap > 0u) ? (p_pos % pc.cap) : p_pos;
+#ifdef KV_BDA
+    if (pc.page_rows > 0u) { row = kv_paged_row(pt, pc.page_rows, p_pos); }
+#endif
     uint off = row * pc.n;
 #else
     uint off = pc.off;
+#ifdef KV_BDA
+    if (pc.page_rows > 0u) {
+        uint r = i / pc.rs;
+        off = kv_paged_row(pt, pc.page_rows, pc.row + r) * pc.rs - r * pc.rs;
+    }
+#endif
 #endif
 #ifdef KV_BDA
-    kv_store_half(k_addr, off + i, src[pc.src_off + i]);
+    kv_store_half(k_addr, off + i, float(src[pc.src_off + i]));
 #else
     dst[off + i] = float16_t(src[pc.src_off + i]);
 #endif

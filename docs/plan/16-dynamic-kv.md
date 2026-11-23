@@ -29,13 +29,14 @@ path, which writes at `row_base + pos` and never consults the table**.
    empty and grows one logical page at a time; `clear`/`truncate` release pages
    at the end of a request. `--parallel N` still bounds concurrent sequences;
    the pool is shared across them.
-2. **Writes resolve pages on the host.** For a store of logical rows
-   `pos..pos+n`, look up `table[pos/PAGE_ROWS]`, call `ensure_writable` (COW)
-   once per touched page, and record the existing `store_f16`/`store_q8`
-   dispatch split at page boundaries with a physical row base per segment. A
-   chunk is at most 512–1024 rows, so this is one to three dispatches per
-   store. The shaders do not change in the first cut; the table-aware store is
-   an optimization if the dispatch split ever measures.
+2. **Writes resolve pages in the store kernels.** For a store of logical rows
+   `pos..pos+n`, the host still calls `ensure_writable` (COW) once per touched
+   page, but the destination row is resolved in the kernel: every store shader
+   computes `phys = table[row / PAGE_ROWS] * PAGE_ROWS + row % PAGE_ROWS` from
+   the table's device address and `page_rows` (push constants on the
+   static/prefill path, params SSBO words 2-3 on the record-once decode path),
+   so no host per-token updates and no dispatch splits at page boundaries are
+   needed. `page_rows == 0` keeps the linear identity.
    The decode params path (`USE_PARAMS`) resolves the one current row the same
    way before updating `p_pos`.
 3. **Reads are unchanged.** Attention already reads through the table.
@@ -49,27 +50,50 @@ path, which writes at `row_base + pos` and never consults the table**.
    states, MLA and diffusion layers keep their small per-slot buffers. Only
    full-attention layers use the pool.
 6. **Prefix sharing and COW** are the existing `share_prefix`/`ensure_writable`
-   mechanics, now on demand: a matching prefix points at the parent's pages and
-   only the tail is allocated.
+   mechanics, now on demand: at admission, a request whose prompt starts with a
+   live slot's cached tokens points the new slot at those pages and prefills only
+   the tail. This is the performance win, and it needs no dynamic sizing: the
+   fixed-block pool already supports it, the scheduler just never borrows.
+   **Hybrid models are not eligible yet.** qwen35's DeltaNet state at an
+   arbitrary prefix is not in the pages, and the host prefix store already skips
+   qwen35 for that reason. Page sharing therefore helps models with no
+   unrewindable state and no SWA ring (llama, qwen2, qwen3 dense); gemma's SWA
+   ring rows must be copied, and qwen35 needs a recurrent-state snapshot at the
+   shared prefix (llama.cpp's rollback planes, not ported).
 
 ## Phases
 
-- **P1 — Host-resolved stores.** Remove the `row_base` assumption from the
-  store path; a permuted page map must produce bit-identical logits to a
-  linear cache. No shader change. This is the gate: nothing else starts until
-  a scrambled map is exact.
-- **P2 — Grow on demand inside a slot.** `SlotMap` starts empty, grows as
-  `cached` advances, uploads the table once per forward, frees on `reset`.
-  Test: two sequential requests reuse the same pages (`in_use` returns to 0).
-- **P3 — Shared budget and admission.** `KvPool` pages from a budget;
+- **P1 — Table-resolved stores.** Remove the `row_base` assumption from the
+  store path: every store kernel resolves the destination row through the
+  slot's page table (`phys = table[row / PAGE_ROWS] * PAGE_ROWS + row %
+  PAGE_ROWS`, the same formula the reads use) instead of landing at
+  `row_base + pos`. The table's device address and `page_rows` reach the
+  kernels as push constants on the static/prefill path and via the params SSBO
+  (words 2-3, unchanged by `params_advance`) on the record-once decode path, so
+  a permuted page map must produce bit-identical logits to a linear cache with
+  no host per-token updates and no dispatch splits. `row_base` remains only the
+  linear fallback/bias where the table is unavailable (never added on top of a
+  resolved row). No change to reads. This is the gate for every non-contiguous
+  map.
+- **P2 — Runtime prefix borrow (the speed slice).** At admission, when the
+  prompt shares a cached prefix with a live slot and the model has no
+  unrewindable state, seed the new slot's pages from that slot
+  (`share_prefix`), set its `cached` to the shared tokens, and prefill only the
+  suffix. Measure TTFT for two concurrent conversations over a shared system
+  prompt. SWA-ring rows are copied for gemma; qwen35 is refused until P3's
+  snapshot exists.
+- **P3 — Recurrent snapshots at prefix boundaries.** For qwen35 and other
+  unrewindable models, capture the recurrent state at page boundaries (the
+  store's per-block capture, extended) so a shared prefix can restore it. This
+  is what makes the speed slice apply to the 4B.
+- **P4 — Shared budget and admission.** `KvPool` pages from a budget;
   reservation at admission; `/status` reports pages used/free. Test: two
   concurrent requests share the budget, a small request holds few pages, an
   over-budget request is a 400 before prefill.
-- **P4 — Prefix sharing under dynamic pages.** `share_prefix` + COW; the host
-  prefix store (`kv.store_mb`) captures/restores logical pages instead of a
-  row range. Test: two conversations over a long shared prefix, and the
-  existing `kv_paged_session`/`kv_paged_graph`.
-- **P5 — Fit and chunk decoupling.** `max_ctx` becomes the trained window
+- **P5 — Grow and release on demand, and the store.** `SlotMap` grows as
+  `cached` advances and frees on `reset`; `kv.store_mb` captures/restores
+  logical pages instead of a row range.
+- **P6 — Fit and chunk decoupling.** `max_ctx` becomes the trained window
   (capped by the model), and the pool budget comes from the VRAM fit. The
   activation reserve no longer prices every slot at the full window, so a
   short request can use a larger prefill chunk. Measure TTFT and decode at 4k
@@ -102,8 +126,10 @@ path, which writes at `row_base + pos` and never consults the table**.
 ## Acceptance
 
 - A permuted page map is bit-identical to a linear cache (P1).
+- Two concurrent conversations over a shared system prompt prefill the second
+  one's prefix once, on a full-attention model (P2).
 - One 8 GB RX 580 serves a 4k request and a 100k request from the same
-  auto-sized pool without preallocating either window per slot.
+  auto-sized pool without preallocating either window per slot (P4/P5).
 - Two concurrent requests share a prefix; `in_use` returns to zero after both
   finish.
 - TTFT at 4k does not regress against today's small-window server.

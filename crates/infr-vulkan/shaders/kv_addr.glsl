@@ -63,6 +63,14 @@ uint kv_word(uint64_t base, uint wi) {
     return KvWords(base + uint64_t(wi << 2u)).v[0];
 }
 
+// Logical KV row -> physical row through a page table of u32 page ids (one per logical page, plus
+// a repeat of the last). `page_rows == 0` is the linear identity.
+uint kv_paged_row(uint64_t table, uint page_rows, uint row) {
+    if (page_rows == 0u) { return row; }
+    uint logical = row / page_rows;
+    return kv_word(table, logical) * page_rows + (row - logical * page_rows);
+}
+
 // ── Wide constant-index reads (declared now; consumed by slices 2+ which read f16vec4 KV) ───────
 // The b128/b64 analogs of native_weight_addr.glsl's NW4/NW2: four (KV4) or two (KV2) CONSTANT
 // indices off ONE pointer, so ACO's load/store vectorizer fuses them into a single

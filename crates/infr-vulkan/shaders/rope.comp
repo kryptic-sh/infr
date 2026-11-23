@@ -27,6 +27,8 @@ layout(push_constant) uniform PC {
     // `k_addr`, d_lo/d_hi); the `y` binding disappears, cache stays bound inert for the barrier —
     // see Recorder::rope_f16_at.
     uint d_lo; uint d_hi;
+    // Paged cache store: logical rows resolve through the table. `page_rows == 0` is linear.
+    uint page_rows; uint page_lo; uint page_hi;
 #endif
 } pc;
 layout(binding = 0) readonly buffer XB { float x[]; };
@@ -37,7 +39,11 @@ layout(binding = 0) readonly buffer XB { float x[]; };
 // come last for the store→read barrier. Under KV_BDA y is never declared, but the recorder still
 // binds the cache inert in that last slot.
 #ifdef USE_PARAMS
-layout(binding = 1) readonly buffer PB { uint p_pos; uint p_kvlen; };
+layout(binding = 1) readonly buffer PB { uint p_pos; uint p_kvlen;
+#ifdef KV_BDA
+    uint p_pagelo; uint p_pagehi;
+#endif
+};
 #ifdef FREQ_FACTORS
 layout(binding = 2) readonly buffer FB { float ff[]; };
 #ifndef KV_BDA
@@ -78,6 +84,14 @@ layout(binding = 1) buffer YB { float y[]; };
 void main() {
 #if defined(OUT_F16) && defined(KV_BDA)
     k_addr = kv_base(pc.d_lo, pc.d_hi);
+    uint64_t pt = 0ul;
+    if (pc.page_rows > 0u) {
+#ifdef USE_PARAMS
+        pt = kv_base(p_pagelo, p_pagehi);
+#else
+        pt = kv_base(pc.page_lo, pc.page_hi);
+#endif
+    }
 #endif
     // Flat index across `Recorder::dispatch_wide`'s 2-D split of a grid wider than
     // `maxComputeWorkGroupCount[0]`; equal to `gl_GlobalInvocationID.x` when unsplit.
@@ -101,7 +115,13 @@ void main() {
     uint out_base = pc.out_base;
 #endif
     uint base = idx * pc.hd;
-    uint obase = out_base * pc.nheads * pc.hd + base;
+    uint r = idx / pc.nheads;
+    uint h = idx - r * pc.nheads;
+    uint orow = out_base + r;
+#if defined(OUT_F16) && defined(KV_BDA)
+    if (pc.page_rows > 0u) { orow = kv_paged_row(pt, pc.page_rows, orow); }
+#endif
+    uint obase = (orow * pc.nheads + h) * pc.hd;
     // Passthrough only the un-rotated tail [rope_dim, hd); the rotated loop below overwrites
     // [0, rope_dim), so copying it here too just doubled the store traffic (into the KV cache
     // under KV_BDA). Final bytes are identical (as in qk_norm_rope.comp's partial-RoPE tail).

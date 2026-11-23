@@ -520,6 +520,26 @@ fn resolve<'a>(
     }
 }
 
+/// A cache's page table as `(device address, page rows)`, or `None` for a linear cache
+/// (`page_rows == 0`). A paged cache whose table exposes no device address is a hard error —
+/// silently falling back to the linear `row_base` store would write the wrong rows.
+fn cache_pages(
+    graph: &Graph,
+    scratch: &[Option<Box<dyn Buffer>>],
+    bindings: &Bindings,
+    id: TensorId,
+) -> Result<Option<(u64, u32)>> {
+    match graph.desc(id).pages.filter(|p| p.page_rows > 0) {
+        Some(p) => {
+            let addr = resolve(scratch, bindings, p.table)?
+                .device_addr()
+                .ok_or_else(|| be("vulkan adapter: paged KV cache table has no device address"))?;
+            Ok(Some((addr, p.page_rows)))
+        }
+        None => Ok(None),
+    }
+}
+
 /// Paged K/V: the single page table a paged decode reads through, as `(device address, page rows)`.
 /// Page ids are token-granular and identical across layers, so ONE table per slot covers every
 /// layer's K and V caches — a graph whose caches disagree would silently read one layer's rows
@@ -2127,8 +2147,9 @@ fn lower_op(
             let src_f16 = matches!(graph.desc(*src).dtype, infr_core::DType::F16);
             // Planar scales region begins at byte `cap` = total cache elements.
             let cap = graph.desc(*cache).numel();
-            // A pooled cache owns one contiguous block of rows; every store is biased into it.
+            // Linear stores bias into the slot's block; paged stores resolve rows through the table.
             let rb = kv_row_base(graph, *cache);
+            let pages = cache_pages(graph, scratch, bindings, *cache)?;
             // SWA ring cache: the write for position p lands at row p % cap_rows — the ring only
             // recycles rows whose positions the window mask already excludes (see the runner's
             // ring sizing). A batched prefill write crossing the wrap splits into two contiguous
@@ -2161,23 +2182,50 @@ fn lower_op(
                 )));
             }
             match mode {
-                RopeMode::Static(_) if cache_q8 => {
-                    for &(sr, dr, nr) in segs.iter().filter(|&&(_, _, nr)| nr > 0) {
-                        rec.store_q8(s, c, nr * rs, (dr + rb) * rs, cap, src_f16, sr * rs);
+                RopeMode::Static(_) if cache_q8 => match pages {
+                    Some((table, page_rows)) => {
+                        for &(sr, dr, nr) in segs.iter().filter(|&&(_, _, nr)| nr > 0) {
+                            rec.store_q8_paged(
+                                s,
+                                c,
+                                nr * rs,
+                                dr,
+                                rs,
+                                cap,
+                                src_f16,
+                                sr * rs,
+                                table,
+                                page_rows,
+                            );
+                        }
                     }
-                }
-                RopeMode::Dynamic(params) if cache_q8 => {
-                    rec.store_q8_dyn(s, *params, c, n, cap, src_f16)
-                }
+                    None => {
+                        for &(sr, dr, nr) in segs.iter().filter(|&&(_, _, nr)| nr > 0) {
+                            rec.store_q8(s, c, nr * rs, (dr + rb) * rs, cap, src_f16, sr * rs);
+                        }
+                    }
+                },
+                RopeMode::Dynamic(params) if cache_q8 => match pages {
+                    Some((_, page_rows)) => {
+                        rec.store_q8_dyn_paged(s, *params, c, n, cap, src_f16, page_rows)
+                    }
+                    None => rec.store_q8_dyn(s, *params, c, n, cap, src_f16),
+                },
                 // Mainline low-bit KV quants: quantize into standard GGUF blocks (static only — a
                 // quantized KV cache forces static decode, so a Dynamic WriteKv never reaches here).
-                RopeMode::Static(_) if is_kv_quant(cache_dt) => {
-                    rec.quant_kv(cache_dt, s, c, n, (pos + rb) * rs, src_f16)
-                }
+                RopeMode::Static(_) if is_kv_quant(cache_dt) => match pages {
+                    Some((table, page_rows)) => {
+                        rec.quant_kv_paged(cache_dt, s, c, n, pos, rs, src_f16, table, page_rows)
+                    }
+                    None => rec.quant_kv(cache_dt, s, c, n, (pos + rb) * rs, src_f16),
+                },
                 // Dense f32/bf16 cache: cast-store the row (also static-only).
-                RopeMode::Static(_) if is_kv_dense_alt(cache_dt) => {
-                    rec.store_kv_dense(cache_dt, s, c, n, (pos + rb) * rs, src_f16)
-                }
+                RopeMode::Static(_) if is_kv_dense_alt(cache_dt) => match pages {
+                    Some((table, page_rows)) => rec.store_kv_dense_paged(
+                        cache_dt, s, c, n, pos, rs, src_f16, table, page_rows,
+                    ),
+                    None => rec.store_kv_dense(cache_dt, s, c, n, (pos + rb) * rs, src_f16),
+                },
                 // TurboQuant cache: WHT-quantize the row (static-only). NOT BDA-migrated (#74 slice 3
                 // deferred turbo — its dequant read is byte-granular, outside the u32-word/f16 read
                 // family; experimental, not in the gate suite).
@@ -2187,14 +2235,40 @@ fn lower_op(
                 RopeMode::Static(_) => {
                     for &(sr, dr, nr) in segs.iter().filter(|&&(_, _, nr)| nr > 0) {
                         match graph.desc(*src).dtype {
-                            infr_core::DType::F16 => {
-                                rec.copy(s, sr * rs * 2, c, (dr + rb) * rs * 2, nr * rs * 2)
-                            }
-                            _ => match c_addr {
-                                Some(a) => {
+                            infr_core::DType::F16 => match (c_addr, pages) {
+                                (Some(a), Some((table, page_rows))) => rec.store_f16_off_paged_at(
+                                    s,
+                                    c,
+                                    a,
+                                    nr * rs,
+                                    dr,
+                                    rs,
+                                    sr * rs,
+                                    table,
+                                    page_rows,
+                                    true,
+                                ),
+                                _ => rec.copy(s, sr * rs * 2, c, (dr + rb) * rs * 2, nr * rs * 2),
+                            },
+                            _ => match (c_addr, pages) {
+                                (Some(a), Some((table, page_rows))) => rec.store_f16_off_paged_at(
+                                    s,
+                                    c,
+                                    a,
+                                    nr * rs,
+                                    dr,
+                                    rs,
+                                    sr * rs,
+                                    table,
+                                    page_rows,
+                                    false,
+                                ),
+                                (Some(a), None) => {
                                     rec.store_f16_off_at(s, c, a, nr * rs, (dr + rb) * rs, sr * rs)
                                 }
-                                None => rec.store_f16_off(s, c, nr * rs, (dr + rb) * rs, sr * rs),
+                                (None, _) => {
+                                    rec.store_f16_off(s, c, nr * rs, (dr + rb) * rs, sr * rs)
+                                }
                             },
                         }
                     }
@@ -2205,8 +2279,11 @@ fn lower_op(
                     infr_core::DType::F16 => {
                         return Err(be("vulkan adapter: dynamic decode f16 WriteKv unexpected"))
                     }
-                    _ => match c_addr {
-                        Some(a) => {
+                    _ => match (c_addr, pages) {
+                        (Some(a), Some((_, page_rows))) => {
+                            rec.store_f16_dyn_paged_at(s, *params, c, a, n, page_rows)
+                        }
+                        (Some(a), None) => {
                             // A pooled slot's rows start at `row_base`. The record-once store reads
                             // its position from params (no host bias possible), so the block offset
                             // rides the base address instead; `row_base + max_ctx <= cap_rows`, so
@@ -2220,7 +2297,7 @@ fn lower_op(
                                 cap_rows,
                             )
                         }
-                        None => rec.store_f16_dyn(s, *params, c, n, cap_rows),
+                        (None, _) => rec.store_f16_dyn(s, *params, c, n, cap_rows),
                     },
                 },
             }
@@ -2275,10 +2352,21 @@ fn lower_op(
             // on the bound build. `out_buf` stays bound at its write slot in the `_at` method for the
             // store→read barrier. Bit-identical to the bound dispatch.
             let k_row = (*n_head as usize) * (*head_dim as usize);
-            let k_bias = fused_kv_write.get(&op_idx).map_or(0, |&(cache, _)| {
-                kv_row_base(graph, cache) * graph.desc(cache).dtype.dense_bytes(k_row).unwrap_or(0)
-            });
-            let y_addr = out_buf.device_addr().map(|a| a + k_bias as u64);
+            let fused_pages = match fused_kv_write.get(&op_idx) {
+                Some(&(cache, _)) => cache_pages(graph, scratch, bindings, cache)?,
+                None => None,
+            };
+            // The row-base bias drops ONLY when the fused kernel actually receives the page table
+            // (the BDA arm); a bound fallback keeps the linear bias.
+            let y_addr = out_buf.device_addr();
+            let k_bias = match (fused_pages, y_addr) {
+                (Some(_), Some(_)) => 0,
+                _ => fused_kv_write.get(&op_idx).map_or(0, |&(cache, _)| {
+                    kv_row_base(graph, cache)
+                        * graph.desc(cache).dtype.dense_bytes(k_row).unwrap_or(0)
+                }),
+            };
+            let y_addr = y_addr.map(|a| a + k_bias as u64);
             match mode {
                 RopeMode::Static(rope_pos) => {
                     let ff = match freq_factors {
@@ -2302,6 +2390,7 @@ fn lower_op(
                                 fused.unwrap_or(0),
                                 *eps,
                                 *x_stride as usize,
+                                fused_pages,
                             ),
                             None => rec.qk_norm_rope_interleaved(
                                 r(*x)?,
@@ -2334,6 +2423,7 @@ fn lower_op(
                                 fused.unwrap_or(0),
                                 *eps,
                                 ff,
+                                fused_pages,
                             ),
                             None => rec.qk_norm_rope(
                                 r(*x)?,
@@ -2390,6 +2480,7 @@ fn lower_op(
                                 out_base_mul,
                                 *eps,
                                 *x_stride as usize,
+                                fused_pages,
                             ),
                             None => rec.qk_norm_rope_interleaved_dyn(
                                 r(*x)?,
@@ -2424,6 +2515,7 @@ fn lower_op(
                                 out_base_mul,
                                 *eps,
                                 kc,
+                                fused_pages,
                             ),
                             None => rec.qk_norm_rope_dyn(
                                 r(*x)?,
@@ -2494,15 +2586,25 @@ fn lower_op(
             // slot in the `_at` method for the store→read barrier. A pooled slot's rows start at its
             // block, so the fused write's base address carries the same row-base bias the
             // `QkNormRope` arm applies.
-            let k_bias = fused_kv_write.get(&op_idx).map_or(0, |&(cache, _)| {
-                kv_row_base(graph, cache)
-                    * graph
-                        .desc(cache)
-                        .dtype
-                        .dense_bytes((*n_head as usize) * (*head_dim as usize))
-                        .unwrap_or(0)
-            });
-            let y_addr = out_buf.device_addr().map(|a| a + k_bias as u64);
+            let fused_pages = match fused_kv_write.get(&op_idx) {
+                Some(&(cache, _)) => cache_pages(graph, scratch, bindings, cache)?,
+                None => None,
+            };
+            // The row-base bias drops ONLY when the fused kernel actually receives the page table
+            // (the BDA arm); a bound fallback keeps the linear bias.
+            let y_addr = out_buf.device_addr();
+            let k_bias = match (fused_pages, y_addr) {
+                (Some(_), Some(_)) => 0,
+                _ => fused_kv_write.get(&op_idx).map_or(0, |&(cache, _)| {
+                    kv_row_base(graph, cache)
+                        * graph
+                            .desc(cache)
+                            .dtype
+                            .dense_bytes((*n_head as usize) * (*head_dim as usize))
+                            .unwrap_or(0)
+                }),
+            };
+            let y_addr = y_addr.map(|a| a + k_bias as u64);
             match mode {
                 RopeMode::Static(rope_pos) => {
                     if f16_out {
@@ -2519,6 +2621,7 @@ fn lower_op(
                                 rope_pos[&positions.0],
                                 fused.unwrap_or(0),
                                 ff,
+                                fused_pages,
                             ),
                             None => rec.rope_f16(
                                 r(*x)?,
@@ -2577,6 +2680,7 @@ fn lower_op(
                             *theta,
                             usize::from(fused.is_some()),
                             ff,
+                            fused_pages,
                         ),
                         None => rec.rope_f16_dyn(
                             r(*x)?,

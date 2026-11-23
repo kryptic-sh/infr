@@ -15,12 +15,18 @@ layout(push_constant) uniform PC {
     // `y` binding disappears, cache stays bound inert for the barrier — see Recorder::
     // qk_norm_rope_interleaved_at.
     uint d_lo; uint d_hi;
+    // Paged cache store: logical rows resolve through the table. `page_rows == 0` is linear.
+    uint page_rows; uint page_lo; uint page_hi;
 #endif
 } pc;
 layout(binding = 0) readonly buffer XB { float x[]; };
 layout(binding = 1) readonly buffer NB { float nw[]; };
 #ifdef USE_PARAMS
-layout(binding = 2) readonly buffer PB { uint p_pos; uint p_kvlen; };
+layout(binding = 2) readonly buffer PB { uint p_pos; uint p_kvlen;
+#ifdef KV_BDA
+    uint p_pagelo; uint p_pagehi;
+#endif
+};
 #ifdef FREQ_FACTORS
 layout(binding = 3) readonly buffer FF { float ff[]; };
 #ifndef KV_BDA
@@ -53,6 +59,14 @@ shared float red[64];
 void main() {
 #ifdef KV_BDA
     k_addr = kv_base(pc.d_lo, pc.d_hi);
+    uint64_t pt = 0ul;
+    if (pc.page_rows > 0u) {
+#ifdef USE_PARAMS
+        pt = kv_base(p_pagelo, p_pagehi);
+#else
+        pt = kv_base(pc.page_lo, pc.page_hi);
+#endif
+    }
 #endif
     uint t = gl_LocalInvocationID.x;
     // Flat workgroup index across `Recorder::dispatch_wide`'s 2-D split of a grid wider than
@@ -83,7 +97,11 @@ void main() {
     uint out_base = pc.out_base;
 #endif
     uint absp = rope_pos + r;
-    uint out_base_idx = ((out_base + r) * pc.nheads + h) * pc.hd;
+    uint orow = out_base + r;
+#ifdef KV_BDA
+    if (pc.page_rows > 0u) { orow = kv_paged_row(pt, pc.page_rows, orow); }
+#endif
+    uint out_base_idx = (orow * pc.nheads + h) * pc.hd;
     uint hf = pc.rope_dim / 2u;
     for (uint p = t; p < hf; p += 64u) {
         uint i0 = p;

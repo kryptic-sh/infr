@@ -257,13 +257,14 @@ pub type Shape = Vec<usize>;
 
 /// Physical layout of a KV cache whose rows are scattered across a page pool: logical pages of
 /// `page_rows` keys are mapped through `table` (one u32 physical page id per entry, plus a repeat of
-/// the last page) to their rows. Only the attention kernels read this; a cache without one is linear.
+/// the last page) to their rows. Reads and stores resolve rows through it; a cache without one is
+/// linear.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PageMap {
     pub table: TensorId,
     pub page_rows: u32,
-    /// First row of this slot's private block inside the pool. Reads ignore it (the table carries
-    /// the mapping); stores bias into it, because new rows never land in a shared page.
+    /// First row of this slot's private block inside the pool: the linear fallback/bias when a
+    /// store cannot use the table. Never added on top of a table-resolved physical row.
     pub row_base: usize,
 }
 

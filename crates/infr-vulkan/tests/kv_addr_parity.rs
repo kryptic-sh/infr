@@ -1203,6 +1203,7 @@ fn qk_norm_rope_bda_matches_bound() {
             0,
             1e-6,
             None,
+            None,
         ),
         None => rec.qk_norm_rope(
             x.as_ref(),

@@ -24,6 +24,8 @@ layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
 // vectorize (cold path); the hot f16 stores go through store_f16/qk_norm_rope.
 layout(push_constant) uniform PC { uint n; uint off; uint cap; uint src_off;
     uint d_lo; uint d_hi;
+    // Paged cache store: logical rows resolve through the table. `page_rows == 0` is linear.
+    uint row; uint rs; uint page_rows; uint page_lo; uint page_hi;
 } pc;
 #ifdef SRC_F16
 layout(binding = 0) readonly buffer SB { float16_t src[]; };
@@ -31,7 +33,7 @@ layout(binding = 0) readonly buffer SB { float16_t src[]; };
 layout(binding = 0) readonly buffer SB { float src[]; };
 #endif
 #ifdef USE_PARAMS
-layout(binding = 1) readonly buffer PB { uint p_pos; uint p_kvlen; };
+layout(binding = 1) readonly buffer PB { uint p_pos; uint p_kvlen; uint p_pagelo; uint p_pagehi; };
 #endif
 #define KV_STORE_BYTE
 #include "kv_addr.glsl"
@@ -39,6 +41,11 @@ layout(binding = 1) readonly buffer PB { uint p_pos; uint p_kvlen; };
 
 void main() {
     k_addr = kv_base(pc.d_lo, pc.d_hi);
+#ifdef USE_PARAMS
+    uint64_t pt = kv_base(p_pagelo, p_pagehi);
+#else
+    uint64_t pt = kv_base(pc.page_lo, pc.page_hi);
+#endif
     // Flat workgroup index across `Recorder::dispatch_wide`'s 2-D split of a grid wider than
     // `maxComputeWorkGroupCount[0]`; equal to `gl_WorkGroupID.x` when unsplit. A padding
     // workgroup (one 32-element block) returns whole, before any subgroup op, so control flow
@@ -52,9 +59,15 @@ void main() {
     // write row is pos % rows — an identity on a full-context cache (pos < rows always).
     uint rows = pc.cap / pc.n;
     uint row = (rows > 0u) ? (p_pos % rows) : p_pos;
+    if (pc.page_rows > 0u) { row = kv_paged_row(pt, pc.page_rows, p_pos); }
     uint off = row * pc.n;
 #else
     uint off = pc.off;
+    if (pc.page_rows > 0u) {
+        uint e = blk * 32u;
+        uint r = e / pc.rs;
+        off = kv_paged_row(pt, pc.page_rows, pc.row + r) * pc.rs - r * pc.rs;
+    }
 #endif
     float v = float(src[pc.src_off + blk * 32u + t]);
     float amax = subgroupMax(abs(v));
@@ -62,11 +75,13 @@ void main() {
     float inv = (amax > 0.0) ? 1.0 / d : 0.0;
     int q = clamp(int(round(v * inv)), -127, 127);
     // Planar: code byte = global element index (codes region [0,cap)); scale for this block sits in
-    // the scales region at byte cap + block*2 (block = (off+blk*32)/32 = off/32 + blk).
+    // the scales region at byte cap + block*2. `elem` IS the physical element index (u32 wrap on a
+    // downward page map is exact), so derive the block from it — `off / 32` could wrap past the
+    // scales region.
     uint elem = off + blk * 32u + t;
     STB(elem, uint(q) & 0xFFu);   // two's-complement byte; reader sign-extends
     if (t == 0u) {
-        uint block = off / 32u + blk;
+        uint block = elem / 32u;
         uint sb = pc.cap + block * 2u;
         uint16_t s = float16BitsToUint16(float16_t(d));
         STB(sb, uint(s & uint16_t(0xFFu)));

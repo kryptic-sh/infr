@@ -57,11 +57,11 @@ struct Built {
     out: TensorId,
 }
 
-fn attention_graph(cache_elems: usize, paged: Option<(usize, usize)>) -> Built {
+fn attention_graph(rows: usize, cache_elems: usize, paged: Option<(usize, usize)>) -> Built {
     let mut g = Graph::new();
-    let q = g.input(f16d(ROWS * NH * HD));
-    let k = g.input(f32d(ROWS * NKV * HD));
-    let v = g.input(f32d(ROWS * NKV * HD));
+    let q = g.input(f16d(rows * NH * HD));
+    let k = g.input(f32d(rows * NKV * HD));
+    let v = g.input(f32d(rows * NKV * HD));
     let table = paged.map(|(_, len)| g.input(TensorDesc::new(vec![len], DType::I32)));
     let mut kc_desc = f16d(cache_elems);
     let mut vc_desc = f16d(cache_elems);
@@ -79,18 +79,18 @@ fn attention_graph(cache_elems: usize, paged: Option<(usize, usize)>) -> Built {
     }
     let kc = g.input(kc_desc);
     let vc = g.input(vc_desc);
-    let out = g.output(f32d(ROWS * NH * HD));
+    let out = g.output(f32d(rows * NH * HD));
     g.push(Op::WriteKv {
         src: k,
         cache: kc,
-        rows: ROWS as u32,
+        rows: rows as u32,
         row_stride: (NKV * HD) as u32,
         pos: 0,
     });
     g.push(Op::WriteKv {
         src: v,
         cache: vc,
-        rows: ROWS as u32,
+        rows: rows as u32,
         row_stride: (NKV * HD) as u32,
         pos: 0,
     });
@@ -99,8 +99,8 @@ fn attention_graph(cache_elems: usize, paged: Option<(usize, usize)>) -> Built {
         k_cache: kc,
         v_cache: vc,
         dst: out,
-        rows: ROWS as u32,
-        kv_len: ROWS as u32,
+        rows: rows as u32,
+        kv_len: rows as u32,
         n_head: NH as u32,
         n_kv: NKV as u32,
         head_dim: HD as u32,
@@ -207,7 +207,7 @@ fn a_paged_cache_attends_the_same_bits_as_a_contiguous_one() {
 
     // Contiguous: the slot's rows are the whole cache.
     let lin_elems = ROWS * row;
-    let lin = attention_graph(lin_elems, None);
+    let lin = attention_graph(ROWS, lin_elems, None);
     let want = run(
         &be,
         &lin,
@@ -224,7 +224,7 @@ fn a_paged_cache_attends_the_same_bits_as_a_contiguous_one() {
     let pps = ROW_BASE.div_ceil(PAGE_ROWS).max(1);
     let pool_rows = 2 * pps * PAGE_ROWS;
     let pool_elems = pool_rows * row;
-    let pg = attention_graph(pool_elems, Some((ROW_BASE, pps + 1)));
+    let pg = attention_graph(ROWS, pool_elems, Some((ROW_BASE, pps + 1)));
     let table = table_bytes(pps, (ROW_BASE / PAGE_ROWS) as u32);
     let got = run(
         &be,
@@ -251,5 +251,67 @@ fn a_paged_cache_attends_the_same_bits_as_a_contiguous_one() {
     assert!(
         max_err < 1e-4,
         "the paged graph diverges: max_err={max_err:e}"
+    );
+}
+
+/// A store that ignores the table lands at `row_base + pos`; a permuted map whose physical pages
+/// are swapped, with the chunk crossing a page boundary, must still produce the contiguous bits.
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn a_permuted_page_map_stores_the_same_bits_as_a_contiguous_cache() {
+    let Some(be) = vulkan() else { return };
+    let rows = PAGE_ROWS + 256;
+    let row = NKV * HD;
+    let q_data = gen(rows * NH * HD, 21);
+    let k_data = gen(rows * row, 22);
+    let v_data = gen(rows * row, 23);
+    let out_len = rows * NH * HD;
+
+    let lin_elems = rows * row;
+    let lin = attention_graph(rows, lin_elems, None);
+    let want = run(
+        &be,
+        &lin,
+        &q_data,
+        &k_data,
+        &v_data,
+        lin_elems * 2,
+        None,
+        out_len,
+    );
+
+    // The slot's block is pages 2..4 but the table swaps them: logical page 0 -> 3, page 1 -> 2.
+    let row_base = PAGE_ROWS * 2;
+    let pps = 2;
+    let pool_rows = 2 * pps * PAGE_ROWS;
+    let pool_elems = pool_rows * row;
+    let pg = attention_graph(rows, pool_elems, Some((row_base, pps + 1)));
+    let table: Vec<u8> = [3u32, 2, 2]
+        .into_iter()
+        .flat_map(|p| p.to_le_bytes())
+        .collect();
+    let got = run(
+        &be,
+        &pg,
+        &q_data,
+        &k_data,
+        &v_data,
+        pool_elems * 2,
+        Some(&table),
+        out_len,
+    );
+
+    assert!(
+        want.iter().any(|x| *x != 0.0),
+        "the output must not be all zero"
+    );
+    let max_err = want
+        .iter()
+        .zip(&got)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_err < 1e-4,
+        "the permuted page map diverges: max_err={max_err:e}"
     );
 }

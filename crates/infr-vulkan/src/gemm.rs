@@ -3530,6 +3530,7 @@ dyn_spv!(store_kv_bf16_from_f16_spv, "store_kv_bf16_from_f16");
 // dequant_q8_f16/dequant_kv_f16 kernels went BDA-only (slice 5): their base getters below now yield
 // the (unconditional) BDA build and their bound twins/`*_bda` getters were deleted.
 dyn_spv!(store_f16_bda_spv, "store_f16_bda");
+dyn_spv!(store_f16_f16_bda_spv, "store_f16_f16_bda");
 dyn_spv!(store_f16_dyn_bda_spv, "store_f16_dyn_bda");
 dyn_spv!(rope_f16_bda_spv, "rope_f16_bda");
 dyn_spv!(rope_f16_dyn_bda_spv, "rope_f16_dyn_bda");

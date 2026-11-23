@@ -1,10 +1,11 @@
 //! Session-wide KV page pool: the physical half of forward PagedAttention in the seam.
 //!
 //! One [`KvPool`] serves every conversation slot of a session. Each slot owns a contiguous BLOCK
-//! of pages inside every layer's pool buffer, and that block's first row is the slot's store bias
-//! ([`infr_core::tensor::PageMap::row_base`]), so a store never consults the table. A forked slot
-//! starts by SHARING its parent's prefix pages instead of copying them, and splits the sharing one
-//! page at a time when it writes into shared rows.
+//! of pages inside every layer's pool buffer; reads and stores resolve logical rows through the
+//! slot's page table, and the block's first row is the linear fallback
+//! ([`infr_core::tensor::PageMap::row_base`]). A forked slot starts by SHARING its parent's prefix
+//! pages instead of copying them, and splits the sharing one page at a time when it writes into
+//! shared rows.
 //!
 //! Page ids are token-granular and identical across layers: physical page `p` holds rows
 //! `p*PAGE_ROWS..(p+1)*PAGE_ROWS` of EVERY pooled layer. That is what lets one table buffer per
@@ -29,8 +30,8 @@ use infr_vulkan::paged::{PagePool, PAGE_ROWS};
 /// their LRU slot.
 pub(crate) const POOL_BLOCKS: usize = 2;
 
-/// Whether layer `l`'s cache can live in the page pool: its reads go through the page table and its
-/// stores through the block bias; SWA and recurrent layers are position-addressed private caches.
+/// Whether layer `l`'s cache can live in the page pool: reads and stores go through the page
+/// table; SWA and recurrent layers are position-addressed private caches.
 pub(crate) fn paged_layer(cfg: &Config, l: usize) -> bool {
     if cfg.is_recurrent_layer(l) {
         return false;
@@ -92,6 +93,15 @@ impl KvPool {
     ) -> AResult<Arc<Self>> {
         if let Some(why) = no_poolable_layer(cfg) {
             return Err(anyhow!("{why}"));
+        }
+        // A TurboQuant cache has no page-aware store or dequant prepass, so a page table would
+        // write rows the linear reads never find.
+        let turbo = |f: DType| matches!(f, DType::Turbo2 | DType::Turbo3 | DType::Turbo4);
+        if turbo(k_fmt) || turbo(v_fmt) {
+            return Err(anyhow!(
+                "a TurboQuant KV cache ({k_fmt:?} K / {v_fmt:?} V) has no page-aware store or \
+                 dequant, so kv.paged stays off"
+            ));
         }
         let blocks = blocks.max(1);
         let pps = max_ctx.div_ceil(PAGE_ROWS).max(1);
@@ -531,6 +541,24 @@ mod tests {
         let mut out = vec![0u8; bytes];
         be.download_at(buf, page * bytes, &mut out).unwrap();
         out
+    }
+
+    /// A TurboQuant KV side has no page-aware store or dequant prepass, so the pool must refuse
+    /// rather than write rows the linear reads never find.
+    #[test]
+    fn a_turbo_kv_cache_refuses_paging() {
+        let be = cpu();
+        let c = cfg();
+        for (k_fmt, v_fmt) in [
+            (DType::Turbo3, DType::F16),
+            (DType::F16, DType::Turbo4),
+            (DType::Turbo2, DType::Turbo2),
+        ] {
+            let err = KvPool::new(&be, &c, 1024, k_fmt, v_fmt, 2)
+                .expect_err("a turbo side must refuse the pool")
+                .to_string();
+            assert!(err.contains("Turbo"), "the error names the format: {err}");
+        }
     }
 
     /// The whole point of the pool: a fork shares the parent's pages instead of copying them, a

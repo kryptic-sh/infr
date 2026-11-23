@@ -11,6 +11,17 @@
 /// spans at most two pages.
 pub const PAGE_ROWS: usize = 512;
 
+/// Physical row for logical `row` through a page table (one u32 page id per logical page, plus a
+/// repeat of the last page). `page_rows == 0` is the linear identity. Mirrors `kv_paged_row` in
+/// `kv_addr.glsl`, the formula every store kernel applies on the device.
+pub fn phys_row(table: &[u32], page_rows: usize, row: usize) -> usize {
+    if page_rows == 0 {
+        return row;
+    }
+    let logical = row / page_rows;
+    table[logical] as usize * page_rows + row % page_rows
+}
+
 /// Physical page bookkeeping for one KV buffer (one layer, one side).
 pub struct PagePool {
     refs: Vec<u32>,
@@ -222,6 +233,46 @@ mod tests {
         b.clear(&mut pool);
         assert!(b.is_empty());
         assert_eq!(pool.in_use(), 2);
+    }
+
+    #[test]
+    fn phys_row_identity_and_permuted_maps() {
+        let page_rows = PAGE_ROWS;
+        let identity: Vec<u32> = (0..6).collect();
+        assert_eq!(phys_row(&identity, 0, 1234), 1234, "linear cache");
+        for row in [
+            0,
+            page_rows - 1,
+            page_rows,
+            page_rows + 1,
+            3 * page_rows - 1,
+        ] {
+            assert_eq!(phys_row(&identity, page_rows, row), row);
+        }
+
+        let mut swapped = identity.clone();
+        swapped.swap(0, 1);
+        assert_eq!(phys_row(&swapped, page_rows, 0), page_rows);
+        assert_eq!(
+            phys_row(&swapped, page_rows, page_rows - 1),
+            2 * page_rows - 1
+        );
+        assert_eq!(phys_row(&swapped, page_rows, page_rows), 0);
+        assert_eq!(phys_row(&swapped, page_rows, page_rows + 88), 88);
+
+        let crossed: Vec<usize> = (500..525)
+            .map(|row| phys_row(&swapped, page_rows, row))
+            .collect();
+        let want: Vec<usize> = (500..525)
+            .map(|row| {
+                if row < page_rows {
+                    row + page_rows
+                } else {
+                    row - page_rows
+                }
+            })
+            .collect();
+        assert_eq!(crossed, want, "a range crossing a page boundary");
     }
 
     #[test]

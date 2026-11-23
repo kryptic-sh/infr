@@ -17,6 +17,8 @@ layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 // vectorize (cold path).
 layout(push_constant) uniform PC { uint n; uint off;
     uint d_lo; uint d_hi;
+    // Paged cache store: logical rows resolve through the table. `page_rows == 0` is linear.
+    uint row; uint rs; uint page_rows; uint page_lo; uint page_hi;
 } pc;
 #ifdef SRC_F16
 layout(binding = 0) readonly buffer SB { float16_t src[]; };
@@ -53,6 +55,7 @@ int best_index(float x) {
 
 void main() {
     k_addr = kv_base(pc.d_lo, pc.d_hi);
+    uint64_t pt = kv_base(pc.page_lo, pc.page_hi);
     // Flat index across `Recorder::dispatch_wide`'s 2-D split of a grid wider than
     // `maxComputeWorkGroupCount[0]`; equal to `gl_GlobalInvocationID.x` when unsplit.
     uint blk = (gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x) * gl_WorkGroupSize.x
@@ -68,6 +71,13 @@ void main() {
         x[j] = float(src[blk * 32u + j]);
     }
     uint dblk = off / 32u + blk; // destination block index
+#ifndef USE_PARAMS
+    if (pc.page_rows > 0u) {
+        uint e = blk * 32u;
+        uint r = e / pc.rs;
+        dblk = (kv_paged_row(pt, pc.page_rows, pc.row + r) * pc.rs + (e - r * pc.rs)) / 32u;
+    }
+#endif
 
 #if defined(FMT_Q4_0)
     uint bo = dblk * 18u;

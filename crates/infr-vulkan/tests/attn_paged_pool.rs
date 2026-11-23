@@ -452,17 +452,10 @@ fn a_write_at_a_page_offset_reads_back_through_the_table() {
     assert!(walk_nonzero(&want.bits) > 0);
 }
 
-/// A replayed store writes at `p_pos + p_rb`, so a slot whose block starts at row 512 must land
-/// its rows there and leave block 0 alone — the store half of the row base the attention read
-/// never needed (its table already points at the right pages).
-///
-/// Ignored: the `p_rb` params word this pins never landed in a store kernel. A paged slot's row
-/// base reaches the store through the destination device address instead (adapter.rs
-/// `kv_row_base * row_bytes`), so there is nothing here to exercise until a params-based row base
-/// exists.
+/// Every store kernel resolves each logical row through a permuted table, including a multi-row
+/// static store crossing a page boundary and the one-row `params` (decode) store.
 #[test]
-#[ignore = "p_rb params row base never landed; row bases travel in the device address"]
-fn a_store_row_base_puts_the_row_in_that_block() {
+fn stores_resolve_permuted_pages_for_static_and_params_rows() {
     let be = match VulkanBackend::new_with(Arc::new(Config::default())) {
         Ok(be) => be,
         Err(e) => {
@@ -470,78 +463,463 @@ fn a_store_row_base_puts_the_row_in_that_block() {
             return;
         }
     };
-    let n = NKV * HD; // one KV row, block-aligned for Q8
-    let block_rows = PAGE_ROWS;
-    let pool_rows = 2 * block_rows;
-    let pool_elems = pool_rows * n;
-    let src = gen_f32(n, 555);
-    let rb = block_rows as u32;
+    let pr = PAGE_ROWS;
+    let rs = NKV * HD;
+    let rows = pr + 24;
+    let pool_rows = 4 * pr;
+    let pool_elems = pool_rows * rs;
+    let entries = [3u32, 2, 2];
+    let table = be.alloc(entries.len() * 4, BufferUsage::KvCache).unwrap();
+    let table_bytes: Vec<u8> = entries.iter().flat_map(|p| p.to_le_bytes()).collect();
+    be.upload(table.as_ref(), &table_bytes).unwrap();
+    let taddr = table.device_addr().unwrap();
+    let src_data = gen_f32(rows * rs, 8801);
+    let src = be
+        .alloc(src_data.len() * 4, BufferUsage::Activations)
+        .unwrap();
+    be.upload(src.as_ref(), bytemuck::cast_slice(&src_data))
+        .unwrap();
+    let phys = |r: usize| infr_vulkan::paged::phys_row(&entries, pr, r);
 
-    let store = |q8: bool, rb: u32| -> (Vec<u8>, usize) {
-        let bytes = if q8 {
-            pool_elems + pool_elems / 16
-        } else {
-            pool_elems * 2
-        };
-        let dst = be.alloc(bytes, BufferUsage::KvCache).unwrap();
-        let sb = be.alloc(n * 4, BufferUsage::Activations).unwrap();
-        be.upload(sb.as_ref(), bytemuck::cast_slice(&src)).unwrap();
-        let params = be.alloc(24, BufferUsage::Activations).unwrap();
-        let mut pb = [0u8; 24];
-        pb[4..8].copy_from_slice(&1u32.to_le_bytes());
-        pb[16..20].copy_from_slice(&rb.to_le_bytes());
-        be.upload(params.as_ref(), &pb).unwrap();
-        let rec = be.recorder().unwrap();
-        if q8 {
-            rec.store_q8_dyn(
-                sb.as_ref(),
-                params.as_ref(),
-                dst.as_ref(),
-                n,
-                pool_elems,
-                false,
-            );
-        } else {
-            rec.store_f16_dyn_at(
-                sb.as_ref(),
-                params.as_ref(),
-                dst.as_ref(),
-                dst.device_addr().unwrap(),
-                n,
-                pool_rows,
-            );
-        }
-        rec.finish().unwrap();
-        let mut out = vec![0u8; bytes];
-        be.download(dst.as_ref(), &mut out).unwrap();
-        (out, bytes)
-    };
-    let row_bytes = |q8: bool, out: &[u8], rb: u32| -> Vec<u8> {
-        let r = rb as usize;
-        if q8 {
-            let mut row = out[r * n..r * n + n].to_vec();
-            let scales = pool_elems + r * n / 32 * 2;
-            row.extend_from_slice(&out[scales..scales + n / 32 * 2]);
-            row
-        } else {
-            out[r * n * 2..r * n * 2 + n * 2].to_vec()
-        }
-    };
+    let f16_dst = be.alloc(pool_elems * 2, BufferUsage::KvCache).unwrap();
+    let f16_src_data = f16_data(rows * rs, 9901);
+    let f16_src = be
+        .alloc(f16_src_data.len(), BufferUsage::Activations)
+        .unwrap();
+    be.upload(f16_src.as_ref(), &f16_src_data).unwrap();
+    let f16_copy_dst = be.alloc(pool_elems * 2, BufferUsage::KvCache).unwrap();
+    let lin_cap = rows * rs;
+    let q8_bytes = infr_core::budget::kv_fmt_bytes(infr_core::DType::Q8_0, pool_elems);
+    let q8_dst = be.alloc(q8_bytes, BufferUsage::KvCache).unwrap();
+    let q8_lin_bytes = infr_core::budget::kv_fmt_bytes(infr_core::DType::Q8_0, lin_cap);
+    let q8_lin = be.alloc(q8_lin_bytes, BufferUsage::KvCache).unwrap();
+    let dense_dst = be.alloc(pool_elems * 4, BufferUsage::KvCache).unwrap();
+    let dense_lin = be.alloc(lin_cap * 4, BufferUsage::KvCache).unwrap();
 
-    for q8 in [false, true] {
-        let (lo, _) = store(q8, 0);
-        let (hi, _) = store(q8, rb);
+    let rec = be.recorder().unwrap();
+    rec.store_f16_off_paged_at(
+        src.as_ref(),
+        f16_dst.as_ref(),
+        f16_dst.device_addr().unwrap(),
+        rows * rs,
+        0,
+        rs,
+        0,
+        taddr,
+        pr as u32,
+        false,
+    );
+    rec.store_f16_off_paged_at(
+        f16_src.as_ref(),
+        f16_copy_dst.as_ref(),
+        f16_copy_dst.device_addr().unwrap(),
+        rows * rs,
+        0,
+        rs,
+        0,
+        taddr,
+        pr as u32,
+        true,
+    );
+    rec.store_q8(src.as_ref(), q8_lin.as_ref(), lin_cap, 0, lin_cap, false, 0);
+    rec.store_q8_paged(
+        src.as_ref(),
+        q8_dst.as_ref(),
+        lin_cap,
+        0,
+        rs,
+        pool_elems,
+        false,
+        0,
+        taddr,
+        pr as u32,
+    );
+    rec.store_kv_dense(
+        infr_core::DType::F32,
+        src.as_ref(),
+        dense_lin.as_ref(),
+        lin_cap,
+        0,
+        false,
+    );
+    rec.store_kv_dense_paged(
+        infr_core::DType::F32,
+        src.as_ref(),
+        dense_dst.as_ref(),
+        lin_cap,
+        0,
+        rs,
+        false,
+        taddr,
+        pr as u32,
+    );
+
+    let params = be.alloc(16, BufferUsage::Activations).unwrap();
+    let row = pr + 8;
+    let mut pb = [0u8; 16];
+    pb[0..4].copy_from_slice(&(row as u32).to_le_bytes());
+    pb[8..12].copy_from_slice(&(taddr as u32).to_le_bytes());
+    pb[12..16].copy_from_slice(&((taddr >> 32) as u32).to_le_bytes());
+    be.upload(params.as_ref(), &pb).unwrap();
+    let row_src = be.alloc(rs * 4, BufferUsage::Activations).unwrap();
+    be.upload(
+        row_src.as_ref(),
+        bytemuck::cast_slice(&src_data[row * rs..(row + 1) * rs]),
+    )
+    .unwrap();
+    let dyn_f16 = be.alloc(pool_elems * 2, BufferUsage::KvCache).unwrap();
+    let dyn_q8 = be.alloc(q8_bytes, BufferUsage::KvCache).unwrap();
+    rec.store_f16_dyn_paged_at(
+        row_src.as_ref(),
+        params.as_ref(),
+        dyn_f16.as_ref(),
+        dyn_f16.device_addr().unwrap(),
+        rs,
+        pr as u32,
+    );
+    rec.store_q8_dyn_paged(
+        row_src.as_ref(),
+        params.as_ref(),
+        dyn_q8.as_ref(),
+        rs,
+        pool_elems,
+        false,
+        pr as u32,
+    );
+    rec.finish().unwrap();
+
+    let mut f16_out = vec![0u8; pool_elems * 2];
+    be.download(f16_dst.as_ref(), &mut f16_out).unwrap();
+    let mut f16_copy_out = vec![0u8; pool_elems * 2];
+    be.download(f16_copy_dst.as_ref(), &mut f16_copy_out)
+        .unwrap();
+    let mut q8_out = vec![0u8; q8_bytes];
+    be.download(q8_dst.as_ref(), &mut q8_out).unwrap();
+    let mut q8_linear = vec![0u8; q8_lin_bytes];
+    be.download(q8_lin.as_ref(), &mut q8_linear).unwrap();
+    let mut dense_out = vec![0u8; pool_elems * 4];
+    be.download(dense_dst.as_ref(), &mut dense_out).unwrap();
+    let mut dense_linear = vec![0u8; lin_cap * 4];
+    be.download(dense_lin.as_ref(), &mut dense_linear).unwrap();
+    let mut dyn_f16_out = vec![0u8; pool_elems * 2];
+    be.download(dyn_f16.as_ref(), &mut dyn_f16_out).unwrap();
+    let mut dyn_q8_out = vec![0u8; q8_bytes];
+    be.download(dyn_q8.as_ref(), &mut dyn_q8_out).unwrap();
+
+    let f16_row = |r: usize| -> Vec<u8> {
+        src_data[r * rs..(r + 1) * rs]
+            .iter()
+            .flat_map(|v| half::f16::from_f32(*v).to_bits().to_le_bytes())
+            .collect()
+    };
+    let q8_row = |buf: &[u8], cap: usize, r: usize| -> (Vec<u8>, Vec<u8>) {
+        let codes = buf[r * rs..(r + 1) * rs].to_vec();
+        let sb = cap + r * rs / 32 * 2;
+        (codes, buf[sb..sb + rs / 32 * 2].to_vec())
+    };
+    for r in [0, pr - 1, pr, pr + 3, rows - 1] {
+        let p = phys(r);
         assert_eq!(
-            row_bytes(q8, &hi, rb),
-            row_bytes(q8, &lo, 0),
-            "q8={q8}: the row must quantize identically at the block row base"
+            &f16_out[p * rs * 2..(p + 1) * rs * 2],
+            f16_row(r),
+            "f16 row {r} -> physical {p}"
         );
         assert_eq!(
-            row_bytes(q8, &hi, 0),
-            vec![0u8; row_bytes(q8, &hi, 0).len()],
-            "q8={q8}: block 0 must stay untouched when the row base is 512"
+            &f16_copy_out[p * rs * 2..(p + 1) * rs * 2],
+            &f16_src_data[r * rs * 2..(r + 1) * rs * 2],
+            "f16-source row {r} -> physical {p}"
+        );
+        assert_eq!(
+            &dense_out[p * rs * 4..(p + 1) * rs * 4],
+            &dense_linear[r * rs * 4..(r + 1) * rs * 4],
+            "dense row {r} -> physical {p}"
+        );
+        assert_eq!(
+            q8_row(&q8_out, pool_elems, p),
+            q8_row(&q8_linear, lin_cap, r),
+            "q8 row {r} -> physical {p}"
         );
     }
+    let p = phys(row);
+    assert_eq!(
+        &dyn_f16_out[p * rs * 2..(p + 1) * rs * 2],
+        f16_row(row),
+        "decode f16 row {row} -> physical {p}"
+    );
+    assert_eq!(
+        q8_row(&dyn_q8_out, pool_elems, p),
+        q8_row(&q8_linear, lin_cap, row),
+        "decode q8 row {row} -> physical {p}"
+    );
+}
+
+/// The fused RoPE stores write through the same page table as the plain stores, static and params.
+#[test]
+fn fused_rope_stores_resolve_permuted_pages() {
+    let be = match VulkanBackend::new_with(Arc::new(Config::default())) {
+        Ok(be) => be,
+        Err(e) => {
+            eprintln!("skipping: no Vulkan device ({e})");
+            return;
+        }
+    };
+    let pr = PAGE_ROWS;
+    let nh = 2;
+    let hd = HD;
+    let rs = nh * hd;
+    let rows = pr + 8;
+    let pool_rows = 4 * pr;
+    let pool_elems = pool_rows * rs;
+    let entries = [3u32, 2, 2];
+    let table = be.alloc(entries.len() * 4, BufferUsage::KvCache).unwrap();
+    let table_bytes: Vec<u8> = entries.iter().flat_map(|p| p.to_le_bytes()).collect();
+    be.upload(table.as_ref(), &table_bytes).unwrap();
+    let taddr = table.device_addr().unwrap();
+    let phys = |r: usize| infr_vulkan::paged::phys_row(&entries, pr, r);
+
+    let x_data = gen_f32(rows * rs, 7701);
+    let x = be
+        .alloc(x_data.len() * 4, BufferUsage::Activations)
+        .unwrap();
+    be.upload(x.as_ref(), bytemuck::cast_slice(&x_data))
+        .unwrap();
+    let nw_data = gen_f32(hd, 7702);
+    let nw = be
+        .alloc(nw_data.len() * 4, BufferUsage::Activations)
+        .unwrap();
+    be.upload(nw.as_ref(), bytemuck::cast_slice(&nw_data))
+        .unwrap();
+
+    let qk_lin = be.alloc(rows * rs * 2, BufferUsage::KvCache).unwrap();
+    let qk_pg = be.alloc(pool_elems * 2, BufferUsage::KvCache).unwrap();
+    let rope_lin = be.alloc(rows * rs * 2, BufferUsage::KvCache).unwrap();
+    let rope_pg = be.alloc(pool_elems * 2, BufferUsage::KvCache).unwrap();
+    let rec = be.recorder().unwrap();
+    rec.qk_norm_rope_at(
+        x.as_ref(),
+        nw.as_ref(),
+        qk_lin.as_ref(),
+        qk_lin.device_addr().unwrap(),
+        rows,
+        nh,
+        hd,
+        hd,
+        1e4,
+        0,
+        0,
+        1e-6,
+        None,
+        None,
+    );
+    rec.qk_norm_rope_at(
+        x.as_ref(),
+        nw.as_ref(),
+        qk_pg.as_ref(),
+        qk_pg.device_addr().unwrap(),
+        rows,
+        nh,
+        hd,
+        hd,
+        1e4,
+        0,
+        0,
+        1e-6,
+        None,
+        Some((taddr, pr as u32)),
+    );
+    rec.rope_f16_at(
+        x.as_ref(),
+        rope_lin.as_ref(),
+        rope_lin.device_addr().unwrap(),
+        rows,
+        nh,
+        hd,
+        hd,
+        1e4,
+        0,
+        0,
+        None,
+        None,
+    );
+    rec.rope_f16_at(
+        x.as_ref(),
+        rope_pg.as_ref(),
+        rope_pg.device_addr().unwrap(),
+        rows,
+        nh,
+        hd,
+        hd,
+        1e4,
+        0,
+        0,
+        None,
+        Some((taddr, pr as u32)),
+    );
+
+    let row = pr + 3;
+    let params = be.alloc(16, BufferUsage::Activations).unwrap();
+    let mut pb = [0u8; 16];
+    pb[0..4].copy_from_slice(&(row as u32).to_le_bytes());
+    pb[8..12].copy_from_slice(&(taddr as u32).to_le_bytes());
+    pb[12..16].copy_from_slice(&((taddr >> 32) as u32).to_le_bytes());
+    be.upload(params.as_ref(), &pb).unwrap();
+    let row_x = be.alloc(rs * 4, BufferUsage::Activations).unwrap();
+    be.upload(
+        row_x.as_ref(),
+        bytemuck::cast_slice(&x_data[row * rs..(row + 1) * rs]),
+    )
+    .unwrap();
+    let qk_dyn = be.alloc(pool_elems * 2, BufferUsage::KvCache).unwrap();
+    let rope_dyn = be.alloc(pool_elems * 2, BufferUsage::KvCache).unwrap();
+    rec.qk_norm_rope_dyn_at(
+        row_x.as_ref(),
+        nw.as_ref(),
+        params.as_ref(),
+        None,
+        qk_dyn.as_ref(),
+        qk_dyn.device_addr().unwrap(),
+        1,
+        nh,
+        hd,
+        hd,
+        1e4,
+        1,
+        1e-6,
+        0,
+        Some((taddr, pr as u32)),
+    );
+    rec.rope_f16_dyn_at(
+        row_x.as_ref(),
+        params.as_ref(),
+        rope_dyn.as_ref(),
+        rope_dyn.device_addr().unwrap(),
+        1,
+        nh,
+        hd,
+        hd,
+        1e4,
+        1,
+        None,
+        Some((taddr, pr as u32)),
+    );
+    rec.finish().unwrap();
+
+    let mut qk_linear = vec![0u8; rows * rs * 2];
+    be.download(qk_lin.as_ref(), &mut qk_linear).unwrap();
+    let mut qk_paged = vec![0u8; pool_elems * 2];
+    be.download(qk_pg.as_ref(), &mut qk_paged).unwrap();
+    let mut rope_linear = vec![0u8; rows * rs * 2];
+    be.download(rope_lin.as_ref(), &mut rope_linear).unwrap();
+    let mut rope_paged_out = vec![0u8; pool_elems * 2];
+    be.download(rope_pg.as_ref(), &mut rope_paged_out).unwrap();
+    let mut qk_dyn_out = vec![0u8; pool_elems * 2];
+    be.download(qk_dyn.as_ref(), &mut qk_dyn_out).unwrap();
+    let mut rope_dyn_out = vec![0u8; pool_elems * 2];
+    be.download(rope_dyn.as_ref(), &mut rope_dyn_out).unwrap();
+
+    for r in [0, pr - 1, pr, pr + 3, rows - 1] {
+        let p = phys(r);
+        assert_eq!(
+            &qk_paged[p * rs * 2..(p + 1) * rs * 2],
+            &qk_linear[r * rs * 2..(r + 1) * rs * 2],
+            "qk row {r} -> physical {p}"
+        );
+        assert_eq!(
+            &rope_paged_out[p * rs * 2..(p + 1) * rs * 2],
+            &rope_linear[r * rs * 2..(r + 1) * rs * 2],
+            "rope row {r} -> physical {p}"
+        );
+    }
+    let p = phys(row);
+    assert_eq!(
+        &qk_dyn_out[p * rs * 2..(p + 1) * rs * 2],
+        &qk_linear[row * rs * 2..(row + 1) * rs * 2],
+        "decode qk row {row} -> physical {p}"
+    );
+    assert_eq!(
+        &rope_dyn_out[p * rs * 2..(p + 1) * rs * 2],
+        &rope_linear[row * rs * 2..(row + 1) * rs * 2],
+        "decode rope row {row} -> physical {p}"
+    );
+}
+
+/// A DOWNWARD page map (physical page below the logical one) must not corrupt the Q8 scale
+/// region: `off` wraps in uint, so the scale block derives from the physical element index
+/// (`elem / 32`), not `off / 32 + blk`. The upward `[3,2,2]` map in the test above cannot
+/// catch this.
+#[test]
+fn q8_scales_land_with_the_row_on_a_downward_page_map() {
+    let be = match VulkanBackend::new_with(Arc::new(Config::default())) {
+        Ok(be) => be,
+        Err(e) => {
+            eprintln!("skipping: no Vulkan device ({e})");
+            return;
+        }
+    };
+    let pr = PAGE_ROWS;
+    let rs = NKV * HD; // 256 elements = 8 Q8 blocks
+    let row = pr + 88; // second logical page, mapped below the first
+    let entries = [1u32, 0, 0];
+    let pool_elems = 2 * pr * rs;
+    let table = be.alloc(entries.len() * 4, BufferUsage::KvCache).unwrap();
+    let table_bytes: Vec<u8> = entries.iter().flat_map(|p| p.to_le_bytes()).collect();
+    be.upload(table.as_ref(), &table_bytes).unwrap();
+    let taddr = table.device_addr().unwrap();
+
+    let src_data = gen_f32(rs, 5151);
+    let src = be
+        .alloc(src_data.len() * 4, BufferUsage::Activations)
+        .unwrap();
+    be.upload(src.as_ref(), bytemuck::cast_slice(&src_data))
+        .unwrap();
+    let q8_bytes = infr_core::budget::kv_fmt_bytes(infr_core::DType::Q8_0, pool_elems);
+    let dst = be.alloc(q8_bytes, BufferUsage::KvCache).unwrap();
+    let lin = be
+        .alloc(
+            infr_core::budget::kv_fmt_bytes(infr_core::DType::Q8_0, rs),
+            BufferUsage::KvCache,
+        )
+        .unwrap();
+    let rec = be.recorder().unwrap();
+    rec.store_q8_paged(
+        src.as_ref(),
+        dst.as_ref(),
+        rs,
+        row,
+        rs,
+        pool_elems,
+        false,
+        0,
+        taddr,
+        pr as u32,
+    );
+    rec.store_q8(src.as_ref(), lin.as_ref(), rs, 0, rs, false, 0);
+    rec.finish().unwrap();
+
+    let mut out = vec![0u8; q8_bytes];
+    be.download(dst.as_ref(), &mut out).unwrap();
+    let mut linear = vec![0u8; infr_core::budget::kv_fmt_bytes(infr_core::DType::Q8_0, rs)];
+    be.download(lin.as_ref(), &mut linear).unwrap();
+
+    let phys = infr_vulkan::paged::phys_row(&entries, pr, row);
+    assert_eq!(phys, 88, "the map must point down");
+    let q8_row = |buf: &[u8], cap: usize, r: usize| -> (Vec<u8>, Vec<u8>) {
+        let codes = buf[r * rs..(r + 1) * rs].to_vec();
+        let sb = cap + r * rs / 32 * 2;
+        (codes, buf[sb..sb + rs / 32 * 2].to_vec())
+    };
+    assert_eq!(
+        q8_row(&out, pool_elems, phys),
+        q8_row(&linear, rs, 0),
+        "the row must quantize identically at the downward physical row"
+    );
+    // The corruption this pins wrote block scales 256 MiB past the region; the untouched pages'
+    // scales must still be zero.
+    assert_eq!(
+        &out[pool_elems..pool_elems + rs / 32 * 2],
+        &vec![0u8; rs / 32 * 2][..],
+        "block 0's scales must stay untouched"
+    );
 }
 
 fn gen_f32(n: usize, seed: u64) -> Vec<f32> {

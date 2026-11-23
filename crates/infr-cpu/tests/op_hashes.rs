@@ -1568,7 +1568,7 @@ fn op_name(op: &Op) -> &'static str {
 
 /// The number of `Op` variants [`op_name`] names (keep in step with it: a variant named there
 /// but not counted here fails [`every_op_variant_has_a_case`]).
-const OP_VARIANTS: usize = 40;
+const OP_VARIANTS: usize = 41;
 
 #[test]
 fn every_op_variant_has_a_case() {

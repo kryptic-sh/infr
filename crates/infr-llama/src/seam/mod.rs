@@ -4297,6 +4297,8 @@ pub(crate) fn generate_dense_metal_session(
         None,
         None,
         req,
+        None, // paged_blocks
+        1,    // slot_copies
     )
 }
 
@@ -4340,6 +4342,8 @@ pub(crate) fn verify_dense_metal2(
         None,
         None,
         None,
+        None, // paged_blocks
+        1,    // slot_copies
     )?;
     Ok((logits, stats.prompt_secs))
 }

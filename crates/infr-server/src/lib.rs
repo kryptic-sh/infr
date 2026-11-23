@@ -1226,6 +1226,7 @@ pub struct ChatCompletionResponse {
     pub model: String,
     pub choices: Vec<CompletionChoice>,
     pub usage: UsageInfo,
+    pub timings: Timings,
 }
 
 #[derive(Debug, Serialize)]
@@ -1346,6 +1347,46 @@ impl UsageInfo {
     }
 }
 
+/// Per-request prefill and decode timings in llama.cpp's `timings` shape. `prompt_n` counts the
+/// tokens this request actually prefilled, so a cached prefix is excluded from both the count and
+/// the rate.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct Timings {
+    pub prompt_n: u32,
+    pub prompt_ms: f64,
+    pub prompt_per_token_ms: f64,
+    pub prompt_per_second: f64,
+    pub predicted_n: u32,
+    pub predicted_ms: f64,
+    pub predicted_per_token_ms: f64,
+    pub predicted_per_second: f64,
+}
+
+impl Timings {
+    pub(crate) fn from_record(rec: &ReqRecord) -> Self {
+        let prompt_ms = rec.prefill.as_secs_f64() * 1000.0;
+        let predicted_ms = rec.decode.as_secs_f64() * 1000.0;
+        Self {
+            prompt_n: rec.prompt_tokens,
+            prompt_ms,
+            prompt_per_token_ms: per_token_ms(prompt_ms, rec.prompt_tokens),
+            prompt_per_second: rec.prefill_tps(),
+            predicted_n: rec.gen_tokens,
+            predicted_ms,
+            predicted_per_token_ms: per_token_ms(predicted_ms, rec.gen_tokens),
+            predicted_per_second: rec.decode_tps(),
+        }
+    }
+}
+
+fn per_token_ms(total_ms: f64, tokens: u32) -> f64 {
+    if tokens > 0 {
+        total_ms / f64::from(tokens)
+    } else {
+        0.0
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Response DTOs — /v1/chat/completions  (streaming chunks)
 // ---------------------------------------------------------------------------
@@ -1360,6 +1401,8 @@ pub struct ChatCompletionChunk {
     /// Only on the final `stream_options.include_usage` chunk.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<UsageInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timings: Option<Timings>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1996,6 +2039,7 @@ pub fn build_router(state: AppState) -> Router {
     let body_limit = max_body_bytes(&state.cfg);
     Router::new()
         .route("/v1/models", get(models_handler))
+        .route("/health", get(health_handler))
         .route("/metrics", get(metrics::metrics_handler))
         .route("/status", get(status::status_handler))
         .route(
@@ -2017,7 +2061,6 @@ pub fn build_router(state: AppState) -> Router {
             state.clone(),
             host::host_gate,
         ))
-        .route("/health", get(health_handler))
         .with_state(state)
 }
 
@@ -2597,6 +2640,7 @@ async fn non_streaming(
                     finish_reason: finish.as_str().into(),
                 }],
                 usage: UsageInfo::from_outcome(&outcome),
+                timings: Timings::from_record(&rec),
             })
             .into_response()
         }
@@ -2819,13 +2863,15 @@ async fn streaming(
                     last_logprobs,
                     Some(finish.as_str().into()),
                 )));
-                if include_usage {
-                    let _ = tx.send(Ok(sse_usage_chunk(&cid, &model_id, created, &outcome)));
-                }
                 // Fold the request's tallies in ONCE, here, and log its completion line. The finish
                 // chunk above IS this stream's terminal frame, so the guard must not also report a
                 // failure when it drops.
                 let rec = tally.finish(outcome, finish);
+                if include_usage {
+                    let _ = tx.send(Ok(sse_usage_chunk(
+                        &cid, &model_id, created, &outcome, &rec,
+                    )));
+                }
                 stats.fold_completion(&rec);
                 log_request_done(req_id, &model_id, stream, &rec);
                 done.settled();
@@ -2969,6 +3015,7 @@ fn sse_chunk(
             finish_reason,
         }],
         usage: None,
+        timings: None,
     };
     Event::default()
         .json_data(chunk)
@@ -2977,7 +3024,13 @@ fn sse_chunk(
 
 /// The `stream_options.include_usage` chunk: the whole request's `usage`, and an empty `choices`
 /// array, sent after the finish chunk and before `[DONE]`.
-fn sse_usage_chunk(cid: &str, model: &str, created: i64, outcome: &ChatOutcome) -> Event {
+fn sse_usage_chunk(
+    cid: &str,
+    model: &str,
+    created: i64,
+    outcome: &ChatOutcome,
+    rec: &ReqRecord,
+) -> Event {
     let chunk = ChatCompletionChunk {
         id: cid.to_owned(),
         object: "chat.completion.chunk",
@@ -2985,6 +3038,7 @@ fn sse_usage_chunk(cid: &str, model: &str, created: i64, outcome: &ChatOutcome) 
         model: model.to_owned(),
         choices: Vec::new(),
         usage: Some(UsageInfo::from_outcome(outcome)),
+        timings: Some(Timings::from_record(rec)),
     };
     Event::default()
         .json_data(chunk)
@@ -3878,6 +3932,7 @@ mod tests {
                 total_tokens: 15,
                 prompt_tokens_details: PromptTokensDetails { cached_tokens: 0 },
             },
+            timings: Timings::default(),
         };
         let v: serde_json::Value = serde_json::to_value(&resp).unwrap();
         assert_eq!(v["object"], "chat.completion");
@@ -3913,6 +3968,7 @@ mod tests {
                 total_tokens: 0,
                 prompt_tokens_details: PromptTokensDetails { cached_tokens: 0 },
             },
+            timings: Timings::default(),
         };
         let v: serde_json::Value = serde_json::to_value(&resp).unwrap();
         assert_eq!(
@@ -3954,6 +4010,7 @@ mod tests {
                 total_tokens: 0,
                 prompt_tokens_details: PromptTokensDetails { cached_tokens: 0 },
             },
+            timings: Timings::default(),
         };
         let v: serde_json::Value = serde_json::to_value(&resp).unwrap();
         assert_eq!(v["choices"][0]["finish_reason"], "tool_calls");
@@ -3985,6 +4042,7 @@ mod tests {
                 finish_reason: None,
             }],
             usage: None,
+            timings: None,
         };
         let v: serde_json::Value = serde_json::to_value(&chunk).unwrap();
         assert_eq!(v["object"], "chat.completion.chunk");
@@ -4013,6 +4071,7 @@ mod tests {
                 finish_reason: None,
             }],
             usage: None,
+            timings: None,
         };
         let v: serde_json::Value = serde_json::to_value(&chunk).unwrap();
         assert_eq!(v["choices"][0]["delta"]["content"], "hello");
@@ -4036,6 +4095,7 @@ mod tests {
                 finish_reason: None,
             }],
             usage: None,
+            timings: None,
         };
         let v: serde_json::Value = serde_json::to_value(&chunk).unwrap();
         assert_eq!(v["choices"][0]["delta"]["reasoning_content"], "thinking...");
@@ -4067,6 +4127,7 @@ mod tests {
                 finish_reason: None,
             }],
             usage: None,
+            timings: None,
         };
         let v: serde_json::Value = serde_json::to_value(&chunk).unwrap();
         let tc = &v["choices"][0]["delta"]["tool_calls"][0];
@@ -4089,6 +4150,7 @@ mod tests {
                 finish_reason: Some("stop".into()),
             }],
             usage: None,
+            timings: None,
         };
         let v: serde_json::Value = serde_json::to_value(&chunk).unwrap();
         assert_eq!(v["choices"][0]["finish_reason"], "stop");
@@ -5502,6 +5564,19 @@ mod tests {
             total: Duration::from_millis(500),
             finish: Finish::Stop,
         }
+    }
+
+    #[test]
+    fn timings_report_the_request_prefill_and_decode() {
+        let timings = Timings::from_record(&rec(100, 20, 2));
+        assert_eq!(timings.prompt_n, 100);
+        assert_eq!(timings.predicted_n, 20);
+        assert!((timings.prompt_ms - 100.0).abs() < 1e-9);
+        assert!((timings.predicted_ms - 400.0).abs() < 1e-9);
+        assert!((timings.prompt_per_token_ms - 1.0).abs() < 1e-9);
+        assert!((timings.predicted_per_token_ms - 20.0).abs() < 1e-9);
+        assert!((timings.prompt_per_second - 1000.0).abs() < 1e-9);
+        assert!((timings.predicted_per_second - 50.0).abs() < 1e-9);
     }
 
     /// **The whole point of the periodic line.** Its numbers must describe the INTERVAL, so a drain

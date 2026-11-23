@@ -117,6 +117,7 @@ struct TextCompletionResponse {
     model: String,
     choices: Vec<TextChoice>,
     usage: UsageInfo,
+    timings: Timings,
 }
 
 #[derive(Serialize)]
@@ -153,7 +154,13 @@ fn text_event(
 
 /// The `stream_options.include_usage` chunk for a text completion: the whole request's `usage`
 /// with an empty `choices` array, sent after the finish chunk and before `[DONE]`.
-fn text_usage_event(cid: &str, model: &str, created: i64, outcome: &ChatOutcome) -> Event {
+fn text_usage_event(
+    cid: &str,
+    model: &str,
+    created: i64,
+    outcome: &ChatOutcome,
+    rec: &ReqRecord,
+) -> Event {
     Event::default()
         .json_data(serde_json::json!({
             "id": cid,
@@ -162,6 +169,7 @@ fn text_usage_event(cid: &str, model: &str, created: i64, outcome: &ChatOutcome)
             "model": model,
             "choices": [],
             "usage": UsageInfo::from_outcome(outcome),
+            "timings": Timings::from_record(rec),
         }))
         .expect("a usage chunk always serializes")
 }
@@ -336,6 +344,7 @@ async fn non_streaming(
                     finish_reason: Some(finish.as_str().into()),
                 }],
                 usage: UsageInfo::from_outcome(&outcome),
+                timings: Timings::from_record(&rec),
             })
             .into_response()
         }
@@ -447,10 +456,12 @@ async fn streaming(
                     last_logprobs,
                     Some(finish.as_str()),
                 )));
-                if include_usage {
-                    let _ = tx.send(Ok(text_usage_event(&cid, &model_id, created, &outcome)));
-                }
                 let rec = tally.finish(outcome, finish);
+                if include_usage {
+                    let _ = tx.send(Ok(text_usage_event(
+                        &cid, &model_id, created, &outcome, &rec,
+                    )));
+                }
                 stats.fold_completion(&rec);
                 log_request_done(req_id, &model_id, stream, &rec);
                 done.settled();

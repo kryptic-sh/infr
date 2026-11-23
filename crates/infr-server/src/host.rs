@@ -21,6 +21,9 @@ const LOOPBACK_HOSTS: [&str; 3] = ["localhost", "127.0.0.1", "[::1]"];
 /// The `Host` check every route but `/health` runs first: DNS-rebinding protection. A layer, like
 /// the bearer check, so a refused request is answered on its headers alone.
 pub(crate) async fn host_gate(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    if req.uri().path() == "/health" {
+        return next.run(req).await;
+    }
     // HTTP/2 carries the host as the URI authority instead of a `Host` header.
     let host = match req.headers().get(axum::http::header::HOST) {
         Some(v) => Some(v.to_str().unwrap_or_default()),

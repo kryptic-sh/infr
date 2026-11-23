@@ -136,7 +136,7 @@ impl KvPrefixStore {
         kv: &mut SeamKv,
         prompt: &[u32],
     ) -> Result<usize> {
-        if !self.enabled() || cfg.qwen35 {
+        if !self.enabled() || cfg.has_recurrent_state() {
             return Ok(0);
         }
         let (mut p, hits) = self.matched(prompt);
@@ -199,8 +199,9 @@ impl KvPrefixStore {
     /// Capture `kv`'s first `upto` rows as reusable blocks. Returns the token count kept.
     ///
     /// Blocks already stored are skipped, so a conversation that extends its own prefix keeps only
-    /// the new suffix. Skipped entirely when the rows are not reusable (qwen35's recurrent state
-    /// has no prefix) or the prefix is short.
+    /// the new suffix. Skipped entirely when the rows are not reusable: a recurrent state (qwen35
+    /// DeltaNet, LFM short convolution) has no prefix to restore from pages, so the store does not
+    /// apply to that model at all.
     pub(crate) fn capture(
         &mut self,
         be: &dyn Backend,
@@ -209,7 +210,7 @@ impl KvPrefixStore {
         kv: &SeamKv,
         upto: usize,
     ) -> Result<usize> {
-        if !self.enabled() || cfg.qwen35 {
+        if !self.enabled() || cfg.has_recurrent_state() {
             return Ok(0);
         }
         let p = upto.min(kv.cached.len()).min(kv.max_ctx);

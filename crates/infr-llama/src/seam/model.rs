@@ -1126,6 +1126,8 @@ impl SeamModel {
             max_ctx,
             constraint,
             req,
+            None, // paged_blocks
+            1,    // slot_copies
         )?;
         // The cold init may have re-clamped the window against the memory the device reported free
         // once the weights were resident (`crate::seam::reclamp_ctx_to_live_room`), so the slot's
@@ -2076,6 +2078,8 @@ impl SeamModel {
                 want,
                 None, // constraint
                 None, // req: bench is a sole sequence — env sampling, no gate
+                None, // paged_blocks
+                1,    // slot_copies
             )?;
             Ok(stats)
         };
@@ -2742,6 +2746,8 @@ impl DiffusionGemmaCpuSession {
             None,
             None,
             None,
+            None, // paged_blocks
+            1,    // slot_copies
         )?;
         Ok(())
     }
@@ -2791,6 +2797,8 @@ impl DiffusionGemmaCpuSession {
                 reduced: &mut reduced,
             }),
             None,
+            None, // paged_blocks
+            1,    // slot_copies
         )?;
         Ok(out_logits)
     }
@@ -2833,6 +2841,8 @@ impl DiffusionGemmaVulkanSession {
             None,
             None,
             None,
+            None, // paged_blocks
+            1,    // slot_copies
         )?;
         // Once per prefill (a denoise step would print per step — far too noisy).
         self.be.print_moe_pager_stats();
@@ -2901,6 +2911,8 @@ impl DiffusionGemmaVulkanSession {
                 reduced: &mut reduced,
             }),
             None,
+            None, // paged_blocks
+            1,    // slot_copies
         )?;
         Ok(match reduced {
             Some(r) => crate::seam::DenoiseOutcome::Reduced(r),

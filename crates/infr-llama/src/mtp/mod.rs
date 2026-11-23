@@ -2138,6 +2138,8 @@ fn run_verify(
         Some(&mut h),
         None,
         None,
+        None, // paged_blocks
+        1,    // slot_copies
     )?;
     if ids.is_empty() {
         // Host fallback: the runner downloaded the m×vocab logits instead (see this fn's doc).
@@ -2200,6 +2202,8 @@ fn run_verify_full(
         Some(&mut h),
         None,
         None,
+        None, // paged_blocks
+        1,    // slot_copies
     )?;
     Ok((logits, h))
 }
@@ -2260,6 +2264,8 @@ fn run_prime_last(
         Some(&mut h),
         None,
         None,
+        None, // paged_blocks
+        1,    // slot_copies
     )?;
     anyhow::ensure!(
         ids.len() == 1 && h.len() == cfg.n_embd,

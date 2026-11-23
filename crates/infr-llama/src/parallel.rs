@@ -267,6 +267,11 @@ impl ParallelSeam {
     /// rest off it. `&mut self` — this runs at startup, before the engine is shared.
     fn init_slots(&mut self, n_slots: usize) -> Result<()> {
         let t0 = std::time::Instant::now();
+        let paged_blocks = crate::seam::paged_blocks_for(
+            n_slots,
+            self.model.engine_cfg().kv.paged == Some(true),
+            &infr_core::backend::Backend::capabilities(&self.vk),
+        );
         // The warmup generation both uploads the weights and compiles every lazily-built pipeline,
         // so the first REAL request pays neither. INFR_PROF_OPS is suppressed for it (recorders read
         // it at construction; warmup submits would pollute a later bench's per-op aggregate) via the
@@ -287,6 +292,8 @@ impl ParallelSeam {
                 self.max_ctx,
                 None, // constraint
                 None, // req: startup, not a request — env sampling, no gate
+                paged_blocks,
+                n_slots,
             )
         })?;
         let mut slot0 = slot0.ok_or_else(|| anyhow!("warmup did not initialize a KV slot"))?;
@@ -295,30 +302,15 @@ impl ParallelSeam {
         // window that was actually allocated: every slot forked below is sized from it, and it is
         // what the server advertises and admits requests against.
         self.max_ctx = slot0.max_ctx();
+        if self.model.engine_cfg().kv.paged == Some(true) && n_slots == 1 {
+            tracing::info!(
+                "kv.paged: single-slot engine never forks, so no page pool is allocated; KV stays \
+                 linear"
+            );
+        }
         // Drop the warmup tokens so the first real prompt prefills a clean slot from row 0 instead
         // of forking off a garbage prefix.
         slot0.reset();
-        // `kv.paged`: with a fixed slot count known at boot, the pool is built here — every slot
-        // below is then a BLOCK of it instead of its own contiguous cache.
-        if self.model.engine_cfg().kv.paged == Some(true)
-            && infr_core::backend::Backend::capabilities(&self.vk).kv_paging
-        {
-            let (k_fmt, v_fmt) = slot0.kv_fmts();
-            let built = crate::seam::KvPool::new(
-                &self.vk,
-                self.model.config(),
-                slot0.max_ctx(),
-                k_fmt,
-                v_fmt,
-                n_slots.max(crate::seam::POOL_BLOCKS),
-            )
-            .and_then(|pool| slot0.attach_paged(&self.vk, self.model.config(), &pool));
-            if let Err(e) = built {
-                tracing::warn!(
-                    "kv.paged: could not page this session's KV ({e}); slots stay linear"
-                );
-            }
-        }
 
         let mut slots = Vec::with_capacity(n_slots);
         for i in 1..n_slots {
@@ -564,6 +556,8 @@ impl ParallelSeam {
             self.max_ctx,
             constraint,
             Some(req),
+            None, // paged_blocks
+            1,    // slot_copies
         )?;
         // Keep this prompt's rows for whoever asks the adjacent question next. A failure here is a
         // cache miss on the next request, never a failed request.

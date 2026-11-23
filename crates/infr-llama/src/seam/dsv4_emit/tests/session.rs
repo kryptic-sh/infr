@@ -214,6 +214,8 @@ impl Model {
             None,
             None,
             req,
+            None, // paged_blocks
+            1,    // slot_copies
         )?;
         assert_eq!(logits.len(), self.cfg.vocab);
         Ok(Gen {

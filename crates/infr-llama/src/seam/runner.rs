@@ -508,6 +508,8 @@ pub(crate) fn generate_dense_backend(
     h_out: Option<&mut Vec<f32>>,
     denoise_req: Option<DenoiseReq>,
     req: Option<&crate::sampling::RequestCtx>,
+    paged_blocks: Option<usize>,
+    slot_copies: usize,
 ) -> AResult<(Vec<u32>, GenStats)> {
     generate_dense_backend_bound(
         None,
@@ -532,6 +534,8 @@ pub(crate) fn generate_dense_backend(
         req,
         None, // prefill_logits
         None, // route
+        paged_blocks,
+        slot_copies,
     )
 }
 
@@ -621,6 +625,10 @@ pub(crate) fn generate_dense_backend_bound(
     // selection instead of their own. `None` everywhere but that harness: no op, no input, no
     // buffer, no download.
     mut route: Option<&mut RouteTap>,
+    // Blocks the `kv.paged` cold init allocates; `None` for a linear slot.
+    paged_blocks: Option<usize>,
+    // KV copies this engine will hold; slot 0 allocates one here, forks allocate the rest.
+    slot_copies: usize,
 ) -> AResult<(Vec<u32>, GenStats)> {
     let c = cfg;
     // Qwen4-Exp must never silently take the qwen35 forward: that would ignore its HC
@@ -1549,13 +1557,40 @@ pub(crate) fn generate_dense_backend_bound(
         // and the driver's own memory that no pre-load footprint prices — so the budget query here
         // is a MEASUREMENT where the clamp that sized `want_ctx` could only estimate. Shrinks only,
         // and never a context the user pinned. See `reclamp_ctx_to_live_room`.
-        let want_ctx = crate::seam::reclamp_ctx_to_live_room(be, c, ec, want_ctx, k_fmt, v_fmt)?;
+        let want_ctx =
+            crate::seam::reclamp_ctx_to_live_room(be, c, ec, want_ctx, k_fmt, v_fmt, slot_copies)?;
         // A model infr only matches the reference over a bounded context gets no larger cache.
         // Sessions arrive already capped (`SeamModel::session_ctx`); this is the one-shot paths'
         // cap (they size `prompt + max_new + 1`). The load already warned.
         let want_ctx = c
             .faithful_ctx_limit()
             .map_or(want_ctx, |limit| want_ctx.min(limit));
+        // The guard prices the whole pool, so measure the budget before allocating it.
+        let room = be.device_alloc_room();
+        let pool = match paged_blocks.filter(|_| caps.kv_paging) {
+            Some(blocks) => match crate::seam::KvPool::new(be, c, want_ctx, k_fmt, v_fmt, blocks) {
+                Ok(pool) => {
+                    tracing::info!(
+                        "kv.paged: {} of {} layers in {} pool blocks of {} rows",
+                        (0..c.n_layer)
+                            .filter(|&l| crate::seam::paged_layer(c, l))
+                            .count(),
+                        c.n_layer,
+                        pool.blocks(),
+                        pool.slot_rows(),
+                    );
+                    Some(pool)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "kv.paged: could not page this session's KV ({e}); slots stay linear"
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
+        let pool_rows = pool.as_ref().map(|p| p.slot_rows() * p.blocks());
 
         // ── persistent KV cache buffers, sized per-layer (gemma4 SWA layers are narrower) and
         //    per-side (K and V pick their dtype independently) ────────────────────────────────
@@ -1568,7 +1603,7 @@ pub(crate) fn generate_dense_backend_bound(
         let ubatch = crate::seam::ubatch_rows(ec);
         let kv_sizes: Vec<(usize, usize)> = (0..c.n_layer)
             .map(|l| {
-                crate::seam::kv_layer_alloc_bytes(
+                crate::seam::kv_layer_alloc_bytes_pooled(
                     c,
                     l,
                     want_ctx,
@@ -1577,19 +1612,18 @@ pub(crate) fn generate_dense_backend_bound(
                     be.kv_row_align(),
                     k_fmt,
                     v_fmt,
+                    pool_rows,
                 )
             })
             .collect();
-        let room = be.device_alloc_room();
-        // The guard sees every KV-class allocation this init makes: the K/V pairs, then a V4
-        // compressed layer's block caches and rings, one entry each.
-        let guarded: Vec<(usize, usize)> = kv_sizes
-            .iter()
-            .copied()
-            .chain(
-                (0..c.n_layer).flat_map(|l| crate::seam::dsv4_comp_allocs(c, l, want_ctx, k_fmt)),
-            )
+        // The guard prices the pool once, non-pooled layers once per slot, and V4 buffers per slot.
+        let mut guarded = crate::seam::kv_guard_sizes(c, &kv_sizes, pool.is_some(), slot_copies);
+        let dsv4: Vec<(usize, usize)> = (0..c.n_layer)
+            .flat_map(|l| crate::seam::dsv4_comp_allocs(c, l, want_ctx, k_fmt))
             .collect();
+        for _ in 0..slot_copies.max(1) {
+            guarded.extend_from_slice(&dsv4);
+        }
         crate::seam::refuse_unallocatable_kv(
             ec,
             &guarded,
@@ -1600,12 +1634,30 @@ pub(crate) fn generate_dense_backend_bound(
             "after the weights",
             || {
                 let budget = room?.saturating_sub(crate::seam::POST_KV_DEVICE_RESERVE);
-                crate::seam::kv_fit_ctx_in_budget(c, ec, budget, None, &[ubatch], k_fmt, v_fmt)
+                crate::seam::kv_fit_ctx_in_budget(
+                    c,
+                    ec,
+                    budget,
+                    None,
+                    &[ubatch],
+                    k_fmt,
+                    v_fmt,
+                    slot_copies,
+                )
             },
         )?;
         let mut kbufs: Vec<std::sync::Arc<dyn Buffer>> = Vec::new();
         let mut vbufs: Vec<std::sync::Arc<dyn Buffer>> = Vec::new();
-        for &(k_bytes, v_bytes) in &kv_sizes {
+        for (l, &(k_bytes, v_bytes)) in kv_sizes.iter().enumerate() {
+            if let Some(pool) = &pool {
+                if let Some(k) = pool.k(l) {
+                    kbufs.push(std::sync::Arc::clone(k));
+                    vbufs.push(std::sync::Arc::clone(
+                        pool.v(l).expect("pooled layer has both sides"),
+                    ));
+                    continue;
+                }
+            }
             kbufs.push(std::sync::Arc::from(
                 be.alloc(k_bytes, BufferUsage::KvCache)
                     .map_err(|e| anyhow!("{e}"))?,
@@ -1697,9 +1749,10 @@ pub(crate) fn generate_dense_backend_bound(
             cached: Vec::new(),
             written_end: 0,
             delta_snapshot_refused: false,
-            // A cold slot is linear; `start_paging` attaches a pool when the session first forks
-            // (see `DenseVulkanSession`).
-            paged: None,
+            paged: match &pool {
+                Some(pool) => Some(crate::seam::PagedSlot::new(pool, be)?),
+                None => None,
+            },
             denoise_cache: None,
             self_cond_w: None,
             sc_embt: None,
@@ -7531,6 +7584,8 @@ mod tests {
             None,
             None,
             None,
+            None, // paged_blocks
+            1,    // slot_copies
         )
         .expect("qwen35 synthetic generation");
         logits
@@ -7819,6 +7874,8 @@ mod tests {
                 None,
                 None,
                 req,
+                None, // paged_blocks
+                1,    // slot_copies
             )
             .map(|_| logits)
         };
@@ -7934,6 +7991,8 @@ mod tests {
                 None,
                 None,
                 req,
+                None, // paged_blocks
+                1,    // slot_copies
             )
             .expect("synthetic generation on Vulkan");
             stats
@@ -8484,6 +8543,8 @@ mod tests {
             None,
             None,
             Some(&req),
+            None, // paged_blocks
+            1,    // slot_copies
         )
         .expect("synthetic generation");
         out
@@ -8665,6 +8726,8 @@ mod tests {
             None,
             None,
             None,
+            None, // paged_blocks
+            1,    // slot_copies
         )
         .expect("synthetic generation");
         logits
@@ -8790,6 +8853,8 @@ mod tests {
             None,
             None,
             None,
+            None, // paged_blocks
+            1,    // slot_copies
         )
         .expect("synthetic generation on Vulkan");
         drop(bypass);
@@ -9004,6 +9069,8 @@ mod tests {
             None,
             None,
             None,
+            None, // paged_blocks
+            1,    // slot_copies
         )
         .expect("llama4 synthetic generation");
         assert_eq!(slot.expect("slot initialized").max_ctx, limit);
@@ -9349,6 +9416,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // paged_blocks
+                1,    // slot_copies
             )
             .map(|_| n)
         };
@@ -9396,6 +9465,8 @@ mod tests {
             None,
             None,
             None,
+            None, // paged_blocks
+            1,    // slot_copies
         )
         .expect_err("a 3-element rope_freqs on a 16-wide rope must be refused");
         assert_eq!(
@@ -9530,6 +9601,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // paged_blocks
+                1,    // slot_copies
             )
             .expect("gemma3 synthetic generation");
             out
@@ -9612,6 +9685,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // paged_blocks
+                1,    // slot_copies
             )
             .expect("gemma3 synthetic generation");
             out
@@ -9694,6 +9769,8 @@ mod tests {
                 None,
                 None,
                 req,
+                None, // paged_blocks
+                1,    // slot_copies
             )
             .map(|_| out)
         };

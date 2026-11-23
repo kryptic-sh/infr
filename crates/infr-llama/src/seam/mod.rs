@@ -825,6 +825,8 @@ pub(crate) fn generate_dense_cpu_mode(
             req,
             None, // prefill_logits
             None, // route
+            None, // paged_blocks
+            1,    // slot_copies
         )
     };
     // A cold init that got as far as building `state` left the bound weights in it, whole, even
@@ -919,6 +921,8 @@ pub(crate) fn generate_dense_vulkan(
         prompt.len() + max_new + 1,
         None, // constraint
         None, // req: the one-shot runner is a sole sequence — config sampling, no gate
+        None, // paged_blocks
+        1,    // slot_copies
     )
 }
 
@@ -947,6 +951,8 @@ pub(crate) fn generate_dense_vulkan_session(
     want_ctx: usize,
     constraint: Option<&mut crate::grammar::Constraint>,
     req: Option<&crate::sampling::RequestCtx>,
+    paged_blocks: Option<usize>,
+    slot_copies: usize,
 ) -> AResult<(Vec<u32>, GenStats)> {
     crate::qwen4_exp::ensure_forward_supported(cfg)?;
     // Placement can allocate + upload (the pager arenas, a weight re-bind), i.e. it RECORDS on the
@@ -965,8 +971,27 @@ pub(crate) fn generate_dense_vulkan_session(
         vulkan_moe_binder(vk, g, cfg, ec, true, want_ctx)?
     };
     let out = generate_dense_backend(
-        vk, &*bind, g, cfg, ec, token_embd, ple, prompt, max_new, on_token, state, want_ctx,
-        constraint, None, None, None, None, None, req,
+        vk,
+        &*bind,
+        g,
+        cfg,
+        ec,
+        token_embd,
+        ple,
+        prompt,
+        max_new,
+        on_token,
+        state,
+        want_ctx,
+        constraint,
+        None,
+        None,
+        None,
+        None,
+        None,
+        req,
+        paged_blocks,
+        slot_copies,
     )?;
     // INFR_PAGER_STATS=1: cumulative hit/miss/eviction counters since this pager was installed
     // (persists across calls on the same session — see `MoePagerSession`). A no-op when no paged
@@ -2011,6 +2036,15 @@ pub(crate) fn kv_ring_wanted(cfg: &Config, ec: &EngineConfig) -> bool {
 /// every derived per-slot / fractional window is held to.
 pub(crate) const MIN_SESSION_CTX: usize = 1024;
 
+/// Blocks a `kv.paged` engine allocates: `n_slots` (at least [`POOL_BLOCKS`]), else `None`.
+pub(crate) fn paged_blocks_for(
+    n_slots: usize,
+    paged: bool,
+    caps: &infr_core::backend::Capabilities,
+) -> Option<usize> {
+    (paged && caps.kv_paging && n_slots > 1).then(|| n_slots.max(POOL_BLOCKS))
+}
+
 // ── one budget, two families of callers ───────────────────────────────────────────────────────
 //
 // The context-fit math ([`kv_fit_ctx_for`], via `SeamModel::kv_fit_ctx_fmt`) and the placement
@@ -2205,6 +2239,7 @@ pub(crate) fn kv_fit_ctx_for(
         &ubatch_candidates(ec),
         k_fmt,
         v_fmt,
+        1,
     )
 }
 
@@ -2219,7 +2254,7 @@ pub(crate) fn kv_fit_ctx_for(
 /// have been allocated. Same arithmetic either way; only the confidence in the input differs.
 ///
 /// `moe_reserve` is the MoE arm's flat headroom in place of the dense activation reserve (`None`
-/// for a dense model).
+/// for a dense model). `slot_copies` prices that many KV caches beside one activation reserve.
 pub(crate) fn kv_fit_ctx_in_budget(
     cfg: &Config,
     ec: &EngineConfig,
@@ -2228,15 +2263,18 @@ pub(crate) fn kv_fit_ctx_in_budget(
     cands: &[usize],
     k_fmt: DType,
     v_fmt: DType,
+    slot_copies: usize,
 ) -> Option<usize> {
     if (0..cfg.n_layer).all(|l| kv_row_elems(cfg, l) == (0, 0)) {
         return None;
     }
     // Same gate the runner applies (`generate_dense_backend`'s `kv_ring`) — see `placement_ring`.
     let ring = placement_ring(cfg, ec, k_fmt, v_fmt);
+    let copies = slot_copies.max(1) as u64;
     let fits = |ctx: usize| -> bool {
         cands.iter().any(|&ubatch| {
-            let kv = kv_bytes_estimate_fmt(cfg, ctx, ring, ubatch, k_fmt, v_fmt);
+            let kv =
+                kv_bytes_estimate_fmt(cfg, ctx, ring, ubatch, k_fmt, v_fmt).saturating_mul(copies);
             let reserve = moe_reserve.unwrap_or_else(|| dense_act_reserve_at(cfg, ctx, ubatch));
             kv.saturating_add(reserve) <= budget
         })
@@ -2304,6 +2342,7 @@ pub(crate) const POST_KV_DEVICE_RESERVE: u64 = 256 * 1024 * 1024;
 ///
 /// May also LOWER the pinned prefill chunk ([`repin_ubatch_lower`]) when a shorter one serves more
 /// context — the same trade the pre-load sweep makes, retaken with the weight bytes known.
+/// `slot_copies` prices every cache the engine will fork beside one activation reserve.
 pub(crate) fn reclamp_ctx_to_live_room(
     be: &dyn Backend,
     cfg: &Config,
@@ -2311,6 +2350,7 @@ pub(crate) fn reclamp_ctx_to_live_room(
     want_ctx: usize,
     k_fmt: DType,
     v_fmt: DType,
+    slot_copies: usize,
 ) -> AResult<usize> {
     let Some(room) = be.device_alloc_room() else {
         return Ok(want_ctx);
@@ -2327,7 +2367,8 @@ pub(crate) fn reclamp_ctx_to_live_room(
     // MoE: the pager's arenas are already allocated by the binder at this point, so the live room
     // has them netted out and the flat `total/12` stand-in would double-count. The dense reserve
     // is what an MoE forward's activations actually need beside them.
-    let at = |ub: usize| kv_fit_ctx_in_budget(cfg, ec, budget, None, &[ub], k_fmt, v_fmt);
+    let at =
+        |ub: usize| kv_fit_ctx_in_budget(cfg, ec, budget, None, &[ub], k_fmt, v_fmt, slot_copies);
     let Some(_) = at(cands[0]) else {
         return Ok(want_ctx); // pure recurrent-state arch: no per-token KV to size.
     };
@@ -2354,7 +2395,8 @@ pub(crate) fn reclamp_ctx_to_live_room(
         room_bytes = room,
         post_kv_reserve_bytes = POST_KV_DEVICE_RESERVE,
         act_reserve_bytes = dense_act_reserve_at(cfg, fit, ubatch),
-        kv_bytes = kv_bytes_estimate_fmt(cfg, fit, ring, ubatch, k_fmt, v_fmt),
+        kv_bytes = kv_bytes_estimate_fmt(cfg, fit, ring, ubatch, k_fmt, v_fmt)
+            .saturating_mul(slot_copies.max(1) as u64),
         ubatch,
         want_ctx,
         fit,
@@ -2379,7 +2421,8 @@ pub(crate) fn reclamp_ctx_to_live_room(
         // Not one token of context fits: say so with the measured numbers, rather than let the
         // request fail later as a context overflow against a capacity of 0.
         let floor = dense_act_reserve_at(cfg, 1, ubatch)
-            + kv_bytes_estimate_fmt(cfg, 1, ring, ubatch, k_fmt, v_fmt);
+            + kv_bytes_estimate_fmt(cfg, 1, ring, ubatch, k_fmt, v_fmt)
+                .saturating_mul(slot_copies.max(1) as u64);
         return Err(anyhow!(
             "this model does not fit the device's free memory: after its weights are resident the \
              device reports {:.2} GiB allocatable, and even a one-token context needs {:.2} GiB \
@@ -2402,7 +2445,10 @@ pub(crate) fn reclamp_ctx_to_live_room(
          pre-load estimate does not price the weight arena's block tails or the driver's own \
          memory; set INFR_CTX to override",
         gib(room),
-        gib(kv_bytes_estimate_fmt(cfg, fit, ring, ubatch, k_fmt, v_fmt)),
+        gib(
+            kv_bytes_estimate_fmt(cfg, fit, ring, ubatch, k_fmt, v_fmt)
+                .saturating_mul(slot_copies.max(1) as u64),
+        ),
         gib(dense_act_reserve_at(cfg, fit, ubatch)),
         gib(POST_KV_DEVICE_RESERVE),
     );
@@ -2452,6 +2498,49 @@ pub(crate) fn kv_layer_alloc_bytes(
         kv_side_bytes(k_fmt, rows * k_row),
         kv_side_bytes(v_fmt, rows * v_row),
     )
+}
+
+/// [`kv_layer_alloc_bytes`], except a pooled layer is priced at the whole pool's `pool_rows`.
+pub(crate) fn kv_layer_alloc_bytes_pooled(
+    cfg: &Config,
+    l: usize,
+    want_ctx: usize,
+    ring: bool,
+    ubatch: usize,
+    row_align: usize,
+    k_fmt: DType,
+    v_fmt: DType,
+    pool_rows: Option<usize>,
+) -> (usize, usize) {
+    match pool_rows.filter(|_| paged_layer(cfg, l)) {
+        Some(rows) => {
+            let (k_row, v_row) = kv_row_elems(cfg, l);
+            (
+                kv_side_bytes(k_fmt, rows * k_row),
+                kv_side_bytes(v_fmt, rows * v_row),
+            )
+        }
+        None => kv_layer_alloc_bytes(cfg, l, want_ctx, ring, ubatch, row_align, k_fmt, v_fmt),
+    }
+}
+
+/// Guard entries: a pooled layer's whole pool once, every other layer's slot-0 bytes per slot.
+pub(crate) fn kv_guard_sizes(
+    cfg: &Config,
+    slot0: &[(usize, usize)],
+    pooled: bool,
+    slot_copies: usize,
+) -> Vec<(usize, usize)> {
+    (0..cfg.n_layer)
+        .flat_map(|l| {
+            let copies = if pooled && paged_layer(cfg, l) {
+                1
+            } else {
+                slot_copies.max(1)
+            };
+            std::iter::repeat_n(slot0[l], copies)
+        })
+        .collect()
 }
 
 /// The smallest KV cache `n_slots` sessions of `want_ctx` tokens can still end up allocating,
@@ -3598,6 +3687,8 @@ fn run_dense_oneshot(
         None, // h_out
         None, // denoise_req
         None, // req
+        None, // paged_blocks
+        1,    // slot_copies
     )
 }
 
@@ -4292,6 +4383,8 @@ pub(crate) fn verify_dense_cpu(
         None,
         None,
         None,
+        None, // paged_blocks
+        1,    // slot_copies
     )?;
     Ok(logits)
 }
@@ -4336,6 +4429,8 @@ pub(crate) fn verify_dense_cpu_with_h(
         Some(&mut h),
         None,
         None,
+        None, // paged_blocks
+        1,    // slot_copies
     )?;
     Ok((logits, h))
 }
@@ -4382,6 +4477,8 @@ pub(crate) fn verify_rows_cpu_with_h(
         Some(&mut h),
         None,
         None,
+        None, // paged_blocks
+        1,    // slot_copies
     )?;
     Ok((logits, h))
 }
@@ -4435,6 +4532,8 @@ pub(crate) fn verify_dense_vulkan(
         None,
         None,
         None,
+        None, // paged_blocks
+        1,    // slot_copies
     )?;
     Ok(logits)
 }
@@ -4475,6 +4574,8 @@ pub(crate) fn verify_rows_vulkan(
         None,
         None,
         None,
+        None, // paged_blocks
+        1,    // slot_copies
     )?;
     Ok(logits)
 }
@@ -4517,6 +4618,8 @@ pub(crate) fn window_logits_rows(
         None,
         None,
         None,
+        None, // paged_blocks
+        1,    // slot_copies
     )?;
     Ok(logits)
 }
@@ -4656,6 +4759,8 @@ pub(crate) fn forced_run(
         None,
         (head != PrefillHead::Off).then_some(&mut tap),
         route_tap.as_mut(),
+        None, // paged_blocks
+        1,    // slot_copies
     )?;
     let vocab = cfg.vocab;
     let prefill_rows = tap.positions.len();
@@ -4705,6 +4810,8 @@ pub(crate) fn forced_run(
             None,
             None,
             route_tap.as_mut(),
+            None, // paged_blocks
+            1,    // slot_copies
         )?;
         if row.len() != vocab {
             return Err(anyhow!(
@@ -4854,6 +4961,8 @@ pub(crate) fn greedy_tail_vulkan(
         want_ctx,
         None,
         None,
+        None, // paged_blocks
+        1,    // slot_copies
     )?;
     let recordings = vk.decode_recordings();
     let seq: Vec<u32> = prompt.iter().chain(&ids).copied().collect();
@@ -4878,6 +4987,8 @@ pub(crate) fn greedy_tail_vulkan(
         None,
         None,
         None,
+        None, // paged_blocks
+        1,    // slot_copies
     )?;
     // A step that re-prefilled would score a prefill, not the KV the generation wrote.
     if (tail.n_cached, tail.n_prompt) != (seq.len() - 1, 1) {
@@ -5767,6 +5878,127 @@ mod seam_helper_tests {
         assert_eq!(est, want as u64);
     }
 
+    /// 32 qwen35-style layers: 8 full-attention (pooled) and 24 DeltaNet (linear state).
+    fn qwen35_8x24() -> Config {
+        Config {
+            n_layer: 32,
+            n_embd: 64,
+            n_head: 4,
+            n_kv: 2,
+            head_dim: 16,
+            qwen35: true,
+            full_attn_interval: 4,
+            ssm_d_conv: 4,
+            ssm_d_inner: 64,
+            ssm_d_state: 16,
+            ssm_n_group: 2,
+            ssm_dt_rank: 4,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn paged_blocks_follow_slots_and_only_when_paging_is_live() {
+        let caps = infr_core::backend::Capabilities {
+            kv_paging: true,
+            ..Default::default()
+        };
+        assert_eq!(super::paged_blocks_for(1, true, &caps), None);
+        assert_eq!(super::paged_blocks_for(2, true, &caps), Some(2));
+        assert_eq!(super::paged_blocks_for(4, true, &caps), Some(4));
+        assert_eq!(super::paged_blocks_for(4, false, &caps), None);
+        assert_eq!(
+            super::paged_blocks_for(4, true, &infr_core::backend::Capabilities::default()),
+            None
+        );
+    }
+
+    /// Pooled layers are priced at the whole pool; non-pooled layers at one slot per copy.
+    #[test]
+    fn pooled_kv_sizing_prices_blocks_for_pooled_layers_only() {
+        let cfg = qwen35_8x24();
+        let pooled: Vec<usize> = (0..cfg.n_layer)
+            .filter(|&l| cfg.is_qwen35_attn_layer(l) && !cfg.is_recurrent_layer(l))
+            .collect();
+        assert_eq!(pooled.len(), 8);
+        assert_eq!(cfg.n_layer - pooled.len(), 24);
+        let is_pooled = |l: usize| pooled.contains(&l);
+        for l in 0..cfg.n_layer {
+            assert_eq!(super::paged_layer(&cfg, l), is_pooled(l), "layer {l}");
+            assert!(!cfg.is_recurrent_layer(l) || !super::paged_layer(&cfg, l));
+        }
+
+        let (ctx, blocks, ub) = (4096usize + 100, 4usize, 512usize);
+        let (k, v) = (DType::F16, DType::F16);
+        let be = infr_cpu::CpuBackend::new();
+        let pool = super::KvPool::new(&be, &cfg, ctx, k, v, blocks).expect("pool");
+        assert_eq!(
+            pool.slot_rows(),
+            ctx.next_multiple_of(infr_vulkan::paged::PAGE_ROWS)
+        );
+        assert!(pool.slot_rows() > ctx, "the pool must round the window up");
+        let pool_rows = pool.slot_rows() * pool.blocks();
+        let one = |l| super::kv_layer_alloc_bytes_pooled(&cfg, l, ctx, false, ub, 1, k, v, None);
+        let pooled_bytes = |l| {
+            super::kv_layer_alloc_bytes_pooled(&cfg, l, ctx, false, ub, 1, k, v, Some(pool_rows))
+        };
+        for &l in &pooled {
+            let (kb, vb) = pooled_bytes(l);
+            assert_eq!(
+                (kb, vb),
+                (
+                    pool.k(l).expect("pooled K").len_bytes(),
+                    pool.v(l).expect("pooled V").len_bytes(),
+                ),
+                "helper must match pool layer {l}"
+            );
+            let (k1, v1) = one(l);
+            assert!(kb > k1 && vb > v1, "layer {l} must grow past one slot");
+        }
+        for l in (0..cfg.n_layer).filter(|&l| !is_pooled(l)) {
+            assert!(pool.k(l).is_none() && pool.v(l).is_none());
+            assert_eq!(pooled_bytes(l), one(l), "layer {l} must keep one slot");
+        }
+
+        let slot0: Vec<(usize, usize)> = (0..cfg.n_layer).map(pooled_bytes).collect();
+        let expected_guard = |copies: usize| -> Vec<(usize, usize)> {
+            (0..cfg.n_layer)
+                .flat_map(|l| {
+                    let c = if is_pooled(l) { 1 } else { copies };
+                    std::iter::repeat_n(slot0[l], c)
+                })
+                .collect()
+        };
+        for copies in [1usize, 2, 4] {
+            assert_eq!(
+                super::kv_guard_sizes(&cfg, &slot0, true, copies),
+                expected_guard(copies),
+                "guard entries at {copies} slots"
+            );
+        }
+        let non_pooled_total = |copies: usize| -> (usize, usize) {
+            (0..cfg.n_layer)
+                .filter(|&l| !is_pooled(l))
+                .fold((0usize, 0usize), |(ks, vs), l| {
+                    let (kb, vb) = slot0[l];
+                    (ks + kb * copies, vs + vb * copies)
+                })
+        };
+        let one_copy = non_pooled_total(1);
+        assert_eq!(non_pooled_total(2), (one_copy.0 * 2, one_copy.1 * 2));
+        assert_eq!(non_pooled_total(4), (one_copy.0 * 4, one_copy.1 * 4));
+
+        let linear0: Vec<(usize, usize)> = (0..cfg.n_layer).map(one).collect();
+        let all_linear: Vec<(usize, usize)> = (0..cfg.n_layer)
+            .flat_map(|l| std::iter::repeat_n(linear0[l], 3))
+            .collect();
+        assert_eq!(
+            super::kv_guard_sizes(&cfg, &linear0, false, 3),
+            all_linear,
+            "a failed pool prices every layer linearly"
+        );
+    }
+
     /// `kv_q8_layout_ok` is the "may this model use a q8 cache" gate the Vulkan auto-q8 placement
     /// PIN consults, so it must reject MLA — the pin is priced into the VRAM estimate, and
     /// `generate_dense_backend` will build an f16 cache for MLA no matter what was pinned. The
@@ -6523,7 +6755,7 @@ mod seam_helper_tests {
         let (k, v) = (DType::F16, DType::F16);
         let want = 32768;
         let call = |be: &dyn infr_core::backend::Backend, ec: &EngineConfig| {
-            super::reclamp_ctx_to_live_room(be, &cfg, ec, want, k, v).expect("reclamp")
+            super::reclamp_ctx_to_live_room(be, &cfg, ec, want, k, v, 1).expect("reclamp")
         };
 
         // No budget to report: the caller's window survives untouched.
@@ -6548,6 +6780,20 @@ mod seam_helper_tests {
             "the clamped window must fit the measured budget: {need} > {tight}"
         );
 
+        // Multiple slots: the shrink must leave every fork's cache allocatable.
+        let slots = 4usize;
+        let got4 =
+            super::reclamp_ctx_to_live_room(&RoomOnly(Some(tight)), &cfg, &ec, want, k, v, slots)
+                .expect("reclamp");
+        assert!(got4 <= got, "{slots} slots must not clamp less than one");
+        let need4 = super::kv_bytes_estimate_fmt(&cfg, got4, true, ub, k, v)
+            .saturating_mul(slots as u64)
+            + super::dense_act_reserve_at(&cfg, got4, ub);
+        assert!(
+            need4 <= tight - super::POST_KV_DEVICE_RESERVE,
+            "the {slots}-slot window must fit the measured budget: {need4} > {tight}"
+        );
+
         // Pinned by the user: honored verbatim, however tight the device is.
         let pinned = EngineConfig {
             device: infr_core::config::DeviceCfg {
@@ -6567,6 +6813,7 @@ mod seam_helper_tests {
             want,
             k,
             v,
+            1,
         )
         .expect_err("a room holding only the driver reserve must refuse");
         let msg = err.to_string();

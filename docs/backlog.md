@@ -8548,3 +8548,15 @@ queue against two, tokens per second and the pager's upload time.
   long-lived embedder that recreates backends after a failure would keep the
   leaked one.
 - **Metal's waits were not reviewed** for the same unbounded-wait pattern.
+
+### B235 — `kv.paged` can never build at the clamp it is sized for (2026-11-24)
+
+**Tag:** kv · vram · **Plan:** `docs/plan/14-kv-paged-boot.md`
+
+`ParallelSeam::init_slots` builds slot 0's linear KV, resets it, then builds the
+page pool on top, so boot needs `n_slots + 1` caches while the clamp priced
+`n_slots`. On kikuri (RX 580 8 GB, Qwen3.5-4B Q4_K_M, q8): `--parallel 2` clamps
+to 103559/slot and the pool is refused (215.7 MiB requested + 7.62 GiB in use >
+7.75 GiB); slots stay linear. One slot with q8 builds at `--ctx 81920` and is
+refused at 98304 — the boundary is the transient, not the pool. Fix: allocate
+the pool in the cold KV init and skip it entirely at `n_slots == 1`.

@@ -669,6 +669,8 @@ pub(crate) fn generate_spec(
         Some(&mut h),
         None,
         None,
+        None, // paged_blocks
+        1,    // slot_copies
     )?;
     let prompt_secs = t_prompt.elapsed().as_secs_f64();
     anyhow::ensure!(
@@ -737,6 +739,8 @@ pub(crate) fn generate_spec(
             Some(&mut vh),
             None,
             None,
+            None, // paged_blocks
+            1,    // slot_copies
         )?;
         if vids.is_empty() {
             vids = logits

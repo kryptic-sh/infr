@@ -30,11 +30,9 @@ use infr_vulkan::paged::{PagePool, PAGE_ROWS};
 pub(crate) const POOL_BLOCKS: usize = 2;
 
 /// Whether layer `l`'s cache can live in the page pool: its reads go through the page table and its
-/// stores through the block bias. SWA layers ring (position-addressed, never page-addressed), and
-/// qwen35's DeltaNet layers and the MLA/lite architectures keep state the paged kernels do not
-/// read.
+/// stores through the block bias; SWA and recurrent layers are position-addressed private caches.
 pub(crate) fn paged_layer(cfg: &Config, l: usize) -> bool {
-    if cfg.qwen35 && !cfg.is_qwen35_attn_layer(l) {
+    if cfg.is_recurrent_layer(l) {
         return false;
     }
     if cfg.deepseek2 || cfg.deepseek4 || cfg.is_lite || cfg.diffusion_gemma {
@@ -614,6 +612,28 @@ mod tests {
         assert_eq!(split, 1, "rows 600..700 live in page 1 only");
         assert!(!slot.map.is_private(0), "page 0 is still the parent's");
         assert!(slot.map.is_private(1));
+    }
+
+    /// LFM3 short-convolution layers hold recurrent state, not row-addressed KV.
+    #[test]
+    fn shortconv_layers_are_not_poolable() {
+        let c = Config {
+            n_layer: 2,
+            n_head: 4,
+            n_kv: 2,
+            n_embd: 64,
+            head_dim: 16,
+            lfm3: true,
+            shortconv_layers: vec![true, false],
+            shortconv_l_cache: 4,
+            ..Default::default()
+        };
+        assert!(c.is_shortconv_layer(0) && c.is_recurrent_layer(0));
+        assert!(!paged_layer(&c, 0));
+        assert!(paged_layer(&c, 1));
+        assert!((0..c.n_layer)
+            .filter(|&l| c.is_recurrent_layer(l))
+            .all(|l| !paged_layer(&c, l)));
     }
 
     /// A prefix that ends inside a page must still be reused, not dropped: the tail rows are copied

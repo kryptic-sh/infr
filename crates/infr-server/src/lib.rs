@@ -671,7 +671,7 @@ impl std::fmt::Display for ParamError {
 impl std::error::Error for ParamError {}
 
 /// OpenAI's upper bound for `top_logprobs`.
-const MAX_TOP_LOGPROBS: usize = 20;
+pub const MAX_TOP_LOGPROBS: usize = 20;
 
 impl GenParams {
     /// Validate + normalise the request's sampling fields. Out-of-range values are a 400, NEVER a

@@ -466,6 +466,23 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **`strftime_now` in chat templates is formatted by the C library, and accepts
+  fewer conversions.** The date a template stamps (Llama 3.x and SmolLM3 write
+  `Today Date:` with it) now comes from the C library's local-time conversion
+  and `strftime`, as llama.cpp's does; the `chrono` crate, flagged unmaintained
+  by RUSTSEC-2026-0543, is no longer a dependency. Accepted: literal text, `%%`,
+  the C99 conversions
+  `%a %A %b %B %c %C %d %D %e %F %g %G %h %H %I %j %m %M %n %p %r %R %S %t %T %u %U %V %w %W %x %X %y %Y %z %Z`,
+  and `%-` (no padding) before a numeric one. Those render as before, in English
+  whatever the system locale, except `%Z`, which is now the zone's name as the C
+  library gives it (`PST`, or `Pacific Standard Time` on Windows) where it used
+  to be the UTC offset (`-08:00`); on Windows a localized zone name that is not
+  UTF-8 in the system's ANSI code page makes `%Z` a template error. No longer
+  accepted, and a template error as any unknown conversion already was: `%q`,
+  `%v`, `%k`, `%l`, `%P`, `%s`, `%+`, the fractional seconds (`%f`, `%.f`,
+  `%.3f`, `%3f` and the like), `%:z` and its longer forms, `%#z`, and the
+  padding flags `%_` and `%0`. A format longer than 1024 bytes is also a
+  template error. The error message now names the conversion at fault.
 - **An over-long prompt is a real `400` on a stream.** `infr serve` counts the
   prompt before it queues the request, so a streamed request whose prompt does
   not fit gets `400 context_length_exceeded` where it used to get a `200`
@@ -1412,6 +1429,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   on none, a list or a dict is refused as Python refuses it. `| format` with
   more or fewer positional arguments than conversions is refused, and `%.3s`
   cuts Python's `str()` of a bool or a container.
+
+### Security
+
+- Update `url` 2.5.8 → 2.5.9 for RUSTSEC-2026-0592 (a stack overflow, which
+  aborts the process, in `Url::origin()` on a deeply nested `blob:` URL).
+  Reached through `reqwest` and `tower-http`, the HTTP stack model downloads and
+  `infr serve` use.
 
 ## [0.3.0] - 2026-11-13
 

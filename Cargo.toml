@@ -91,8 +91,6 @@ clap_mangen = "0.3"
 # loads (`jinja2.ext.loopcontrols`) and real templates use (Kimi-K3, Cohere's command-r7b).
 minijinja = { version = "2", features = ["preserve_order", "fuel", "loop_controls"] }
 minijinja-contrib = { version = "2", features = ["pycompat"] }
-# `strftime_now` in HF chat templates (Llama-3.x stamps "Today Date:") — llama.cpp-minja parity.
-chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ash = "0.38"

@@ -60,8 +60,9 @@ static ENV_CACHE: LazyLock<Mutex<HashMap<String, SharedEnv>>> =
 pub(crate) const CHAT_TEMPLATE_FUEL: u64 = 100_000_000;
 
 /// Largest pad width or count a template may hand a native helper whose argument is parsed
-/// exactly (`tojson(indent=)`, the `indent` filter, `|batch` and `|slice`). Format strings have
-/// their own, looser bound: [`FORMAT_NUMBER_MAX`].
+/// exactly (`tojson(indent=)`, the `indent` filter, `|batch` and `|slice`), and the longest format
+/// `strftime_now` takes. `str.format` format strings have their own, looser bound:
+/// [`FORMAT_NUMBER_MAX`].
 ///
 /// [`CHAT_TEMPLATE_FUEL`] counts template INSTRUCTIONS; the work inside one native call is free to
 /// it. These helpers build `" ".repeat(width)` (per line, for the indenting ones) from a number the
@@ -150,20 +151,23 @@ fn build_env(template: &str) -> Result<minijinja::Environment<'static>, minijinj
     // `strftime_now(format)` — llama.cpp-minja parity: Llama-3.x templates stamp
     // `Today Date: {{ strftime_now("%d %b %Y") }}` (guarded by `is defined`, so defining it
     // switches those templates from their hardcoded fallback date to the real one).
-    // The format string is the template's: an unknown specifier makes chrono's `Display` fail, so
-    // it is written into a `String` and the failure surfaced as a template error.
+    // The format string is the template's, so it is untrusted: `strftime_local` accepts only the
+    // conversions every supported C library implements and reports anything else, which is
+    // surfaced here as a template error. Its length is bounded like the widths below: each
+    // conversion in it is a C library call and the template's `*` can build a format of any size
+    // in one instruction, which the fuel bound does not see.
     env.add_function(
         "strftime_now",
         |fmt: String| -> Result<String, minijinja::Error> {
-            use std::fmt::Write;
-            let mut out = String::new();
-            write!(out, "{}", chrono::Local::now().format(&fmt)).map_err(|_| {
-                minijinja::Error::new(
-                    minijinja::ErrorKind::InvalidOperation,
-                    format!("strftime_now: invalid format string {fmt:?}"),
-                )
-            })?;
-            Ok(out)
+            check_width("strftime_now format length", fmt.len())?;
+            infr_plat::localtime::strftime_local(&fmt, std::time::SystemTime::now()).map_err(
+                |err| {
+                    minijinja::Error::new(
+                        minijinja::ErrorKind::InvalidOperation,
+                        format!("strftime_now: invalid format string {fmt:?}: {err}"),
+                    )
+                },
+            )
         },
     );
     // `tojson` as the reference writes it (Python's `json.dumps` separators, no HTML escaping),
@@ -697,7 +701,8 @@ mod template_tests {
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 
-    /// `strftime_now` with a specifier chrono does not know is a template ERROR, not a panic: the
+    /// `strftime_now` with a specifier outside the accepted set is a template ERROR, not a panic or
+    /// an abort (Microsoft's C runtime terminates the process on one it is handed): the
     /// format string comes from the untrusted template, and a panic here aborts `infr run` on the
     /// first prompt and fails every `serve` request for that model.
     #[test]
@@ -712,6 +717,45 @@ mod template_tests {
         let year = render("{{ strftime_now('%Y') }}").unwrap();
         assert_eq!(year.len(), 4, "{year}");
         assert!(year.chars().all(|c| c.is_ascii_digit()), "{year}");
+    }
+
+    /// `strftime_now` formats the clock's current instant: its answer is the one `strftime_local`
+    /// gives for a `SystemTime::now()` read just before the render or just after it (both, so a
+    /// run that crosses a minute boundary still matches).
+    #[test]
+    fn strftime_now_reads_the_current_time() {
+        const FORMAT: &str = "%Y-%m-%d %H:%M";
+        let now = || infr_plat::localtime::strftime_local(FORMAT, std::time::SystemTime::now());
+        let before = now().unwrap();
+        let got = render(&format!("{{{{ strftime_now('{FORMAT}') }}}}")).unwrap();
+        let after = now().unwrap();
+        assert!(got == before || got == after, "{before} / {got} / {after}");
+    }
+
+    /// The format `strftime_now` takes is bounded in length: every conversion in it is a C library
+    /// call, and the template's own `*` builds one of any size in a single instruction.
+    #[test]
+    fn strftime_now_format_length_is_bounded() {
+        let at_limit = "%Y".repeat(TEMPLATE_WIDTH_MAX / 2);
+        assert_eq!(at_limit.len(), TEMPLATE_WIDTH_MAX);
+        let year = render("{{ strftime_now('%Y') }}").unwrap();
+        assert_eq!(
+            render(&format!("{{{{ strftime_now('{at_limit}') }}}}")).unwrap(),
+            year.repeat(TEMPLATE_WIDTH_MAX / 2)
+        );
+        for src in [
+            format!("{{{{ strftime_now('{at_limit}x') }}}}"),
+            // What a hostile template would write; small enough here to finish if unbounded.
+            "{{ strftime_now('%c' * 100000) }}".to_string(),
+        ] {
+            let err = render(&src).expect_err("an over-long format must fail");
+            assert_eq!(
+                err.kind(),
+                minijinja::ErrorKind::InvalidOperation,
+                "{err:#}"
+            );
+            assert!(err.to_string().contains("chat-template limit"), "{err:#}");
+        }
     }
 
     /// Every width a template can hand a native helper is bounded: each of these asks for a

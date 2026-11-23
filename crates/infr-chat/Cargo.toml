@@ -13,5 +13,5 @@ tokenizers.workspace = true
 minijinja.workspace = true
 minijinja-contrib.workspace = true
 serde_json.workspace = true
-chrono.workspace = true
 tracing.workspace = true
+infr-plat.workspace = true

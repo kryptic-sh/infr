@@ -3954,15 +3954,87 @@ unless marked:
   2026-11-12; llama.cpp reads `n_predict: -1` as "until the context is full".
   Recorded so the difference is a decision and not an accident.
 
-### B225 — `cargo deny` fails on RUSTSEC-2026-0543 (2026-11-21)
+### B232 — `strftime_local` reads `TZ` unsynchronised with `std::env::set_var` (2026-11-23)
 
-`chrono` is flagged unmaintained and is a direct dependency of `infr-chat`
-(`cargo tree -i chrono`); what uses it there was not read. `cargo deny check` is
-red on `main` at `9151fbd` and the weekly `cron.yml` job will report it.
-Options: replace `chrono` in `infr-chat` with a maintained crate or the standard
-library, if its use is small; or add the advisory to `deny.toml`'s `ignore` list
-with the reason, as the existing unmaintained entries are. A dependency
-decision, so not made here.
+**Tag:** plat · chat · soundness · **Kind:** open, needs a decision
+
+`infr_plat::localtime::strftime_local` (the chat templates' `strftime_now`)
+calls the C library's `localtime_r` on Unix. The C library takes the zone from
+the `TZ` environment variable, reading the process environment directly and not
+under `std`'s environment lock, so a `std::env::set_var` or `remove_var` on
+another thread during that read is a data race. Edition 2021 lets safe code call
+`set_var`, and `std`'s lock is private, so the function cannot enforce the
+condition; its doc comment states it as a limitation. This is the class of
+RUSTSEC-2020-0159, which `chrono` avoided by reading the zone files itself.
+
+When the read happens differs by C library, which decides both the width of the
+window and whether a later change to `TZ` is seen:
+
+- **glibc 2.44, run here** (a C program and a Rust one: `setenv` one zone,
+  `localtime_r` and `strftime`, `setenv` another, convert again): the second
+  zone is not seen, by `localtime_r` or by `strftime`, however many times they
+  are called. A `localtime` or `tzset` call takes the new value. So the zone is
+  read at the process's first local-time conversion and then fixed, and the
+  window is that first read, unless other code in the process calls `tzset` or
+  `localtime`. Nothing in `infr-plat` does; C libraries loaded into the process
+  were not checked.
+- **musl, run here** (the same Rust program built for
+  `x86_64-unknown-linux-musl`, statically linked): the second zone is seen by
+  the next `localtime_r`. Every call reads `TZ`, so every call is a window. Not
+  a target the project ships.
+- **Apple's libc: not checked.** The doc comment says to assume the musl-like
+  window.
+- **UCRT, from its source only** (`ucrt/time/tzset.cpp` in the Windows SDK):
+  `__tzset` initialises the zone once under the runtime's time lock and returns
+  early afterwards, reading `TZ` through `_wgetenv_s`. Not run, and how that
+  read interacts with a concurrent `std::env::set_var` was not checked.
+
+It is safe today only because the one `set_var` outside tests,
+`publish_thread_count` in `infr-cli`'s `main.rs`, runs in `main` before any
+other thread exists (found by a grep of the workspace's `.rs` files for
+`set_var` and `remove_var` on 2026-11-23; the others are in
+`infr-vulkan/tests/gpuav_support` and `infr-metal/tests/pcache.rs`, test
+binaries that do not render templates).
+
+What would close it, cheapest first:
+
+- Move the workspace to edition 2024, where `set_var` is `unsafe` and the
+  obligation sits on the writer, which is where it can be discharged. The
+  migration point is already marked at `publish_thread_count`.
+- Deliver the thread count to rayon without the environment (build the global
+  pool with `ThreadPoolBuilder::num_threads`), leaving no environment write in
+  production code at all, and guard that with a test over the sources as
+  `platform_seam.rs` guards manifests.
+- Stop calling the C library: resolve the local offset once at startup while
+  single-threaded and format from it, or read the zone data directly. This is a
+  date library's job, so it means a new dependency or a sizeable module.
+
+### B233 — `%Z` in `strftime_now` on Windows: failure modes read from source, never run (2026-11-23)
+
+**Tag:** plat · chat · windows · **Kind:** coverage gap, unverified on Windows
+
+`infr_plat::localtime::strftime_local` formats `%Z` through the UCRT's
+`strftime`, which writes the system's localized zone name and converts it from
+wide characters through the time locale's code page; the startup "C" locale sets
+that to `CP_ACP` (`ucrt/locale/nlsdata.cpp`, `ucrt/time/strftime.cpp`). Read
+from the SDK's source, not run on a Windows machine:
+
+- A zone name with non-ASCII characters, on a machine whose ANSI code page is
+  not UTF-8, comes back as bytes that are not UTF-8, which `strftime_local`
+  refuses as `StrftimeError::NotUtf8` so that no replacement character reaches a
+  prompt.
+- If the conversion back from wide characters fails, `_Strftime_l` returns 0.
+  `field_text` cannot tell that from a full buffer and reports
+  `StrftimeError::FieldTooLong`. When that conversion fails was not traced.
+
+Either way a chat template whose `strftime_now` format contains `%Z` fails to
+render on such a machine; formats without `%Z` are unaffected, and no cached
+template is known to use it (not surveyed). What is tested: `field_text` on
+Windows-1252 bytes, on any platform; CI's Windows leg runs `%Z` only under
+`TZ=XXX-5:30`, an ASCII name. To verify: run `strftime_now('%Z')` on a Windows
+machine with a non-English display language. If it matters, the fix is to take
+the name from the wide API (`wcsftime` or `GetTimeZoneInformation`) and convert
+it to UTF-8 in Rust.
 
 ### B138 — smaller infr-core findings (2026-11-11)
 
@@ -7510,22 +7582,22 @@ tasks).
 - **Date-stamped chat templates.** SmolLM3's template writes
   `Today Date: {{ strftime_now("%d %B %Y") }}` into its default system block,
   and `infr-chat`'s `strftime_now` (`template.rs`) formats
-  `chrono::Local::now()` with no way to fix the clock: no parameter, environment
-  variable or test hook. So `cpu_act_quant`'s chat prompts on SmolLM3 tokenize
-  differently every day, and its per-position KL after the date (positions 0 to
-  240 of those prompts are the shared system preamble that follows it) is
-  comparable only within one day: on 2026-11-18 the worst chat position was 229
-  at 0.33 (240 at 0.22); on 2026-11-19, on `origin/main` and the exact sparse
-  dot alike, 240 at 0.691 (229 at 0.027, the review's run). Nothing regressed.
-  Fix: a way to pin the date for tests and measurements (a render option or a
-  test-only clock in `infr-chat`), then use it in `cpu_act_quant`; not done
-  here, to add no production surface in a CPU slice. Goldens checked
-  (2026-11-19): `cpu_golden_smollm3` renders through `smollm3_render`, whose
-  `/system_override` system message replaces the dated block, and asserts the
-  render has no `Today Date`; of the cached GGUFs the CPU goldens use (Qwen3,
-  Qwen3.5, gemma-3-1b, ERNIE, LFM3, Qwen3-30B-A3B, ERNIE-21B), only SmolLM3's
-  template contains `strftime_now`. gemma-4-E2B's template was not checked (not
-  cached here; its golden skips).
+  `std::time::SystemTime::now()` through `infr_plat::localtime::strftime_local`
+  with no way to fix the clock: no parameter, environment variable or test hook.
+  So `cpu_act_quant`'s chat prompts on SmolLM3 tokenize differently every day,
+  and its per-position KL after the date (positions 0 to 240 of those prompts
+  are the shared system preamble that follows it) is comparable only within one
+  day: on 2026-11-18 the worst chat position was 229 at 0.33 (240 at 0.22); on
+  2026-11-19, on `origin/main` and the exact sparse dot alike, 240 at 0.691 (229
+  at 0.027, the review's run). Nothing regressed. Fix: a way to pin the date for
+  tests and measurements (a render option or a test-only clock in `infr-chat`),
+  then use it in `cpu_act_quant`; not done here, to add no production surface in
+  a CPU slice. Goldens checked (2026-11-19): `cpu_golden_smollm3` renders
+  through `smollm3_render`, whose `/system_override` system message replaces the
+  dated block, and asserts the render has no `Today Date`; of the cached GGUFs
+  the CPU goldens use (Qwen3, Qwen3.5, gemma-3-1b, ERNIE, LFM3, Qwen3-30B-A3B,
+  ERNIE-21B), only SmolLM3's template contains `strftime_now`. gemma-4-E2B's
+  template was not checked (not cached here; its golden skips).
 - **The binary's file.** In the 2026-11-19 rounds (`docs/cpu-activations.md`,
   "Speed with the exact sparse dot") a copy of the native binary ran 1.22% ahead
   of the original in 12 of 12 Qwen3-1.7B prefill rounds although the order was

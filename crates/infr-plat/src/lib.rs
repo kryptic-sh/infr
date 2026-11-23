@@ -25,12 +25,15 @@
 //!   unclamped figure inside a container is an OOM kill.
 //! - [`lock::FileLock`] is advisory on Unix and mandatory on Windows. It promises the weaker of
 //!   the two.
+//! - [`localtime::strftime_local`] writes `%Z` as the C library names the zone, which is not the
+//!   same string on every platform.
 //! - [`proc::pid_alive`] answers `true` on a platform with no probe — losing a tripwire rather
 //!   than misreporting a live process as dead.
 
 pub mod cpu;
 pub mod fileio;
 pub mod link;
+pub mod localtime;
 pub mod lock;
 pub mod mem;
 pub mod paths;

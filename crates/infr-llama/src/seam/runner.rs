@@ -80,7 +80,10 @@ fn qwen35_gguf_tensor_name<'a>(g: &dyn WeightSource, c: &Config, name: &'a str) 
     {
         return name;
     }
-    let Some(legacy) = name.strip_suffix(".bias").filter(|name| name.ends_with(".ssm_dt")) else {
+    let Some(legacy) = name
+        .strip_suffix(".bias")
+        .filter(|name| name.ends_with(".ssm_dt"))
+    else {
         return name;
     };
     if g.tensors().iter().any(|tensor| tensor.name == legacy) {
@@ -936,7 +939,9 @@ pub(crate) fn generate_dense_backend_bound(
                         }
                     }
                     let source_name = qwen35_gguf_tensor_name(g, c, name);
-                    Ok(g.tensor_bytes(source_name).map_err(|e| anyhow!("{e}"))?.to_vec())
+                    Ok(g.tensor_bytes(source_name)
+                        .map_err(|e| anyhow!("{e}"))?
+                        .to_vec())
                 };
                 // The same tensor as `own_bytes`, but a GGUF keeps its zero-copy mmap view: the
                 // CPU paged store and `PageReleaser` need the file range a view carries, and a
@@ -950,10 +955,13 @@ pub(crate) fn generate_dense_backend_bound(
                     let source_name = qwen35_gguf_tensor_name(g, c, name);
                     match g.as_any().downcast_ref::<infr_gguf::Gguf>() {
                         Some(gg) => Ok(WBytes::Mmap(
-                            gg.tensor_bytes_arc(source_name).map_err(|e| anyhow!("{e}"))?,
+                            gg.tensor_bytes_arc(source_name)
+                                .map_err(|e| anyhow!("{e}"))?,
                         )),
                         None => Ok(WBytes::Owned(
-                            g.tensor_bytes(source_name).map_err(|e| anyhow!("{e}"))?.to_vec(),
+                            g.tensor_bytes(source_name)
+                                .map_err(|e| anyhow!("{e}"))?
+                                .to_vec(),
                         )),
                     }
                 };
@@ -1923,6 +1931,9 @@ pub(crate) fn generate_dense_backend_bound(
     // GPU-sampling ops bake the sampler config into the graph.
     let sampler = crate::sampling::Sampler::resolve(req, &ec.sampling);
     let mut rng = crate::sampling::resolve_seed(req, &ec.sampling);
+    // OpenAI `logprobs`: the row must stay on the host after sampling, so both GPU sampling
+    // shortcuts below are off for this request.
+    let logprobs = req.and_then(|r| r.sampling().logprobs);
     // Repetition penalties and `logit_bias` (`infr serve`'s presence/frequency/repeat and
     // logit_bias request fields). `None` for every non-serve caller AND for any request that leaves
     // them at their neutral defaults — see `Penalties::resolve`. When active they must MUTATE the
@@ -1937,6 +1948,7 @@ pub(crate) fn generate_dense_backend_bound(
     let gpu_argmax = (sampler.temp <= 0.0 || sampler.top_k == 1)
         && constraint.is_none()
         && !penalize
+        && logprobs.is_none()
         && ec.spec.gpu_argmax;
     // GPU-resident stochastic sampling (`Op::Sample`): temperature + top-k + top-p ON the device,
     // inverse-CDF'd with a host-drawn uniform uploaded as 4 bytes/token — the host consumes the
@@ -1951,6 +1963,7 @@ pub(crate) fn generate_dense_backend_bound(
         && sampler.min_p <= 0.0
         && constraint.is_none()
         && !penalize
+        && logprobs.is_none()
         && caps.gpu_sample
         && ec.spec.gpu_sample;
 
@@ -6788,6 +6801,11 @@ pub(crate) fn generate_dense_backend_bound(
                 decode_t += step_t0.elapsed();
                 decode_n += 1;
                 if !is_eos {
+                    if let (Some(top_n), Some(req)) = (logprobs, req) {
+                        req.push_logprob(crate::sampling::token_logprob(
+                            &logits, sampler, next, top_n,
+                        ));
+                    }
                     on_token(next); // stream the token (EOS is not emitted)
                 }
                 // `on_token` -> the server's stop-sequence matcher may have latched an abort (a stop

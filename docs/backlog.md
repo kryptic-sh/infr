@@ -6381,21 +6381,27 @@ shader bodies.
   or keep the OpenAI reading for presence/frequency and seed only the repeat
   window from the prompt. Fix the doc either way.
 - **What is left of `logit_bias`, `min_p`, `logprobs` and `n`.** `infr serve`
-  now applies `logit_bias` (in `Penalties::apply`, ahead of the penalties) and
-  `min_p` (in `truncated_softmax`) on the dense seam decode loop, and answers
-  `n > 1`, `logprobs: true` and `top_logprobs > 0` with a 400. Still open:
-  DiffusionGemma's denoise sampler and `SpecMetalChat` apply neither, and now
-  refuse a request carrying either (`refuse_seam_only_fields`, a 400) — applying
-  them there is separate work, and both still ignore the penalties without a
-  word; the parked MTP paths read only the process sampler; `infr run` has no
-  `--min-p`, which needs a `sampling.min_p` config key, its env and manifest
-  entries and the flag, and the GGUF's `general.sampling.min_p` is still ignored
-  (see `unapplied_sampling_keys`). Returning several choices or log
-  probabilities is feature work nobody has asked for. `sample_from_dist` (MTP's
-  draw over `truncated_dist`, id order when `top_p` is 1) keeps the zero-draw
-  shape `sample_logits` was fixed for: a uniform of exactly 0 takes the lowest
-  id with any mass. `top_k` is still typed `Option<i64>`, so `"top_k": 40.0` or
-  a string is a body-parse 400 that names no parameter, where `n` and
+  applies `logit_bias` (in `Penalties::apply`, ahead of the penalties) and
+  `min_p` (in `truncated_softmax`) on the dense seam decode loop, returns
+  OpenAI log probabilities (the chosen token plus `top_logprobs` alternatives
+  from the full temperature-scaled softmax, streaming and non-streaming, on chat
+  and completions), and answers `n > 1` with a 400. Still open: DiffusionGemma's denoise sampler and `SpecMetalChat`
+  apply neither `logit_bias` nor `min_p` and refuse a request carrying them
+  (`refuse_seam_only_fields`, a 400) — applying them there is separate work, and
+  both still ignore the penalties without a word; the parked MTP paths read only
+  the process sampler; `infr run` has no `--min-p`, which needs a
+  `sampling.min_p` config key, its env and manifest entries and the flag, and
+  the GGUF's `general.sampling.min_p` is still ignored (see
+  `unapplied_sampling_keys`). Logprob gaps: a grammar-forced tool-call span has
+  no entries, streaming attaches a piece's entries to the first delta that
+  splitter emits for it (a `</think>` boundary can merge reasoning and content
+  tokens into one chunk), and a byte-fallback token that only completes in
+  context decodes to a replacement character in `token`/`bytes`. Returning
+  several choices is still open. `sample_from_dist` (MTP's draw over
+  `truncated_dist`, id order when `top_p` is 1) keeps the zero-draw shape
+  `sample_logits` was fixed for: a uniform of exactly 0 takes the lowest id with
+  any mass. `top_k` is still typed `Option<i64>`, so `"top_k": 40.0` or a
+  string is a body-parse 400 that names no parameter, where `n` and
   `top_logprobs` now name theirs. The `SpecMetalChat` refusal compiles only on
   macOS and has not been built or run. B137 records `response_format`, still
   accepted and ignored.

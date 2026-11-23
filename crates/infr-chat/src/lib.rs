@@ -11,6 +11,7 @@
 //!   `<|tool_call>` blocks).
 
 mod generation;
+mod logprob;
 mod pyformat;
 mod pystr;
 mod pyvalue;
@@ -19,6 +20,7 @@ mod template;
 mod tojson;
 mod tools;
 
+pub use logprob::{TokenLogprob, TokenLogprobAlt};
 pub use stream::{prompt_prefills_think, ChatStream, Delta};
 pub use template::{
     render_chat_jinja, render_chat_oai, render_chat_user, render_template, TemplateError,

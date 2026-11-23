@@ -8,6 +8,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Breaking
 
+- **OpenAI `logprobs` support changes three public traits.**
+  `infr_server::ChatGenerator` gains `supports_logprobs` (default `false`) and
+  `complete_with_logprobs` (default refuses a request that asked for them);
+  `infr_engine::Delta` gains a `Logprob(TokenLogprob)` variant, so an exhaustive
+  match must handle it; `infr_llama::sampling::RequestSampling` gains `logprobs`,
+  and `infr_llama::chat::ChatModel` gains `supports_logprobs` (default `false`).
+  `ChatRequest` / `GenParams` now accept `logprobs` and `top_logprobs` (`0..=20`,
+  default 20 when `logprobs` is true), where `logprobs: true` used to be a `400`.
+
 - **Host paging API.** `infr_cpu::paged::plan_pools` takes the model's weights
   as `Pageable`s (size and read pattern, an expert bank's with its layer)
   instead of `TensorInfo`s; `PoolPlan` gains a public `experts` field, so struct
@@ -41,6 +50,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `GenParams::from_request`.
 
 ### Added
+
+- **`infr serve` returns OpenAI log probabilities.** `/v1/chat/completions` and
+  `/v1/completions` accept `logprobs` and `top_logprobs` and return the chosen
+  token's log probability plus its most likely alternatives, in the OpenAI chat
+  shape and in the completions shape llama.cpp's server emits. Streaming chunks
+  carry the same `logprobs` object as the text delta they belong to. The
+  probabilities are the model's full temperature-scaled softmax, not
+  renormalized over the top-k/top-p nucleus, so a merely-most-likely token does
+  not report `0.0`; a logprobs request keeps the logits row on the host, so GPU
+  sampling and MTP are off for that request. Supported on the dense seam
+  (Vulkan, CPU, reference Metal); diffusion and speculative-Metal answer `400`.
+  The EOS token is not included, and a grammar-forced tool-call span produces no
+  entries because the model did not sample it.
 
 - **`kernels.cpu.max_tier` (`INFR_CPU_MAX_TIER`): a ceiling on the CPU's SIMD
   tier**, `scalar`, `avx2`, `avx512` or `avx512vnni`. Every run-time dispatch in

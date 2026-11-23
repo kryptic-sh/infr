@@ -35,6 +35,11 @@ impl ChatModel for CpuDenseChat {
         &self.model
     }
 
+    fn supports_logprobs(&self) -> bool {
+        // The qwen4_exp CPU forward has its own decode loop and no logprob tap.
+        self.model.config().qwen4_exp.is_none()
+    }
+
     fn generate(
         &mut self,
         prompt: &str,

@@ -459,7 +459,10 @@ fn qwen35_kv_heads(
         return positive_model_dimension(key, value);
     };
     if values.len() != n_layer_all {
-        bail!("{key} has {} entries; block_count is {n_layer_all}", values.len());
+        bail!(
+            "{key} has {} entries; block_count is {n_layer_all}",
+            values.len()
+        );
     }
 
     let mut full_attention_heads = None;

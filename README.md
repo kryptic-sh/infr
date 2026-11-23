@@ -264,9 +264,13 @@ a per-request OpenAI `temperature`/`top_p` still overrides them. See
 [Configuration](#configuration).
 
 Per-request sampling fields: `temperature`, `top_p`, `top_k`, `min_p`, `seed`,
-`presence_penalty`, `frequency_penalty`, `repeat_penalty`, `logit_bias`, `stop`
-and `max_tokens` / `max_completion_tokens`. `n` above 1, `logprobs` and
-`top_logprobs` are not supported and answer `400`.
+`presence_penalty`, `frequency_penalty`, `repeat_penalty`, `logit_bias`, `stop`,
+`max_tokens` / `max_completion_tokens`, and `logprobs` / `top_logprobs`. `n` above 1
+is not supported and answers `400`. Log probabilities are returned by the dense seam
+(Vulkan, CPU, reference Metal) on `/v1/chat/completions` and `/v1/completions`, in
+the OpenAI shapes, streaming and non-streaming; `top_logprobs` defaults to 20 when
+`logprobs` is true, as in llama.cpp. A backend with its own decode loop (diffusion,
+speculative Metal) answers `400` for `logprobs` instead of omitting the data.
 
 ## Performance
 

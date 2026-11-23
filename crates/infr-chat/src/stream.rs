@@ -18,7 +18,13 @@ pub fn prompt_prefills_think(prompt: &str) -> bool {
 pub enum Delta {
     Reasoning(String),
     Content(String),
-    ToolCall { name: String, arguments: String },
+    ToolCall {
+        name: String,
+        arguments: String,
+    },
+    /// One sampled token's log probability. Emitted before the text delta it belongs to, so a
+    /// streaming server can attach it to the chunk that carries that text.
+    Logprob(crate::TokenLogprob),
 }
 
 /// Incremental splitter for the streaming server path. Accumulates the raw decoded text and, on each
@@ -50,6 +56,16 @@ pub struct ChatStream {
     cur_pipe: Cursor,  // gemma4/E2B/DG `<|tool_call>`
     cur_final: Cursor, // channel-format `<channel|>`
     bare: BareJson,
+    /// Token log probabilities waiting for the byte range of `raw` they cover to be emitted.
+    logprobs: Vec<TokenSpan>,
+}
+
+/// One sampled token's bytes inside [`ChatStream::raw`], with its log probability.
+#[derive(Clone, Debug)]
+struct TokenSpan {
+    start: usize,
+    end: usize,
+    lp: crate::TokenLogprob,
 }
 
 /// Incremental scan for a bare-JSON tool call at the head of a content region: skips leading
@@ -200,7 +216,44 @@ impl ChatStream {
             cur_pipe: Cursor::default(),
             cur_final: Cursor::default(),
             bare: BareJson::default(),
+            logprobs: Vec::new(),
         }
+    }
+
+    /// [`push`](Self::push) with the sampled tokens' log probabilities. Each entry is tagged with
+    /// the byte range of `piece` its token's bytes cover, so `emit` can attach it to the text delta
+    /// that actually carries those bytes. A delta never splits a tagged token: the splitter backs
+    /// its safe end up to the last token boundary, so a chunk's `content` and `logprobs.content`
+    /// describe the same tokens.
+    pub fn push_with_logprobs(
+        &mut self,
+        piece: &str,
+        logprobs: &mut Vec<crate::TokenLogprob>,
+        on_delta: &mut dyn FnMut(Delta),
+    ) {
+        let start = self.raw.len();
+        self.raw.push_str(piece);
+        // A token belongs to this piece only while its bytes still fit: `piece` is the text the
+        // stop matcher released, and the rest of the pending entries wait for the next release.
+        // Byte lengths are exact for the byte-level and byte-fallback vocabularies; a decoder that
+        // changes a token's bytes in context leaves its entry tagged with the whole piece.
+        let piece_end = start + piece.len();
+        let mut at = start;
+        let mut take = 0;
+        for lp in logprobs.iter() {
+            if at + lp.bytes.len() > piece_end {
+                break;
+            }
+            at += lp.bytes.len();
+            take += 1;
+        }
+        let mut at = start;
+        for lp in logprobs.drain(..take) {
+            let end = at + lp.bytes.len();
+            self.logprobs.push(TokenSpan { start: at, end, lp });
+            at = end;
+        }
+        self.emit(false, on_delta);
     }
 
     pub fn push(&mut self, piece: &str, on_delta: &mut dyn FnMut(Delta)) {
@@ -213,6 +266,11 @@ impl ChatStream {
     /// when it holds none.
     pub fn finish(&mut self, on_delta: &mut dyn FnMut(Delta)) {
         self.emit(true, on_delta);
+        // Tokens whose text never became part of a delta (a parsed-away call, a special token)
+        // still get their entry; the server attaches these to the finish chunk.
+        for span in self.logprobs.drain(..) {
+            on_delta(Delta::Logprob(span.lp));
+        }
     }
 
     /// The earliest tool-call opener at/after `cs`, across every dialect `finish()` parses — Hermes
@@ -248,6 +306,17 @@ impl ChatStream {
     }
 
     fn emit(&mut self, final_flush: bool, on_delta: &mut dyn FnMut(Delta)) {
+        let mut logprobs = std::mem::take(&mut self.logprobs);
+        self.emit_with(final_flush, on_delta, &mut logprobs);
+        self.logprobs = logprobs;
+    }
+
+    fn emit_with(
+        &mut self,
+        final_flush: bool,
+        on_delta: &mut dyn FnMut(Delta),
+        logprobs: &mut Vec<TokenSpan>,
+    ) {
         const TO: &str = "<think>";
         const TC: &str = "</think>";
         // Channel-format head (E2B/gpt-oss: `<|channel>thought…<channel|>answer`): reasoning runs
@@ -259,9 +328,18 @@ impl ChatStream {
                 Some(f) => (f, false, Some(f + FINAL.len())),
                 None => (self.raw.len(), !final_flush, None),
             };
-            emit_region(&self.raw, hm, r_end, hold, &mut self.sent_r, true, on_delta);
+            emit_region(
+                &self.raw,
+                hm,
+                r_end,
+                hold,
+                &mut self.sent_r,
+                true,
+                on_delta,
+                logprobs,
+            );
             if let Some(cs) = c_start {
-                self.emit_content(cs, final_flush, on_delta);
+                self.emit_content(cs, final_flush, on_delta, logprobs);
             }
             return;
         }
@@ -306,13 +384,21 @@ impl ChatStream {
                 &mut self.sent_lead,
                 false,
                 on_delta,
+                logprobs,
             );
             note_shown(&mut self.shown_gap, &self.raw[from..self.sent_lead]);
             // The lead-in ends at `<think>`, so a stretch held at an opener in it is complete the
             // moment the opener arrives: settle it now, ahead of the reasoning that follows it.
             // Content follows after the reasoning, so its end is not the reply's.
             if unsent && stop < end {
-                settle_held(&self.raw[stop..end], &mut self.shown_gap, false, on_delta);
+                settle_held(
+                    &self.raw[stop..end],
+                    &mut self.shown_gap,
+                    false,
+                    on_delta,
+                    logprobs,
+                    stop,
+                );
                 self.sent_lead = end;
             }
         }
@@ -323,7 +409,16 @@ impl ChatStream {
                 Some(tc) => (tc, false),
                 None => (self.raw.len(), !final_flush),
             };
-            emit_region(&self.raw, rs, r_end, hold, &mut self.sent_r, true, on_delta);
+            emit_region(
+                &self.raw,
+                rs,
+                r_end,
+                hold,
+                &mut self.sent_r,
+                true,
+                on_delta,
+                logprobs,
+            );
         }
         // Content region: after `</think>` (or from the start when there's no `<think>` at all), up to
         // a tool-call opener (whose block is buffered, not streamed) or the end.
@@ -333,13 +428,19 @@ impl ChatStream {
             None => None,
         };
         if let Some(cs) = c_start {
-            self.emit_content(cs, final_flush, on_delta);
+            self.emit_content(cs, final_flush, on_delta, logprobs);
         }
     }
 
     /// Stream the content region starting at `cs` up to its first tool-call opener. On the final
     /// flush the stretch from that opener on is settled ([`settle_held`]).
-    fn emit_content(&mut self, cs: usize, final_flush: bool, on_delta: &mut dyn FnMut(Delta)) {
+    fn emit_content(
+        &mut self,
+        cs: usize,
+        final_flush: bool,
+        on_delta: &mut dyn FnMut(Delta),
+        logprobs: &mut Vec<TokenSpan>,
+    ) {
         let tool_open = self.tool_open_at(cs, final_flush).filter(|&t| t >= cs);
         let (c_end, hold) = match tool_open {
             Some(t) => (t, false),
@@ -354,10 +455,18 @@ impl ChatStream {
             &mut self.sent_c,
             false,
             on_delta,
+            logprobs,
         );
         note_shown(&mut self.shown_gap, &self.raw[from..cs + self.sent_c]);
         if let (true, Some(t)) = (final_flush, tool_open) {
-            settle_held(&self.raw[t..], &mut self.shown_gap, true, on_delta);
+            settle_held(
+                &self.raw[t..],
+                &mut self.shown_gap,
+                true,
+                on_delta,
+                logprobs,
+                t,
+            );
         }
     }
 }
@@ -379,7 +488,24 @@ fn settle_held(
     shown_gap: &mut Option<String>,
     at_end: bool,
     on_delta: &mut dyn FnMut(Delta),
+    logprobs: &mut Vec<TokenSpan>,
+    base: usize,
 ) {
+    // A held stretch is usually a tool call: its tokens were sampled, so report them ahead of the
+    // parsed deltas. The text may be edited around a removed call, so byte-level pairing is not
+    // preserved here; the entries stay in generation order.
+    if !logprobs.is_empty() {
+        let end = base + held.len();
+        let mut keep = Vec::with_capacity(logprobs.len());
+        for span in logprobs.drain(..) {
+            if span.start >= base && span.start < end {
+                on_delta(Delta::Logprob(span.lp));
+            } else {
+                keep.push(span);
+            }
+        }
+        *logprobs = keep;
+    }
     let mut fired = Vec::new();
     let spans = reasoning_spans(held);
     // Only the stretch's last text span can end the reply; an earlier one is followed by more.
@@ -510,6 +636,7 @@ fn channel_thought_head(raw: &str) -> Option<usize> {
 /// Emit the not-yet-sent slice of `raw[region_start .. region_end]` (past `*sent` bytes), holding back
 /// a marker-length tail when `hold` (so a partial marker isn't emitted mid-stream), clamped to a UTF-8
 /// boundary. Advances `*sent`.
+#[allow(clippy::too_many_arguments)]
 fn emit_region(
     raw: &str,
     region_start: usize,
@@ -518,6 +645,7 @@ fn emit_region(
     sent: &mut usize,
     reasoning: bool,
     on_delta: &mut dyn FnMut(Delta),
+    logprobs: &mut Vec<TokenSpan>,
 ) {
     const HOLD: usize = 12; // > the longest marker, so a partial one never streams
     let abs = region_start + *sent;
@@ -529,11 +657,35 @@ fn emit_region(
     } else {
         region_end
     };
+    // Never split a token across two deltas: back the cut up to the last token boundary. When no
+    // boundary fits (the whole token is inside the held tail), hold its text until the next push.
+    if !(!hold && end == region_end) && logprobs.iter().any(|s| s.start >= abs && s.end > end) {
+        match logprobs
+            .iter()
+            .filter(|s| s.end > abs && s.end <= end)
+            .map(|s| s.end)
+            .max()
+        {
+            Some(boundary) => end = boundary,
+            None => return,
+        }
+    }
     while end > abs && !raw.is_char_boundary(end) {
         end -= 1;
     }
     if end <= abs {
         return;
+    }
+    if !logprobs.is_empty() {
+        let mut keep = Vec::with_capacity(logprobs.len());
+        for span in logprobs.drain(..) {
+            if span.start >= abs && span.start < end {
+                on_delta(Delta::Logprob(span.lp));
+            } else {
+                keep.push(span);
+            }
+        }
+        *logprobs = keep;
     }
     let text = &raw[abs..end];
     if text.is_empty() {
@@ -568,9 +720,52 @@ mod chat_stream_tests {
                 Delta::Reasoning(x) => r.push_str(x),
                 Delta::Content(x) => c.push_str(x),
                 Delta::ToolCall { name, arguments } => t.push((name.clone(), arguments.clone())),
+                Delta::Logprob(_) => {}
             }
         }
         (r, c, t)
+    }
+
+    #[test]
+    fn logprobs_ride_the_token_aligned_content_chunks() {
+        fn lp(c: char) -> crate::TokenLogprob {
+            crate::TokenLogprob {
+                token: c as u32,
+                text: c.to_string(),
+                bytes: c.to_string().into_bytes(),
+                logprob: -0.5,
+                top: Vec::new(),
+            }
+        }
+        let mut out: Vec<Delta> = Vec::new();
+        let mut s = ChatStream::new(false);
+        for c in "abcdefghijklmnop".chars() {
+            let mut one = vec![lp(c)];
+            s.push_with_logprobs(&c.to_string(), &mut one, &mut |d| out.push(d));
+        }
+        s.finish(&mut |d| out.push(d));
+
+        let mut queued: Vec<String> = Vec::new();
+        let mut content = String::new();
+        for d in out {
+            match d {
+                Delta::Logprob(lp) => queued.push(lp.text),
+                Delta::Content(text) => {
+                    assert_eq!(
+                        queued.len(),
+                        text.chars().count(),
+                        "chunk {text:?} has {queued:?}"
+                    );
+                    for (lp, c) in queued.drain(..).zip(text.chars()) {
+                        assert_eq!(lp, c.to_string());
+                    }
+                    content.push_str(&text);
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        assert_eq!(content, "abcdefghijklmnop");
+        assert!(queued.is_empty());
     }
 
     #[test]

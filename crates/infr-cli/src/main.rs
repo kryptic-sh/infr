@@ -1263,6 +1263,7 @@ impl ThinkRender {
                 print!("{t}");
             }
             infr_engine::Delta::ToolCall { .. } => {}
+            infr_engine::Delta::Logprob(_) => {}
         }
     }
 }
@@ -1986,6 +1987,11 @@ trait GenBackend: Send + Sync {
     /// nonsense, so a served reply is worth one `fstat`.
     fn weights(&self) -> &infr_llama::WeightWatch;
 
+    /// One token's decoded text and exact bytes, for `logprobs`. `None` leaves the entry empty.
+    fn token_text(&self, _id: u32) -> Option<(String, Vec<u8>)> {
+        None
+    }
+
     /// The reply budget for a request that names none: `sampling.max_new` (`INFR_MAX_NEW`,
     /// default 2048) off the config this backend's renderer was opened with. A trait method
     /// rather than a free function because the config is per-backend state — and the default
@@ -2019,6 +2025,10 @@ impl GenBackend for SeamGenerator {
 
     fn weights(&self) -> &infr_llama::WeightWatch {
         &self.watch
+    }
+
+    fn token_text(&self, id: u32) -> Option<(String, Vec<u8>)> {
+        self.renderer.token_text(id)
     }
 
     fn request_ctx(
@@ -2077,6 +2087,10 @@ impl GenBackend for ParallelGenerator {
         &self.watch
     }
 
+    fn token_text(&self, id: u32) -> Option<(String, Vec<u8>)> {
+        self.renderer.token_text(id)
+    }
+
     fn request_ctx(
         &self,
         sampling: infr_llama::sampling::RequestSampling,
@@ -2111,6 +2125,7 @@ fn request_sampling(p: &infr_server::GenParams) -> infr_llama::sampling::Request
         repeat_penalty: p.repeat_penalty.unwrap_or(1.0),
         min_p: p.min_p,
         logit_bias: p.logit_bias.clone(),
+        logprobs: p.logprobs.then_some(p.top_logprobs),
         ..Default::default()
     }
 }
@@ -2129,6 +2144,10 @@ impl infr_server::ChatGenerator for SeamGenerator {
 
     fn vocab_size(&self) -> usize {
         self.vocab
+    }
+
+    fn supports_logprobs(&self) -> bool {
+        lock_recovered(&self.model).supports_logprobs()
     }
 
     fn chat(
@@ -2150,7 +2169,18 @@ impl infr_server::ChatGenerator for SeamGenerator {
         cancel: &Arc<std::sync::atomic::AtomicBool>,
         on_text: &mut dyn FnMut(&str),
     ) -> anyhow::Result<infr_server::ChatOutcome> {
-        run_completion(self, prompt, params, cancel, on_text)
+        run_completion(self, prompt, params, cancel, on_text, None)
+    }
+
+    fn complete_with_logprobs(
+        &self,
+        prompt: &str,
+        params: &infr_server::GenParams,
+        cancel: &Arc<std::sync::atomic::AtomicBool>,
+        on_text: &mut dyn FnMut(&str),
+        on_logprob: &mut dyn FnMut(infr_engine::TokenLogprob),
+    ) -> anyhow::Result<infr_server::ChatOutcome> {
+        run_completion(self, prompt, params, cancel, on_text, Some(on_logprob))
     }
 }
 
@@ -2178,6 +2208,10 @@ impl infr_server::ChatGenerator for ParallelGenerator {
         self.vocab
     }
 
+    fn supports_logprobs(&self) -> bool {
+        true
+    }
+
     fn chat(
         &self,
         messages: &[infr_engine::ChatMessage],
@@ -2197,7 +2231,18 @@ impl infr_server::ChatGenerator for ParallelGenerator {
         cancel: &Arc<std::sync::atomic::AtomicBool>,
         on_text: &mut dyn FnMut(&str),
     ) -> anyhow::Result<infr_server::ChatOutcome> {
-        run_completion(self, prompt, params, cancel, on_text)
+        run_completion(self, prompt, params, cancel, on_text, None)
+    }
+
+    fn complete_with_logprobs(
+        &self,
+        prompt: &str,
+        params: &infr_server::GenParams,
+        cancel: &Arc<std::sync::atomic::AtomicBool>,
+        on_text: &mut dyn FnMut(&str),
+        on_logprob: &mut dyn FnMut(infr_engine::TokenLogprob),
+    ) -> anyhow::Result<infr_server::ChatOutcome> {
+        run_completion(self, prompt, params, cancel, on_text, Some(on_logprob))
     }
 }
 
@@ -2209,6 +2254,7 @@ fn run_completion(
     params: &infr_server::GenParams,
     cancel: &Arc<std::sync::atomic::AtomicBool>,
     on_text: &mut dyn FnMut(&str),
+    mut on_logprob: Option<&mut dyn FnMut(infr_engine::TokenLogprob)>,
 ) -> anyhow::Result<infr_server::ChatOutcome> {
     be.weights().check()?;
     let prompt = be.renderer().with_bos(prompt);
@@ -2221,14 +2267,25 @@ fn run_completion(
         .with_cancel(cancel.clone());
     let mut stops = infr_server::StopMatcher::new(params.stop.clone());
     let stats = be.generate(&prompt, max_new, None, &req, &mut |piece: &str| {
+        if let Some(cb) = on_logprob.as_mut() {
+            for lp in req.take_logprobs() {
+                cb(resolve_logprob(be, lp));
+            }
+        }
         let safe = stops.push(piece);
         if !safe.is_empty() {
             on_text(&safe);
         }
         if stops.hit() {
+            let _ = req.take_logprobs();
             req.abort();
         }
     })?;
+    if let Some(cb) = on_logprob.as_mut() {
+        for lp in req.take_logprobs() {
+            cb(resolve_logprob(be, lp));
+        }
+    }
     let tail = stops.flush();
     if !tail.is_empty() {
         on_text(&tail);
@@ -2267,6 +2324,48 @@ fn forced_tool_call(body: &str) -> Option<(String, String)> {
         .cloned()
         .unwrap_or(serde_json::json!({}));
     Some((name, serde_json::to_string(&arguments).ok()?))
+}
+
+/// Resolve every token id the decode loop has queued since the last text callback into the
+/// tokenizer-dependent fields (`token`, `bytes`) and append them to `pending`. The ids are queued
+/// before the text callback, so this runs at the start of the callback and the entries wait for
+/// the piece they belong to.
+fn collect_logprobs(
+    be: &dyn GenBackend,
+    req: &infr_llama::sampling::RequestCtx,
+    pending: &mut Vec<infr_engine::TokenLogprob>,
+) {
+    for lp in req.take_logprobs() {
+        pending.push(resolve_logprob(be, lp));
+    }
+}
+
+/// Emit every queued logprob ahead of the text delta it belongs to.
+fn flush_logprobs(
+    pending: &mut Vec<infr_engine::TokenLogprob>,
+    on_delta: &mut dyn FnMut(infr_engine::Delta),
+) {
+    for lp in pending.drain(..) {
+        on_delta(infr_engine::Delta::Logprob(lp));
+    }
+}
+
+/// Fill one token's `text`/`bytes` (and its alternatives') from the backend's tokenizer.
+fn resolve_logprob(
+    be: &dyn GenBackend,
+    mut lp: infr_engine::TokenLogprob,
+) -> infr_engine::TokenLogprob {
+    if let Some((text, bytes)) = be.token_text(lp.token) {
+        lp.text = text;
+        lp.bytes = bytes;
+    }
+    for alt in &mut lp.top {
+        if let Some((text, bytes)) = be.token_text(alt.token) {
+            alt.text = text;
+            alt.bytes = bytes;
+        }
+    }
+    lp
 }
 
 /// The OpenAI chat body, shared by every serve backend: render the conversation through the model's
@@ -2353,6 +2452,8 @@ fn run_chat(
         // matcher and the latch are both per-call locals, so N concurrent requests each stop on
         // their OWN stop strings and nobody else's.
         let mut stops = infr_server::StopMatcher::new(params.stop.clone());
+        // Log probabilities whose text the stop matcher has not released yet.
+        let mut pending_logprobs: Vec<infr_engine::TokenLogprob> = Vec::new();
         let stats = {
             let od = &mut *on_delta;
             // Template-prefilled thinking (the PROMPT ends with the `<think>` opener): inject a
@@ -2364,12 +2465,15 @@ fn run_chat(
             let stats = be
                 .generate(&prompt, max_new, None, &req, &mut |piece: &str| {
                     let safe = stops.push(piece);
+                    collect_logprobs(be, &req, &mut pending_logprobs);
                     if !safe.is_empty() {
-                        stream.push(&safe, &mut *od);
+                        stream.push_with_logprobs(&safe, &mut pending_logprobs, &mut *od);
                     }
                     // A stop sequence hit aborts THIS sequence's decode at its next poll, freeing
                     // the GPU slot promptly (the server's `cancel` already reaches it through `req`).
                     if stops.hit() {
+                        pending_logprobs.clear();
+                        let _ = req.take_logprobs();
                         req.abort();
                     }
                 })
@@ -2380,8 +2484,15 @@ fn run_chat(
                 })?;
             // No stop fired: whatever the matcher was holding back was never a stop prefix.
             let tail = stops.flush();
+            if !stops.hit() {
+                collect_logprobs(be, &req, &mut pending_logprobs);
+            }
             if !tail.is_empty() {
-                stream.push(&tail, &mut *od);
+                stream.push_with_logprobs(&tail, &mut pending_logprobs, &mut *od);
+            }
+            // A token that decoded to no text has no delta to ride; the finish chunk carries it.
+            if !stops.hit() {
+                flush_logprobs(&mut pending_logprobs, &mut *od);
             }
             stats
         };

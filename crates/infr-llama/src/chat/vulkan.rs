@@ -183,6 +183,10 @@ impl ChatModel for DenseSeamChat {
         crate::with_profiling_suppressed(|| self.warmup_session())
     }
 
+    fn supports_logprobs(&self) -> bool {
+        true
+    }
+
     fn generate(
         &mut self,
         prompt: &str,

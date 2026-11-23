@@ -61,7 +61,7 @@ mod status;
 #[cfg(all(test, unix))]
 mod uds_tests;
 
-pub use status::{DeviceMemory, GeneratorStatus};
+pub use status::{DeviceMemory, GeneratorStatus, KvPageStats};
 
 /// Why generation ended — the OpenAI `finish_reason`. The generator reports it; the handlers
 /// serialize it (a tool call still overrides to [`Finish::ToolCalls`] at the wire layer).
@@ -3117,6 +3117,15 @@ fn request_error_body(e: &anyhow::Error) -> Option<serde_json::Value> {
     if let Some(c) = e.downcast_ref::<ContextLengthExceeded>() {
         return Some(context_length_body(c));
     }
+    // The paged KV pool ran out before prefill: the request asked for more pages than the
+    // session's budget holds, which shortening the conversation (or a smaller max_tokens) fixes.
+    if let Some(k) = e.downcast_ref::<infr_core::paging::KvPagesExhausted>() {
+        return Some(invalid_request_body(
+            Some("max_tokens"),
+            Some("kv_pool_exhausted"),
+            &k.to_string(),
+        ));
+    }
     e.downcast_ref::<ParamError>()
         .map(|p| invalid_request_body(Some(p.param), None, &p.message))
 }
@@ -3561,6 +3570,28 @@ mod tests {
         ))
     }
 
+    /// A spent page budget is the request's to fix (shorter prompt or smaller `max_tokens`), so it
+    /// answers `400` with a code and the page counts instead of a generic `500`.
+    #[test]
+    fn a_spent_kv_page_budget_is_a_400_naming_the_pool() {
+        let e = anyhow::Error::new(infr_core::paging::KvPagesExhausted {
+            need: 40,
+            allocated: 8,
+            free: 3,
+            total: 12,
+        });
+        let body = request_error_body(&e).expect("a request error");
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["error"]["code"], "kv_pool_exhausted");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("3 free of 12 pages"),
+            "the message names the budget: {body}"
+        );
+    }
+
     // --- HTTP endpoint tests (no Engine required) ---------------------------
 
     #[tokio::test]
@@ -3612,6 +3643,7 @@ mod tests {
             device: None,
             ctx_per_slot: None,
             memory: None,
+            kv_pages: None,
         }
     }
 
@@ -3630,6 +3662,7 @@ mod tests {
                     live: true,
                     unified: false,
                 }),
+                kv_pages: None,
             }
         }
 

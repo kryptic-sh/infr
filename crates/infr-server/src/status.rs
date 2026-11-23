@@ -28,6 +28,16 @@ pub struct GeneratorStatus {
     pub ctx_per_slot: Option<usize>,
     /// The device's memory as this process sees it.
     pub memory: Option<DeviceMemory>,
+    /// The paged KV pool's page usage, when this generator pages its cache.
+    pub kv_pages: Option<KvPageStats>,
+}
+
+/// Physical pages in a generator's shared KV pool. `used` excludes the reserved zero page, so an
+/// idle pool reports `used: 0`; `total` is `used + free`, the pages a slot can own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct KvPageStats {
+    pub used: usize,
+    pub total: usize,
 }
 
 /// A device memory snapshot.
@@ -146,6 +156,10 @@ mod tests {
         assert_eq!(models[0]["backend"], "vulkan");
         assert_eq!(models[0]["ctx_per_slot"], 4096);
         assert_eq!(models[0]["memory"]["available_bytes"], 6u64 << 30);
+        assert!(
+            models[0]["kv_pages"].is_null(),
+            "a linear generator reports no pages"
+        );
         assert_eq!(models[0]["slots"]["total"], 2);
         assert_eq!(models[0]["slots"]["busy"], 0);
         assert_eq!(models[1]["device"], "dev-beta");

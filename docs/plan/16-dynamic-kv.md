@@ -18,9 +18,9 @@ holds eight 512-row pages, not a 4k slice of a preallocated block.
 - `seam/kv_store.rs`: the host prefix store captures/restores rows through the
   same `row_base`.
 
-The gaps are the fixed block (`KvPool::new` allocates `blocks * slot_rows`
-up front, `SlotMap::take` maps every logical page to its block) and the **store
-path, which writes at `row_base + pos` and never consults the table**.
+The fixed block and the `row_base` store path are gone: `KvPool` is a budget of
+physical pages, each slot grows its map on demand, and the store uploads and
+downloads through that map.
 
 ## Design
 
@@ -52,16 +52,21 @@ path, which writes at `row_base + pos` and never consults the table**.
 6. **Prefix sharing and COW** are the existing `share_prefix`/`ensure_writable`
    mechanics, now on demand: at admission, a request whose prompt starts with a
    live slot's cached tokens points the new slot at those pages and prefills only
-   the tail. This is the performance win, and it needs no dynamic sizing: the
-   fixed-block pool already supports it, the scheduler just never borrows.
-   **Hybrid models are not eligible yet.** qwen35's DeltaNet state at an
-   arbitrary prefix is not in the pages, and the host prefix store already skips
-   qwen35 for that reason. Page sharing therefore helps models with no
-   unrewindable state and no SWA ring (llama, qwen2, qwen3 dense); gemma's SWA
-   ring rows must be copied, and qwen35 needs a recurrent-state snapshot at the
-   shared prefix (llama.cpp's rollback planes, not ported).
+   the tail. This is the performance win, now on demand rather than at a block
+   boundary. **Hybrid models are served by P3's snapshots.** A recurrent layer's
+   state cannot be sliced out of a page, so it rides the page-boundary snapshot
+   instead: a divergent prompt resumes from the newest snapshot at or before its
+   common prefix, and the host store keeps the same snapshots. Page sharing
+   therefore helps every full-attention layer, and gemma's SWA ring rows are
+   still copied rather than shared.
 
 ## Phases
+
+**Status (2026-11-24):** P1–P6 shipped. A paged session advertises the pool's token
+fit as its window instead of `fit / slots`, the pool is sized from that fit (or
+`kv.pool_mb`), and slots hold only the pages they use. The activation reserve
+still prices the whole window, so a short request preflights at the window's
+chunk height rather than a taller one.
 
 - **P1 — Table-resolved stores.** Remove the `row_base` assumption from the
   store path: every store kernel resolves the destination row through the

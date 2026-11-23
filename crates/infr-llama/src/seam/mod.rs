@@ -2036,13 +2036,23 @@ pub(crate) fn kv_ring_wanted(cfg: &Config, ec: &EngineConfig) -> bool {
 /// every derived per-slot / fractional window is held to.
 pub(crate) const MIN_SESSION_CTX: usize = 1024;
 
-/// Blocks a `kv.paged` engine allocates: `n_slots` (at least [`POOL_BLOCKS`]), else `None`.
-pub(crate) fn paged_blocks_for(
+/// Physical pages a `kv.paged` engine allocates: `1 +` the pool's token budget in pages, or `None`
+/// for a linear engine or a single-slot one (which never forks). The token budget is the KV fit,
+/// capped at `n_slots` full windows so a model whose fit exceeds the trained window cannot spend
+/// VRAM on rows no slot can address.
+pub(crate) fn paged_pages_for(
     n_slots: usize,
     paged: bool,
     caps: &infr_core::backend::Capabilities,
+    fit_tokens: Option<usize>,
+    max_ctx: usize,
 ) -> Option<usize> {
-    (paged && caps.kv_paging && n_slots > 1).then(|| n_slots.max(POOL_BLOCKS))
+    if !(paged && caps.kv_paging && n_slots > 1) {
+        return None;
+    }
+    let cap = n_slots.saturating_mul(max_ctx);
+    let tokens = fit_tokens.map_or(cap, |f| f.min(cap));
+    Some(1 + tokens.div_ceil(infr_vulkan::paged::PAGE_ROWS).max(1))
 }
 
 // ── one budget, two families of callers ───────────────────────────────────────────────────────
@@ -5902,17 +5912,42 @@ mod seam_helper_tests {
     }
 
     #[test]
-    fn paged_blocks_follow_slots_and_only_when_paging_is_live() {
+    fn paged_pages_follow_the_fit_and_only_when_paging_is_live() {
         let caps = infr_core::backend::Capabilities {
             kv_paging: true,
             ..Default::default()
         };
-        assert_eq!(super::paged_blocks_for(1, true, &caps), None);
-        assert_eq!(super::paged_blocks_for(2, true, &caps), Some(2));
-        assert_eq!(super::paged_blocks_for(4, true, &caps), Some(4));
-        assert_eq!(super::paged_blocks_for(4, false, &caps), None);
         assert_eq!(
-            super::paged_blocks_for(4, true, &infr_core::backend::Capabilities::default()),
+            super::paged_pages_for(1, true, &caps, Some(4096), 4096),
+            None
+        );
+        // A fit smaller than `slots * window` is the pool: one zero page plus the fit's pages.
+        assert_eq!(
+            super::paged_pages_for(2, true, &caps, Some(4096), 8192),
+            Some(9)
+        );
+        // A fit larger than the slots can address is capped at `slots * window`.
+        assert_eq!(
+            super::paged_pages_for(4, true, &caps, Some(1 << 30), 2048),
+            Some(1 + 16)
+        );
+        // No fit report (a purely recurrent arch) falls back to the slots' windows.
+        assert_eq!(
+            super::paged_pages_for(2, true, &caps, None, 1024),
+            Some(1 + 4)
+        );
+        assert_eq!(
+            super::paged_pages_for(4, false, &caps, Some(4096), 4096),
+            None
+        );
+        assert_eq!(
+            super::paged_pages_for(
+                4,
+                true,
+                &infr_core::backend::Capabilities::default(),
+                Some(4096),
+                4096
+            ),
             None
         );
     }
@@ -5935,13 +5970,18 @@ mod seam_helper_tests {
         let (ctx, blocks, ub) = (4096usize + 100, 4usize, 512usize);
         let (k, v) = (DType::F16, DType::F16);
         let be = infr_cpu::CpuBackend::new();
-        let pool = super::KvPool::new(&be, &cfg, ctx, k, v, blocks).expect("pool");
+        let pps = ctx.div_ceil(infr_vulkan::paged::PAGE_ROWS);
+        let pool = super::KvPool::new(&be, &cfg, ctx, k, v, 1 + blocks * pps).expect("pool");
         assert_eq!(
             pool.slot_rows(),
             ctx.next_multiple_of(infr_vulkan::paged::PAGE_ROWS)
         );
         assert!(pool.slot_rows() > ctx, "the pool must round the window up");
-        let pool_rows = pool.slot_rows() * pool.blocks();
+        let pool_rows = pool.total_rows();
+        assert_eq!(
+            pool_rows,
+            (1 + blocks * pps) * infr_vulkan::paged::PAGE_ROWS
+        );
         let one = |l| super::kv_layer_alloc_bytes_pooled(&cfg, l, ctx, false, ub, 1, k, v, None);
         let pooled_bytes = |l| {
             super::kv_layer_alloc_bytes_pooled(&cfg, l, ctx, false, ub, 1, k, v, Some(pool_rows))

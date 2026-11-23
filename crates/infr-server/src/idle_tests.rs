@@ -28,6 +28,7 @@ impl ChatGenerator for BlockingGen {
             device: None,
             ctx_per_slot: None,
             memory: None,
+            kv_pages: None,
         }
     }
     fn vocab_size(&self) -> usize {

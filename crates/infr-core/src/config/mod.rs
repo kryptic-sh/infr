@@ -150,6 +150,9 @@ cfg_struct! {
         /// `INFR_KV_STORE_MB`: host-RAM budget for the cross-conversation KV prefix store, in MiB.
         /// `None` = off, and the store is never built.
         store_mb: Option<u64> = None,
+        /// `INFR_KV_POOL_MB`: device-RAM budget for the `kv.paged` page pool, in MiB. `None` =
+        /// auto, which sizes the pool at `slots` full windows (today's linear allocation).
+        pool_mb: Option<u64> = None,
         /// `INFR_KV_PAGED`: forward PagedAttention — one page pool shared by the slots, with
         /// copy-on-write for a shared prefix. `None`/`false` = every slot owns a contiguous cache.
         /// The pool is built at the session's first fork (see `docs/perf/kv-prefix.md`), so a

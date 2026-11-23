@@ -793,14 +793,9 @@ impl SeamKv {
         self.paged.is_some()
     }
 
-    /// The store bias for ONE layer: its block's first row when that layer is pooled, else 0 — a
-    /// slot's sliding-window, recurrent and compressed layers keep private buffers that still start
-    /// at row 0.
-    pub(crate) fn paged_row_base_at(&self, cfg: &Config, l: usize) -> usize {
-        match &self.paged {
-            Some(p) if crate::seam::paged_layer(cfg, l) => p.row_base(),
-            _ => 0,
-        }
+    /// The page pool this slot's KV lives in, when `kv.paged` built one.
+    pub(crate) fn paged_pool(&self) -> Option<&std::sync::Arc<crate::seam::KvPool>> {
+        self.paged.as_ref().map(|p| p.map.pool())
     }
 
     /// Turn this slot's pooled layers into blocks of `pool`: move the rows it already holds into
@@ -812,34 +807,24 @@ impl SeamKv {
         cfg: &Config,
         pool: &std::sync::Arc<crate::seam::KvPool>,
     ) -> AResult<()> {
-        let slot = crate::seam::PagedSlot::new(pool, be)?;
-        let block = slot.map.block();
+        let mut slot = crate::seam::PagedSlot::new(pool, be)?;
         let rows = self.cached.len().min(pool.slot_rows());
+        slot.reserve_rows(be, rows)?;
+        pool.import_linear(be, &slot.map, rows, &self.kbufs, &self.vbufs)?;
         for l in 0..cfg.n_layer {
             let Some(dst) = pool.k(l) else { continue };
-            if rows > 0 {
-                pool.import_rows(
-                    be,
-                    l,
-                    block,
-                    rows,
-                    self.kbufs[l].as_ref(),
-                    self.vbufs[l].as_ref(),
-                )?;
-            }
             self.kbufs[l] = std::sync::Arc::clone(dst);
             self.vbufs[l] = std::sync::Arc::clone(pool.v(l).expect("pooled layer has both sides"));
         }
         self.paged = Some(slot);
         let layers = (0..cfg.n_layer).filter(|&l| pool.k(l).is_some()).count();
         tracing::info!(
-            "kv.paged: {} of {} layers in {} pool blocks of {} rows; this slot's block starts at \
-             row {}",
+            "kv.paged: {} of {} layers in a {}-page pool of {} rows; this slot owns {} pages",
             layers,
             cfg.n_layer,
-            pool.blocks(),
+            pool.pages(),
             pool.slot_rows(),
-            self.paged.as_ref().expect("just set").row_base(),
+            self.paged.as_ref().expect("just set").map.len(),
         );
         Ok(())
     }
@@ -1020,11 +1005,7 @@ impl SeamKv {
             recurrent_snaps: Vec::new(),
         };
         if let Some(p) = &child.paged {
-            tracing::info!(
-                "kv.paged: forked slot in block {} (its rows start at {})",
-                p.map.block(),
-                p.row_base(),
-            );
+            tracing::info!("kv.paged: forked slot with {} shared pages", p.map.len());
         }
         Ok(child)
     }
@@ -1080,7 +1061,7 @@ impl SeamKv {
             let page_rows = infr_vulkan::paged::PAGE_ROWS;
             let pages = p / page_rows;
             if pages > 0 {
-                dst.map.share_prefix(&src_paged.map, pages);
+                dst.map.share_prefix(&src_paged.map, pages)?;
                 dst.upload_table(be)?;
                 tracing::info!(
                     "kv.paged: forked slot shares {} pages ({} rows) of the prefix",

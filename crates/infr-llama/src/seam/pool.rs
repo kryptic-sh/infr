@@ -1,33 +1,34 @@
 //! Session-wide KV page pool: the physical half of forward PagedAttention in the seam.
 //!
-//! One [`KvPool`] serves every conversation slot of a session. Each slot owns a contiguous BLOCK
-//! of pages inside every layer's pool buffer; reads and stores resolve logical rows through the
-//! slot's page table, and the block's first row is the linear fallback
-//! ([`infr_core::tensor::PageMap::row_base`]). A forked slot starts by SHARING its parent's prefix
-//! pages instead of copying them, and splits the sharing one page at a time when it writes into
-//! shared rows.
+//! One [`KvPool`] serves every conversation slot of a session out of a shared budget of physical
+//! pages. A slot starts with no pages and grows as its sequence does; pages are handed back when
+//! the slot is reset. Reads and stores resolve logical rows through the slot's page table, so a
+//! request's memory is what it uses, not the model's whole window.
+//!
+//! A forked slot starts by SHARING its parent's prefix pages instead of copying them, and splits
+//! the sharing one page at a time when it writes into shared rows. Physical page 0 is a zero page
+//! the table uses for logical pages a slot has not allocated yet; attention never reads one.
 //!
 //! Page ids are token-granular and identical across layers: physical page `p` holds rows
 //! `p*PAGE_ROWS..(p+1)*PAGE_ROWS` of EVERY pooled layer. That is what lets one table buffer per
-//! SLOT (not per layer) drive every layer's reads. A slot's block mirrors one logical page space
-//! one-to-one — logical page `j` lives at physical page `block*pps + j` while the slot is not
-//! sharing it — so a copy-on-write always has a home and the bias stays a single offset.
+//! SLOT (not per layer) drive every layer's reads.
 
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Result as AResult};
 use infr_core::backend::{Backend, Buffer, BufferUsage};
 use infr_core::budget::kv_fmt_bytes;
+use infr_core::paging::KvPagesExhausted;
 use infr_core::DType;
 
 use crate::seam::{kv_row_elems, kv_side_bytes};
 use crate::Config;
 use infr_vulkan::paged::{PagePool, PAGE_ROWS};
 
-/// Conversation slots one pool covers. Two is where sharing pays (the acceptance case is two
-/// conversations over one long shared prefix) and it stays at what two linear slots already cost.
-/// A further fork finds no block and fails, which the slot allocators already handle by recycling
-/// their LRU slot.
+/// Conversation slots one auto-sized pool covers. Two is where sharing pays (the acceptance case
+/// is two conversations over one long shared prefix) and it stays at what two linear slots already
+/// cost. A further fork finds no room and fails, which the slot allocators already handle by
+/// recycling their LRU slot.
 pub(crate) const POOL_BLOCKS: usize = 2;
 
 /// Whether layer `l`'s cache can live in the page pool: reads and stores go through the page
@@ -69,27 +70,26 @@ pub(crate) struct KvPool {
     v_row: Vec<usize>,
     k_fmt: DType,
     v_fmt: DType,
-    /// Reference ledger: `refs[p]` counts the slots pointing at physical page `p`. A block's own
-    /// pages start at 1 and never drop below it (see [`KvPool::new`]).
+    /// Reference ledger: `refs[p]` counts the slots pointing at physical page `p`. Page 0 is
+    /// reserved forever as the table's unallocated filler.
     pages: Mutex<PagePool>,
-    /// Logical pages per slot block, and rows per slot block (the store bias stride).
+    /// Logical pages per slot (the model window, rounded up to whole pages), and its row count.
     pps: usize,
     slot_rows: usize,
-    blocks: usize,
-    /// Blocks handed out so far — block 0 is the slot that existed when the pool was built, every
-    /// later one is a fork.
-    next_block: Mutex<usize>,
+    /// Physical pages, page 0 included.
+    total_pages: usize,
 }
 
 impl KvPool {
-    /// Build a pool of `blocks` conversation slots with room for `max_ctx` rows each.
+    /// Build a pool of `pages` physical pages (page 0 is the zero page). `max_ctx` sets the
+    /// logical window each slot's table covers.
     pub(crate) fn new(
         be: &dyn Backend,
         cfg: &Config,
         max_ctx: usize,
         k_fmt: DType,
         v_fmt: DType,
-        blocks: usize,
+        pages: usize,
     ) -> AResult<Arc<Self>> {
         if let Some(why) = no_poolable_layer(cfg) {
             return Err(anyhow!("{why}"));
@@ -103,10 +103,10 @@ impl KvPool {
                  dequant, so kv.paged stays off"
             ));
         }
-        let blocks = blocks.max(1);
+        let pages = pages.max(2);
         let pps = max_ctx.div_ceil(PAGE_ROWS).max(1);
         let slot_rows = pps * PAGE_ROWS;
-        let pool_rows = blocks * slot_rows;
+        let pool_rows = pages * PAGE_ROWS;
         let mut k = Vec::with_capacity(cfg.n_layer);
         let mut v = Vec::with_capacity(cfg.n_layer);
         let mut k_row = Vec::with_capacity(cfg.n_layer);
@@ -131,12 +131,11 @@ impl KvPool {
             k_row.push(kr);
             v_row.push(vr);
         }
-        // A block's own pages hold one reference from birth: the ledger counts slots pointing at a
-        // page, and every block page is always pointed at by its own slot.
-        let mut pages = PagePool::new(blocks * pps);
-        for p in 0..(blocks * pps) as u32 {
-            pages.share(p);
-        }
+        let mut ledger = PagePool::new(pages);
+        // The zero page is never handed out and never freed: every unallocated table entry
+        // points at it.
+        let zero = ledger.alloc().expect("a pool has at least two pages");
+        debug_assert_eq!(zero, 0);
         Ok(Arc::new(Self {
             k,
             v,
@@ -144,11 +143,10 @@ impl KvPool {
             v_row,
             k_fmt,
             v_fmt,
-            pages: Mutex::new(pages),
+            pages: Mutex::new(ledger),
             pps,
             slot_rows,
-            blocks,
-            next_block: Mutex::new(0),
+            total_pages: pages,
         }))
     }
 
@@ -161,8 +159,14 @@ impl KvPool {
         self.v.get(l).and_then(|b| b.as_ref())
     }
 
+    /// The logical window (rows) one slot's table covers.
     pub(crate) fn slot_rows(&self) -> usize {
         self.slot_rows
+    }
+
+    /// Physical rows in every pool buffer (page 0 included).
+    pub(crate) fn total_rows(&self) -> usize {
+        self.total_pages * PAGE_ROWS
     }
 
     /// Entries a slot table needs: one per logical page plus the repeat of the last page that a
@@ -171,51 +175,68 @@ impl KvPool {
         self.pps + 1
     }
 
-    pub(crate) fn blocks(&self) -> usize {
-        self.blocks
+    /// Physical pages in the budget, page 0 included.
+    pub(crate) fn pages(&self) -> usize {
+        self.total_pages
     }
 
-    fn take_block(&self) -> Option<usize> {
-        let mut n = self.next_block.lock().expect("page-pool block lock");
-        if *n >= self.blocks {
-            return None;
-        }
-        let b = *n;
-        *n += 1;
-        Some(b)
+    pub(crate) fn in_use_pages(&self) -> usize {
+        self.pages.lock().expect("page-pool lock").in_use()
     }
 
-    /// Copy `rows` rows of layer `l` from the slot's linear buffers into `block`'s rows.
-    pub(crate) fn import_rows(
+    /// Pages a slot can actually own: the zero page is always referenced but never usable.
+    pub(crate) fn used_pages(&self) -> usize {
+        self.in_use_pages().saturating_sub(1)
+    }
+
+    pub(crate) fn free_pages(&self) -> usize {
+        self.total_pages - self.in_use_pages()
+    }
+
+    pub(crate) fn ledger(&self) -> &Mutex<PagePool> {
+        &self.pages
+    }
+
+    /// Copy `rows` rows of every pooled layer from a slot's linear buffers into the physical pages
+    /// its map now holds.
+    pub(crate) fn import_linear(
         &self,
         be: &dyn Backend,
-        l: usize,
-        block: usize,
+        map: &SlotMap,
         rows: usize,
-        src_k: &dyn Buffer,
-        src_v: &dyn Buffer,
+        src_k: &[Arc<dyn Buffer>],
+        src_v: &[Arc<dyn Buffer>],
     ) -> AResult<()> {
-        let (k_row, v_row) = (self.k_row[l], self.v_row[l]);
-        let k_off = kv_fmt_bytes(self.k_fmt, block * self.slot_rows * k_row);
-        let v_off = kv_fmt_bytes(self.v_fmt, block * self.slot_rows * v_row);
-        let k = self.k[l].as_ref().expect("pooled layer has both sides");
-        let v = self.v[l].as_ref().expect("pooled layer has both sides");
-        be.copy_buffer_at(
-            src_k,
-            0,
-            k.as_ref(),
-            k_off,
-            kv_fmt_bytes(self.k_fmt, rows * k_row),
-        )
-        .map_err(|e| anyhow!("{e}"))?;
-        be.copy_buffer_at(
-            src_v,
-            0,
-            v.as_ref(),
-            v_off,
-            kv_fmt_bytes(self.v_fmt, rows * v_row),
-        )
-        .map_err(|e| anyhow!("{e}"))
+        let rows = rows.min(self.slot_rows);
+        for l in 0..self.k.len() {
+            let Some(k) = self.k[l].as_ref() else {
+                continue;
+            };
+            let (k_row, v_row) = (self.k_row[l], self.v_row[l]);
+            let v = self.v[l].as_ref().expect("pooled layer has both sides");
+            for page in 0..rows.div_ceil(PAGE_ROWS) {
+                let first = page * PAGE_ROWS;
+                let n = PAGE_ROWS.min(rows - first);
+                let phys = map.page(page);
+                be.copy_buffer_at(
+                    src_k[l].as_ref(),
+                    kv_fmt_bytes(self.k_fmt, first * k_row),
+                    k.as_ref(),
+                    kv_fmt_bytes(self.k_fmt, phys as usize * PAGE_ROWS * k_row),
+                    kv_fmt_bytes(self.k_fmt, n * k_row),
+                )
+                .map_err(|e| anyhow!("{e}"))?;
+                be.copy_buffer_at(
+                    src_v[l].as_ref(),
+                    kv_fmt_bytes(self.v_fmt, first * v_row),
+                    v.as_ref(),
+                    kv_fmt_bytes(self.v_fmt, phys as usize * PAGE_ROWS * v_row),
+                    kv_fmt_bytes(self.v_fmt, n * v_row),
+                )
+                .map_err(|e| anyhow!("{e}"))?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -224,7 +245,8 @@ impl std::fmt::Debug for KvPool {
         f.debug_struct("KvPool")
             .field("pps", &self.pps)
             .field("slot_rows", &self.slot_rows)
-            .field("blocks", &self.blocks)
+            .field("pages", &self.total_pages)
+            .field("in_use", &self.in_use_pages())
             .field(
                 "pooled_layers",
                 &self.k.iter().filter(|b| b.is_some()).count(),
@@ -234,61 +256,47 @@ impl std::fmt::Debug for KvPool {
 }
 
 /// One slot's logical-page mapping into a [`KvPool`]: `map[j]` is the physical page holding logical
-/// page `j`. Shared entries are released on drop, so a recycled conversation slot gives its
-/// parent's pages back.
+/// page `j`, or 0 when the slot has not allocated it. Shared entries are released on drop, so a
+/// recycled conversation slot gives its parent's pages back.
 pub(crate) struct SlotMap {
     pool: Arc<KvPool>,
-    block: usize,
     map: Vec<u32>,
 }
 
 impl SlotMap {
-    /// Take a free block: every logical page on its own block page.
-    fn take(pool: &Arc<KvPool>) -> AResult<Self> {
-        let block = pool.take_block().ok_or_else(|| {
-            anyhow!(
-                "all {} page-pool blocks of this session are taken",
-                pool.blocks()
-            )
-        })?;
-        let base = block * pool.pps;
-        Ok(Self {
-            map: (0..pool.pps).map(|j| (base + j) as u32).collect(),
+    /// A slot with no pages yet.
+    fn take(pool: &Arc<KvPool>) -> Self {
+        Self {
             pool: Arc::clone(pool),
-            block,
-        })
-    }
-
-    /// Physical block this map occupies inside the pool.
-    pub(crate) fn block(&self) -> usize {
-        self.block
+            map: Vec::new(),
+        }
     }
 
     pub(crate) fn pool(&self) -> &Arc<KvPool> {
         &self.pool
     }
 
-    /// First row of this slot's block inside every layer's pool buffer (the store bias).
-    pub(crate) fn row_base(&self) -> usize {
-        self.block * self.pool.slot_rows
+    /// Logical pages this slot has allocated (a prefix; the rest are zero page).
+    pub(crate) fn len(&self) -> usize {
+        self.map.len()
     }
 
-    /// Whether logical page `j` sits in this slot's own block, so a write needs no copy.
-    pub(crate) fn is_private(&self, j: usize) -> bool {
-        self.map[j] as usize == self.block * self.pool.pps + j
-    }
-
-    /// Physical page holding logical page `j`.
+    /// Physical page holding logical page `j`, 0 when unallocated.
     pub(crate) fn page(&self, j: usize) -> u32 {
-        self.map[j]
+        self.map.get(j).copied().unwrap_or(0)
     }
 
-    /// One physical page id per logical page, plus the repeat of the last page.
+    /// Whether logical page `j` has this slot as its only owner, so a write needs no copy.
+    pub(crate) fn is_private(&self, j: usize) -> bool {
+        let p = self.page(j);
+        p != 0 && self.pool.ledger().lock().expect("page-pool lock").refs(p) == 1
+    }
+
+    /// One physical page id per logical page of the window, plus the repeat of the last page.
     pub(crate) fn table_bytes(&self) -> Vec<u8> {
-        let mut t = self.map.clone();
-        if let Some(&last) = t.last() {
-            t.push(last);
-        }
+        let mut t: Vec<u32> = (0..self.pool.pps).map(|j| self.page(j)).collect();
+        let last = t.last().copied().unwrap_or(0);
+        t.push(last);
         let mut out = Vec::with_capacity(t.len() * 4);
         for p in t {
             out.extend_from_slice(&p.to_le_bytes());
@@ -296,46 +304,71 @@ impl SlotMap {
         out
     }
 
+    /// Allocate private pages until the map covers `pages` logical pages.
+    pub(crate) fn grow(&mut self, pages: usize) -> AResult<()> {
+        let pages = pages.min(self.pool.pps);
+        let mut ledger = self.pool.ledger().lock().expect("page-pool lock");
+        while self.map.len() < pages {
+            let Some(p) = ledger.alloc() else {
+                return Err(anyhow::Error::new(KvPagesExhausted {
+                    need: pages,
+                    allocated: self.map.len(),
+                    free: ledger.capacity() - ledger.in_use(),
+                    total: ledger.capacity(),
+                }));
+            };
+            self.map.push(p);
+        }
+        Ok(())
+    }
+
     /// Share the first `pages` logical pages of `src`: the prefix both slots hold. Callers only
     /// pass whole pages; a prefix under one page is re-prefilled instead of shared.
-    pub(crate) fn share_prefix(&mut self, src: &SlotMap, pages: usize) {
-        let pages = pages.min(src.map.len()).min(self.map.len());
-        let mut ledger = self.pool.pages.lock().expect("page-pool lock");
+    pub(crate) fn share_prefix(&mut self, src: &SlotMap, pages: usize) -> AResult<()> {
+        let pages = pages.min(src.len()).min(self.pool.pps);
+        self.grow(pages)?;
+        let mut ledger = self.pool.ledger().lock().expect("page-pool lock");
         for j in 0..pages {
             let p = src.map[j];
             if self.map[j] == p {
                 continue;
             }
             ledger.share(p);
-            if !self.is_private(j) {
+            if self.map[j] != 0 {
                 ledger.release(self.map[j]);
             }
             self.map[j] = p;
         }
+        Ok(())
     }
 
-    /// Point every logical page back at this slot's own block and release shared references. The
-    /// rows are left alone — a caller that resets the cache re-prefills them.
+    /// Release every page and start over empty. The rows are left alone — a caller that resets
+    /// the cache re-prefills them.
     pub(crate) fn unshare_all(&mut self) {
-        let base = self.block * self.pool.pps;
-        let mut ledger = self.pool.pages.lock().expect("page-pool lock");
-        for (j, p) in self.map.iter_mut().enumerate() {
-            if *p as usize != base + j {
-                ledger.release(*p);
-                *p = (base + j) as u32;
+        let mut ledger = self.pool.ledger().lock().expect("page-pool lock");
+        for p in self.map.drain(..) {
+            if p != 0 {
+                ledger.release(p);
             }
         }
     }
 
-    /// Split logical page `j` away from its sharers: copy the page into this slot's own block page,
+    /// Split logical page `j` away from its sharers: copy the page into a fresh physical page,
     /// then release the shared reference. Device-to-device, per pooled layer and side.
     pub(crate) fn cow_page(&mut self, be: &dyn Backend, j: usize) -> AResult<()> {
         if j >= self.map.len() || self.is_private(j) {
             return Ok(());
         }
         let pool = Arc::clone(&self.pool);
-        let own = (self.block * pool.pps + j) as u32;
         let src = self.map[j];
+        let Some(own) = pool.ledger().lock().expect("page-pool lock").alloc() else {
+            return Err(anyhow::Error::new(KvPagesExhausted {
+                need: j + 1,
+                allocated: self.map.len(),
+                free: pool.free_pages(),
+                total: pool.pages(),
+            }));
+        };
         for l in 0..pool.k.len() {
             let Some(k) = pool.k[l].as_ref() else {
                 continue;
@@ -346,7 +379,9 @@ impl SlotMap {
             let vb = kv_fmt_bytes(pool.v_fmt, PAGE_ROWS * pool.v_row[l]);
             copy_page(be, v.as_ref(), src, own, vb)?;
         }
-        pool.pages.lock().expect("page-pool lock").release(src);
+        if src != 0 {
+            pool.ledger().lock().expect("page-pool lock").release(src);
+        }
         self.map[j] = own;
         Ok(())
     }
@@ -408,20 +443,20 @@ impl PagedSlot {
         Ok(slot)
     }
 
-    /// First pages of a slot: a free block, all pages private.
+    /// First pages of a slot: no pages allocated yet.
     pub(crate) fn new(pool: &Arc<KvPool>, be: &dyn Backend) -> AResult<Self> {
-        Self::with_table(SlotMap::take(pool)?, be)
+        Self::with_table(SlotMap::take(pool), be)
     }
 
-    /// A fork: a free block whose first `pages` logical pages point at `src`'s pages.
+    /// A fork: a free map whose first `pages` logical pages point at `src`'s pages.
     pub(crate) fn fork(
         pool: &Arc<KvPool>,
         be: &dyn Backend,
         src: &SlotMap,
         pages: usize,
     ) -> AResult<Self> {
-        let mut map = SlotMap::take(pool)?;
-        map.share_prefix(src, pages);
+        let mut map = SlotMap::take(pool);
+        map.share_prefix(src, pages)?;
         Self::with_table(map, be)
     }
 
@@ -429,8 +464,6 @@ impl PagedSlot {
     pub(crate) fn upload_table(&self, be: &dyn Backend) -> AResult<()> {
         let bytes = self.map.table_bytes();
         tracing::debug!(
-            block = self.map.block(),
-            row_base = self.map.row_base(),
             first = ?&bytes[..bytes.len().min(24)],
             "kv.paged: uploading a slot's page table"
         );
@@ -438,24 +471,38 @@ impl PagedSlot {
             .map_err(|e| anyhow!("{e}"))
     }
 
+    /// The linear fallback bias. A paged slot resolves every row through its table, so this is 0.
     pub(crate) fn row_base(&self) -> usize {
-        self.map.row_base()
+        0
+    }
+
+    /// Allocate pages through `rows` and push the table if the map grew. Returns the page count
+    /// now allocated.
+    pub(crate) fn reserve_rows(&mut self, be: &dyn Backend, rows: usize) -> AResult<usize> {
+        let need = rows.div_ceil(PAGE_ROWS).min(self.map.pool().pps);
+        let before = self.map.len();
+        self.map.grow(need)?;
+        if self.map.len() != before {
+            self.upload_table(be)?;
+        }
+        Ok(self.map.len())
     }
 
     /// Copy the rows a prefix has inside logical page `page` (fewer than `PAGE_ROWS` of them) from
     /// `src` to this slot's own page, so a shared prefix shorter than one page is still reused.
     pub(crate) fn copy_tail(
-        &self,
+        &mut self,
         be: &dyn Backend,
         src: &SlotMap,
         page: usize,
         rows: usize,
     ) -> AResult<()> {
-        let pool = self.map.pool();
         let rows = rows.min(PAGE_ROWS);
-        if rows == 0 || page >= self.map.map.len() {
+        if rows == 0 || page >= self.map.pool().pps {
             return Ok(());
         }
+        self.map.grow(page + 1)?;
+        let pool = self.map.pool();
         let from = src.page(page);
         let to = self.map.page(page);
         for l in 0..pool.k.len() {
@@ -470,10 +517,11 @@ impl PagedSlot {
             let n = kv_fmt_bytes(pool.v_fmt, rows * pool.v_row[l]);
             copy_page_rows(be, v.as_ref(), from, to, n, vb)?;
         }
+        self.upload_table(be)?;
         Ok(())
     }
 
-    /// Drop every shared page without a device copy; the table is refreshed on the next forward.
+    /// Drop every page without a device copy; the table is refreshed on the next forward.
     pub(crate) fn release_pages(&mut self) {
         self.map.unshare_all();
         self.stale = true;
@@ -488,16 +536,20 @@ impl PagedSlot {
         Ok(())
     }
 
-    /// Take private copies of every page holding rows `[start, end)`. Returns how many pages it
-    /// split, for logging.
+    /// Take private copies of every page holding rows `[start, end)`, allocating the pages first.
+    /// Returns how many pages it split, for logging.
     pub(crate) fn make_private(
         &mut self,
         be: &dyn Backend,
         start: usize,
         end: usize,
     ) -> AResult<usize> {
-        let last_page = (self.map.map.len() - 1).min(end.saturating_sub(1) / PAGE_ROWS);
-        let first_page = (start / PAGE_ROWS).min(last_page);
+        if end == 0 {
+            return Ok(0);
+        }
+        self.reserve_rows(be, end)?;
+        let first_page = start / PAGE_ROWS;
+        let last_page = (end - 1) / PAGE_ROWS;
         let mut split = 0;
         for j in first_page..=last_page {
             if !self.map.is_private(j) {
@@ -554,7 +606,7 @@ mod tests {
             (DType::F16, DType::Turbo4),
             (DType::Turbo2, DType::Turbo2),
         ] {
-            let err = KvPool::new(&be, &c, 1024, k_fmt, v_fmt, 2)
+            let err = KvPool::new(&be, &c, 1024, k_fmt, v_fmt, 4)
                 .expect_err("a turbo side must refuse the pool")
                 .to_string();
             assert!(err.contains("Turbo"), "the error names the format: {err}");
@@ -567,7 +619,7 @@ mod tests {
     fn a_fork_shares_page_bytes_and_a_write_splits_them() {
         let be = cpu();
         let c = cfg();
-        let pool = KvPool::new(&be, &c, 1024, DType::F16, DType::F16, 2).unwrap();
+        let pool = KvPool::new(&be, &c, 1024, DType::F16, DType::F16, 5).unwrap();
         assert_eq!(pool.pps, 2, "1024 rows of ctx over 512-row pages");
         assert_eq!(pool.slot_rows(), 1024);
         let bytes = page_bytes(&pool);
@@ -577,44 +629,37 @@ mod tests {
             "512 rows × (n_kv·head_dim) f16"
         );
 
-        let mut src = SlotMap::take(&pool).unwrap();
-        assert_eq!(src.row_base(), 0);
+        let mut src = SlotMap::take(&pool);
+        src.grow(2).unwrap();
+        let src_page = src.page(0);
         let k = pool.k(0).unwrap().clone();
-        be.upload_at(k.as_ref(), 0, &vec![0xAAu8; bytes]).unwrap();
+        be.upload_at(k.as_ref(), src_page as usize * bytes, &vec![0xAAu8; bytes])
+            .unwrap();
 
-        let mut dst = SlotMap::take(&pool).unwrap();
-        assert_eq!(dst.row_base(), 1024, "second block starts at row 1024");
-        dst.share_prefix(&src, 1);
-        assert_eq!(dst.table_bytes()[..8], [0u8, 0, 0, 0, 3, 0, 0, 0]);
-        assert_eq!(pool.pages.lock().unwrap().refs(0), 2);
+        let mut dst = SlotMap::take(&pool);
+        dst.share_prefix(&src, 1).unwrap();
+        assert_eq!(dst.page(0), src_page);
+        assert_eq!(pool.pages.lock().unwrap().refs(src_page), 2);
+        assert!(!dst.is_private(0));
 
         dst.cow_page(&be, 0).unwrap();
-        assert_eq!(dst.table_bytes()[..8], [2u8, 0, 0, 0, 3, 0, 0, 0]);
-        assert_eq!(pool.pages.lock().unwrap().refs(0), 1);
+        assert_ne!(dst.page(0), src_page);
+        assert_eq!(pool.pages.lock().unwrap().refs(src_page), 1);
         assert_eq!(
-            read_page(&be, k.as_ref(), 0, bytes),
+            read_page(&be, k.as_ref(), dst.page(0) as usize, bytes),
             vec![0xAAu8; bytes],
             "the split copied the shared page"
         );
-        assert_eq!(
-            read_page(&be, k.as_ref(), 2, bytes),
-            vec![0xAAu8; bytes],
-            "…into the slot's own page"
-        );
 
-        be.upload_at(
-            k.as_ref(),
-            src.row_base() * (bytes / PAGE_ROWS),
-            &[0x11u8; 64],
-        )
-        .unwrap();
+        be.upload_at(k.as_ref(), src_page as usize * bytes, &[0x11u8; 64])
+            .unwrap();
         assert_eq!(
-            read_page(&be, k.as_ref(), 2, bytes)[..64],
+            read_page(&be, k.as_ref(), dst.page(0) as usize, bytes)[..64],
             vec![0xAAu8; 64],
             "a parent write must not land in the child's page"
         );
         src.unshare_all();
-        assert_eq!(pool.pages.lock().unwrap().refs(2), 1);
+        assert_eq!(pool.pages.lock().unwrap().refs(src_page), 0);
     }
 
     /// `make_private` splits exactly the pages covering `[start, end)` — the range a forward is
@@ -623,23 +668,69 @@ mod tests {
     fn make_private_splits_only_the_rows_about_to_be_written() {
         let be = cpu();
         let c = cfg();
-        let pool = KvPool::new(&be, &c, 1024, DType::F16, DType::F16, 2).unwrap();
-        let src = SlotMap::take(&pool).unwrap();
+        let pool = KvPool::new(&be, &c, 1024, DType::F16, DType::F16, 5).unwrap();
+        let mut src = SlotMap::take(&pool);
+        src.grow(2).unwrap();
         let table = be
             .alloc(4 * pool.table_len(), BufferUsage::KvCache)
             .unwrap();
         let mut slot = PagedSlot {
-            map: SlotMap::take(&pool).unwrap(),
+            map: SlotMap::take(&pool),
             table,
             stale: false,
         };
-        slot.map.share_prefix(&src, 2);
+        slot.map.share_prefix(&src, 2).unwrap();
         assert!(!slot.map.is_private(0) && !slot.map.is_private(1));
 
         let split = slot.make_private(&be, 600, 700).unwrap();
         assert_eq!(split, 1, "rows 600..700 live in page 1 only");
         assert!(!slot.map.is_private(0), "page 0 is still the parent's");
         assert!(slot.map.is_private(1));
+    }
+
+    /// A slot grows page by page; the pool refuses the page that does not fit instead of writing
+    /// past its buffer, and a reset returns every page.
+    #[test]
+    fn grow_stops_at_the_budget_and_reset_returns_pages() {
+        let be = cpu();
+        let c = cfg();
+        let pool = KvPool::new(&be, &c, 1024, DType::F16, DType::F16, 3).unwrap();
+        let mut slot = PagedSlot::new(&pool, &be).unwrap();
+        slot.reserve_rows(&be, 1024).unwrap();
+        assert_eq!(slot.map.len(), 2);
+        assert_eq!(pool.in_use_pages(), 3, "page 0 plus the slot's two");
+        let mut other = PagedSlot::new(&pool, &be).unwrap();
+        let err = other.reserve_rows(&be, 600).unwrap_err();
+        assert!(
+            err.downcast_ref::<KvPagesExhausted>().is_some(),
+            "the refusal names the page budget: {err}"
+        );
+        slot.release_pages();
+        assert_eq!(pool.in_use_pages(), 1, "only the zero page is left");
+        other.reserve_rows(&be, 600).unwrap();
+    }
+
+    /// A small and a large request share one budget: each holds only the pages it uses, the second
+    /// cannot grow past what is left, and releasing both returns the pool to idle.
+    #[test]
+    fn a_small_and_a_large_request_share_one_page_budget() {
+        let be = cpu();
+        let c = cfg();
+        let pool = KvPool::new(&be, &c, 1536, DType::F16, DType::F16, 1 + 5).unwrap();
+        let mut small = PagedSlot::new(&pool, &be).unwrap();
+        let mut large = PagedSlot::new(&pool, &be).unwrap();
+        small.reserve_rows(&be, 700).unwrap();
+        assert_eq!(small.map.len(), 2, "700 rows over 512-row pages");
+        large.reserve_rows(&be, 1400).unwrap();
+        assert_eq!(large.map.len(), 3);
+        assert_eq!(pool.used_pages(), 5);
+        assert_eq!(pool.free_pages(), 0);
+        small.release_pages();
+        assert_eq!(pool.used_pages(), 3);
+        assert_eq!(pool.free_pages(), 2);
+        large.release_pages();
+        assert_eq!(pool.used_pages(), 0, "an idle pool is empty");
+        assert_eq!(pool.free_pages(), 5);
     }
 
     /// LFM3 short-convolution layers hold recurrent state, not row-addressed KV.
@@ -670,16 +761,23 @@ mod tests {
     fn a_prefix_shorter_than_a_page_is_copied() {
         let be = cpu();
         let c = cfg();
-        let pool = KvPool::new(&be, &c, 1024, DType::F16, DType::F16, 2).unwrap();
+        let pool = KvPool::new(&be, &c, 1024, DType::F16, DType::F16, 5).unwrap();
         let bytes = page_bytes(&pool);
         let row = bytes / PAGE_ROWS;
         assert_eq!(row, 64, "n_kv·head_dim f16");
 
-        let src = SlotMap::take(&pool).unwrap();
+        let mut src = SlotMap::take(&pool);
+        src.grow(1).unwrap();
+        let src_page = src.page(0);
         let k = pool.k(0).unwrap().clone();
-        be.upload_at(k.as_ref(), 0, &vec![0xAAu8; 7 * row]).unwrap();
+        be.upload_at(
+            k.as_ref(),
+            src_page as usize * bytes,
+            &vec![0xAAu8; 7 * row],
+        )
+        .unwrap();
 
-        let dst = PagedSlot::new(&pool, &be).unwrap();
+        let mut dst = PagedSlot::new(&pool, &be).unwrap();
         dst.copy_tail(&be, &src, 0, 7).unwrap();
         assert!(
             dst.map.is_private(0),

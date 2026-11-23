@@ -27,6 +27,8 @@ pub mod kernel_cache;
 pub mod loader;
 pub mod math;
 pub mod pager;
+/// The paged-KV budget's typed refusal (`KvPagesExhausted`), shared with the server.
+pub mod paging;
 /// The per-op profiling seam every backend reports through — one collector, one label grammar,
 /// one report, one on/off predicate (`prof.per_op()` ANDed with the warmup-suppression flag).
 pub mod prof;

@@ -238,9 +238,11 @@ its slot is recycled, and a later request sharing that prefix uploads them
 instead of re-prefilling, with LRU eviction once the budget is full. It is
 off by default because those rows are derived from the prompt. `paged`
 (`INFR_KV_PAGED`) turns on forward PagedAttention instead: the session's slots
-share one page pool, a fork points at its parent's complete pages, and only a
-page a slot writes is copied first. It costs the same device bytes as the slots
-it replaces (one block per slot), is built at the first fork, and helps a
+share one pool of physical pages, built with the session's KV in the cold init;
+a slot allocates pages as its sequence grows and returns them when it resets, a
+fork points at its parent's complete pages, and only a page a slot writes is
+copied first. `pool_mb` (`INFR_KV_POOL_MB`) caps the pool in MiB; unset sizes it
+at one full window per slot, which is what the linear slots cost. Paging helps a
 full-attention model the most — ring, recurrent, MLA and diffusion layers stay
 compact. Only the Vulkan backend walks a page table; elsewhere the knob warns
 and the slots stay linear. The two knobs are independent and compose: the pool

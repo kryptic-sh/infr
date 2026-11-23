@@ -625,7 +625,8 @@ pub(crate) fn generate_dense_backend_bound(
     // selection instead of their own. `None` everywhere but that harness: no op, no input, no
     // buffer, no download.
     mut route: Option<&mut RouteTap>,
-    // Blocks the `kv.paged` cold init allocates; `None` for a linear slot.
+    // Physical pages the `kv.paged` cold init allocates (zero page included); `None` for a
+    // linear slot.
     paged_blocks: Option<usize>,
     // KV copies this engine will hold; slot 0 allocates one here, forks allocate the rest.
     slot_copies: usize,
@@ -1557,26 +1558,46 @@ pub(crate) fn generate_dense_backend_bound(
         // and the driver's own memory that no pre-load footprint prices — so the budget query here
         // is a MEASUREMENT where the clamp that sized `want_ctx` could only estimate. Shrinks only,
         // and never a context the user pinned. See `reclamp_ctx_to_live_room`.
-        let want_ctx =
-            crate::seam::reclamp_ctx_to_live_room(be, c, ec, want_ctx, k_fmt, v_fmt, slot_copies)?;
+        let kv_copies = if paged_blocks.is_some() {
+            1
+        } else {
+            slot_copies
+        };
+        let mut want_ctx =
+            crate::seam::reclamp_ctx_to_live_room(be, c, ec, want_ctx, k_fmt, v_fmt, kv_copies)?;
         // A model infr only matches the reference over a bounded context gets no larger cache.
         // Sessions arrive already capped (`SeamModel::session_ctx`); this is the one-shot paths'
         // cap (they size `prompt + max_new + 1`). The load already warned.
-        let want_ctx = c
+        want_ctx = c
             .faithful_ctx_limit()
             .map_or(want_ctx, |limit| want_ctx.min(limit));
         // The guard prices the whole pool, so measure the budget before allocating it.
         let room = be.device_alloc_room();
-        let pool = match paged_blocks.filter(|_| caps.kv_paging) {
-            Some(blocks) => match crate::seam::KvPool::new(be, c, want_ctx, k_fmt, v_fmt, blocks) {
+        let mut pool_pages = paged_blocks;
+        if let (Some(pages), Some(mb)) = (pool_pages.as_mut(), ec.kv.pool_mb) {
+            let page_bytes: u64 = (0..c.n_layer)
+                .filter(|&l| crate::seam::paged_layer(c, l))
+                .map(|l| {
+                    let (kr, vr) = crate::seam::kv_row_elems(c, l);
+                    crate::seam::kv_side_bytes(k_fmt, infr_vulkan::paged::PAGE_ROWS * kr) as u64
+                        + crate::seam::kv_side_bytes(v_fmt, infr_vulkan::paged::PAGE_ROWS * vr)
+                            as u64
+                })
+                .sum();
+            if let Some(pages_from_budget) = (mb << 20).checked_div(page_bytes) {
+                *pages = (pages_from_budget as usize).max(2);
+            }
+        }
+        let pool = match pool_pages.filter(|_| caps.kv_paging) {
+            Some(pages) => match crate::seam::KvPool::new(be, c, want_ctx, k_fmt, v_fmt, pages) {
                 Ok(pool) => {
                     tracing::info!(
-                        "kv.paged: {} of {} layers in {} pool blocks of {} rows",
+                        "kv.paged: {} of {} layers in a {}-page pool of {} rows",
                         (0..c.n_layer)
                             .filter(|&l| crate::seam::paged_layer(c, l))
                             .count(),
                         c.n_layer,
-                        pool.blocks(),
+                        pool.pages(),
                         pool.slot_rows(),
                     );
                     Some(pool)
@@ -1590,7 +1611,15 @@ pub(crate) fn generate_dense_backend_bound(
             },
             None => None,
         };
-        let pool_rows = pool.as_ref().map(|p| p.slot_rows() * p.blocks());
+        // A failed pool falls back to one linear cache per slot, which is the allocation the
+        // pool was sized to replace: re-clamp against that shape instead of keeping the paged
+        // window.
+        let want_ctx = if pool.is_none() && paged_blocks.is_some() {
+            crate::seam::reclamp_ctx_to_live_room(be, c, ec, want_ctx, k_fmt, v_fmt, slot_copies)?
+        } else {
+            want_ctx
+        };
+        let pool_rows = pool.as_ref().map(|p| p.total_rows());
 
         // ── persistent KV cache buffers, sized per-layer (gemma4 SWA layers are narrower) and
         //    per-side (K and V pick their dtype independently) ────────────────────────────────
@@ -1992,21 +2021,19 @@ pub(crate) fn generate_dense_backend_bound(
         cached.clear();
     }
 
-    // Paged slot: this call writes rows [start, prompt.len()), so those are the rows it must stop
-    // sharing with the slot it forked from (page by page, device-to-device). Pages past the prefix
-    // are the slot's own already. `refresh` pushes a table a `reset` left behind.
+    // Paged slot: reserve the pages this request can write (prompt plus the reply budget), then
+    // take private copies of the rows [start, prompt.len()) it is about to prefill — pages a fork
+    // shares with its parent. `refresh` pushes a table a `reset` left behind.
     if let Some(p) = paged.as_mut() {
+        let need = prompt.len().saturating_add(max_new).min(max_ctx);
+        p.reserve_rows(be, need)?;
         p.refresh(be)?;
         p.make_private(be, start, prompt.len())?;
     }
     let pg_table = paged.as_ref().map(|p| p.table.as_ref() as &dyn Buffer);
     let pg_desc = paged.as_ref().map(|p| {
         let pool = p.map.pool();
-        (
-            pool.table_len(),
-            p.row_base(),
-            pool.slot_rows() * pool.blocks(),
-        )
+        (pool.table_len(), p.row_base(), pool.total_rows())
     });
 
     // Build a forward graph for `batch` tokens starting at absolute position `start_pos`.

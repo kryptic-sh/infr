@@ -190,6 +190,9 @@ pub struct ParallelSeam {
     /// [`crate::seam::KvPrefixStore`]). Empty and inert unless `kv.store_mb` is set.
     store: Mutex<crate::seam::KvPrefixStore>,
     max_ctx: usize,
+    /// The session's page pool when `kv.paged` built one, kept here so `/status` can report its
+    /// usage even while every slot's KV is checked out of the pool mutex.
+    paged_pool: Option<Arc<crate::seam::KvPool>>,
     /// This model's OWN placement pins (pinned prefill chunk / auto-q8 KV — see
     /// [`crate::seam::PlacementPins`]). Per-engine so a multi-model host (`infr multi` runs N of
     /// these concurrently) never leaks one model's ladder decision to another. Entered as the
@@ -256,6 +259,7 @@ impl ParallelSeam {
             // path `infr run` takes (see `RequestCtx::gate_pass`: `None` constructs nothing).
             gate: (n_slots > 1).then(|| Arc::new(StepGate::new())),
             max_ctx,
+            paged_pool: None,
             pins,
         };
         engine.init_slots(n_slots)?;
@@ -263,14 +267,24 @@ impl ParallelSeam {
         Ok(engine)
     }
 
+    /// The paged KV pool's `(used, free)` physical pages, when this engine pages its cache.
+    pub fn kv_pages(&self) -> Option<(usize, usize)> {
+        self.paged_pool
+            .as_ref()
+            .map(|p| (p.used_pages(), p.free_pages()))
+    }
+
     /// Materialize slot 0 (weights + KV + pipelines) with a throwaway generation, then fork the
     /// rest off it. `&mut self` — this runs at startup, before the engine is shared.
     fn init_slots(&mut self, n_slots: usize) -> Result<()> {
         let t0 = std::time::Instant::now();
-        let paged_blocks = crate::seam::paged_blocks_for(
+        let fit = self.model.kv_fit_ctx(&self.vk);
+        let paged_blocks = crate::seam::paged_pages_for(
             n_slots,
             self.model.engine_cfg().kv.paged == Some(true),
             &infr_core::backend::Backend::capabilities(&self.vk),
+            fit,
+            self.max_ctx,
         );
         // The warmup generation both uploads the weights and compiles every lazily-built pipeline,
         // so the first REAL request pays neither. INFR_PROF_OPS is suppressed for it (recorders read
@@ -302,6 +316,7 @@ impl ParallelSeam {
         // window that was actually allocated: every slot forked below is sized from it, and it is
         // what the server advertises and admits requests against.
         self.max_ctx = slot0.max_ctx();
+        self.paged_pool = slot0.paged_pool().map(Arc::clone);
         if self.model.engine_cfg().kv.paged == Some(true) && n_slots == 1 {
             tracing::info!(
                 "kv.paged: single-slot engine never forks, so no page pool is allocated; KV stays \

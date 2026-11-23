@@ -2302,6 +2302,7 @@ impl infr_server::ChatGenerator for SeamGenerator {
             device: None,
             ctx_per_slot: None,
             memory: None,
+            kv_pages: None,
         }
     }
 
@@ -2390,6 +2391,13 @@ impl infr_server::ChatGenerator for ParallelGenerator {
                 live: vram.live,
                 unified: vram.uma,
             }),
+            kv_pages: self
+                .engine
+                .kv_pages()
+                .map(|(used, free)| infr_server::KvPageStats {
+                    used,
+                    total: used + free,
+                }),
         }
     }
 

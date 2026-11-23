@@ -8572,3 +8572,30 @@ runs at about 1 TFLOP/s effective on a card that sustains much more in the
 GEMMs, so the prefill ceiling is the kernel's tile and wave scheme. A
 wave64-native or retiled hd128 flash prefill is the slice; measure at 58k
 against 440 t/s. The KV dtype and the host store do not move this number.
+
+Each full-attention layer adds about 8.5 ms per 1,024 keys at chunk 1024, which
+is 1.0 TFLOP/s against the card's 6.2 TFLOP/s FP32 peak; the Q4_K GEMM runs near
+4.4 TFLOP/s. `RADV_DEBUG=shaderstats` with `INFR_NO_PIPELINE_CACHE=1` shows the
+hd128 build at 256 VGPRs with 62 spilled to 10 KB of scratch and one wave per
+SIMD, because the compiler fully unrolls the 64-key PV loop and hoists its LDS
+loads. Capping that unroll at 8 keys gives 80 VGPRs, no spills, and two waves
+per SIMD: attention at d16384 drops 866 to 606 ms, pp1024@d32768 goes 396 to
+494 t/s (llama.cpp on the same card: 456), and pp58728 goes 440 to 539 t/s.
+After that the kernel is LDS-bound at two 32 KB workgroups per CU, with about
+3 B of LDS traffic per FMA and 15 barriers per 64-key block. The next step is a
+wave64 tile that stages Q and K d-major so one ds_read_b128 feeds four rows,
+uses an 8x4 or 8x8 microtile, and runs softmax with subgroup ops. 1,000 t/s at
+58k needs attention near 4 TFLOP/s and the GEMM near 80% of peak, so it is the
+ceiling rather than a near target.
+
+### B238 — a short request still preflights at the window's chunk height (2026-11-24)
+
+**Tag:** kv · prefill · **Plan:** `docs/plan/16-dynamic-kv.md` (P6)
+
+The paged window is now the pool's fit (185,344 tokens on qwen35-4B at 2 slots, up
+from the 103k per-slot clamp), but the activation reserve still prices that whole
+window. On the RX 580 that forces a 128-row prefill chunk even for a 4k request
+(1024 rows needs 3+ GiB of activations at the window). Decouple the reserve from
+`max_ctx`: price it against the prompt/chunk actually being run, and let a short
+request prefill at the tallest chunk that fits. Measure TTFT at 4k before and
+after; the 112k case stays at the window-sized reserve.

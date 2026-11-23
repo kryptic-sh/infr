@@ -99,10 +99,10 @@ under the pool instead of being the whole mechanism.
 - The read side is one table read per chunk and one compare per key in
   `attn_decode.comp` (`pc.page_rows == 0` is the identity), so a linear cache
   pays a compare and nothing else.
-- The write side needs no shader change: `store_kv_dense.comp` and friends write
-  at a raw element offset, so a chunk that straddles a page boundary is split
-  into two dispatches that differ only in `off`. Decode writes one row and never
-  straddles.
+- The write side resolves every store row through the same table
+  (`kv_paged_row` in `kv_addr.glsl`), so a chunk that straddles a page boundary
+  needs no dispatch split; decode resolves its one row from the params SSBO.
+  `row_base` remains only the linear fallback when no table is bound.
 - The cost is the allocator: a physical page pool with refcounts, copy-on-write
   on the first write into a shared page (~5 MB per layer at hd 2560, ~0.2 ms
   across the 7 non-ring layers), and eviction into the host tier.

@@ -16,7 +16,7 @@
 use crate::Config;
 use crate::EngineConfig;
 use anyhow::Result;
-use infr_core::backend::Backend;
+use infr_core::backend::{Backend, Buffer};
 use infr_core::budget::kv_fmt_bytes;
 use infr_core::DType;
 use std::collections::hash_map::DefaultHasher;
@@ -184,6 +184,9 @@ impl KvPrefixStore {
         if n < MIN_PREFIX_TOKENS {
             return Ok(0);
         }
+        if let Some(p) = kv.paged.as_mut() {
+            p.make_private(be, 0, n)?;
+        }
         for l in 0..cfg.n_layer {
             if cfg.is_recurrent_layer(l) {
                 continue;
@@ -195,8 +198,17 @@ impl KvPrefixStore {
                 buf.extend_from_slice(&self.blocks[*i].k[l]);
             }
             debug_assert_eq!(buf.len(), kb);
-            let off = kv_fmt_bytes(kv.k_fmt, kv.paged_row_base_at(cfg, l) * k_row);
-            be.upload_at(kv.kbufs[l].as_ref(), off, &buf)?;
+            Self::write_rows(
+                be,
+                cfg,
+                kv,
+                l,
+                kv.k_fmt,
+                k_row,
+                n,
+                kv.kbufs[l].as_ref(),
+                &buf,
+            )?;
             if v_row > 0 {
                 let vb = kv_fmt_bytes(kv.v_fmt, n * v_row);
                 let mut buf = Vec::with_capacity(vb);
@@ -204,8 +216,17 @@ impl KvPrefixStore {
                     buf.extend_from_slice(&self.blocks[*i].v[l]);
                 }
                 debug_assert_eq!(buf.len(), vb);
-                let off = kv_fmt_bytes(kv.v_fmt, kv.paged_row_base_at(cfg, l) * v_row);
-                be.upload_at(kv.vbufs[l].as_ref(), off, &buf)?;
+                Self::write_rows(
+                    be,
+                    cfg,
+                    kv,
+                    l,
+                    kv.v_fmt,
+                    v_row,
+                    n,
+                    kv.vbufs[l].as_ref(),
+                    &buf,
+                )?;
             }
         }
         if cfg.has_recurrent_state() {
@@ -363,12 +384,30 @@ impl KvPrefixStore {
             }
             let (k_row, v_row) = kv_row_elems(cfg, l);
             let mut kbuf = vec![0u8; kv_fmt_bytes(kv.k_fmt, p * k_row)];
-            let koff = kv_fmt_bytes(kv.k_fmt, kv.paged_row_base_at(cfg, l) * k_row);
-            be.download_at(kv.kbufs[l].as_ref(), koff, &mut kbuf)?;
+            Self::read_rows(
+                be,
+                cfg,
+                kv,
+                l,
+                kv.k_fmt,
+                k_row,
+                p,
+                kv.kbufs[l].as_ref(),
+                &mut kbuf,
+            )?;
             let vbuf = if v_row > 0 {
                 let mut buf = vec![0u8; kv_fmt_bytes(kv.v_fmt, p * v_row)];
-                let voff = kv_fmt_bytes(kv.v_fmt, kv.paged_row_base_at(cfg, l) * v_row);
-                be.download_at(kv.vbufs[l].as_ref(), voff, &mut buf)?;
+                Self::read_rows(
+                    be,
+                    cfg,
+                    kv,
+                    l,
+                    kv.v_fmt,
+                    v_row,
+                    p,
+                    kv.vbufs[l].as_ref(),
+                    &mut buf,
+                )?;
                 buf
             } else {
                 Vec::new()
@@ -389,6 +428,79 @@ impl KvPrefixStore {
                 b.k[l] = kslice;
                 b.v[l] = vslice;
             }
+        }
+        Ok(())
+    }
+
+    /// Download `rows` rows of one side into `buf`, walking the slot's page table when the layer
+    /// is pooled (a paged layer has no single row base to read from).
+    #[allow(clippy::too_many_arguments)]
+    fn read_rows(
+        be: &dyn Backend,
+        cfg: &Config,
+        kv: &SeamKv,
+        l: usize,
+        fmt: DType,
+        row: usize,
+        rows: usize,
+        src: &dyn Buffer,
+        buf: &mut [u8],
+    ) -> Result<()> {
+        let Some(paged) = kv
+            .paged
+            .as_ref()
+            .filter(|_| crate::seam::paged_layer(cfg, l))
+        else {
+            be.download_at(src, 0, buf)?;
+            return Ok(());
+        };
+        for page in 0..rows.div_ceil(infr_vulkan::paged::PAGE_ROWS) {
+            let first = page * infr_vulkan::paged::PAGE_ROWS;
+            let n = infr_vulkan::paged::PAGE_ROWS.min(rows - first);
+            let phys = paged.map.page(page) as usize;
+            let at = kv_fmt_bytes(fmt, first * row);
+            let bytes = kv_fmt_bytes(fmt, n * row);
+            be.download_at(
+                src,
+                kv_fmt_bytes(fmt, phys * infr_vulkan::paged::PAGE_ROWS * row),
+                &mut buf[at..at + bytes],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Upload `rows` rows of one side from `buf`, page by page when the layer is pooled.
+    #[allow(clippy::too_many_arguments)]
+    fn write_rows(
+        be: &dyn Backend,
+        cfg: &Config,
+        kv: &SeamKv,
+        l: usize,
+        fmt: DType,
+        row: usize,
+        rows: usize,
+        dst: &dyn Buffer,
+        buf: &[u8],
+    ) -> Result<()> {
+        let Some(paged) = kv
+            .paged
+            .as_ref()
+            .filter(|_| crate::seam::paged_layer(cfg, l))
+        else {
+            be.upload_at(dst, 0, buf)?;
+            return Ok(());
+        };
+        for page in 0..rows.div_ceil(infr_vulkan::paged::PAGE_ROWS) {
+            let first = page * infr_vulkan::paged::PAGE_ROWS;
+            let n = infr_vulkan::paged::PAGE_ROWS.min(rows - first);
+            let phys = paged.map.page(page) as usize;
+            let at = kv_fmt_bytes(fmt, first * row);
+            let bytes = kv_fmt_bytes(fmt, n * row);
+            be.upload_at(
+                dst,
+                kv_fmt_bytes(fmt, phys * infr_vulkan::paged::PAGE_ROWS * row),
+                &buf[at..at + bytes],
+            )?;
         }
         Ok(())
     }

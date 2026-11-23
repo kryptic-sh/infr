@@ -169,7 +169,8 @@ fn start_paging(
     }
     let (k_fmt, v_fmt) = src.kv_fmts();
     let blocks = max_slots.max(crate::seam::POOL_BLOCKS);
-    let built = crate::seam::KvPool::new(be, cfg, src.max_ctx(), k_fmt, v_fmt, blocks)
+    let pps = src.max_ctx().div_ceil(infr_vulkan::paged::PAGE_ROWS).max(1);
+    let built = crate::seam::KvPool::new(be, cfg, src.max_ctx(), k_fmt, v_fmt, 1 + blocks * pps)
         .and_then(|pool| src.attach_paged(be, cfg, &pool));
     if let Err(e) = built {
         tracing::warn!("kv.paged: could not page this session's KV ({e}); slots stay linear");
@@ -1028,7 +1029,7 @@ impl SeamModel {
     /// rung is the reader of that. `None` for a pure recurrent-state arch (no per-token KV).
     /// Extra KV slots (INFR_KV_SLOTS forks) aren't modeled — the alloc-time budget guard remains
     /// the backstop.
-    fn kv_fit_ctx(&self, vk: &infr_vulkan::VulkanBackend) -> Option<usize> {
+    pub(crate) fn kv_fit_ctx(&self, vk: &infr_vulkan::VulkanBackend) -> Option<usize> {
         // Price whatever the runner will actually allocate: the auto-q8 pin (if the placement
         // ladder set it earlier in this process) or the plain env-driven formats.
         self.kv_fit_ctx_fmt(vk, crate::seam::kv_auto_q8())
@@ -1415,11 +1416,17 @@ impl SeamModel {
     ) -> Result<usize> {
         let n_slots = n_slots.max(1);
         // An explicit token count is the user's demand — honour it verbatim, at any N, quantizing
-        // the cache to q8_0 when that is what it takes to fit.
+        // the cache to q8_0 when that is what it takes to fit. A paged session prices ONE window:
+        // the pool is shared, so N slots do not each own a copy of it.
         if let Some(infr_core::SizeSpec::Bytes(c)) = want {
             let ctx = self.session_ctx((c as usize).max(1));
-            self.auto_q8_for_explicit_ctx(vk, ctx, n_slots);
-            self.refuse_explicit_ctx(vk, ctx, n_slots)?;
+            let copies = if self.ecfg.kv.paged == Some(true) {
+                1
+            } else {
+                n_slots
+            };
+            self.auto_q8_for_explicit_ctx(vk, ctx, copies);
+            self.refuse_explicit_ctx(vk, ctx, copies)?;
             return Ok(ctx);
         }
         let trained = self.session_ctx(self.cfg.n_ctx_train);
@@ -1433,6 +1440,19 @@ impl SeamModel {
             Some(infr_core::SizeSpec::Percent(f)) => (fit as f64 * f) as usize,
             _ => fit,
         };
+        // A paged session's window is the pool's capacity, not one slot's slice of it: a slot owns
+        // pages only while it uses them, so the advertised window can be the whole KV fit.
+        if self.ecfg.kv.paged == Some(true) && !self.ecfg.kv.overflow {
+            let ctx = trained.min(budget);
+            tracing::info!(
+                ctx,
+                trained,
+                fit,
+                slots = n_slots,
+                "kv.paged: the per-request window is the pool's fit, not fit/{n_slots}"
+            );
+            return Ok(ctx);
+        }
         // `MIN_SESSION_CTX` is the runner's own floor — below it a slot is useless and the alloc
         // guard's clear error is the better outcome than a silently-crippled window.
         let per_slot = (budget / n_slots).max(crate::seam::MIN_SESSION_CTX);

@@ -922,7 +922,7 @@ pub(crate) fn token_logprob(
     let logprob = idx
         .iter()
         .position(|&id| id as u32 == selected)
-        .map_or(f32::NEG_INFINITY, |j| probs[j].ln());
+        .map_or(f32::NEG_INFINITY, |j| math::ln(probs[j]));
     if top_n == 0 {
         return infr_chat::TokenLogprob::unresolved(selected, logprob, Vec::new());
     }
@@ -944,7 +944,7 @@ pub(crate) fn token_logprob(
             token: id,
             text: String::new(),
             bytes: Vec::new(),
-            logprob: p.ln(),
+            logprob: math::ln(p),
         })
         .collect();
     infr_chat::TokenLogprob::unresolved(selected, logprob, top)

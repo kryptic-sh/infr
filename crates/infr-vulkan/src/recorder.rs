@@ -13,8 +13,12 @@ use ash::vk;
 
 use infr_core::{backend::Buffer, error::Result};
 
+use super::gpu_wait::SubmitDesc;
 use super::ops::ComputeKernel;
 use super::{as_vk_buf, be, Backing, VkBuffer, VulkanBackend};
+
+mod work_cut;
+use work_cut::{account_work, WatchStamps};
 
 /// Coopmat prefill shmem-staging mode for `attention_prefill_flash` (Levers 2 & 5,
 /// kv-decode-perf-levers). `Off` = the default direct coopMatLoad from the bound descriptor.
@@ -973,7 +977,7 @@ enum ConvKind {
 
 pub struct Recorder<'a> {
     be: &'a VulkanBackend,
-    cmd: vk::CommandBuffer,
+    cmd: std::cell::Cell<vk::CommandBuffer>,
     /// Descriptor pools, GROWN on exhaustion (a batched-MoE prefill chunk records ~50k dispatches
     /// — far beyond any fixed max_sets). The last entry is the active pool; `alloc_set` appends a
     /// fresh one on ERROR_OUT_OF_POOL_MEMORY. Empty on the push-descriptor path, which never
@@ -1008,7 +1012,7 @@ pub struct Recorder<'a> {
     /// index 1 by `finish`/`finish_nowait`), for the submit splitter's GPU-time measurement
     /// (`crate::ForwardClock`). Null on a persistent recorder or when the queue writes no
     /// timestamps; the completed segment then counts as untimed.
-    seg_query_pool: vk::QueryPool,
+    seg_query_pool: std::cell::Cell<vk::QueryPool>,
     ts_labels: RefCell<Vec<&'static str>>,
     /// Dispatches past the query-pool capacity: counted (and reported) instead of stamped.
     ts_dropped: std::cell::Cell<usize>,
@@ -1029,6 +1033,13 @@ pub struct Recorder<'a> {
     /// The submit splitter reads it to decide when the segment has grown to the device's cap —
     /// see `VulkanShared::submit_dispatch_cap` and `adapter::execute_static`.
     dispatches: std::cell::Cell<usize>,
+    /// The first and last kernel recorded into this command buffer, so a submit that never
+    /// completes can be named (`gpu_wait::SubmitDesc`).
+    first_op: std::cell::Cell<Option<&'static str>>,
+    last_op: std::cell::Cell<Option<&'static str>>,
+    /// `last_op` before the newest dispatch: a dispatch cut into ranges can open a new command
+    /// buffer before its first range, and the one it leaves must not name it.
+    prev_last_op: std::cell::Cell<Option<&'static str>>,
     /// `kernels.vulkan.bda_chunk_elems` / `_bytes`, HOISTED here at construction (they used
     /// to be two env-seeded `AtomicU64` memos). Read on the decode GEMV path via
     /// [`Self::chunk_caps`].
@@ -1036,6 +1047,28 @@ pub struct Recorder<'a> {
     bda_chunk_byte_cap: u64,
     /// Process-unique id of this recording (see [`Self::serial`]).
     serial: u64,
+    /// The work bound (`crate::work`): what the next dispatch costs, said by the op recording it
+    /// ([`Self::work_next`]) and consumed by that dispatch.
+    work_next: std::cell::Cell<Option<crate::work::WorkTag>>,
+    /// Estimated GPU time of the dispatches recorded here so far, in ns: the submit splitter's
+    /// work trigger ([`Self::work_ns`]).
+    work_ns: std::cell::Cell<u64>,
+    /// The dispatches timed for the work estimate (`crate::work::WorkModel::watch`).
+    watch: RefCell<WatchStamps>,
+    /// The estimated work recorded into this command buffer, by kernel, for the model to set
+    /// against the buffer's measured GPU time (`crate::work::WorkModel::calibrate`).
+    seg_work: RefCell<crate::work::SegmentWork>,
+    /// An error met while recording that a dispatch method cannot return: a submit made in the
+    /// middle of an op failed ([`Self::rollover`]). The open command buffer is then never
+    /// submitted, and finishing the recorder returns this.
+    failed: RefCell<Option<infr_core::error::Error>>,
+    /// Command buffers this recorder already submitted itself, oldest first: a dispatch cut into
+    /// ranges puts each range in its own submit ([`Self::rollover`]). Finishing the recorder waits
+    /// for them before anything that could free what they use.
+    flushed: RefCell<std::collections::VecDeque<PendingSegment>>,
+    /// Dispatches in every command buffer this recorder submitted itself, whether still in
+    /// `flushed` or already waited for.
+    flushed_dispatches: std::cell::Cell<usize>,
 }
 
 /// Intern a profiling shape label, leaking each DISTINCT string at most ONCE and handing back the
@@ -1094,6 +1127,8 @@ impl<'a> Recorder<'a> {
     }
 
     fn new_inner(backend: &'a VulkanBackend, persistent: bool) -> Result<Self> {
+        // A poisoned backend records nothing (see `gpu_wait`).
+        backend.shared.live()?;
         let device = &backend.shared.device;
         let cmd_pool = *backend.shared.cmd_pool.lock().unwrap();
         let cmd = unsafe {
@@ -1153,7 +1188,7 @@ impl<'a> Recorder<'a> {
                 )
             }
             .map_err(|e| be(format!("create query pool: {e}")))?;
-            unsafe { device.cmd_reset_query_pool(cmd, qp, 0, MAX_TS) };
+            Self::reset_queries(backend, cmd, qp, MAX_TS);
             qp
         } else {
             vk::QueryPool::null()
@@ -1162,38 +1197,15 @@ impl<'a> Recorder<'a> {
         // command has finished that stage, so stamp 0 lands when this segment can actually start
         // (after the segment queued ahead of it), not while that one is still running — the
         // per-segment intervals then tile the queue instead of overlapping.
-        let seg_query_pool = if !persistent && backend.shared.segment_ts_period.is_some() {
-            match unsafe {
-                device.create_query_pool(
-                    &vk::QueryPoolCreateInfo::default()
-                        .query_type(vk::QueryType::TIMESTAMP)
-                        .query_count(2),
-                    None,
-                )
-            } {
-                Ok(qp) => {
-                    unsafe {
-                        device.cmd_reset_query_pool(cmd, qp, 0, 2);
-                        device.cmd_write_timestamp(
-                            cmd,
-                            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                            qp,
-                            0,
-                        );
-                    }
-                    qp
-                }
-                // Untimed is a supported state (the forward falls back to wall time), so a failed
-                // create degrades instead of failing the recording.
-                Err(_) => vk::QueryPool::null(),
-            }
-        } else {
+        let seg_query_pool = if persistent {
             vk::QueryPool::null()
+        } else {
+            Self::open_segment_stamps(backend, cmd)
         };
 
         Ok(Self {
             be: backend,
-            cmd,
+            cmd: std::cell::Cell::new(cmd),
             pools: std::cell::RefCell::new(pools),
             dirty_writes: RefCell::new(HashSet::new()),
             dirty_reads: RefCell::new(HashSet::new()),
@@ -1206,7 +1218,7 @@ impl<'a> Recorder<'a> {
             prof_ops,
             op_shapes,
             query_pool,
-            seg_query_pool,
+            seg_query_pool: std::cell::Cell::new(seg_query_pool),
             ts_labels: RefCell::new(Vec::new()),
             ts_dropped: std::cell::Cell::new(0),
             next_label: std::cell::Cell::new(None),
@@ -1214,9 +1226,19 @@ impl<'a> Recorder<'a> {
             t0: std::time::Instant::now(),
             suppress: std::cell::Cell::new(false),
             dispatches: std::cell::Cell::new(0),
+            first_op: std::cell::Cell::new(None),
+            last_op: std::cell::Cell::new(None),
+            prev_last_op: std::cell::Cell::new(None),
             bda_chunk_elem_cap,
             bda_chunk_byte_cap,
             serial: NEXT_SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            work_next: std::cell::Cell::new(None),
+            work_ns: std::cell::Cell::new(0),
+            watch: RefCell::new(WatchStamps::default()),
+            seg_work: RefCell::new(crate::work::SegmentWork::default()),
+            failed: RefCell::new(None),
+            flushed: RefCell::new(std::collections::VecDeque::new()),
+            flushed_dispatches: std::cell::Cell::new(0),
         })
     }
 
@@ -1253,9 +1275,68 @@ impl<'a> Recorder<'a> {
         (self.bda_chunk_elem_cap, self.bda_chunk_byte_cap)
     }
 
+    /// Reset a new query pool's first `n` queries: from the host when `hostQueryReset` is enabled,
+    /// so a timestamp the GPU never writes (its command buffer discarded by a watchdog reset)
+    /// reads as reliably unavailable — a query never reset is in an undefined state, and the
+    /// in-command-buffer reset would be discarded with the rest. In the command buffer otherwise.
+    /// A segment's two-stamp pool with its opening stamp written into `cmd`, or null when the queue
+    /// writes no timestamps or the pool cannot be created (untimed is a supported state: the
+    /// forward falls back to wall time, so a failed create degrades instead of failing).
+    fn open_segment_stamps(backend: &VulkanBackend, cmd: vk::CommandBuffer) -> vk::QueryPool {
+        if backend.shared.segment_ts_period.is_none() {
+            return vk::QueryPool::null();
+        }
+        let device = &backend.shared.device;
+        match unsafe {
+            device.create_query_pool(
+                &vk::QueryPoolCreateInfo::default()
+                    .query_type(vk::QueryType::TIMESTAMP)
+                    .query_count(2),
+                None,
+            )
+        } {
+            Ok(qp) => {
+                Self::reset_queries(backend, cmd, qp, 2);
+                unsafe {
+                    device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, qp, 0);
+                }
+                qp
+            }
+            Err(_) => vk::QueryPool::null(),
+        }
+    }
+
+    fn reset_queries(backend: &VulkanBackend, cmd: vk::CommandBuffer, qp: vk::QueryPool, n: u32) {
+        let device = &backend.shared.device;
+        unsafe {
+            if backend.shared.host_query_reset {
+                device.reset_query_pool(qp, 0, n);
+            } else {
+                device.cmd_reset_query_pool(cmd, qp, 0, n);
+            }
+        }
+    }
+
     /// Dispatches recorded into this command buffer so far — the submit splitter's trigger.
     pub fn dispatches(&self) -> usize {
         self.dispatches.get()
+    }
+
+    /// Dispatches recorded through this recorder in all: the open command buffer's and those of
+    /// every buffer it already submitted itself (a dispatch cut into ranges, `work_cut`). What a
+    /// forward reports for the recorder it finishes with a blocking [`Self::finish`];
+    /// `PendingSegment::dispatches` is the same total for one finished without waiting.
+    pub fn total_dispatches(&self) -> usize {
+        self.dispatches.get() + self.flushed_dispatches.get()
+    }
+
+    /// This command buffer as a failed wait names it.
+    fn submit_desc(&self) -> SubmitDesc {
+        SubmitDesc {
+            dispatches: self.dispatches.get(),
+            first: self.first_op.get(),
+            last: self.last_op.get(),
+        }
     }
 
     /// Disjoint-batch barrier suppression: while ON, recorded dispatches accumulate hazard state
@@ -1362,6 +1443,10 @@ impl<'a> Recorder<'a> {
         // the submit splitter (`Recorder::dispatches`) needs the count whether or not INFR_PROF_OPS
         // is on.
         self.dispatches.set(self.dispatches.get() + 1);
+        if self.first_op.get().is_none() {
+            self.first_op.set(Some(label));
+        }
+        self.prev_last_op.set(self.last_op.replace(Some(label)));
         if !self.prof_ops {
             return;
         }
@@ -1373,7 +1458,7 @@ impl<'a> Recorder<'a> {
         }
         unsafe {
             self.be.shared.device.cmd_write_timestamp(
-                self.cmd,
+                self.cmd.get(),
                 vk::PipelineStageFlags::BOTTOM_OF_PIPE,
                 self.query_pool,
                 idx,
@@ -1441,7 +1526,7 @@ impl<'a> Recorder<'a> {
                 .dst_access_mask(dst_access);
             unsafe {
                 self.be.shared.device.cmd_pipeline_barrier(
-                    self.cmd,
+                    self.cmd.get(),
                     src,
                     dst,
                     vk::DependencyFlags::empty(),
@@ -1539,7 +1624,9 @@ impl<'a> Recorder<'a> {
     /// the extension is unavailable; `k.ds_layout` was built to match (see `ops.rs`).
     fn bind_descriptors(&self, k: ComputeKernel, buffers: &[vk::DescriptorBufferInfo]) {
         let device = &self.be.shared.device;
-        unsafe { device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, k.pipeline) };
+        unsafe {
+            device.cmd_bind_pipeline(self.cmd.get(), vk::PipelineBindPoint::COMPUTE, k.pipeline)
+        };
         let n = buffers.len();
         debug_assert!(
             n <= MAX_DISPATCH_BINDINGS,
@@ -1559,7 +1646,7 @@ impl<'a> Recorder<'a> {
             }
             unsafe {
                 pd.cmd_push_descriptor_set(
-                    self.cmd,
+                    self.cmd.get(),
                     vk::PipelineBindPoint::COMPUTE,
                     k.pipeline_layout,
                     0,
@@ -1578,7 +1665,7 @@ impl<'a> Recorder<'a> {
             unsafe {
                 device.update_descriptor_sets(&ds_writes[..n], &[]);
                 device.cmd_bind_descriptor_sets(
-                    self.cmd,
+                    self.cmd.get(),
                     vk::PipelineBindPoint::COMPUTE,
                     k.pipeline_layout,
                     0,
@@ -1607,6 +1694,11 @@ impl<'a> Recorder<'a> {
         // before `sync` so a barrier's cost lands in the op it fences (same as the old
         // stamp-at-op-start convention). One `prof_ops` branch when profiling is off.
         self.stamp(k.name);
+        let stale = self.work_next.take();
+        debug_assert!(
+            stale.is_none(),
+            "an indirect dispatch was tagged for the work bound"
+        );
         let n = buffers.len();
         debug_assert!(
             n <= MAX_DISPATCH_BINDINGS,
@@ -1634,14 +1726,14 @@ impl<'a> Recorder<'a> {
         unsafe {
             if k.push_size > 0 {
                 device.cmd_push_constants(
-                    self.cmd,
+                    self.cmd.get(),
                     k.pipeline_layout,
                     vk::ShaderStageFlags::COMPUTE,
                     0,
                     push,
                 );
             }
-            device.cmd_dispatch_indirect(self.cmd, args, args_off);
+            device.cmd_dispatch_indirect(self.cmd.get(), args, args_off);
         }
     }
 
@@ -1676,15 +1768,15 @@ impl<'a> Recorder<'a> {
         unsafe {
             if k.push_size > 0 {
                 device.cmd_push_constants(
-                    self.cmd,
+                    self.cmd.get(),
                     k.pipeline_layout,
                     vk::ShaderStageFlags::COMPUTE,
                     0,
                     push,
                 );
             }
-            device.cmd_dispatch(self.cmd, gx, gy, gz);
         }
+        self.record_dispatch(k, buffers, push, [gx, gy, gz]);
     }
 
     /// `&dyn Buffer` → `vk::DescriptorBufferInfo` — the SOLE choke point every dispatch call site in
@@ -2209,9 +2301,14 @@ impl<'a> Recorder<'a> {
         );
     }
 
-    /// Which `linear_f32r` build [`Self::linear_f32_at`] dispatches for `rows` × `in_f` — public
-    /// so the parity test can assert the shape it meant to cover actually reached that kernel.
+    /// Which f32 GEMV build [`Self::linear_f32_at`] dispatches for `rows` × `in_f` when the
+    /// weight's address is 16-byte aligned — public so the parity test can assert the shape it
+    /// meant to cover actually reached that kernel. (`linear_f32_mo` reads the weight as aligned
+    /// vec4s; at an unaligned address [`Self::linear_f32_at`] takes the `linear_f32r` build this
+    /// would name with `gemv.kq_fma` off.)
     ///
+    /// One row with a vec4-wide `in_f` takes `linear_f32_mo` where the tuning parameter
+    /// `gemv.kq_fma` is on (devices without an accelerated int8 dot), else `linear_f32r_v4`.
     /// The two escapes govern different things: `INFR_NO_F32_MROW` (`f32_mrow`) turns off the
     /// ROW-TILED builds (several rows per workgroup, `rows > 1`), `INFR_NO_F32_V4` (`f32_v4`) the
     /// vec4 K stream. The one-row vec4 build has no row tiling, so only the vec4 escape reaches it.
@@ -2222,7 +2319,9 @@ impl<'a> Recorder<'a> {
     pub fn linear_f32_kernel(&self, rows: usize, in_f: usize) -> &'static str {
         let v4 = in_f.is_multiple_of(4) && self.vk().f32_v4;
         let mrow = rows > 1 && self.vk().f32_mrow;
-        if rows == 1 && v4 {
+        if rows == 1 && v4 && self.tuning().gemv_kq_fma {
+            "linear_f32_mo"
+        } else if rows == 1 && v4 {
             "linear_f32r_v4"
         } else if mrow && v4 && rows <= 4 {
             "linear_f32r_mrow4_v4"
@@ -2236,7 +2335,9 @@ impl<'a> Recorder<'a> {
     }
 
     /// Decode (m=1) f32 GEMV over `linear_f32_mo.comp` with `2^tpo_log2` threads per output
-    /// (1..=8). Requires `in_f % 4 == 0` and a 16-byte-aligned `arena_addr`.
+    /// (`tpo_log2` at most 8). Requires `in_f % 4 == 0` and a 16-byte-aligned `arena_addr`. The
+    /// grid is one workgroup per `256 >> tpo_log2` outputs, split into two dimensions past the
+    /// guaranteed grid width, which a vocabulary-sized `out_f` reaches.
     pub fn linear_f32_mo_at(
         &self,
         arena_addr: u64,
@@ -2258,7 +2359,7 @@ impl<'a> Recorder<'a> {
         push[12..16].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
         push[16..20].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
         let per_wg = 256usize >> tpo_log2;
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(x), Self::vkb(x), Self::vkb(y)],
             1,
@@ -2280,15 +2381,18 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
     ) {
-        if rows == 1 && in_f.is_multiple_of(4) && arena_addr.is_multiple_of(16) && self.vk().f32_v4
-        {
-            // 64 threads per output, 32 when a row is too short to give each thread two vec4s.
-            let tpo_log2 = if in_f / 4 >= 128 { 6 } else { 5 };
-            self.linear_f32_mo_at(arena_addr, x, y, in_f, out_f, tpo_log2);
-            return;
+        let mut name = self.linear_f32_kernel(rows, in_f);
+        if name == "linear_f32_mo" {
+            if arena_addr.is_multiple_of(16) {
+                // 64 threads per output, 32 when a row is too short to give each thread two
+                // vec4s.
+                let tpo_log2 = if in_f / 4 >= 128 { 6 } else { 5 };
+                self.linear_f32_mo_at(arena_addr, x, y, in_f, out_f, tpo_log2);
+                return;
+            }
+            name = "linear_f32r_v4";
         }
         self.label_gemv("lin_f32_streamed", rows, in_f, out_f);
-        let name = self.linear_f32_kernel(rows, in_f);
         let (spv, groups) = match name {
             "linear_f32r_v4" => (crate::gemm::linear_f32r_v4_spv(), out_f as u32),
             "linear_f32r_mrow4_v4" => (
@@ -2603,6 +2707,7 @@ impl<'a> Recorder<'a> {
         push[16..20].copy_from_slice(&(w_addr as u32).to_ne_bytes());
         push[20..24].copy_from_slice(&((w_addr >> 32) as u32).to_ne_bytes());
         let groups = (m.div_ceil(64) * groups_n) as u32;
+        self.tag_gemm(crate::work::Family::Matrix, m, k, n);
         self.dispatch(
             kern,
             &[Self::vkb(a), Self::vkb(a), Self::vkb(c)],
@@ -2643,6 +2748,7 @@ impl<'a> Recorder<'a> {
         // land in the adapter's ceil(m/64)*64-row padded dst, same convention as the 16x16x16
         // warptiles).
         let groups = (m.div_ceil(32) * (n / 128)) as u32;
+        self.tag_gemm(crate::work::Family::Matrix, m, k, n);
         self.dispatch(
             kern,
             &[Self::vkb(a), Self::vkb(w), Self::vkb(c)],
@@ -2747,6 +2853,7 @@ impl<'a> Recorder<'a> {
         push[16..20].copy_from_slice(&(w_addr as u32).to_ne_bytes());
         push[20..24].copy_from_slice(&((w_addr >> 32) as u32).to_ne_bytes());
         let groups = (m.div_ceil(bm) * (n / bn)) as u32;
+        self.tag_gemm(crate::work::Family::Matrix, m, k, n);
         self.dispatch(
             kern,
             &[Self::vkb(a16), Self::vkb(a16), Self::vkb(c)],
@@ -2815,6 +2922,7 @@ impl<'a> Recorder<'a> {
         push[16..20].copy_from_slice(&(w_addr as u32).to_ne_bytes());
         push[20..24].copy_from_slice(&((w_addr >> 32) as u32).to_ne_bytes());
         let groups = (m.div_ceil(bm) * (n / 128)) as u32;
+        self.tag_gemm(crate::work::Family::Matrix, m, k, n);
         self.dispatch(
             kern,
             // Binding 0 is the f32 activation buffer; binding 1 filler bound to a (inert, the
@@ -2884,6 +2992,7 @@ impl<'a> Recorder<'a> {
         push[24..28].copy_from_slice(&(w_addr as u32).to_ne_bytes());
         push[28..32].copy_from_slice(&((w_addr >> 32) as u32).to_ne_bytes());
         let groups = ((mpad / 64) * (n / 128) * splits) as u32;
+        self.tag_gemm(crate::work::Family::Matrix, m, k, n);
         self.dispatch(
             kern,
             &[Self::vkb(a), Self::vkb(a), Self::vkb(partials)],
@@ -2940,6 +3049,7 @@ impl<'a> Recorder<'a> {
         push[8..12].copy_from_slice(&(k as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
         let groups = (m.div_ceil(64) * (n / 64)) as u32;
+        self.tag_gemm(crate::work::Family::Int8, m, k, n);
         self.dispatch(
             kern,
             &[
@@ -2995,6 +3105,7 @@ impl<'a> Recorder<'a> {
         push[16..20].copy_from_slice(&(w_addr as u32).to_ne_bytes());
         push[20..24].copy_from_slice(&((w_addr >> 32) as u32).to_ne_bytes());
         let groups = (m.div_ceil(tile.tokens) * (n / tile.rows)) as u32;
+        self.tag_gemm(crate::work::Family::Int8, m, k, n);
         self.dispatch(
             kern,
             &[
@@ -3053,6 +3164,7 @@ impl<'a> Recorder<'a> {
         push[16..20].copy_from_slice(&(w_addr as u32).to_ne_bytes());
         push[20..24].copy_from_slice(&((w_addr >> 32) as u32).to_ne_bytes());
         let groups = (m.div_ceil(tile.tokens()) * (n / tile.rows())) as u32;
+        self.tag_gemm(crate::work::Family::Matrix, m, k, n);
         self.dispatch(
             kern,
             &[
@@ -3529,6 +3641,7 @@ impl<'a> Recorder<'a> {
         push[8..12].copy_from_slice(&(k as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
         let groups = (m.div_ceil(64) * (n / 64)) as u32;
+        self.tag_gemm(crate::work::Family::Int8, m, k, n);
         self.dispatch(
             kern,
             &[Self::vkb(qa), Self::vkb(dact), Self::vkb(w), Self::vkb(c)],
@@ -3604,6 +3717,7 @@ impl<'a> Recorder<'a> {
         push[16..20].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
         push[20..24].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
         let groups = nc_gemm_groups(m, n) as u32;
+        self.tag_gemm(crate::work::Family::Int8, m, k, n);
         let mut bufs = vec![Self::vkb(qa), Self::vkb(dact)];
         if needs_sact {
             bufs.push(Self::vkb(sact));
@@ -3743,6 +3857,7 @@ impl<'a> Recorder<'a> {
         push[16..20].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
         push[20..24].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
         let groups = nc_gemm_groups(m, n) as u32;
+        self.tag_gemm(crate::work::Family::FloatTile, m, k, n);
         self.dispatch(
             kern,
             &[Self::vkb(a), Self::vkb(a), Self::vkb(c)],
@@ -3903,6 +4018,15 @@ impl<'a> Recorder<'a> {
         push[20..24].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
         let tiles = out_f.div_ceil(nr) as u32;
         let groups = rows.div_ceil(4) as u32;
+        // The work bound: a GEMV over several rows, its flat index recovered the
+        // `dispatch_wide` way.
+        if rows > 1 {
+            self.work_next(
+                crate::work::Family::Gemv,
+                crate::work::gemm_flops(rows, in_f, out_f),
+                crate::work::Split::WideGrid,
+            );
+        }
         self.dispatch_wide(
             kern,
             &[Self::vkb(x), Self::vkb(y)],
@@ -4036,8 +4160,10 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
     ) {
-        // bf16 decode: the dedicated reduction GEMV is ~5x the generic dequant GEMV's bandwidth.
+        // bf16 decode where `gemv.kq_fma` is on: the dedicated reduction GEMV measured about 5x
+        // the generic dequant GEMV's bandwidth on the device that parameter defaults on for.
         if rows == 1
+            && self.tuning().gemv_kq_fma
             && dtype == infr_core::DType::Bf16
             && w_base.is_multiple_of(2)
             && out_f <= Self::MAX_GROUP_COUNT_X as usize
@@ -4139,6 +4265,13 @@ impl<'a> Recorder<'a> {
                 |n| n.div_ceil(per_wg),
             );
             return;
+        }
+        if rows > 1 {
+            self.work_next(
+                crate::work::Family::Gemv,
+                crate::work::gemm_flops(rows, in_f, out_f),
+                crate::work::Split::WideGrid,
+            );
         }
         // Binding 0 = `x` (small filler, unread by the STREAMED shader); 1 = x; 2 = y (the sole
         // write, kept LAST so `dispatch_wide`'s tail-n_out split marks it the write).
@@ -6582,6 +6715,15 @@ impl<'a> Recorder<'a> {
         p[28..32].copy_from_slice(&scale.to_ne_bytes());
         p[32..36].copy_from_slice(&(cap as u32).to_ne_bytes());
         let groups = (rows.div_ceil(bm) * nh) as u32;
+        // One workgroup per (query tile, head), reading only `gl_WorkGroupID`: QK^T and PV over
+        // at most `kv_len` keys, two FLOPs per multiply-add.
+        if rows > 1 {
+            self.work_next(
+                crate::work::Family::FloatTile,
+                4 * rows as u64 * kv_len as u64 * hd as u64 * nh as u64,
+                crate::work::Split::Flat,
+            );
+        }
         self.dispatch(
             k,
             &[Self::vkb(q), Self::vkb(kc), Self::vkb(vc), Self::vkb(attn)],
@@ -8847,7 +8989,7 @@ impl<'a> Recorder<'a> {
         self.dirty_transfer.set(true);
         unsafe {
             device.cmd_copy_buffer(
-                self.cmd,
+                self.cmd.get(),
                 src_h,
                 dst_h,
                 &[vk::BufferCopy {
@@ -10003,7 +10145,7 @@ impl<'a> Recorder<'a> {
             .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
         unsafe {
             self.be.shared.device.cmd_pipeline_barrier(
-                self.cmd,
+                self.cmd.get(),
                 vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
                 vk::PipelineStageFlags::COMPUTE_SHADER,
                 vk::DependencyFlags::empty(),
@@ -10044,7 +10186,7 @@ impl<'a> Recorder<'a> {
             );
         unsafe {
             self.be.shared.device.cmd_pipeline_barrier(
-                self.cmd,
+                self.cmd.get(),
                 vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
                 vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
                 vk::DependencyFlags::empty(),
@@ -10261,10 +10403,13 @@ impl<'a> Recorder<'a> {
         let sub = Self::vk_of(buf).sub_offset;
         self.sync(&[], &[buf_h], true);
         unsafe {
-            self.be
-                .shared
-                .device
-                .cmd_fill_buffer(self.cmd, buf_h, sub as u64, (n * 4) as u64, 0);
+            self.be.shared.device.cmd_fill_buffer(
+                self.cmd.get(),
+                buf_h,
+                sub as u64,
+                (n * 4) as u64,
+                0,
+            );
         }
     }
 
@@ -11294,16 +11439,24 @@ impl<'a> Recorder<'a> {
     /// recorder.
     fn free_transient(&self) {
         let device = &self.be.shared.device;
+        // A command buffer this recorder already submitted may still read its descriptor pools
+        // and write its profiling timestamps (`query_pool`, shared by every buffer of the
+        // recorder): wait for those before anything is destroyed. A failed wait poisoned the
+        // backend, and then nothing is freed, as after any failed wait (see `gpu_wait`).
+        if self.drain_flushed().is_err() {
+            return;
+        }
         unsafe {
             // query_pool is null unless prof_ops created one; the null check is equivalent to `prof_ops`.
             if self.query_pool != vk::QueryPool::null() {
                 device.destroy_query_pool(self.query_pool, None);
             }
-            if self.seg_query_pool != vk::QueryPool::null() {
-                device.destroy_query_pool(self.seg_query_pool, None);
+            if self.seg_query_pool.get() != vk::QueryPool::null() {
+                device.destroy_query_pool(self.seg_query_pool.get(), None);
             }
+            self.watch.borrow_mut().destroy(device);
             let cmd_pool = *self.be.shared.cmd_pool.lock().unwrap();
-            device.free_command_buffers(cmd_pool, &[self.cmd]);
+            device.free_command_buffers(cmd_pool, &[self.cmd.get()]);
             for p in self.pools.borrow().iter() {
                 device.destroy_descriptor_pool(*p, None);
             }
@@ -11312,6 +11465,12 @@ impl<'a> Recorder<'a> {
 
     /// End recording, submit once, wait, and release transient objects.
     pub fn finish(self) -> Result<()> {
+        if let Err(e) = self.settle() {
+            if !self.be.shared.poisoned() {
+                self.free_transient();
+            }
+            return Err(e);
+        }
         let device = &self.be.shared.device;
         let t_record = self.t0.elapsed();
         if self.stages {
@@ -11322,7 +11481,7 @@ impl<'a> Recorder<'a> {
             let idx = self.ts_labels.borrow().len() as u32;
             unsafe {
                 device.cmd_write_timestamp(
-                    self.cmd,
+                    self.cmd.get(),
                     vk::PipelineStageFlags::BOTTOM_OF_PIPE,
                     self.query_pool,
                     idx,
@@ -11330,28 +11489,38 @@ impl<'a> Recorder<'a> {
             }
         }
         self.stamp_segment_end();
-        let queue = self.be.shared.queue;
         // Each fallible step frees the transient objects before propagating — see `free_transient`.
-        if let Err(e) = unsafe { device.end_command_buffer(self.cmd) } {
+        if let Err(e) = unsafe { device.end_command_buffer(self.cmd.get()) } {
             self.free_transient();
             return Err(be(format!("end cmd: {e}")));
         }
-        let submit = unsafe {
-            device.queue_submit(
-                queue,
-                &[vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&self.cmd))],
-                vk::Fence::null(),
-            )
-        };
-        if let Err(e) = submit {
-            self.free_transient();
-            return Err(be(format!("queue_submit: {e}")));
+        let desc = self.submit_desc();
+        // The wait fence rides on this submit, so waiting adds no submit. A submit that failed
+        // with an ordinary error queued nothing and its objects are freed; any failure that
+        // poisons the backend (a failed wait, a lost device) leaves them to the GPU that may
+        // still be running them: leaked, never freed (see `gpu_wait`).
+        let submitted = std::time::Instant::now();
+        let waited = self.be.shared.submit_wait(
+            &[vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&self.cmd.get()))],
+            &|| format!("a forward submitted as one command buffer of {desc}"),
+        );
+        if let Err(e) = waited {
+            if !self.be.shared.poisoned() {
+                self.free_transient();
+            }
+            return Err(e);
         }
-        if let Err(e) = unsafe { device.queue_wait_idle(queue) } {
-            self.free_transient();
-            return Err(be(format!("queue_wait_idle: {e}")));
-        }
-        account_segment(&self.be.shared, self.seg_query_pool);
+        // Remembered only now: a failed submit or wait names this segment itself.
+        let recent = self.be.shared.note_segment_submitted_at(desc, submitted);
+        // A missing closing stamp poisons the backend (see `account_segment`); what the reset
+        // discarded is leaked like any other failed wait.
+        let gpu_ns = account_segment(&self.be.shared, self.seg_query_pool.get(), desc, recent)?;
+        account_work(
+            &self.be.shared,
+            &mut self.watch.borrow_mut(),
+            &self.seg_work.borrow(),
+            gpu_ns,
+        );
         if self.stages {
             eprintln!(
                 "[prof] record={:.1}ms submit+gpu={:.1}ms",
@@ -11384,7 +11553,7 @@ impl<'a> Recorder<'a> {
     /// drained by the caller — a submitted command buffer cannot be cancelled, only waited on.
     pub fn discard(self) -> Result<()> {
         // Freed even when ending fails: an early return would leak the command buffer and pools.
-        let ended = unsafe { self.be.shared.device.end_command_buffer(self.cmd) };
+        let ended = unsafe { self.be.shared.device.end_command_buffer(self.cmd.get()) };
         self.free_transient();
         ended.map_err(|e| be(format!("end cmd: {e}")))
     }
@@ -11401,7 +11570,14 @@ impl<'a> Recorder<'a> {
     /// per-recorder, so cross-submission RAW/WAR ordering (scratch reuse, arena-slot rewrites vs
     /// a prior segment's reads) is otherwise invisible to it.
     pub fn finish_nowait(self) -> Result<PendingSegment> {
-        let dispatches = self.dispatches.get();
+        if let Err(e) = self.check_failed() {
+            if !self.be.shared.poisoned() {
+                self.free_transient();
+            }
+            return Err(e);
+        }
+        let desc = self.submit_desc();
+        let earlier_dispatches = self.flushed_dispatches.get();
         if self.stages || self.prof_ops {
             let shared = std::sync::Arc::clone(&self.be.shared);
             self.finish()?;
@@ -11411,7 +11587,12 @@ impl<'a> Recorder<'a> {
                 cmd: vk::CommandBuffer::null(),
                 pools: Vec::new(),
                 seg_query_pool: vk::QueryPool::null(),
-                dispatches,
+                watch: WatchStamps::default(),
+                work: crate::work::SegmentWork::default(),
+                earlier: Vec::new(),
+                earlier_dispatches,
+                desc,
+                recent: 0,
             });
         }
         let device = &self.be.shared.device;
@@ -11419,9 +11600,13 @@ impl<'a> Recorder<'a> {
         // On SUCCESS the cmd buffer + pools are handed to the returned `PendingSegment` (freed in
         // its `wait`); on every ERROR exit we own them still and must free them here (`Recorder`
         // has no `Drop`) — see `free_transient`.
-        if let Err(e) = unsafe { device.end_command_buffer(self.cmd) } {
+        if let Err(e) = unsafe { device.end_command_buffer(self.cmd.get()) } {
             self.free_transient();
             return Err(be(format!("end cmd: {e}")));
+        }
+        if let Err(e) = self.be.shared.live() {
+            self.free_transient();
+            return Err(e);
         }
         let fence = match unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) } {
             Ok(f) => f,
@@ -11430,37 +11615,47 @@ impl<'a> Recorder<'a> {
                 return Err(be(format!("create fence: {e}")));
             }
         };
-        let submit = unsafe {
-            device.queue_submit(
-                self.be.shared.queue,
-                &[vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&self.cmd))],
-                fence,
-            )
-        };
+        let submit =
+            unsafe {
+                device.queue_submit(
+                    self.be.shared.queue,
+                    &[vk::SubmitInfo::default()
+                        .command_buffers(std::slice::from_ref(&self.cmd.get()))],
+                    fence,
+                )
+            };
         if let Err(e) = submit {
             unsafe { device.destroy_fence(fence, None) };
             self.free_transient();
-            return Err(be(format!("queue_submit: {e}")));
+            return Err(self
+                .be
+                .shared
+                .submit_failed(e, &format!("a forward segment of {desc}")));
         }
         Ok(PendingSegment {
             shared: std::sync::Arc::clone(&self.be.shared),
             fence: Some(fence),
-            cmd: self.cmd,
+            cmd: self.cmd.get(),
             pools: self.pools.borrow().clone(),
-            seg_query_pool: self.seg_query_pool,
-            dispatches,
+            seg_query_pool: self.seg_query_pool.get(),
+            watch: std::mem::take(&mut *self.watch.borrow_mut()),
+            work: std::mem::take(&mut *self.seg_work.borrow_mut()),
+            earlier: self.flushed.borrow_mut().drain(..).collect(),
+            earlier_dispatches,
+            desc,
+            recent: self.be.shared.note_segment_submitted(desc),
         })
     }
 
     /// Write the segment's closing GPU timestamp (index 1 of `seg_query_pool`), the last command
     /// before the command buffer ends. No-op on an untimed recorder.
     fn stamp_segment_end(&self) {
-        if self.seg_query_pool != vk::QueryPool::null() {
+        if self.seg_query_pool.get() != vk::QueryPool::null() {
             unsafe {
                 self.be.shared.device.cmd_write_timestamp(
-                    self.cmd,
+                    self.cmd.get(),
                     vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                    self.seg_query_pool,
+                    self.seg_query_pool.get(),
                     1,
                 );
             }
@@ -11484,7 +11679,7 @@ impl<'a> Recorder<'a> {
             );
         unsafe {
             self.be.shared.device.cmd_pipeline_barrier(
-                self.cmd,
+                self.cmd.get(),
                 vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
                 vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
                 vk::DependencyFlags::empty(),
@@ -11506,17 +11701,23 @@ impl<'a> Recorder<'a> {
     /// and its own segment is a SEPARATE submit at replay time, so no single submit can trip the
     /// per-submit GPU hang watchdog. A discrete GPU records the whole decode into one segment.
     pub(crate) fn end_segment(self) -> Result<RecordedSegment> {
+        if let Err(e) = self.settle() {
+            if !self.be.shared.poisoned() {
+                self.free_transient();
+            }
+            return Err(e);
+        }
         if self.stages {
             eprintln!("[prof] barriers emitted = {}", self.barriers.borrow());
         }
-        if let Err(e) = unsafe { self.be.shared.device.end_command_buffer(self.cmd) } {
+        if let Err(e) = unsafe { self.be.shared.device.end_command_buffer(self.cmd.get()) } {
             self.free_transient();
             return Err(be(format!("end cmd: {e}")));
         }
         Ok(RecordedSegment {
-            cmd: self.cmd,
+            cmd: self.cmd.get(),
             pools: self.pools.borrow().clone(),
-            dispatches: self.dispatches.get(),
+            desc: self.submit_desc(),
         })
     }
 
@@ -11548,19 +11749,28 @@ impl<'a> Recorder<'a> {
                 Self::MAX_TS,
             );
         }
-        let mut ticks = vec![0u64; n + 1];
-        unsafe {
-            self.be
-                .shared
-                .device
-                .get_query_pool_results(
-                    self.query_pool,
-                    0,
-                    &mut ticks,
-                    vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
-                )
-                .expect("get_query_pool_results");
+        // Read without waiting, with availability: after a hang-watchdog reset the fence signals
+        // although stamps were never written, and a `WAIT` read of those never returns (see
+        // `account_segment`).
+        let mut stamps = vec![[0u64; 2]; n + 1];
+        let read = unsafe {
+            self.be.shared.device.get_query_pool_results(
+                self.query_pool,
+                0,
+                &mut stamps,
+                vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WITH_AVAILABILITY,
+            )
+        };
+        let missing = stamps.iter().filter(|s| s[1] == 0).count();
+        if !matches!(read, Ok(()) | Err(vk::Result::NOT_READY)) || missing > 0 {
+            eprintln!(
+                "[prof_ops] WARNING: no per-op report for this submit: {missing} of {} timestamps \
+                 were never written ({read:?})",
+                n + 1
+            );
+            return;
         }
+        let ticks: Vec<u64> = stamps.iter().map(|s| s[0]).collect();
         let period = unsafe {
             self.be
                 .shared
@@ -11601,8 +11811,8 @@ impl VulkanBackend {
 pub(crate) struct RecordedSegment {
     cmd: vk::CommandBuffer,
     pools: Vec<vk::DescriptorPool>,
-    /// Dispatches recorded into this one segment.
-    dispatches: usize,
+    /// Dispatches recorded into this one segment, and its first and last kernel.
+    desc: SubmitDesc,
 }
 
 /// A pre-recorded, resubmittable decode step (from [`Recorder::finish_record`], or accumulated from
@@ -11632,12 +11842,25 @@ impl RecordedCmd {
         shared: std::sync::Arc<crate::VulkanShared>,
         segments: Vec<RecordedSegment>,
     ) -> Self {
-        let dispatches = segments.iter().map(|s| s.dispatches).sum();
+        let dispatches = segments.iter().map(|s| s.desc.dispatches).sum();
         Self {
             shared,
             segments,
             dispatches,
         }
+    }
+
+    /// `n` replays of this recording as a failed wait names them.
+    fn replay_desc(&self, n: usize) -> String {
+        let desc = SubmitDesc {
+            dispatches: self.dispatches * n,
+            first: self.segments.first().and_then(|s| s.desc.first),
+            last: self.segments.last().and_then(|s| s.desc.last),
+        };
+        format!(
+            "{n} decode replay(s) of {} segment(s), {desc}",
+            self.segments.len()
+        )
     }
 
     /// Assemble a (possibly multi-segment) recording — the watchdog-split decode path.
@@ -11664,7 +11887,11 @@ impl RecordedCmd {
             .shared
             .submit_dispatch_cap
             .load(std::sync::atomic::Ordering::Relaxed);
-        if cap == 0 || self.dispatches == 0 {
+        let prefill_only = self
+            .shared
+            .split_prefill_only
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if cap == 0 || prefill_only || self.dispatches == 0 {
             return usize::MAX;
         }
         // Always at least one: a single decode step is indivisible, and it is short enough on
@@ -11686,21 +11913,12 @@ impl RecordedCmd {
             }
             return Ok(());
         };
-        let device = &self.shared.device;
         let cmds = vec![seg.cmd; n];
-        unsafe {
-            device
-                .queue_submit(
-                    self.shared.queue,
-                    &[vk::SubmitInfo::default().command_buffers(&cmds)],
-                    vk::Fence::null(),
-                )
-                .map_err(|e| be(format!("replay_n submit: {e}")))?;
-            device
-                .queue_wait_idle(self.shared.queue)
-                .map_err(|e| be(format!("replay_n wait: {e}")))?;
-        }
-        Ok(())
+        // The wait fence rides on the replay's own submit: no extra submit per token.
+        self.shared
+            .submit_wait(&[vk::SubmitInfo::default().command_buffers(&cmds)], &|| {
+                self.replay_desc(n)
+            })
     }
 
     /// Resubmit the recording and wait for completion. Each segment is a SEPARATE `vkQueueSubmit`,
@@ -11714,40 +11932,63 @@ impl RecordedCmd {
     /// A submit that fails part-way still waits for the segments submitted before it, so the
     /// recording has stopped running when this returns either way: a caller holding a lock until
     /// the replay is over (the dense streaming replay, `adapter::current_replay`) holds it that
-    /// long on the error path too. On a lost device the wait returns at once with its own error.
+    /// long on the error path too. On a lost device the wait returns at once with its own error,
+    /// and every wait is bounded (`gpu_wait`), so the lock is never held forever.
     pub fn replay(&self) -> Result<()> {
+        self.shared.live()?;
         let device = &self.shared.device;
-        unsafe {
-            for seg in &self.segments {
-                let submitted = device.queue_submit(
+        let (last, head) = self
+            .segments
+            .split_last()
+            .expect("a recording has at least one segment");
+        for seg in head {
+            let submitted = unsafe {
+                device.queue_submit(
                     self.shared.queue,
                     &[vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&seg.cmd))],
                     vk::Fence::null(),
-                );
-                if let Err(e) = submitted {
-                    return Err(match device.queue_wait_idle(self.shared.queue) {
-                        Ok(()) => be(format!("replay submit: {e}")),
+                )
+            };
+            if let Err(e) = submitted {
+                let err = self.shared.submit_failed(e, &self.replay_desc(1));
+                return Err(
+                    match self.shared.wait_queue_idle(&|| {
+                        format!(
+                            "the segments submitted before a failed {}",
+                            self.replay_desc(1)
+                        )
+                    }) {
+                        Ok(()) => err,
                         Err(w) => be(format!(
-                            "replay submit: {e} (and the wait for the segments submitted \
-                             before it: {w})"
+                            "{err} (and the wait for the segments submitted before it: {w})"
                         )),
-                    });
-                }
+                    },
+                );
             }
-            device
-                .queue_wait_idle(self.shared.queue)
-                .map_err(|e| be(format!("replay wait: {e}")))?;
         }
-        Ok(())
+        // The wait fence rides on the last segment's own submit: no extra submit per token. That
+        // segment opens with a global barrier over the ones before it (`seed_barrier`), so its
+        // completion is the whole recording's.
+        self.shared.submit_wait(
+            &[vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&last.cmd))],
+            &|| self.replay_desc(1),
+        )
     }
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl Drop for RecordedCmd {
     fn drop(&mut self) {
+        // A replay that never completed may still be executing these command buffers: on a
+        // failed wait they are leaked, not freed (see `gpu_wait`).
+        let idle = self
+            .shared
+            .wait_queue_idle(&|| format!("{} before freeing it", self.replay_desc(1)));
+        if idle.is_err() {
+            return;
+        }
         let device = &self.shared.device;
         unsafe {
-            let _ = device.queue_wait_idle(self.shared.queue);
             let cmd_pool = *self.shared.cmd_pool.lock().unwrap();
             for seg in &self.segments {
                 device.free_command_buffers(cmd_pool, &[seg.cmd]);
@@ -11771,15 +12012,30 @@ pub struct PendingSegment {
     pools: Vec<vk::DescriptorPool>,
     /// The recorder's `seg_query_pool`, read and destroyed once the fence signals.
     seg_query_pool: vk::QueryPool,
+    /// The recorder's timed dispatches, read into the work estimate once the fence signals.
+    watch: WatchStamps,
+    /// The estimated work recorded into this command buffer, set against its GPU time once the
+    /// fence signals.
+    work: crate::work::SegmentWork,
+    /// Command buffers the same recorder submitted before this one ([`Recorder::rollover`]) and
+    /// has not waited for, oldest first: waited before this one, which holds the descriptor pools
+    /// they use.
+    earlier: Vec<PendingSegment>,
+    /// Dispatches in every command buffer the same recorder submitted before this one, waited
+    /// for or not.
+    earlier_dispatches: usize,
     /// Dispatches this segment carried — the submit splitter sums them across a forward to feed
-    /// `VulkanBackend::observe_forward`.
-    dispatches: usize,
+    /// `VulkanBackend::observe_forward` — and its first and last kernel, for a failed wait.
+    desc: SubmitDesc,
+    /// Its id among the segments a later failure reports (`VulkanShared::note_segment_submitted`).
+    recent: u64,
 }
 
 impl PendingSegment {
-    /// Dispatches recorded into this segment's command buffer.
+    /// Dispatches recorded into this segment's command buffer, and into those the same recorder
+    /// submitted before it.
     pub fn dispatches(&self) -> usize {
-        self.dispatches
+        self.desc.dispatches + self.earlier_dispatches
     }
 }
 
@@ -11790,14 +12046,21 @@ impl PendingSegment {
     }
 
     fn drain(&mut self) -> Result<()> {
+        for seg in std::mem::take(&mut self.earlier) {
+            seg.wait()?;
+        }
         let Some(fence) = self.fence.take() else {
             return Ok(()); // already drained
         };
+        let desc = self.desc;
+        self.shared
+            .wait_fences(&[fence], &|| format!("a forward segment of {desc}"))?;
+        // Only reached once the segment completed: a failed wait (above, or a backend already
+        // poisoned) returns first and leaks the command buffer, pools and fence the GPU may still
+        // be using (see `gpu_wait`).
+        let gpu_ns = account_segment(&self.shared, self.seg_query_pool, desc, self.recent)?;
+        account_work(&self.shared, &mut self.watch, &self.work, gpu_ns);
         let device = &self.shared.device;
-        let waited = unsafe { device.wait_for_fences(&[fence], true, u64::MAX) };
-        if waited.is_ok() {
-            account_segment(&self.shared, self.seg_query_pool);
-        }
         unsafe {
             if self.seg_query_pool != vk::QueryPool::null() {
                 device.destroy_query_pool(self.seg_query_pool, None);
@@ -11810,38 +12073,68 @@ impl PendingSegment {
                 device.destroy_descriptor_pool(p, None);
             }
         }
-        waited.map_err(|e| be(format!("wait segment fence: {e}")))
+        Ok(())
     }
 }
 
-/// Add one COMPLETED segment's GPU interval to the backend's running sum (or count it untimed) —
-/// the input `crate::ForwardClock` judges a forward by. `qp` is that segment's two-stamp pool,
-/// null when it was recorded untimed; it is only read here, never destroyed.
-fn account_segment(shared: &crate::VulkanShared, qp: vk::QueryPool) {
+/// Add one segment's GPU interval to the backend's running sum (or count it untimed) — the input
+/// `crate::ForwardClock` judges a forward by — once its fence has signalled. `qp` is that
+/// segment's two-stamp pool, null when it was recorded untimed; it is only read here, never
+/// destroyed. Returns the interval in ns, `None` for an untimed segment.
+///
+/// The stamps double as a completion check. A signalled fence does not prove the work ran: after
+/// a hang-watchdog reset (Windows TDR, an engine timeout) AMD's Windows driver signalled the
+/// fence of a forward on the integrated GPU after about 6 s, and a `WAIT` read of its stamps then
+/// never returned, spinning a core (plan 12 section 0b). So the stamps are read WITHOUT waiting,
+/// and a closing stamp (the segment's last command) missing after the fence signalled poisons
+/// the backend: whatever that segment should have written cannot be trusted. A lost device met
+/// by the read poisons it too. Nothing else has this check: an untimed segment (a queue without
+/// timestamps), a decode replay (`RecordedCmd`: persistent recorders carry no stamps), a one-shot
+/// or staging copy. Dropped work there is reported only by the next submit (`docs/backlog.md`
+/// B222).
+fn account_segment(
+    shared: &crate::VulkanShared,
+    qp: vk::QueryPool,
+    desc: SubmitDesc,
+    recent: u64,
+) -> Result<Option<u64>> {
     use std::sync::atomic::Ordering;
     let Some(period) = shared
         .segment_ts_period
         .filter(|_| qp != vk::QueryPool::null())
     else {
         shared.untimed_segments.fetch_add(1, Ordering::Relaxed);
-        return;
+        return Ok(None);
     };
-    let mut ticks = [0u64; 2];
+    // (value, availability) per stamp.
+    let mut ticks = [[0u64; 2]; 2];
     let read = unsafe {
         shared.device.get_query_pool_results(
             qp,
             0,
             &mut ticks,
-            vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+            vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WITH_AVAILABILITY,
         )
     };
     match read {
-        Ok(()) => {
-            let ns = (ticks[1].wrapping_sub(ticks[0]) as f64 * period as f64) as u64;
+        Ok(()) | Err(vk::Result::NOT_READY) if ticks[0][1] != 0 && ticks[1][1] != 0 => {
+            let ticks =
+                crate::work::ticks_between(ticks[0][0], ticks[1][0], shared.segment_ts_bits);
+            let ns = (ticks as f64 * period as f64) as u64;
             shared.segment_gpu_ns.fetch_add(ns, Ordering::Relaxed);
+            shared.note_segment_ran(recent, ns);
+            Ok(Some(ns))
         }
+        Ok(()) | Err(vk::Result::NOT_READY) => {
+            Err(shared.work_dropped(&format!("a forward segment of {desc}")))
+        }
+        Err(vk::Result::ERROR_DEVICE_LOST) => Err(shared.device_lost(&format!(
+            "reading the closing timestamp of a forward segment of {desc}"
+        ))),
+        // Any other failure only costs this segment its timing, as before.
         Err(_) => {
             shared.untimed_segments.fetch_add(1, Ordering::Relaxed);
+            Ok(None)
         }
     }
 }
@@ -12373,6 +12666,8 @@ mod tests {
         // Workgroup-per-unit kernels (rope family, attention, qk_norm_rope, linear_bf16).
         const HD: usize = 64;
         const UNITS: usize = 5;
+        // `linear_f32_mo` outputs.
+        const N_MO: usize = 4 * 10 + 3;
         // `deltanet_gates_seq` runs one thread per (row, value head) in 256-wide workgroups.
         const DN_ROWS: usize = 3 * 256 / 4 + 1;
         // Sentinel bytes after every buffer's declared size.
@@ -12801,6 +13096,16 @@ mod tests {
                         b[0], b[1], b[2], ka, va, b[3], UNITS, UNITS, 1, 1, HD, 0, 0, 0.0, false,
                         false, 0,
                     )
+                }),
+            ),
+            // Four outputs per workgroup at 64 threads per output: the grid is ragged, and
+            // splits with padding workgroups after it.
+            (
+                "linear_f32_mo_at",
+                vec![f(HD), (N_MO * HD * 4, Fill::Data, Kv), f(N_MO)],
+                Box::new(|r, b| {
+                    let a = b[1].device_addr().unwrap();
+                    r.linear_f32_mo_at(a, b[0], b[2], HD, N_MO, 6)
                 }),
             ),
             (
@@ -14629,6 +14934,81 @@ mod tests {
              ring={ring_rows:?} max_err={err:e}"
         );
         assert!(err < 5e-3, "attn_nc_fa mismatch: {err}");
+    }
+
+    /// The work bound cuts the non-coopmat flash prefill (`attn_nc_fa`, one workgroup per query
+    /// tile and head) into ranges of its grid, each in a submit of its own, bit-identical to the
+    /// whole dispatch: one backend with the bound off, one with a budget and prior so small that
+    /// the dispatch is cut. Runs on any GPU, natively and under `INFR_FORCE_WAVE64`.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn attention_prefill_nc_fa_cut_is_bit_identical() {
+        let (q_len, kv_len, nh, nkv, hd) = (448, 2000, 16, 8, 128);
+        let tuned = |tune: &str| {
+            let mut cfg = crate::test_config();
+            cfg.kernels.vulkan.force_wave64 |= infr_testkit::gpu_env::force_wave64();
+            cfg.kernels.vulkan.tune = infr_core::config::tune::TuneMap {
+                entries: infr_core::config::tune::parse_list(tune).expect("tune list"),
+                aliases: Vec::new(),
+            };
+            VulkanBackend::new_with(std::sync::Arc::new(cfg)).unwrap()
+        };
+        let gen = |n: usize, salt: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| (((i * 13 + salt) % 29) as f32 - 14.0) * 0.05)
+                .collect()
+        };
+        let (q, k, v) = (
+            r16(&gen(q_len * nh * hd, 1)),
+            r16(&gen(kv_len * nkv * hd, 2)),
+            r16(&gen(kv_len * nkv * hd, 3)),
+        );
+        let run = |be: &VulkanBackend| -> Vec<f32> {
+            let (bq, bk, bv) = (upf16(be, &q), upf16(be, &k), upf16(be, &v));
+            let out = be
+                .alloc(q_len * nh * hd * 4, BufferUsage::Readback)
+                .unwrap();
+            let rec = be.recorder().unwrap();
+            rec.attention_prefill_nc_fa(
+                bq.as_ref(),
+                bk.as_ref(),
+                bv.as_ref(),
+                out.as_ref(),
+                q_len,
+                kv_len,
+                nh,
+                nkv,
+                hd,
+                kv_len - q_len,
+                0,
+                0.0,
+                kv_len * nkv * hd,
+            );
+            rec.finish().unwrap();
+            let mut bytes = vec![0u8; q_len * nh * hd * 4];
+            be.download(out.as_ref(), &mut bytes).unwrap();
+            bytemuck::cast_slice(&bytes).to_vec()
+        };
+        let whole = tuned("submit.budget_ms=0");
+        let want = run(&whole);
+        assert_eq!(whole.work_splits(), 0);
+        let cut = tuned("submit.budget_ms=1,submit.prior_gflops=1");
+        let got = run(&cut);
+        println!(
+            "attn_nc_fa cut: {} dispatch(es) cut, {} submit(s) opened",
+            cut.work_splits(),
+            cut.segment_cuts().work
+        );
+        assert_eq!(cut.split_kernels().len(), 1, "{:?}", cut.split_kernels());
+        assert!(cut.segment_cuts().work > 0, "the ranges shared one submit");
+        let mismatch = got
+            .iter()
+            .zip(&want)
+            .position(|(a, b)| a.to_bits() != b.to_bits());
+        assert_eq!(
+            mismatch, None,
+            "cut attn_nc_fa differs at element {mismatch:?}"
+        );
     }
 
     #[test]

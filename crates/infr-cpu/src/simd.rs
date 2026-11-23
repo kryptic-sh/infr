@@ -3,9 +3,10 @@
 //! **Two compilations of the interpreter.** Every dispatcher is generic over
 //! `const CAPPED: bool`, and so is the graph interpreter that calls them
 //! (`CpuBackend::execute_with`), which `execute` picks once per graph from [`capped`]. With
-//! `CAPPED = false` a check is `is_x86_feature_detected!` alone: a build whose target features
-//! already include the tier (`target-cpu=native` on this machine) folds it to a constant, so the
-//! interpreter is exactly the code it was before the ceiling existed. Any run-time test there,
+//! `CAPPED = false` a check is the CPU feature test alone (`is_x86_feature_detected!`,
+//! `is_aarch64_feature_detected!`): a build whose target features already include the tier
+//! (`target-cpu=native` on x86-64, `dotprod` on `aarch64-apple-darwin`) folds it to a constant, so
+//! the interpreter is exactly the code it was before the ceiling existed. Any run-time test there,
 //! even one load and a well-predicted branch per dispatch, measurably slowed prefill on such a
 //! build (docs/math.md has the numbers). With `CAPPED = true` a check asks
 //! [`infr_core::simd::allows`], the CPU's widest tier under the `kernels.cpu.max_tier` ceiling,
@@ -15,23 +16,24 @@
 //! The tiers are cumulative ([`SimdTier::supported`] requires every narrower tier's features),
 //! so a `true` from [`avx512`] also licenses the AVX2 code under it, and [`vnni`] licenses
 //! AVX-512 BW and VL besides VNNI. That is what makes calling a `#[target_feature]` function
-//! behind one of these checks sound, under either value of `CAPPED`.
+//! behind one of these checks sound, under either value of `CAPPED`. On aarch64, [`dotprod`]
+//! licenses NEON (part of every aarch64 target) and the dot-product extension.
 //!
 //! **The rule for new kernels**, on every architecture: a tier's kernel computes the same value
 //! as the scalar kernel of its family, bit for bit, for every input. Integer accumulation may be
 //! reordered freely (it is exact, as long as no intermediate saturates or wraps where the scalar
 //! one does not); a floating-point expression may not: it is written once, and every tier
 //! evaluates the same operations in the same order, using `mul_add` exactly where the scalar
-//! kernel does. A future NEON (or SVE, or RISC-V V) kernel is one more tier behind one more check
-//! here and is held to the same rule by `kernels/tier_tests.rs`, which runs every family at every
-//! tier the host has against the scalar one.
+//! kernel does. A NEON kernel (and a future SVE or RISC-V V one) is one more tier behind one more
+//! check here and is held to the same rule by `kernels/tier_tests.rs`, which runs every family at
+//! every tier the host has against the scalar one.
 //!
 //! In test builds a thread can run at a tier of its own ([`with_tier`]), without touching the
 //! process-wide ceiling other tests run under ([`capped`] is then true on that thread), and each
 //! capped check records the widest tier it allowed on that thread, so a test can tell which
 //! tier's code a dispatcher actually ran.
 
-#[cfg(any(test, target_arch = "x86_64"))]
+#[cfg(any(test, target_arch = "x86_64", target_arch = "aarch64"))]
 pub(crate) use infr_core::simd::SimdTier;
 
 /// Whether a graph must run the interpreter's `CAPPED = true` compilation: a ceiling below the
@@ -46,9 +48,9 @@ pub(crate) fn capped() -> bool {
     infr_core::simd::capped()
 }
 
-/// Whether the active tier is at least `t`, under the ceiling. (Off x86-64 every tier above
-/// scalar is absent, so nothing asks.)
-#[cfg(target_arch = "x86_64")]
+/// Whether the active tier is at least `t`, under the ceiling. (Off x86-64 and aarch64 every
+/// tier above scalar is absent, so nothing asks.)
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[inline(always)]
 fn at_least(t: SimdTier) -> bool {
     #[cfg(not(test))]
@@ -100,6 +102,55 @@ pub(crate) fn vnni<const CAPPED: bool>() -> bool {
     }
 }
 
+/// May this call run NEON code that uses the dot-product extension (`sdot`)? NEON itself is part
+/// of every aarch64 target. Uncapped, the `cfg!` makes it a constant on the targets that include
+/// `dotprod` (`aarch64-apple-darwin`; not iOS, whose target has only `neon`); elsewhere it is the
+/// standard library's cached feature test.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub(crate) fn dotprod<const CAPPED: bool>() -> bool {
+    if CAPPED {
+        at_least(SimdTier::Dotprod)
+    } else {
+        cfg!(target_feature = "dotprod") || std::arch::is_aarch64_feature_detected!("dotprod")
+    }
+}
+
+/// May this call run the FMA code of the f32 dots (`kernels::dot` and its family): AVX2 with FMA
+/// and F16C? It sits in the AVX2 tier, but needs FMA and F16C detected as well, so a CPU (or a
+/// VM) that reports AVX2 without them keeps every other AVX2 kernel and runs the dots' scalar
+/// code. Only a build whose target lacks FMA asks: where the target has it (`target-cpu=native`
+/// here), `mul_add` is already the instruction and the dots have no dispatch at all.
+///
+/// The CPU half of the answer is one cached flag ([`fma_cpu`]); callers ask once per graph or
+/// kernel task (`kernels::Dots::resolve`), never per dot.
+#[cfg(all(target_arch = "x86_64", not(target_feature = "fma")))]
+#[inline(always)]
+pub(crate) fn fma<const CAPPED: bool>() -> bool {
+    // `fma_cpu` includes AVX2, so the uncapped answer is the flag alone; under a ceiling the
+    // AVX2 tier must also be allowed (and is recorded, in test builds).
+    fma_cpu() && (!CAPPED || at_least(SimdTier::Avx2))
+}
+
+/// Whether the CPU has AVX2, FMA and F16C: detected once, then one relaxed load.
+#[cfg(all(target_arch = "x86_64", not(target_feature = "fma")))]
+#[inline(always)]
+fn fma_cpu() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    /// 0 until detected, then 1 (absent) or 2 (present).
+    static FMA_CPU: AtomicU8 = AtomicU8::new(0);
+    match FMA_CPU.load(Ordering::Relaxed) {
+        0 => {
+            let ok = is_x86_feature_detected!("avx2")
+                && is_x86_feature_detected!("fma")
+                && is_x86_feature_detected!("f16c");
+            FMA_CPU.store(1 + ok as u8, Ordering::Relaxed);
+            ok
+        }
+        n => n == 2,
+    }
+}
+
 #[cfg(test)]
 pub(crate) use testing::with_tier;
 
@@ -119,12 +170,12 @@ mod testing {
         OVERRIDE.get().is_some()
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     pub(super) fn current() -> SimdTier {
         OVERRIDE.get().unwrap_or_else(infr_core::simd::active)
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     pub(super) fn record(t: SimdTier) {
         WIDEST.set(WIDEST.get().max(Some(t)));
     }
@@ -143,41 +194,49 @@ mod testing {
     }
 }
 
-#[cfg(all(test, target_arch = "x86_64"))]
+#[cfg(all(test, any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod tests {
     use super::*;
 
+    /// A check's two compilations, `[uncapped, capped]`.
+    type Check = [fn() -> bool; 2];
+
+    /// Every tier check this architecture has, with the tier it asks for.
+    fn checks() -> Vec<(SimdTier, Check)> {
+        #[cfg(target_arch = "x86_64")]
+        return vec![
+            (SimdTier::Avx2, [avx2::<false>, avx2::<true>]),
+            (SimdTier::Avx512, [avx512::<false>, avx512::<true>]),
+            (SimdTier::Avx512Vnni, [vnni::<false>, vnni::<true>]),
+        ];
+        #[cfg(target_arch = "aarch64")]
+        return vec![(SimdTier::Dotprod, [dotprod::<false>, dotprod::<true>])];
+    }
+
     /// At each tier the host has, the capped checks allow exactly that tier and the ones below
     /// it, and report it as the widest they allowed; a thread at its own tier takes the capped
-    /// compilation; the uncapped checks name the CPU's widest tier. Turns red if a check ignores
-    /// the tier it runs under or reports another.
+    /// compilation; the uncapped checks name the CPU's widest tier. Every tier above scalar has a
+    /// check. Turns red if a check ignores the tier it runs under or reports another.
     #[test]
     fn checks_obey_the_tier_they_run_under() {
         assert!(
             !capped(),
             "no ceiling and no thread tier in this test binary's default"
         );
+        let tiers: Vec<SimdTier> = checks().iter().map(|c| c.0).collect();
+        assert_eq!(tiers, SimdTier::ALL[1..], "a tier without a check");
         for t in SimdTier::ALL.into_iter().filter(|t| t.supported()) {
             let (allowed, took) = with_tier(t, || {
                 assert!(capped());
-                [avx2::<true>(), avx512::<true>(), vnni::<true>()]
+                checks().iter().map(|c| c.1[1]()).collect::<Vec<_>>()
             });
-            let want = [
-                t >= SimdTier::Avx2,
-                t >= SimdTier::Avx512,
-                t >= SimdTier::Avx512Vnni,
-            ];
+            let want: Vec<bool> = checks().iter().map(|c| t >= c.0).collect();
             assert_eq!(allowed, want, "{t:?}");
             assert_eq!(took, (t > SimdTier::Scalar).then_some(t), "{t:?}");
         }
         let best = SimdTier::best();
-        assert_eq!(
-            [avx2::<false>(), avx512::<false>(), vnni::<false>()],
-            [
-                best >= SimdTier::Avx2,
-                best >= SimdTier::Avx512,
-                best >= SimdTier::Avx512Vnni
-            ]
-        );
+        let uncapped: Vec<bool> = checks().iter().map(|c| c.1[0]()).collect();
+        let want: Vec<bool> = checks().iter().map(|c| best >= c.0).collect();
+        assert_eq!(uncapped, want);
     }
 }

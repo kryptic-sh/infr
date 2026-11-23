@@ -128,18 +128,24 @@ impl DiffusionGemmaChat {
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl DiffusionGemmaChat {
-    /// Open (or grow) the session for a turn needing `needed` KV rows — see the sizing comment at
-    /// the call site in [`generate`](ChatModel::generate).
-    fn ensure_sess(&mut self, needed: usize) -> Result<()> {
-        if self.sess.is_some() && needed <= self.max_ctx {
-            return Ok(());
-        }
+    /// The turn plan for `prompt` tokens and a reply budget of `max_new` (see [`plan_turn`]):
+    /// the session the turn needs and the budget the room left allows.
+    fn plan(&self, prompt: usize, max_new: usize) -> Result<TurnPlan, crate::ContextOverflow> {
         let cfg = self.model.config();
         // `device.ctx` (INFR_CTX) shared size grammar; % resolves against the trained context (DG
         // sessions size against the canvas/prompt shape, not a VRAM-fit calc).
-        let max_ctx = super::cfg_ctx(self.model.engine_cfg(), cfg.n_ctx_train)
-            .unwrap_or_else(|| cfg.n_ctx_train.min(8192))
-            .max(needed);
+        let start = super::cfg_ctx(self.model.engine_cfg(), cfg.n_ctx_train)
+            .unwrap_or_else(|| cfg.n_ctx_train.min(8192));
+        plan_turn(prompt, max_new, cfg.canvas_length, start, cfg.n_ctx_train)
+    }
+
+    /// Open the session `plan` asks for, unless the open one already holds the turn — see the
+    /// sizing comment at the call site in [`generate`](ChatModel::generate).
+    fn ensure_sess(&mut self, plan: &TurnPlan) -> Result<()> {
+        if self.sess.is_some() && plan.needed <= self.max_ctx {
+            return Ok(());
+        }
+        let max_ctx = plan.session;
         self.max_ctx = max_ctx;
         self.sess = Some(match self.backend {
             DgBackend::Cpu => {
@@ -173,6 +179,19 @@ impl ChatModel for DiffusionGemmaChat {
         &self.model
     }
 
+    /// The block-diffusion decode has no grammar path.
+    fn supports_constraint(&self) -> bool {
+        false
+    }
+
+    /// The longest prompt one block still fits after: the trained context less one canvas and the
+    /// session margin. A longer reply budget is trimmed to the room left, as the seam paths trim
+    /// theirs.
+    fn max_prompt_tokens(&self) -> Option<usize> {
+        let cfg = self.model.config();
+        Some(max_prompt(cfg.n_ctx_train, cfg.canvas_length))
+    }
+
     /// Drops the whole session — its cached prefix along with its buffers — because the DG
     /// sessions have no token-only reset. The next turn reopens it lazily (`ensure_sess`)
     /// and re-prefills from scratch, paying the session open again.
@@ -190,7 +209,8 @@ impl ChatModel for DiffusionGemmaChat {
         // to the shared set warmed here. The throwaway tokens pollute the session's cached prefix
         // harmlessly — a real prompt prefix-diffs to 0 and re-prefills from scratch.
         crate::with_profiling_suppressed(|| -> Result<()> {
-            self.ensure_sess(64)?;
+            let plan = self.plan(0, 0)?;
+            self.ensure_sess(&plan)?;
             let enc = self
                 .model
                 .tokenizer()
@@ -296,9 +316,10 @@ impl DiffusionGemmaChat {
         // Default headroom is min(n_ctx_train, 8192) ≈ 1.8 GB — the same clamp the spec-decode
         // pair uses. A later REPL turn that outgrows the session reopens it bigger (the KV is
         // rebuilt by a from-scratch prefill; correct, just slower for that one turn).
-        let blocks = max_new.div_ceil(canvas_len.max(1)).max(1);
-        let needed = prompt_tokens.len() + blocks * canvas_len + 64;
-        self.ensure_sess(needed)?;
+        // A budget the context cannot hold is trimmed to the blocks that fit, as `reply_budget`
+        // trims the seam paths'; only a prompt that leaves no room for one block is refused.
+        let plan = self.plan(prompt_tokens.len(), max_new)?;
+        self.ensure_sess(&plan)?;
 
         // Stream each block's committed tokens through the shared incremental UTF-8-safe detok —
         // the same helper every other backend's per-token decode loop uses (`crate::stream_token`)
@@ -336,7 +357,7 @@ impl DiffusionGemmaChat {
             vocab,
             &eos_ids,
             &eb,
-            max_new,
+            plan.max_new,
             seed,
             self.max_ctx,
             on_step,
@@ -344,8 +365,78 @@ impl DiffusionGemmaChat {
             stop.as_ref().map(|f| f as &dyn Fn() -> bool),
         )?;
 
-        Ok(result.stats)
+        let mut stats = result.stats;
+        // A reply that used the whole of a budget the context trimmed ran out of context, which
+        // serve reports as `length` (the seam paths say the same through `ctx_full`).
+        stats.ctx_full |= plan.trimmed && stats.n_gen >= plan.max_new;
+        Ok(stats)
     }
+}
+
+/// KV rows a session keeps past a turn's prompt and canvases, so a REPL's next turn usually fits
+/// without reopening it.
+const SESSION_MARGIN: usize = 64;
+
+/// The longest prompt a turn can have in a trained context of `n_ctx_train`: one block's
+/// `canvas` and [`SESSION_MARGIN`] must still fit after it.
+fn max_prompt(n_ctx_train: usize, canvas: usize) -> usize {
+    n_ctx_train.saturating_sub(canvas.max(1) + SESSION_MARGIN)
+}
+
+/// What one turn may use: see [`plan_turn`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TurnPlan {
+    /// KV rows the turn needs: the prompt, its blocks' canvases and [`SESSION_MARGIN`].
+    needed: usize,
+    /// The size to open a session at when the open one does not hold `needed`.
+    session: usize,
+    /// The reply budget after trimming.
+    max_new: usize,
+    /// Whether the budget was trimmed to the room left.
+    trimmed: bool,
+}
+
+/// Plan a turn of `prompt` tokens with a reply budget of `max_new`, never past the trained
+/// context `n_ctx_train`.
+///
+/// The budget is trimmed to the whole blocks of `canvas` tokens the context still holds after the
+/// prompt — the seam paths' `reply_budget`, in blocks — so the prompt bound serve checks before
+/// queueing ([`max_prompt`]) is the only way a turn is refused, and it is refused as the typed
+/// overflow serve answers `400 context_length_exceeded`, quoting that same bound. The session
+/// opens at `start` (`device.ctx`, else the default headroom), or larger when the turn needs it.
+///
+/// The cap is what stops an over-long prompt from opening an arbitrarily large session: DG's
+/// per-token KV is heavy, and a session sized to whatever arrived could ask the backend for
+/// gigabytes it does not have. There is no VRAM fit here: these sessions size against the canvas
+/// and prompt shape, and the backend's allocation guard is the backstop below the cap.
+fn plan_turn(
+    prompt: usize,
+    max_new: usize,
+    canvas: usize,
+    start: usize,
+    n_ctx_train: usize,
+) -> Result<TurnPlan, crate::ContextOverflow> {
+    let canvas = canvas.max(1);
+    let longest = max_prompt(n_ctx_train, canvas);
+    if prompt > longest {
+        // `max_ctx` is one past the longest prompt: the overflow message quotes `max_ctx - 1`,
+        // the row the seam paths keep for the first reply token, which here is that bound.
+        return Err(crate::ContextOverflow {
+            prompt,
+            gen: 0,
+            max_ctx: longest + 1,
+        });
+    }
+    let wanted = max_new.div_ceil(canvas).max(1);
+    let fit = (n_ctx_train - prompt - SESSION_MARGIN) / canvas;
+    let blocks = wanted.min(fit);
+    let needed = prompt + blocks * canvas + SESSION_MARGIN;
+    Ok(TurnPlan {
+        needed,
+        session: start.min(n_ctx_train).max(needed),
+        max_new: max_new.min(blocks * canvas),
+        trimmed: blocks < wanted,
+    })
 }
 
 /// Which RNG seed a DiffusionGemma turn runs with: the REQUEST's if it carries one, else the
@@ -364,7 +455,47 @@ fn resolve_seed(req_seed: Option<u64>, cfg_seed: Option<u64>) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_seed;
+    use super::{max_prompt, plan_turn, resolve_seed, SESSION_MARGIN};
+
+    /// B82: a turn's session is sized to the turn but never past the trained context, and its
+    /// reply budget is trimmed to the whole blocks that still fit — so the prompt bound serve
+    /// checks before queueing is the only refusal, and the overflow quotes that bound.
+    #[test]
+    fn a_turn_is_trimmed_to_the_trained_context_and_refused_only_past_the_prompt_bound() {
+        let (train, canvas, start) = (32_768, 256, 8_192);
+        let plan = |prompt, max_new| plan_turn(prompt, max_new, canvas, start, train);
+        let longest = max_prompt(train, canvas);
+        assert_eq!(longest, train - canvas - SESSION_MARGIN);
+
+        // A short turn: the default headroom, the budget untouched.
+        let p = plan(100, 1_000).unwrap();
+        assert_eq!((p.session, p.max_new, p.trimmed), (start, 1_000, false));
+        assert_eq!(p.needed, 100 + 4 * canvas + SESSION_MARGIN);
+        // A longer turn grows the session to exactly what it needs.
+        let p = plan(20_000, 1_000).unwrap();
+        assert_eq!(
+            (p.session, p.trimmed),
+            (20_000 + 4 * canvas + SESSION_MARGIN, false)
+        );
+        // A budget past the room left is trimmed to the blocks that fit, never past the context.
+        let p = plan(31_000, 2_048).unwrap();
+        let fit = (train - 31_000 - SESSION_MARGIN) / canvas;
+        assert!(fit * canvas < 2_048);
+        assert_eq!((p.max_new, p.trimmed), (fit * canvas, true));
+        assert!(p.needed <= train && p.session <= train);
+        // The longest prompt still gets its one block.
+        let p = plan(longest, 2_048).unwrap();
+        assert_eq!((p.max_new, p.needed), (canvas, train));
+        // A configured start past the trained context is held to it.
+        assert_eq!(
+            plan_turn(100, 1, canvas, 65_536, train).unwrap().session,
+            train
+        );
+        // One token past the bound is refused, and the message's limit is that bound.
+        let err = plan(longest + 1, 1).unwrap_err();
+        assert_eq!((err.prompt, err.gen), (longest + 1, 0));
+        assert_eq!(err.max_ctx - 1, longest);
+    }
 
     /// B21: a per-request seed must beat the process config, which used to be the only thing read.
     #[test]

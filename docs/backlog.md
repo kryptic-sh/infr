@@ -374,24 +374,6 @@ window between the weight upload and the KV allocation, against
    the interaction between a shrunk window and `vulkan_slot_ctx`'s divide-by-N
    is reasoned, not measured.
 
-### B10a — the serve arrival line reports prompt CHARS, not prompt tokens
-
-**Tag:** raised 2026-08-02 · **Blocked on:** a `ChatGenerator` trait change
-
-B10's request/throughput logging landed, with one part of its spec unmet: the
-`request start` line carries `prompt_chars`, not prompt tokens. The tokenizer
-lives behind `ChatGenerator`, so at arrival the server genuinely cannot know the
-token count — it only learns it from `ChatOutcome` when the generation ends,
-which is where the real `prompt_tokens` is logged (`request done`).
-
-Fixing it means a new `ChatGenerator` method
-(`count_prompt_tokens(&[ChatMessage])` or similar) implemented by `infr-cli`'s
-`SeamGenerator` / `ParallelGenerator`, which then have to render the chat
-template a second time — the template render, not just the tokenization, is what
-determines the count. Out of scope for the logging slice: it is a trait change
-plus duplicated render work on every request, for a number the completion line
-already reports accurately a moment later.
-
 ### B11 — an explicit `INFR_CACHE=<pct>` still resolves against raw free VRAM
 
 **Tag:** narrowed 2026-08-02 · **Blocked on:** a decision about what the
@@ -3187,13 +3169,6 @@ model lock after a panic, cancel on client hang-up,
 415 for body rejections, `stream_options.include_usage`, the bearer check before
 the body, `-1` for `seed` / `max_tokens`, and the 401 body. Left:
 
-- **A streamed over-long prompt still answers 200.** The headers and role chunk
-  go out before `engine.chat` runs, so the client gets a typed error frame, not
-  a 400. Returning 400 means tokenizing before the stream opens, as llama.cpp's
-  server does; that is the `count_prompt_tokens` method B10a describes, and it
-  would also let an over-long prompt be refused before it takes a slot.
-- **No body-size key.** The axum default (2 MiB) still applies, undocumented;
-  there is no `serve.*` setting for it.
 - **`ctx_full` and `natural_stop` are set only on the dense seam paths.** The
   MTP, diffusion and Metal speculative paths report `false` for both, so a
   context-cut reply there still says `stop` and an end token on the last allowed
@@ -3206,11 +3181,6 @@ the body, `-1` for `seed` / `max_tokens`, and the 401 body. Left:
   it keep failing. `DiffusionGemmaChat::reset_kv` drops its whole session and
   has no test (it needs a real GGUF). A non-streaming 500 body still includes
   the panic message.
-- **DiffusionGemma under `serve` has no cap on the session it opens.** The
-  untyped overflow in `diffusion_generate` is reachable only from `bench`;
-  `DiffusionGemmaChat::ensure_sess` always sizes the session to at least
-  prompt + blocks × canvas + 64, so an over-long prompt opens an arbitrarily
-  large session instead of being refused. Needs a decision on the cap.
 - `infr-cpu/src/pool.rs` still sets a process-wide panic hook in two tests.
 - The hang-up tests use real sockets with 2 s bounds; a loaded Windows or macOS
   runner could fail them. A failure would be an assertion, not a hang.
@@ -3958,27 +3928,148 @@ first. What is left:
   attention `deq` closure) were left: they read buffers the backend allocates,
   not the GGUF mapping.
 
-### B137 — `infr serve`: three decisions for the owner (2026-11-12)
+### B137 — `infr serve`: what JSON mode, the Host check and prepare-once left (2026-11-21)
 
-- **`response_format` is accepted and ignored.** A client that asks for JSON
-  output gets unconstrained text with a 200. Options: reject `json_object` /
-  `json_schema` with a 400 (safe, but clients that get 200 today break);
-  implement JSON mode on the existing llguidance grammar path (correct,
-  feature-sized); keep ignoring it (silently off-contract).
-- **No `Host` / `Origin` validation on the default keyless loopback server.** A
-  web page that rebinds its hostname to `127.0.0.1` becomes same-origin and
-  could drive completions and read `/status` and `/metrics`. Reported from
-  reading `build_router`; the attack was not tried. Options: validate `Host`
-  against a loopback allow-list (blocks rebinding, breaks custom hostnames and
-  reverse proxies); validate only when a browser `Origin` header is present;
-  document it and leave it. Distinct from B5.
-- **No SSE keep-alive.** Nothing is sent during a long prefill or a forced tool
-  call, so an idle-timeout proxy may cut the stream. axum's `KeepAlive` sends
-  comment lines at a 15 s default, which conforming SSE parsers ignore. Options:
-  add it at the default; make the interval a `serve.*` key; leave it out.
+`response_format`, the `Host` check, SSE keep-alive, `serve.max_body_bytes` and
+preparing a request before it takes a slot have shipped. Left, all read in code
+unless marked:
+
+- **JSON mode narrows numbers.** A number the schema leaves unbounded is limited
+  (`NUMBER_LIMIT`, `NUMBER_STEP` in `infr-llama/src/grammar/caps.rs`) and
+  exponent form is never produced, so `6.02e23` cannot be written. The fraction
+  limit is coarser than llama.cpp's because llguidance's `multipleOf` matcher
+  does its arithmetic in 32 bits. Strings, array lengths and nesting are not
+  bounded, as in llama.cpp, so a reply can still run to `max_tokens` inside a
+  string.
+- **Numbers in intersected subschemas keep only the schema's own bounds**
+  (`allOf`, applicators beside sibling keywords, a property matching a pattern
+  property, definitions referenced from those places): adding bounds or the
+  any-value definition there makes llguidance refuse valid schemas. A digit run
+  there can still reach `max_tokens`.
+- **The schema guard over-refuses by design** (`grammar/shape.rs`,
+  `grammar/caps.rs`). It exists because llguidance compiles recursively and a
+  stack overflow aborts the process: a flat `$ref` chain killed the server
+  before it. Refused although some could compile: any `$ref` that is not a plain
+  local pointer; `$id`, `$anchor` and the dynamic/recursive keywords even where
+  inert; a draft-04 `$schema`; a 2019-09+ keyword under a draft-06/07 `$schema`
+  even as an annotation; two `multipleOf` steps that would combine badly but
+  never meet; a `multipleOf` coefficient above `MAX_STEP_COEFFICIENT`, which
+  llguidance compiles slowly or fails on at the first mask. Fractional steps
+  that llguidance's own float conversion mangles (`0.0007`) are its 400, not
+  infr's.
+- **The stack measurements behind `MAX_COMPILE_LEVELS` are debug-build ones**;
+  intersection-heavy chains were not re-measured in release, where frames are
+  smaller. `the_keyword_lists_match_the_installed_llguidance` notices an
+  llguidance upgrade that refuses or implements a listed keyword, not one that
+  starts implementing a keyword infr treats as an annotation. A grammar built
+  through the public `Constraint::new` gets the compile stack but not the shape
+  check.
+- **A mask-time grammar error** is a 500, or a `server_error` frame after the
+  200 on a stream; the session stays usable (read, not run).
+- **Thinking is off under `response_format`.** llama.cpp lets the model reason
+  first and constrains only the content, through a per-template reasoning parser
+  infr does not have.
+- **The prompt is still tokenized twice** — once to count it, once inside the
+  backend, which takes text. Removing that needs a token-input path on every
+  backend. The render and the grammar compile happen once.
+- **CPU and MTP sessions report no context limit before generation**, so an
+  over-long prompt there is still refused by the runner, as a typed error frame
+  on a stream.
+- **A keyless server bound to `0.0.0.0` is not Host-checked** unless
+  `serve.allowed_hosts` is set, though it is reachable through `127.0.0.1` and
+  so open to the same rebinding. A resolver that forwards `*.localhost` names to
+  DNS (plain glibc without nss-myhostname) weakens that allowance.
+- **Not compiled or run here:** the macOS-only `supports_constraint` and
+  `max_prompt_tokens` overrides in `chat/metal.rs`; JSON mode on Metal; the
+  DiffusionGemma reply trim on a real model (its sizing is tested as a pure
+  function); the arrival log line's `prompt_tokens`, checked by eye only.
+- **`crates/infr-cli/src/main.rs` keeps growing**: the serve adapter and its
+  tests belong in their own module.
 - **`max_tokens: -1` means the server default (`sampling.max_new`)**, chosen on
   2026-11-12; llama.cpp reads `n_predict: -1` as "until the context is full".
   Recorded so the difference is a decision and not an accident.
+
+### B232 — `strftime_local` reads `TZ` unsynchronised with `std::env::set_var` (2026-11-23)
+
+**Tag:** plat · chat · soundness · **Kind:** open, needs a decision
+
+`infr_plat::localtime::strftime_local` (the chat templates' `strftime_now`)
+calls the C library's `localtime_r` on Unix. The C library takes the zone from
+the `TZ` environment variable, reading the process environment directly and not
+under `std`'s environment lock, so a `std::env::set_var` or `remove_var` on
+another thread during that read is a data race. Edition 2021 lets safe code call
+`set_var`, and `std`'s lock is private, so the function cannot enforce the
+condition; its doc comment states it as a limitation. This is the class of
+RUSTSEC-2020-0159, which `chrono` avoided by reading the zone files itself.
+
+When the read happens differs by C library, which decides both the width of the
+window and whether a later change to `TZ` is seen:
+
+- **glibc 2.44, run here** (a C program and a Rust one: `setenv` one zone,
+  `localtime_r` and `strftime`, `setenv` another, convert again): the second
+  zone is not seen, by `localtime_r` or by `strftime`, however many times they
+  are called. A `localtime` or `tzset` call takes the new value. So the zone is
+  read at the process's first local-time conversion and then fixed, and the
+  window is that first read, unless other code in the process calls `tzset` or
+  `localtime`. Nothing in `infr-plat` does; C libraries loaded into the process
+  were not checked.
+- **musl, run here** (the same Rust program built for
+  `x86_64-unknown-linux-musl`, statically linked): the second zone is seen by
+  the next `localtime_r`. Every call reads `TZ`, so every call is a window. Not
+  a target the project ships.
+- **Apple's libc: not checked.** The doc comment says to assume the musl-like
+  window.
+- **UCRT, from its source only** (`ucrt/time/tzset.cpp` in the Windows SDK):
+  `__tzset` initialises the zone once under the runtime's time lock and returns
+  early afterwards, reading `TZ` through `_wgetenv_s`. Not run, and how that
+  read interacts with a concurrent `std::env::set_var` was not checked.
+
+It is safe today only because the one `set_var` outside tests,
+`publish_thread_count` in `infr-cli`'s `main.rs`, runs in `main` before any
+other thread exists (found by a grep of the workspace's `.rs` files for
+`set_var` and `remove_var` on 2026-11-23; the others are in
+`infr-vulkan/tests/gpuav_support` and `infr-metal/tests/pcache.rs`, test
+binaries that do not render templates).
+
+What would close it, cheapest first:
+
+- Move the workspace to edition 2024, where `set_var` is `unsafe` and the
+  obligation sits on the writer, which is where it can be discharged. The
+  migration point is already marked at `publish_thread_count`.
+- Deliver the thread count to rayon without the environment (build the global
+  pool with `ThreadPoolBuilder::num_threads`), leaving no environment write in
+  production code at all, and guard that with a test over the sources as
+  `platform_seam.rs` guards manifests.
+- Stop calling the C library: resolve the local offset once at startup while
+  single-threaded and format from it, or read the zone data directly. This is a
+  date library's job, so it means a new dependency or a sizeable module.
+
+### B233 — `%Z` in `strftime_now` on Windows: failure modes read from source, never run (2026-11-23)
+
+**Tag:** plat · chat · windows · **Kind:** coverage gap, unverified on Windows
+
+`infr_plat::localtime::strftime_local` formats `%Z` through the UCRT's
+`strftime`, which writes the system's localized zone name and converts it from
+wide characters through the time locale's code page; the startup "C" locale sets
+that to `CP_ACP` (`ucrt/locale/nlsdata.cpp`, `ucrt/time/strftime.cpp`). Read
+from the SDK's source, not run on a Windows machine:
+
+- A zone name with non-ASCII characters, on a machine whose ANSI code page is
+  not UTF-8, comes back as bytes that are not UTF-8, which `strftime_local`
+  refuses as `StrftimeError::NotUtf8` so that no replacement character reaches a
+  prompt.
+- If the conversion back from wide characters fails, `_Strftime_l` returns 0.
+  `field_text` cannot tell that from a full buffer and reports
+  `StrftimeError::FieldTooLong`. When that conversion fails was not traced.
+
+Either way a chat template whose `strftime_now` format contains `%Z` fails to
+render on such a machine; formats without `%Z` are unaffected, and no cached
+template is known to use it (not surveyed). What is tested: `field_text` on
+Windows-1252 bytes, on any platform; CI's Windows leg runs `%Z` only under
+`TZ=XXX-5:30`, an ASCII name. To verify: run `strftime_now('%Z')` on a Windows
+machine with a non-English display language. If it matters, the fix is to take
+the name from the wide API (`wcsftime` or `GetTimeZoneInformation`) and convert
+it to UTF-8 in Rust.
 
 ### B138 — smaller infr-core findings (2026-11-11)
 
@@ -5122,12 +5213,14 @@ confirmed them. To run them in CI: add `unsloth/ERNIE-4.5-0.3B-PT-GGUF`
 are the same on Windows and Linux (WSL, 2026-11-14), but its file is 13331015456
 bytes, which is not a download for the `cpu-goldens` job.
 
-`gpu_seam_matches_cpu_ernie4_5` runs the ocean prompt on the F16 file (723955168
-bytes) because on Q4_K_M it fails on both GPUs: after "The ocean is a vast," the
-f32-activation CPU oracle (`generate_cpu_reference`) picks " vast", while the
-Vulkan decode, infr's production CPU path and llama.cpp's CPU pick " dynamic".
-Prefill logits at that token, measured 2026-11-13 (they reproduce the review's
-figures):
+`gpu_seam_matches_cpu_ernie4_5` (retired 2026-11-23 to
+`gpu_seam_tolerance_ernie`, which holds the GPU's greedy tokens to the reference
+only outside near ties; `docs/gpu-tolerance.md`) ran the ocean prompt on the F16
+file (723955168 bytes) because on Q4_K_M it failed on both GPUs: after "The
+ocean is a vast," the f32-activation CPU oracle (`generate_cpu_reference`) picks
+" vast", while the Vulkan decode, infr's production CPU path and llama.cpp's CPU
+pick " dynamic". Prefill logits at that token, measured 2026-11-13 (they
+reproduce the review's figures):
 
 | path                         | " dynamic" (11290) | " vast" (12791) | top-1 by |
 | ---------------------------- | -----------------: | --------------: | -------- |
@@ -5139,10 +5232,12 @@ The reference backend's own value is not exposed (no reference-mode prefill).
 The docs on `SeamModel::generate_cpu_reference`, `seam_vulkan_matches_cpu`,
 `CpuBackend::reference` and `generate_dense_cpu_mode` said the int8 activation
 error is invisible at Q4_K and above; they now say it can flip a near tie.
-`gpu_seam_matches_cpu_ernie4_5_q4_k_m` covers the Q4_K_M kernels on a prompt
-chosen for its margins instead. Its 9-token answer is clear by at least 1.46 on
-every path, which also makes it blind to a Vulkan rope base off by 1000x (the
-32-token F16 case catches that one); it does catch a halved attention scale.
+`gpu_seam_matches_cpu_ernie4_5_q4_k_m` (retired the same day to the same case)
+covered the Q4_K_M kernels on a prompt chosen for its margins instead. Its
+9-token answer was clear by at least 1.46 on every path, which also made it
+blind to a Vulkan rope base off by 1000x (the 32-token F16 case caught that
+one); it did catch a halved attention scale. Neither red path has been shown
+again on `gpu_seam_tolerance_ernie`.
 
 ### B169 — the llama.cpp logit oracle passes an ERNIE 4.5 with permuted Q/K (2026-11-13)
 
@@ -5862,19 +5957,23 @@ Vulkan1 126.3 against 186.83; CPU tg128 49.6 against 56.64).
   1128.14-1141.88 and 1120.53-1151.13, tg128 56.83 and 56.72 against
   59.88-60.24. What is left on the CPU is in B173.
 
-**Considered and declined, with what was measured:**
+**Open, measured once:**
 
 - **The int8 decode GEMV for the small k/v projections on an integrated GPU**
   (dropping `mmv_mw_choice`'s 2M-element floor when `Capabilities::integrated`).
   Measured on the RDNA2 iGPU, LFM3-1.7B: the 2048x512 k/v went from 64.4 / 80.0
   us (Q4_K / Q6_K, dequant GEMV) to 19.7 us on average, tg128 26.7 to 27.5 t/s.
-  Declined because it moves numerics: int8 activations on those GEMVs flip
+  It was declined because it moves numerics and so flipped the text hash
   `gpu_seam_golden_qwen3` on that device (got `0xe91c03c96815974c`, text still
-  coherent: "Okay, the user is asking about the capital of France. Let me think.
-  I know that France is a country in Europe, and its capital is"), while the
-  7900 XTX keeps the f32 GEMV there and the golden is one hash for every device.
-  Taking it needs a per-device golden, or the floor lowered on every device and
-  the golden re-blessed (measured nowhere but this iGPU).
+  coherent). That hash is retired since 2026-11-23 (plan 11's G4), so the reason
+  is gone and the change is open. What it needs now: the `gpu_seam_tolerance_*`
+  tests passing on the integrated GPU with the floor dropped (int8 activations
+  on those GEMVs are Int8-class arithmetic, which the rows already admit; not
+  run), and the speed measured again in a quiet window on more than LFM3, under
+  both drivers (the one figure is from the Windows driver).
+
+**Considered and declined, with what was measured:**
+
 - **Tiles for the dp4a K-quant GEMM on the integrated GPU** (Qwen3-1.7B pp512,
   one rep each, before the attention change; per-call gate/up and Q6_K
   `ffn_down`): 64 tokens x 128 rows, 8x8 per thread, 128 threads: 183.1 t/s, 8.0
@@ -6403,8 +6502,8 @@ shader bodies.
   any mass. `top_k` is still typed `Option<i64>`, so `"top_k": 40.0` or a
   string is a body-parse 400 that names no parameter, where `n` and
   `top_logprobs` now name theirs. The `SpecMetalChat` refusal compiles only on
-  macOS and has not been built or run. B137 records `response_format`, still
-  accepted and ignored.
+  macOS and has not been built or run. B137 records what JSON mode
+  (`response_format`) left.
 - **MTP's `residual_dist` is quadratic in the support.** `dist_prob` is a linear
   search and `residual_dist` (`seam/model.rs`) calls it per entry, so two
   distributions spanning the vocabulary cost about the square of its size per
@@ -6671,45 +6770,6 @@ every other dtype. The options as weighed:
   distribution-level metrics, not by logit differences, which move this much
   from a last-bit change on the CPU alone.
 
-### B203 — `Op::MoeFfn` is not row-count identical: one row f32, several int8 (2026-11-17)
-
-**Tag:** cpu · determinism · **Kind:** approved, not started
-
-**Decided 2026-11-18: the owner approved the first option below, int8
-activations at one row too.** To do: route one-row `Op::MoeFfn` through the int8
-expert kernels, drop the MoE exclusion from the row-count tests, re-bless the
-MoE goldens once (Windows and Linux agreeing before a value is committed, with
-the old and new text compared), and measure MoE decode before and after, since
-the speed gain is expected and not yet measured for the expert tiles.
-
-Plan 11's row-count identity (`tests/support/row_identity.rs`) holds every dense
-family bit for bit at prefill chunk heights 512, 7, 3 and 1. The MoE layer
-cannot, by design: `Op::MoeFfn` feeds Q4_K, Q5_K, Q6_K and Q8_0 expert banks
-int8 activations when the op has two rows or more and f32 activations at one row
-(`int8_ok = rows >= 2 && !reference` in `crates/infr-cpu/src/lib.rs`, then
-`moe::expert_acts_kind`). So a prompt prefilled in chunks and one prefilled a
-row at a time differ from the first MoE layer on, and a chunk that happens to
-hold one row (a prompt length one past a multiple of the height) switches path
-in the middle of a prefill. `docs/deepseek.md` ("Quantized expert banks: chunked
-prefill is close, not equal") measured it on the synthetic V4 file: 1.71e-4 max
-|logit difference| at the prompt's last position. Every height of two rows or
-more is identical to every other, and reference mode (`kernels.cpu.reference`)
-is identical at every height. The row-count tests leave the MoE models out and
-say why.
-
-Options:
-
-- **int8 at one row too** (what B201 chose for `Op::Linear`): row-count identity
-  everywhere, likely faster decode (the int8 one-row `Linear` measured 2.2-8.8x
-  faster than the f32 dot it replaced), slightly further from llama.cpp, and
-  every MoE model's CPU decode output changes once (re-bless
-  `cpu_golden_ernie4_5_moe`, `cpu_golden_qwen3moe` and the synthetic V4
-  fixtures' CPU-side values). Not measured for the MoE expert tiles.
-- **f32 at every row count**: identity, closest to exact, but MoE prefill loses
-  the int8 kernels and the packed VNNI tiles (several times slower prefill on
-  the expert GEMMs, by B201's measurements of the same trade on `Linear`).
-- **Leave it** (today): documented, tested as an exception.
-
 ### B206 — CPU speed from narrower datatypes: what is not int8 yet (2026-11-18)
 
 **Tag:** cpu · perf · **Kind:** queued work, in this order
@@ -6718,15 +6778,35 @@ Quantized weights already run through int8 kernels on x86 (AVX2, AVX-512, VNNI)
 with 8-bit activations. Where that is not yet the case, as reported by plan 11's
 S3/S4 work and not re-read for this entry:
 
-1. **aarch64 has no hand-written kernels.** Every family runs its scalar kernel
-   on Apple Silicon and ARM Linux. NEON int8 dot-product kernels (`dotprod`,
-   `i8mm` where present) are likely the largest CPU gain left. Each must compute
-   the scalar expression, which `kernels/tier_tests.rs` enforces once the tier
-   is one `crate::simd` dispatches. Correctness can run on CI's macOS runner;
-   speed needs a Mac owner (issue 100 collects a baseline first).
-2. **S6 of plan 11:** on baseline x86-64 builds the f32 dots' `mul_add` is a
-   C-runtime call, exact but slow; a run-time FMA tier keeps the bits.
-3. **One-row MoE** (B203, approved).
+1. **aarch64: most families have no NEON kernel yet.** The `dotprod` tier
+   (`kernels/neon.rs`) covers Q4_K, Q6_K and Q8_0, one-row and batch; CI's macOS
+   leg holds them to the scalar bits (`tier_tests`, `op_hashes`) and prints
+   their speed against scalar (`kbench:` lines); the `cpu-bench-macos` job
+   prints the whole model's (`mbench:`). Measured on shared runners on
+   2026-11-19 (`docs/math.md`, aarch64, has the tables): Qwen3-0.6B Q4_K_M
+   decodes about 8.5x faster than scalar and prefills only about 1.9x (pp512
+   about 100 t/s). **Next for prefill: an aarch64 packed or tiled GEMM** for the
+   batch path; that this is where prefill time still is, is an inference from
+   the low prefill gain and speed, not a measured profile. Still scalar on
+   aarch64, in rough order of use: Q5_K (`Q5_K_M`), the native-32-block batch
+   family (Q4_0, Q4_1, Q5_0, Q5_1, Q8_0 below 256 wide, IQ4_NL, MXFP4, NVFP4),
+   Q3_K, Q2_K, IQ4_XS, the grid and ternary formats, and the f32/f16/bf16 dots.
+   Also left: a NEON form of the Q4_K 2- and 8-row tiles (they run the batch
+   kernel row by row, so each activation load serves one weight row where the
+   AVX-512 tile's serves eight) and of the packed GEMM; an `i8mm` tier (`smmla`
+   multiplies 2x8 by 8x2 bytes, a natural fit for the batch tiles, but its
+   intrinsics are not stable Rust as of 1.100). **Unresolved: what the batch
+   tiles' scale hoist (`b0dbceea`) did to speed.** Across two CI runs on
+   different runner sessions, whose scalar baselines differ by 20 to 70%, the
+   Q4_K and Q6_K batch ratios rose (2.57 to 3.04, 4.61 to 5.08) and Q8_0's fell
+   (1.68 to 1.27); two runs cannot attribute that to the hoist. If the Q8_0
+   batch kernel matters, the owed check is a controlled before/after in one
+   process: both variants timed side by side, rounds interleaved. Issue 100's
+   Mac owner can give quiet-machine figures: the commands in `docs/math.md`,
+   aarch64.
+2. **One-row MoE**: done; one-row `Op::MoeFfn` takes the int8 expert kernels
+   (CHANGELOG), and decodes about 2% faster than the f32 path did on
+   Qwen3-30B-A3B and ERNIE-4.5-21B-A3B (`docs/cpu-activations.md`, MoE models).
 
 ### B204 — what plan 11's S3/S4 (tier, thread and row identity) left (2026-11-17)
 
@@ -6776,11 +6856,1695 @@ S3/S4 work and not re-read for this entry:
   lightning indexer's `d.max(0.0)` ReLU, the SwiGLU clamp's `gate.min(limit)`,
   the int8 quantizers' `|x|` maxima. If one of them is ever used for more than
   an `exp(x - max)` offset or a sum term, revisit it.
-- **S6 is open:** on a baseline x86-64 build (the release binaries, CI) every
-  `mul_add` in the f32 dots (`kernels::dot`, `dot_n`, `dot_mn`, `dot_f16`,
-  `dot_bf16`, attention's value accumulation, `dequant_row`) is a call to the C
-  runtime's `fma`: exact, so the bits match a native build, but slow. A run-time
-  FMA tier behind `crate::simd` would keep the bits and the speed.
 - **No NEON kernels.** aarch64 runs every family's scalar kernel. A NEON tier
   must compute the scalar expression; `kernels/tier_tests.rs` will hold it to
   that once it is a tier `crate::simd` dispatches.
+
+### B207 — what the GPU tolerance gate (plan 11, G1/G2) cannot see, and left (2026-11-18)
+
+**Tag:** gpu · tests · tolerance · **Kind:** coverage gaps, findings, decisions
+
+`docs/gpu-tolerance.md` describes the gate; `tolerance::table::TABLE` holds its
+values. What it leaves:
+
+- **The production CPU's first-token row is wrong on SmolLM3-3B, and the
+  production CPU is far from the reference elsewhere on gemma-3 and ERNIE.** Not
+  noise and not the harness: the reviewer of this slice forced the reference's
+  tokens through the production CPU on SmolLM3-3B and found every large KL at
+  position 0 (prompt "Write…": KL 4.88; reference top-1 `"system"` at p=0.996,
+  production top-1 `"bdb"` at p=0.169, its logits collapsed to [-13.5, 13.8];
+  the other two prompts 3.33 and 1.92 at position 0), every later position at
+  most about 2e-2. The measurement here (`measure_gpu_tolerance`, RX 7900 XTX
+  native, CPU production against the CPU reference, worst KL at the first two
+  positions / worst from position 2 on, per prompt 0, 1, 2):
+
+  | Model            | First rows                         | From position 2 on              |
+  | ---------------- | ---------------------------------- | ------------------------------- |
+  | SmolLM3-3B       | 1.92, 4.88, 3.33 (all position 0)  | at most 2.0e-2                  |
+  | gemma-3-1b       | 7.9e-3, 4.6e-2, 1.88 (pos 1, 1, 0) | 2.2e-2; **1.35 (pos 13)**; 0.97 |
+  | ERNIE-4.5-0.3B   | 0.60, 0.27, 0.84 (all position 0)  | 0.22 (decode, pos 36); 0.12     |
+  | Qwen2.5-0.5B     | 2.2e-2, 0.10, 5.1e-2               | at most 1.6e-2                  |
+  | LFM3-1.7B Q4_K_M | 5.2e-2, 0.10, 9.9e-2               | at most 4.5e-2                  |
+  | Qwen3-0.6B       | 7.5e-2, 7.7e-2, 3.7e-2             | at most 6.1e-2                  |
+  | Qwen3.5-0.8B     | 2.6e-2, 8.7e-3, 6.8e-2             | at most 3.4e-2                  |
+
+  On the same rows the shipped int8 GPU stays within 0.33 (gemma-3 position 0)
+  and 8e-3 (SmolLM3). **Cause proven and fixed (2026-11-18):** `quantize_q8`
+  took one scale per 256 activations, so the first token's massive-activation
+  dimensions rounded the rest of their blocks to 0 or ±1; it now splits such
+  outliers into a sparse part, and position 0 is at its steady-state order on
+  every model above that was measured (`docs/cpu-activations.md` has the
+  evidence, the options and the before/after tables). gemma-3's large distances
+  away from position 0 are not outliers: B209 owns them. The table above was
+  taken before the fix; the tolerance table's CPU-side rows were not re-run.
+
+- **The int8 class only catches gross bugs.** With the int8-activation kernels
+  on (the shipped default for every quantized model) the GPU's own activation
+  quantization is two to three orders of magnitude larger than its float
+  rounding. On Qwen3-0.6B (RX 7900 XTX, static decode path) an RMSNorm epsilon
+  ten times too large and a 1% scale error on every block of one `ffn_down`
+  tensor left the int8 run's distance where the clean run's is (steady KL
+  1.35e-2 and 1.46e-2 against the clean run's 1.47e-2), so no bound on that run
+  can see them, even after the first rows got their own bound; the int8-off
+  (`vulkan_float`) run caught both. A bug that lives only in an int8 kernel is
+  that run's blind spot: it is left to the op-level bounds (`seam_op_parity`'s
+  `*_within_int8_bound`, `i8cm_kq_matches_its_decomposition`). An op-level check
+  for each int8 kernel against its own decomposition, for every family the
+  tuning table can switch, is what would close it.
+- **A single mis-scaled block is invisible** (one Q4_K block's scale times 1.01:
+  every metric at half its bound or less in both classes). Only a weight-level
+  check (the dequant parity tests) covers it.
+- **What the mutation demonstrations (G3) do not cover.** They are committed
+  (`infr-llama`'s `mutations` feature, `tests/planted/`) and ran on both GPUs of
+  the Linux machine:
+  - **The GPU demonstrations are in no CI job**: they need a GPU. CI runs the
+    CPU one (`planted_bugs_fail_the_gate_on_the_cpu`) and clippy with the
+    feature, on the Linux legs of the `test` and `clippy` jobs.
+  - **Not planted:** a dropped bias (q/k/v bias, Qwen2.5), any bug with the q8
+    KV cache, any bug in a real MoE model (the synthetic MoE takes the router
+    bias and two in its routed expert banks; its batched and int8 expert kernels
+    never run), and any model but Qwen3-0.6B, gemma-3-1b, ERNIE-4.5-0.3B F16 and
+    the synthetic ones. Bugs (a) and (b) opt their graphs out of the replayed
+    decode, so the replayed decode never runs with either of them planted; every
+    other bug reaches it.
+  - **Two catches on the synthetic llama are thin.** In the CPU demonstration
+    (c) is caught at a worst KL of 1.19x its bound (and a logit deviation of
+    4.43e-3 against 3.9e-3), and (d) only on mean KL, at 1.43x (worst KL 0.73x).
+    They are the first to turn into misses if the synthetic model or its row
+    changes.
+- **Routed-expert (MoE) models are forced along the reference's routing; what
+  that leaves** (2026-11-23). A router near tie used to throw the comparison
+  off: on the synthetic MoE both RADV GPUs select another expert at position
+  107, layer 0, where the CPU reference's margin is 2.14e-4 of selection
+  probability, and every later row inherited it (worst KL 2.87e-3 scored, 0.371
+  at the position itself). A forced run now takes the reference's expert
+  selections as well as its tokens (`Op::MoeFfn::expert_ids`), reads back what
+  each of its own routers would have selected (`Op::MoeRoute`), and the gate
+  holds those selections to the row's `route_near_tie`
+  (`tolerance::metrics::RouteScore`); the synthetic MoE has a row and a gate
+  test (`gpu_seam_tolerance_synthetic_moe`), and `docs/gpu-tolerance.md` has the
+  mechanism, the measurements and the planted bugs. Open:
+  - **No real MoE model has a row or a gate test.** ERNIE-4.5-21B-A3B Q4_K_M was
+    measured on both RADV GPUs (`measure_gpu_tolerance`, key `ernie-21b-moe`;
+    the table in `docs/gpu-tolerance.md`, "Mutations"): forced along the
+    reference's routing its int8-free runs measure a worst KL of 6.1e-6 on the
+    RX 7900 XTX and 3.8e-6 on the integrated GPU (6.8e-3 unforced on the RX 7900
+    XTX), with at most 18 of 8802 selections differing, at margins up to 2.7e-5;
+    its shipped int8 runs measure 3.6e-3 and 1.3e-2, with up to 434 selections
+    differing at margins up to 3.2e-2, where a uniform share among its 64
+    experts is 1.6e-2. So an Int8 routing near tie set by the rule would hold
+    almost nothing there: either the Int8 class of a real MoE model gets no
+    routing check (its Float runs carry it), or the int8 activation error at the
+    router is looked into first. Needs a decision before its rows are set.
+    Qwen3-30B-A3B is cached and was not run. Adding a row is a measurement on
+    both GPUs plus a `gpu_seam_tolerance_*` test; whether the gate should carry
+    a 13 GB model is the owner's call (on the integrated GPU the test's memory
+    rule needs about 39 GB of free host memory for it).
+  - **The routing near tie has no rule for a model that never selects
+    differently.** The synthetic row's is 1.5 times the one legitimate
+    difference seen. A row whose legitimate runs show none would get 0 by that
+    rule, and then fail on the first device that does differ at a real near tie.
+    The top-1 near tie has a floor for this (0.25 nats, 1 nat); a floor in
+    selection score would have to be argued per model, since a router's margins
+    scale with its expert count. Not decided.
+  - **Windows has run none of it**: the row, the gate test, the own-routing
+    check and the planted bugs are RADV only.
+  - **A paged MoE model cannot be forced.** `execute_paged_moe` (Vulkan) refuses
+    `expert_ids`, so a forced run of a model whose experts are paged fails with
+    that error instead of running. Implementing the supplied selection there is
+    the change.
+  - **`Op::MoeRoute` on Vulkan repeats the router dispatch of the `Op::MoeFfn`
+    lowering** (the choice between `linear_native`, `linear_f32` and `linear` by
+    the router's dtype) so that no existing line of the adapter moved.
+    **[read]** That choice is now written out in
+    `crates/infr-vulkan/src/adapter.rs` at each of: the `Op::MoeRoute` arm of
+    `lower_op`, the batched branch and the small-m branch of its `Op::MoeFfn`
+    arm, and `execute_paged_moe`. They must stay in step. The one drift guard,
+    `gpu_seam_tolerance_own_routing_is_the_selection_it_runs`, runs the
+    synthetic model one token at a time: it covers the small-m branch with an
+    f32 router (`linear_f32`) against the `Op::MoeRoute` arm, and neither the
+    batched branch, nor the paged path, nor a quantized or f16 router. The fix
+    is one helper that every one of those sites calls. Not done in this slice:
+    it moves existing lines of a file a Windows session is working in.
+  - **Vulkan reads back the selection, not the scores** (`moe_topk` does not
+    write them; `Op::MoeRoute::dst_scores` is refused there), so only a CPU run
+    can be the reference of a routing comparison. Metal refuses `Op::MoeRoute`
+    by name: a `ForcedOn::Metal` arm needs it implemented first.
+  - **The dual dense-and-MoE layers** (gemma-4 MoE, DiffusionGemma) emit the
+    same readback and take a supplied selection through the same helper
+    (`emit_route`), and no such model is cached here: **not run**.
+  - **A forced run does not run the path from a router's own pick into its
+    experts.** Its expert kernels read the supplied ids. That the two paths
+    compute the same bits is shown on the synthetic model only (the own-routing
+    check above, replayed and static decode, both GPUs), not on a batched
+    prefill and not on quantized expert banks.
+  - **A 1% scale of one layer's routed down bank is missed** by the synthetic
+    row (0.35 of the KL bound and 0.77 of the mean bound on the CPU reference;
+    1.36 times the mean bound on both GPUs, where the device's own distance adds
+    to it). The shared expert beside the bank is not scaled.
+- **Gate and up swapped (e) gives NaN logits on the RX 7900 XTX and finite ones
+  on the integrated GPU** (both RADV, Qwen3-0.6B, both classes; KL 620x and
+  3.3e5x its bound on the integrated GPU). The gate fails either way; why the
+  two devices handle the same overflow differently is not looked into.
+- **gemma-3-1b's rows were re-set on RADV; what that leaves** (2026-11-23, Linux
+  7.3.5-arch1-1, Mesa `mesa` and `vulkan-radeon` 26.3.1-2, headless, no
+  compositor running). Its Float check is split in two
+  (`PathClass::FloatNoCoopmat`, the fine row, scored with the cooperative-matrix
+  tier off, and Float, now a smoke row for the f16 cooperative-matrix prefill
+  path), its Int8 smoke row's near tie is raised, gemma-3 is a planted-bug
+  target (`gpu_planted_gemma3`), and `gpu_seam_tolerance_gemma3` passes on both
+  RADV GPUs with no environment knob (`docs/gpu-tolerance.md`, "The table" and
+  "Mutations", has the values and both sides of each gap). Open:
+  - **Windows has not run the new rows.** FloatNoCoopmat is set from RADV alone
+    (worst KL 8.81e-4 on both GPUs): no Windows run of the
+    `gpu-float-nocoopmat*` configurations exists. The one older Windows figure
+    that may be of this path, the integrated GPU's Float worst of 1.6e-3 quoted
+    under "Against Windows" below, has no printed run behind it, is from the
+    code of 2026-11-18, and is of this path only by inference (that device took
+    the non-coopmat GEMMs on Qwen3); it set nothing, and would sit inside the KL
+    bound. Owed on the Windows box: `gpu_seam_tolerance_gemma3` on both GPUs,
+    and `measure_gpu_tolerance` for gemma with the three `gpu-float-nocoopmat*`
+    configurations, natively and with wave64 forced. A run outside the row there
+    is a finding to investigate, not a reason to widen it.
+  - **The fine row's gap to (d) is thin.** A 1% scale of one layer's FFN output
+    (on gemma the post-FFN norm's gain, `blk.10.post_ffw_norm`: the norm absorbs
+    a scale of the whole `ffn_down`) measures a steady worst KL of 2.6e-3 on the
+    CPU reference against the clean reference and 2.3e-3 on both GPUs: 1.26
+    times the row's KL bound. It also fails the first rows' mean KL (2.5 times
+    its bound on both GPUs, where the legitimate value is 1.6e-6 against a bound
+    of 1.2e-4) and the steady cosine (1.5 times its bound's distance from 1).
+    (c), the epsilon, is 14 times over the KL bound.
+  - **gemma's Int8 smoke row does not hold at moved prompt ends, so those runs
+    set none of it.** With prompt 1 ended early (`INFR_TOL_SPLIT`), so that
+    position 13 and its neighbours are int8 decode rows, the RX 7900 XTX (native
+    lanes, `gpu`) measures a decode worst KL of 0.618 (ended after 10 tokens,
+    position 13; mean 9.0e-2, logit deviation 0.165) and 0.70 (after 12,
+    position 40; mean 8.8e-2, deviation 0.192, cosine 0.546): over the row's
+    steady KL, mean and deviation bounds, with a top-1 miss at a 1.349-nat
+    reference margin (after 10, position 22, where the GPU's choice is 1.96 nats
+    under the reference's), wider than the near tie. On the integrated GPU the
+    prefill mean goes over its bound with prompt 2 ended after 16 tokens
+    (3.46e-2 over 13 rows) and after 4 (4.0e-2, one row), and with prompt 1
+    ended after 16 (3.2e-2); its worst KL there is 0.478 (prompt 1 after 12,
+    position 13), inside. No gate configuration ends a prompt there, but a
+    different prompt set could. Position 13 of prompt 1 is the row the
+    production CPU misses by 1.35 (the table at the top of this entry; B209).
+    Not looked into: whether the int8 decode GEMVs' distance on that row is all
+    activation quantization. Needs a decision: re-derive the whole row with the
+    moved ends in (it then admits more than it does now), or find why those rows
+    are that far first.
+  - **The Int8 row's margins at the gated prompt ends are thin on the integrated
+    GPU.** Configuration `gpu` (the RX 7900 XTX with wave64 forced gives the
+    same digits): worst KL 0.310 at prompt 1, position 13, against the 0.26 the
+    row was set from on Windows, 1.7 times under the bound; mean KL 1.65e-2,
+    1.63 times under; logit deviation 0.115, 1.30 times under. The rule asks for
+    2, 2 and 1.5. Only the steady near tie was re-set (1.5 times the 1.185-nat
+    miss at prompt 2, position 179).
+  - **The coopmat-free runs repeat the Float runs on a device without the
+    tier.** Where the Float run builds no cooperative-matrix GEMM (the
+    integrated GPU; any device with wave64 forced) the three
+    `gpu-float-nocoopmat*` runs build the kernels the three `gpu-float*` runs
+    built and measure the same values, and gemma's test went from 116 s to 202 s
+    on the integrated GPU. The obvious option: skip them when the two kernel
+    lists are equal, which
+    `gpu_seam_tolerance_nocoopmat_runs_build_no_coopmat_gemm` already computes,
+    and hold the Float runs to the fine row there instead. Not done in this
+    slice.
+  - **The f16 cooperative-matrix prefill path's accuracy cost is unfixed.** On
+    the RX 7900 XTX under RADV gemma-3's Float configurations measure a worst KL
+    of 1.02e-2 (prompt 1, position 13) where the f32-operand path measures
+    7.14e-4, and no tuning row matches RADV (B231), so the card's Int8
+    configurations prefill on the same f16 GEMMs. The product option: run the
+    first positions of a prefill through f32-operand kernels. It would help
+    every cooperative-matrix device, Windows included; but the simulation below
+    says a handful of rows is not reliably enough (three held, four to eight did
+    not, of this prompt's 32), so it is a kernel-selection change with a
+    prefill-speed cost on short prompts, unmeasured on any GPU, in code another
+    session owns. Its size is not known until the first-rows curve is taken on a
+    GPU and on more than one prompt. The evidence, all from before the rows were
+    re-set ("the bound" below is the Float row's of the time, 6.4e-3 worst KL):
+    - _Which kernels **[ran]**: the cooperative-matrix f16 prefill GEMM path._
+      With `kernels.vulkan.coopmat` off (`gpu-float-nocoopmat`, the whole
+      cooperative-matrix tier) position 13 measures 7.14e-4 and position 40
+      4.22e-4, what `Vulkan1`, which has no cooperative matrices, measures. The
+      two runs build the same kernels except `native_gemm_warp_q4k_sk_ag`,
+      `_q6k_sk_ag`, `_q8_0_sk_ag`, `_q8_0_n128_ag` (or its `_bm16` build),
+      `_q5_0_n128`, `splitk_reduce` and `store_f16` on one side and `native_q4k`
+      on the other; every decode and attention kernel is in both lists, so
+      decode runs the same kernels in both. (Forced wave64 selects the same f32
+      prefill kernels and is not a second sample.) Turning off the attention
+      warp kernels, `nc_fa`, the small row tiles, or staging A directly, and
+      prefill chunks of 8, 16 or 32 rows, change no digit.
+    - _Where it enters **[ran]**: through the KV of the first few positions, not
+      through row 13's own prefill._ `INFR_TOL_SPLIT` ends the prompt early, so
+      later positions are decode rows on kernels both configurations share.
+      Position 13 / position 40 with the cooperative-matrix GEMMs on, by the
+      number of rows the batched prefill ran: 3 rows 8.73e-3 / 6.55e-3; 4 rows
+      7.42e-3 / 6.37e-3; 5 rows 1.03e-2 / 6.91e-3; 7 rows 5.86e-3 / 4.67e-3; 9
+      rows 7.09e-3 / 6.13e-3; 11 rows 6.30e-3 / 5.23e-3; 13 rows 5.87e-3 /
+      5.12e-3; 15 rows 1.02e-2 / 8.13e-3; 19, 23 and 27 rows 1.02e-2 / 7.85e-3,
+      7.45e-3, 7.69e-3; all 32 rows 1.02e-2 / 7.87e-3. With only positions 0 to
+      2 through those GEMMs the distance is already most of the whole, and from
+      15 rows on position 40 stays within a tenth of its final value. The same
+      splits with the tier off: 4.11e-4 / 2.90e-4 (3 rows), 6.19e-4, 8.07e-5,
+      3.27e-4, 4.27e-4, 8.81e-4, 7.36e-4, then 7.14e-4 from 15 rows on (position
+      13), so the f32 path's own value at that row moves elevenfold with where
+      the prompt ends.
+    - _Mechanism: f16 operand rounding, inferred, with a simulation that
+      supports it **[ran, CPU]**._ The swap above changes kernel, tiling,
+      summation structure and operand type together, and no f32-operand build of
+      the cooperative-matrix kernel exists to hold the rest fixed (its operand
+      type is a shader define with f16 and bf16 values only; whether the device
+      enumerates an f32 cooperative matrix was not checked). What was run
+      instead holds the kernel and changes only the operands, on the CPU: the
+      reference backend with a scratch hook (not committed) that rounds the
+      activations and the decoded weights of every batched-prefill `Op::Linear`
+      to f16, to nearest even, and still takes its exact f32 dot. Against the
+      unmodified reference that run measures 3.44e-3 at position 13 and 2.04e-3
+      at position 40 (weights alone 5.08e-3 / 4.13e-3, activations alone 2.17e-3
+      / 1.79e-3). The GPU's Float run scored against it measures 1.82e-3 and
+      1.89e-3, where against the unmodified reference it measures 1.02e-2 and
+      7.87e-3. So operand rounding alone produces a distance of this order on
+      these rows and accounts for most of the GPU's; it is not shown to be all
+      of it.
+    - _How few rows matter **[ran, the same simulation]**._ Rounding one
+      position's rows only: position 0, 2.14e-3 / 1.11e-3; position 1, 2.25e-3 /
+      1.41e-3; position 2, 3.3e-4 / 1.8e-4; positions 3, 5, 8 and 12, at most
+      3.6e-4 / 1.6e-4; position 13 itself, 6.6e-4 / 4.9e-4; positions 14, 15, 16
+      and 20, at most 2.9e-5 at position 40. Keeping the first N positions exact
+      and rounding the rest: N=1 2.35e-3 / 1.60e-3; N=2 4.48e-3 / 3.06e-3; N=3
+      1.84e-4 / 2.68e-4; N=4 1.27e-3 / 1.26e-3; N=6 3.09e-3 / 2.08e-3; N=8
+      2.31e-3 / 1.90e-3; N=10 4.6e-5 / 5.5e-5; N=12 3.4e-4 / 2.8e-4; N=14, 15
+      and 16 at most 6.5e-5 at position 40. Positions 0 and 1 each carry about
+      as much as the whole, the effects do not add, and no N under 10 holds the
+      distance down reliably (N=3 does, N=4 to 8 do not). One prompt of one
+      model; on the GPU only the complement was run (the split curve above).
+    - _What the driver computes, as far as it was probed **[ran]**._ One
+      variant, `native_gemm_warp_q4k_n128_ag`, at one shape (64 x 512 x 256) on
+      synthetic operands, against host models: weights rounded to f16 to nearest
+      even, exact products, summed: relative L2 1.66e-6; weights truncated to
+      f16: 3.6e-4; products rounded to f16: 6.6e-5. gemma's failing value comes
+      through the `_sk_ag` builds with `splitk_reduce`, `q5_0_n128` and
+      `q8_0_n128_ag`, which were not modelled. In the gate on this device
+      `recorder::tests::matmul_native_splitk_f16_matches_cpu` (a split-K build
+      within its own 5e-2 absolute bound) and
+      `gemm::tests::warp_gemm_matches_cpu` (the generic `gemm_warp` kernel, not
+      a native-block one) pass; neither bounds rounding.
+    - _The value moves with the summation **[ran, one reordering]**._
+      `INFR_TUNE=split_k.fixed_grid=0` turns split-K off (the `n128_ag` builds
+      run in place of `sk_ag` and `splitk_reduce`): position 13 measures 4.18e-3
+      and position 40 1.98e-3, inside the row, and under the shipped int8 decode
+      position 62 goes from 2.29e-2 to 0.112 with three top-1 flips. That is one
+      sample (the other `split_k` settings tried changed no digit), and it does
+      not exclude that the split-K path is the less accurate of the two. Read
+      from the shader, the two builds differ in the order of the f32 sums over
+      the same f16 operands; that a difference of that size moves this row by
+      2.4 times is an inference, supported by the split curve, where position 13
+      ranges from 5.86e-3 to 1.03e-2 with split-K unchanged.
+    - _Why int8 on and off agree._ No row of `tuning/table.toml` matches RADV
+      (B231), so the int8 cooperative-matrix GEMM is off and the Int8
+      configurations prefill on the same f16 GEMMs as Float: the identical
+      1.022885e-2.
+    - _Against Windows._ The same card and kernel family measured a Float worst
+      of 3.2e-3 there (position 40), against 3.0e-4 with wave64 forced and
+      1.6e-3 on the integrated GPU, and it set the bound. Why that run is lower
+      than this one was not established.
+  - **The dp4a K-quant prefill GEMM is the far int8 kernel on the integrated
+    GPU.** Configuration `gpu`, prompt 2 (180 tokens), position 179, the first
+    decode row, flips its top-1 at a 1.185-nat reference margin (KL there 0.18);
+    the near tie now admits it. Every Float configuration measures 3.1e-6 at
+    that position.
+    - _It does not follow the end of the prompt **[ran]**._ Ended at 150 tokens
+      (position 179 a decode row 30 past the boundary) it measures 0.200 and
+      flips; at 170, 0.170 and does not; at 183 and 190 (position 179 a
+      batched-prefill row) 0.166 and does not.
+    - _It is the KV the dp4a K-quant prefill GEMM wrote **[ran]**._ With
+      `kernels.vulkan.dp4a_kq` off (`gpu-no-dp4a-kq`: `native_gemm_dp4a_q4k` and
+      `_q6k` are the only kernels that drop out, their weights then taking
+      `native_gemm_mmq_q4k_streamed` / `_q6k_streamed`, still int8 activations,
+      and the int8 decode GEMVs unchanged) position 179 measures 2.17e-2 and
+      does not flip, the decode phase's worst KL goes from 0.180 to 2.17e-2 and
+      the prefill's mean from 1.53e-2 to 5.9e-3. Positions 0 to 2 keep their
+      values to every digit (0.68, 0.81, 0.18), which was not explained. This is
+      a lead for the entry below on gemma's int8 distance on this GPU: the far
+      kernel is the dp4a K-quant GEMM, not the `mmq` one.
+    - Position 179 is the last token of the prompt, where the reference's top
+      two candidates are 1.185 nats apart; a KL of 0.17 to 0.20 is enough to
+      swap them in some runs.
+  - **Should every model have a FloatNoCoopmat row?** Only gemma-3 has one,
+    because only its Float row was outside its bound on a cooperative-matrix
+    device. The other models' Float rows carry the same f16-operand cost inside
+    their bounds (Qwen3-0.6B's clean Float run is at 0.31 of its KL bound on the
+    RX 7900 XTX and 0.13 on the integrated GPU, the planted-bug table), so a
+    coopmat-free row per model would be a tighter fine check for each. Not
+    measured for any other model: it needs `measure_gpu_tolerance` with the
+    `gpu-float-nocoopmat*` configurations per model on every device, and three
+    more runs per model in the gate.
+  - **Not done:** the first-rows curve on a GPU; the split-K builds against a
+    host model; any planted bug that lives only inside a cooperative-matrix
+    GEMM, which is what the Float smoke row and the op-level tests are left to
+    catch.
+
+- **What the greedy check leaves** (2026-11-23; `docs/gpu-tolerance.md`, "The
+  greedy check"). A forced run records and executes a fresh decode plan per
+  step, so it never replays one recording at advancing positions and never
+  chains. Each gate case now also generates greedily three ways (chained, one
+  replay per token, the forced driver on its own argmax), from its plain prompts
+  and from one chat-templated prompt, requires the same stop, the same tokens
+  and bit-identical logits one step later, and holds the tokens to the CPU
+  reference outside near ties. Open:
+  - **Lost with the retired tests:** a 48-token generation (the longest is now
+    33), the text hash through detokenization (token ids are compared; the CPU
+    goldens still hash text), and the red paths shown on the old tests (a Vulkan
+    rope base cut 1000×, a halved attention scale, LFM3's history rebuild), none
+    shown again on a gate case.
+  - **Windows has not run it.** Bit-for-bit agreement of a chain, a replay and a
+    fresh recording was measured under RADV only, on both GPUs. A difference
+    under the Windows driver would be a finding about that driver's replays, and
+    would show as a red gate case, not a silent pass.
+  - **The integrated GPU chains nothing** (`Backend::max_decode_chain` is 1 on a
+    device that splits its submits), so on the Linux machine the chained decode
+    is compared on the RX 7900 XTX alone; the integrated GPU compares the
+    replayed decode with the stepped one.
+  - **A chained step's logits are never read.** The check sees a chain through
+    its tokens and through the one row after it. An error in the head or the
+    argmax of a chained step that flips no token is not seen. A forced chain
+    would need the chain to read back every step's logits.
+  - **Not exercised:** the chained sampler (`Op::Sample`'s uniform ring,
+    temperature above 0), a chain length other than the shipped
+    `spec.decode_chain`, a chain or a replay on a KV format other than f16 and
+    coupled q8_0, on a session continued from an earlier turn, and on every
+    model without a gate case.
+  - **The token rule sees gross bugs only.** On Qwen3-0.6B, both GPUs
+    (`gpu_planted_greedy_tokens`): gate and up swapped and the rope pairing put
+    several tokens of a prompt past the near tie in both classes; the nibble map
+    and a dropped attention residual one token each (the residual, in Int8, on
+    the chat prompt alone); the epsilon and the 1% scale none. The logit rows of
+    the forced runs are what catch those.
+  - **The stop rule and the chained count were shown red by throwaway edits**,
+    not by a committed test (the runner returning after its first chained
+    submit; the chained generation ignoring end tokens). A planted bug for each
+    would make that permanent.
+  - **A routed-expert model's greedy tokens are not held to the reference.**
+    Left to its own routers a run parts from the reference at a router near tie,
+    which the token rule cannot tell from a wrong token; a rule that reads the
+    routing along the GPU's own tokens would be needed. Its chained, replayed
+    and stepped generations are compared with each other. Only the synthetic MoE
+    is a gate case, and it does not chain.
+  - **The synthetic models do not chain** (their token embedding is gathered on
+    the host), so the chained decode is exercised on real model files only.
+- **The `Vulkan1` table data predates the full prefill head there.** Until
+  2026-11-22 the integrated GPU's int8-off runs scored the prefill on each
+  chunk's last row only, under a submit cap of 4, because the full head (one
+  vocabulary-wide `native_q6k` dispatch, 3.26 s at the default 128-row chunk)
+  was reset by Windows. The backend now cuts that dispatch into ranges, each in
+  its own submit (plan 12 S2, B226), the workaround is gone, and the tolerance
+  tests pass there with every prefill row scored and no table row changed. What
+  is left: the `Vulkan1` rows were SET from the workaround runs (native lanes,
+  tuning rows on only; gemma-3's and Qwen3.5's full-head int8-off runs had not
+  completed), so `measure_gpu_tolerance` has not been re-run there to see how
+  much room the full head leaves under them.
+- **gemma-3-1b's int8 distance is ten times larger on the integrated GPU than on
+  the RX 7900 XTX, unexplained.** Worst KL from position 2 on, configuration
+  `gpu`: 0.26 on `Vulkan1` (prompt 2, position 115; 0.87 at position 1), 2.6e-2
+  on the 7900 natively (0.33 at position 0), 0.11 with wave64 forced, 1.2e-2
+  with the generic tuning (rows off). The other models' int8 rows stay within
+  about 3x across the same paths, apart from LFM3 Q4_K_M (9x, its rows-off run
+  the low one). The 7900 natively runs the int8 coopmat GEMM
+  (`native_gemm_i8cm_*`); with wave64 forced, and on the integrated GPU, the
+  dp4a `native_gemm_mmq_*` runs instead (the int8-free check's kernel lists, on
+  Qwen3 **[ran]**; on gemma **[I]**). Those are the two far paths, so the mmq
+  GEMM on gemma's large activations was the first guess. A later run on
+  `Vulkan1` under RADV points at the dp4a K-quant GEMM instead
+  (`native_gemm_dp4a_q4k` / `_q6k`: with `kernels.vulkan.dp4a_kq` off, prompt
+  2's decode worst KL goes from 0.180 to 2.17e-2 and its prefill mean from
+  1.53e-2 to 5.9e-3; the entry above on RADV). Not looked into further; it is
+  what makes gemma's Int8 row a smoke check.
+- **The int8-free check's marker list is typed by hand** (`INT8_KERNEL_MARKERS`
+  in `tests/gpu_tolerance.rs`): the Vulkan crate has no central list of
+  int8-activation kernels, so an int8 kernel named outside the markers would
+  pass it unseen. A per-kernel "reads int8 activations" fact beside
+  `tuning/classes.rs`'s classification would close it.
+- **The top-set cosine is nearly blind on high-entropy rows.** Its single
+  rest-of-mass component dominates when the union holds little mass (two rows
+  flat over different 1000-token sets of a 32000 vocabulary: 0.99993 at KL 30),
+  and `1 - cos` grows with the square of the leaked mass. KL gates the same
+  rows, so nothing passes on the cosine alone. A Bhattacharyya coefficient
+  (`Σ √(p q)`) would have the right shape; not changed now, because it means
+  re-deriving the table.
+- **One unreproduced failure of
+  `gpu_seam_tolerance_prefill_head_leaves_decode_unchanged` on `Vulkan1`**, in a
+  full GPU gate run (2026-11-18, the tree at `ad3b4458`, after about 170 other
+  GPU tests, failed after 7.8 s; the assertion message was not captured here).
+  The same binary then passed five times alone and three times after a
+  neighbouring test (`goes_red`, `lfm3`), and the reworked test (two hook-off
+  runs compared first, then `All` and `LastOfChunk`, small chunks) passed six
+  times. That gate overlapped this round's stall experiments on the same GPU
+  (section 0b of plan 12: hung and lost-device runs), the likeliest cause, but
+  not shown. If it recurs, the reworked test's message says whether two hook-off
+  decodes already differ (nondeterminism) or the head changed them, with the
+  first differing row and token.
+- **One run starved the host.** A full-configuration measurement of LFM3-1.7B
+  F16 on `Vulkan1` took available memory from 32.5 GB to 2.4 GB before the
+  memory guard stopped it; a repeat with one configuration peaked near 11 GB
+  used and returned it between runs. Another session's WSL VM was also growing
+  at the time, so the cause is not settled. The tolerance tests now skip, with a
+  printed line, on an integrated GPU whose free host memory is under twice the
+  model plus 12 GB; that prices one resident load, so it would not stop growth
+  that is the harness's own.
+- **The q8_0 KV class sits two orders above the float class** (Qwen3-0.6B worst
+  KL about 2e-2 against 4e-5): the GPU quantizes the f16 RoPE output into the
+  cache, the CPU reference its f32 one. It catches what the int8 class catches.
+  Below 8 bits it is worse: K=f16 V=turbo3 measured KL 0.34-0.37 against the CPU
+  reference running turbo3, with top-1 flips at 1.3-1.6-nat margins (Qwen3 0.6B
+  and 1.7B), against 0.12-0.17 for V=q4_0. Worth checking that the GPU and CPU
+  turbo3 codecs agree; not looked into, and no low-bit KV row is in the table.
+- **Qwen2.5-0.5B's float prefill is twenty times further than the other Qwens'**
+  (worst KL 8.1e-4, one top-1 flip; decode is normal). It carries q/k/v biases,
+  which the others do not. Not looked into; Qwen2.5 has no gate row.
+- **On the integrated GPU the gate filter leaves out every test named `moe` or
+  `ernie`** (`& not (test(moe) | test(ernie))`, `docs/gpu-tolerance.md`,
+  "Running it"). Pre-existing, and the doc gives no reason beside it; the reason
+  inferred from the doc's other sections is host memory, since a resident MoE
+  model on a unified-memory device takes twice its file plus a margin and the
+  real MoE files are ERNIE-4.5-21B and Qwen3-30B. The cost: `test(ernie)` also
+  drops `gpu_seam_tolerance_ernie` and the other tests of the 240 MB
+  ERNIE-4.5-0.3B, and `test(moe)` drops the synthetic MoE's tolerance case, so
+  those run there only when someone runs them by hand (2026-11-23: the whole
+  `gpu_seam_tolerance_*` set was, and passes). Every ERNIE-21B GPU test has
+  `moe` in its name, so `test(moe)` alone would keep the real MoE models out and
+  let the small ERNIE cases back in, and the two synthetic MoE tolerance tests
+  could be named back in; not changed here because the filter is the record of
+  what was run.
+- **`gpu_seam_tolerance_float_runs_build_no_int8_kernel` fails at its own guard
+  when `gemv.kq_fma` is forced on under RADV** (2026-11-23, RX 7900 XTX,
+  `INFR_TUNE=gemv.kq_fma=true,attn_split.decode_min_chunk=16`): the shipped run
+  then builds no int8 kernel at all (fp32 decode GEMVs, and no int8 prefill GEMM
+  under RADV, B231), and the test says it cannot fail. It is right to refuse to
+  pass, and wrong to count as a gate failure on a device whose shipped path is
+  int8-free: such a device (an RX 580 class under RADV, by default) cannot run
+  the tolerance set green. What the test should do instead: when the shipped run
+  builds no int8 kernel, print that the Int8 and Float classes run the same
+  kernels on this device and assert that the two kernel lists are equal, the way
+  `gpu_seam_tolerance_nocoopmat_runs_build_no_coopmat_gemm` treats a device
+  without the cooperative-matrix tier. Not done: it changes what a pass of that
+  test means, which is the owner's call.
+- **Not covered by the gate:** every real MoE model (the synthetic one is; see
+  the routed-expert entry above), KV formats other than f16 and q8_0, models not
+  cached here (B60's Qwen3.5-MoE and DiffusionGemma), Metal (no Apple hardware:
+  the doc says how a Mac owner would add it), and every device but these two.
+- **`infr tune check` sees what the gate sees and no more** (2026-11-23). It is
+  the same evaluation on the same prompts, so every blind spot above is the
+  command's too: a tuning parameter whose effect lives only in an int8 kernel is
+  judged by the Int8 smoke row; one that acts only past the prompts' depth (the
+  longest prompt is under 200 tokens and each run decodes 32 steps), in a
+  context deeper than that, in a batch shape the prompts never make, in the
+  chained sampler or at another chain length, is not exercised at all. A PASS
+  says the device is inside the model's rows on these runs, not that the
+  parameter is safe at every shape. B220 has what the command itself left out.
+
+### B234 — tolerance rows are keyed by file name: key them by content, and name a hub file without fetching it (2026-11-23)
+
+**Tag:** gpu · tolerance · cli · hub · **Kind:** design gap, needs a decision
+
+`tolerance::table::TABLE` finds a model's rows by its GGUF file name
+(`Entry::model`), which is all `infr tune check` and the `gpu_seam_tolerance_*`
+tests have to go by. **[read]**
+
+- **A renamed file, or another repository's or quantizer's file under the same
+  name, is scored against rows measured on a different file.** What stands in
+  the way today: the command prints the row it matched and what the file says of
+  itself (`general.architecture`, `general.name`, quantized or float weights,
+  tensor count and bytes), and `gate::check_file` refuses a file whose weights
+  are float where the model has an Int8 row, or quantized where it has none.
+  That is the one fact the rows carry about their file. Two Q4_K_M files of one
+  model from two quantizers (different imatrix, different per-tensor formats)
+  pass it, and their distances to the CPU reference are not the same.
+- **What keying by content would take.** A column per model in the table (not
+  per row: a model's rows share a file): the file's identity as measured, for
+  example the hub's LFS sha256 of the blob (the cache already names blobs by it,
+  so a cached model costs a `readlink`, and a plain path costs a hash of the
+  whole file), or a cheaper digest of the tensor directory (names, formats,
+  shapes, sizes), which tells quantizers and re-quantizations apart without
+  reading the weights and misses a file with the same layout and other values.
+  Options: refuse a mismatch; or score it and mark the verdict as "of another
+  file". The table's existing rows would need their files' identities read on
+  the machines that have them (both GPUs' rows were measured on files from the
+  `unsloth`, `LiquidAI` and `Qwen` repositories of `MODELS` in
+  `tests/support/forced.rs`; the hashes were not recorded with the
+  measurements). Not decided: which identity, and refuse or mark.
+- **`infr tune check org/repo:QUANT` downloads the model before it can say there
+  is no row**, when the repository is not in the cache. The file name such a
+  reference resolves to comes from the hub's file listing (`repo_info` and
+  `pick_gguf` in `infr-hub`), which only `infr_hub::pull` reaches, and it
+  downloads what it picked. A path, a cached model and an explicit `.gguf`
+  selector are refused before any fetch (`name_without_fetching` in
+  `crates/infr-cli/src/tune_check.rs`, tested without network). Closing the rest
+  takes a public `infr-hub` call that returns the picked file name from the
+  listing alone; `infr-hub` was outside the slice that built the command.
+
+### B231 — RADV runs on the generic Vulkan tuning: no table row matches it (2026-11-23)
+
+**Tag:** vulkan · tuning · linux · perf · tests · **Kind:** coverage gap,
+measurement to run
+
+Every row of `crates/infr-vulkan/src/tuning/table.toml` names
+`driver = "AMD_PROPRIETARY"`, so under Mesa RADV neither AMD GPU matches one:
+the RX 7900 XTX gets the generic defaults (`split_k.scale_by_cu` off,
+`gemm_i8cm_kq.enabled` off) and the integrated GPU the generic `queue.family`.
+**[read]** the table; **[ran]** the kernels a shipped run builds on the RX 7900
+XTX under RADV 26.3.1 hold `native_gemm_warp_*` and no `native_gemm_i8cm_*`
+(Qwen3-0.6B and gemma-3-1b, 2026-11-23).
+
+- **Coverage.** The Linux GPU gate never runs `native_gemm_i8cm_kq` through a
+  model: on the RX 7900 XTX under RADV the Int8 tolerance configurations prefill
+  on the f16 cooperative-matrix GEMMs, as the Float ones do (gemma-3's prefill
+  rows are identical in both, B207), so the table's Int8 rows are scored there
+  on int8 decode only. The kernel's own tests in `infr-vulkan` still run.
+- **Performance.** The rows were measured on the Windows driver; their evidence
+  fields give `attn_output` 458 to 302 us for the split-K row and pp512 of
+  Qwen3-1.7B from 7580.6 to 11901.5 t/s for the int8 K-quant row. Whether either
+  pays under RADV is unmeasured, and the int8 row's source notes that int8
+  cooperative matrices hung an older Mesa.
+- **What a tuning pass on RADV needs:** a quiet window; `infr bench` pp512 and
+  tg128 on the models the rows cite, each parameter forced both ways with
+  `INFR_TUNE`, interleaved; `i8cm_kq_matches_its_decomposition` and the int8
+  cooperative-matrix layout check passing on Mesa 26.3.1 before anything is
+  timed; the GPU gate with the candidate values forced; then rows keyed on the
+  RADV driver name with those figures as their source.
+
+### B208 — what the FMA tier (plan 11 S6) left (2026-11-18)
+
+**Tag:** cpu · perf · tests · **Kind:** coverage gaps and open items
+
+- **A baseline build still trails a native one, outside the f32 dots.** On a
+  quiet machine (2026-11-19, twelve paired rounds, `docs/math.md`, the FMA tier
+  section) a baseline build of the tier ran Qwen3-1.7B Q4_K_M pp512 at 90% of
+  the native build (1021.7-1044.8 against 1114.2-1158.2 tok/s), gemma-3-1b pp512
+  at 99%, and decode at 92% (Qwen3-1.7B) and 90% (gemma-3-1b). An earlier per-op
+  profile, taken with another agent's test spinning one core, put the prefill
+  gap mostly in the int8 `Linear` kernels (2048x6144 Q4_K 2.63-2.65 ms per call
+  against 2.47-2.53 natively), whose surrounding code the compiler
+  autovectorizes with the build's own features. Not investigated further.
+- **Native reference mode is slower than baseline in the weight decode.**
+  Confirmed on the quiet machine: Qwen3-0.6B tg64 in reference mode ran 8.1%
+  faster on the baseline build (median paired, 12 of 12 rounds), and the native
+  build was as slow before the FMA tier. With reference-mode `Linear` timed in
+  two halves (a scratch build), the f32 dot takes the same time on both builds
+  and `bytes_to_f32` (the Q4_K / Q6_K row dequantization to f32 it runs per
+  weight row, allocating each row) takes 8 to 17% longer natively: the 1024x3072
+  Q4_K rows 2.0-2.1 ms against 1.8 ms per call summed over threads, the Q6_K
+  output head 115-117 against 106-107 ms. Why the native code generation of
+  those decoders is slower is not traced (`dequant_dot_rows`' decoders, below,
+  go the other way). Reference mode is the test oracle, so this costs test time,
+  not users.
+- **The per-op profile does not time reference-mode `Linear`.** Its branch in
+  `CpuBackend::execute_with` ends in `continue`, which skips the per-op timer
+  (`__t0`) at the end of the loop body, so `INFR_PROF_OPS=1` on a reference run
+  shows a device total of a few percent of the wall time and no `Linear` row.
+  Recording the time before the `continue` fixes it; not done here.
+- **f32 multiply-adds not on the tier.** `seam/sc.rs` (Diffusion-Gemma's host
+  self-conditioning: the soft embedding's f16 `mul_add` and the down phase's) is
+  in `infr-llama`, which has no SIMD dispatch; putting it on the tier means
+  making `kernels::Dots` public from `infr-cpu`. Not measured.
+- **`dequant_dot_rows`' FMA copy decodes at baseline.** Its span decoders are
+  separate functions, compiled for the build's own target: the Q4_K row took
+  0.179 ns per element on the baseline build's FMA tier against 0.115 natively
+  (`bench_float_dots`). It serves expert banks without an int8 kernel (Q2_K,
+  Q3_K, the codebook formats: the shipped V4-Flash file's banks) and reference
+  mode.
+- **Short calls still pay a call.** The FMA copies cannot inline into the
+  baseline-compiled interpreter: a lone 128-element `dot` took 0.252 ns per
+  element against 0.243 natively, `axpy` 0.127 against 0.036. Moving a whole
+  op's loop into the FMA compilation would remove it; nothing measured it at the
+  op level.
+- **Verified only on this AVX-512 Ryzen.** The "AVX2 without FMA or F16C" branch
+  (the dots then run the C runtime's `fmaf`) is checked by reading only. The f32
+  dots' NaN payloads are not compared (`tier_tests` folds NaN; no input makes
+  one); the f16 KV write's NaNs are, exhaustively, and match.
+- **Not run: a whole f16-weight model.** No F16 GGUF is cached here; the f16
+  dot's gain (native 0.321 to 0.084 ns per element) is from the microbench.
+
+### B220 — next up: the rest of plan 11's G4; then the queues (2026-11-22)
+
+**Tag:** handoff · **Kind:** queue
+
+**Top priority, the first slice when work resumes: what is left of plan 11's
+G4** (`docs/plan/11-cpu-bit-identical.md`, section 6). It can be done on the
+Linux machine as well as on the Windows box.
+
+- **Done, 2026-11-23:** every gate case runs the greedy check (the chained and
+  the replayed decode against the per-token path bit for bit, from plain and
+  chat-templated prompts, with the stop and the chain-to-replay hand-off held,
+  the greedy tokens against the reference outside near ties), and
+  `gpu_seam_golden_qwen3`, `gpu_seam_flash_matches_cpu` and the exact-token
+  tests of ERNIE-4.5-0.3B, Qwen3.5-0.8B and LFM3 are retired to their models'
+  `gpu_seam_tolerance_*` tests. `docs/gpu-tolerance.md` has the check ("The
+  greedy check") and the record of every exact and cosine GPU test with what
+  covers it ("The exact and cosine GPU tests"); B207 has what the check leaves.
+- **Done, 2026-11-23: `infr tune check <model>`.** The gate's evaluation is
+  library code now (`infr_llama::tolerance::gate` and `greedy`; the
+  `gpu_seam_tolerance_*` tests and the command both call `gate::check`, and
+  `gate::runs_for` reads a model's runs off its rows), and the command scores a
+  Vulkan device under the tuning in effect against a model's rows
+  (`docs/gpu-tolerance.md`, "The command", has the interface and the recorded
+  runs). What it left:
+  - **No measuring mode.** A model with no row is an error. Printing distances
+    with no verdict (`--measure`) was left out: without a row there is no class
+    to pick the runs by and no near-tie margin to score top-1 at, so it would be
+    `measure_gpu_tolerance` rebuilt in the command (every configuration, margins
+    at 0, the three-way comparison) rather than a flag. Worth doing when someone
+    without a checkout has to set a row.
+  - **No op-level families**, which plan 11's first wording gave it: they are
+    test binaries of `infr-vulkan`. Plan 10 (section 3.5) still lists
+    `check [family]` as each family's known-answer check at the resolved
+    parameters, a different command under the same name; the two need
+    reconciling when plan 10's S5 is taken up (a subcommand argument, or another
+    name). Not decided.
+  - **No watchdog and no host-memory check**, which the tests have. On an
+    integrated GPU a model that does not fit beside the reference in host memory
+    is not refused.
+  - **Run by hand only on RADV** (both GPUs, Qwen3-0.6B Q4_K_M). No automated
+    test runs the command against a GPU: the tests cover its arguments, its
+    refusal of a model with no row and its report, and the evaluation under it
+    is the gate's. Windows has not run it.
+  - **The reference is loaded under the shipped defaults**, apart from the
+    configuration under test, so a setting that changes the CPU reference's
+    arithmetic (a KV format) shows as a distance. Each run reports the settings
+    its own edit wrote over (`gate::overridden`), but a setting given at its
+    default value is not listed (the resolved configuration does not say which
+    layer set a value), and nothing lists the settings that differ from the
+    defaults and were left alone; `tune_hash` and `infr tune show` are how to
+    see the tuning.
+  - **Rows are found by file name only, and a quant selector of an uncached
+    repository is downloaded before it can be refused** (B234).
+- **Tests still to convert, each needing a row first** (the record in
+  `docs/gpu-tolerance.md` lists them one by one): `gpu_seam_golden_qwen3moe`,
+  the last text hash, and the real-MoE token and cosine tests (the Int8 routing
+  near tie of a real MoE model is undecided, B207); the exact-token tests of
+  Qwen2.5, Llama-3.2-1B and SmolLM3 (measured on Windows, no row); the KV-format
+  cosine tests (only the coupled q8_0 cache has a row; turbo3's distance is
+  unexplained, B207); the models not cached on the Linux machine.
+  `gpu_seam_matches_cpu_gemma3` goes once `gpu_seam_tolerance_gemma3` has passed
+  on the Windows box against the rows re-set under RADV.
+- **Owed on the Windows box:** the `gpu_seam_tolerance_*` tests on both GPUs
+  with the greedy check in them, which has run under RADV only.
+- **What the retired golden unblocks:** `attn_split.decode_min_chunk` on the RX
+  7900 XTX, held at 64 by that hash where 16 measured about 4% faster decode at
+  shallow depth. `infr tune check` with the floor at 16 alone passes there under
+  RADV (B227 has the measurement, the verdict and what the change still needs).
+
+Then:
+
+- **Waiting on other people:** issue 94 (the RX 580 owner; a follow-up with
+  commands for the work bound is drafted, not posted), issue 100 (Apple Silicon
+  numbers for the CPU math), issue 101 (the reporter was invited to open a PR
+  for an incremental shader cache), llama.cpp issue 32424.
+- **Next in the queues, not started:** the review findings on the PR follow-ups
+  (B229); the families still scalar on aarch64 and the packed GEMM there (B206);
+  plan 10's tuning slices S2 onward; plan 12's kernel ports from the fork; the
+  activation split's sparse dot on the grid formats (B223).
+
+### B229 — review findings on the PR 105 to 107 follow-ups, not yet fixed (2026-11-22)
+
+**Tag:** vulkan · review · **Kind:** findings, not fixed (the session ended)
+
+A reviewer read the follow-up commits on PRs 105 to 107 (B227) and found nothing
+that blocked landing them. These were left; each was read in the code by the
+reviewer, none was run.
+
+- **Verify batches on the slow class cut at floor 16, unmeasured.** PR 105
+  applied 16 to one-row decode only; `uses_decode_floor` extends it to every MTP
+  verify batch that reaches split-K, so an RX 580 verify batch under 2048 keys
+  runs up to four times the workgroups it did as merged.
+- **`attn_combine.comp` changed on every device with no timing.** PR 105's
+  rewrite (shared arrays, an extra barrier, batched loads) is ungated. The sum
+  order reads unchanged and the goldens pass; no old-against-new timing exists.
+- **Streamed weights never take the kq_fma kernels.** The dispatch in
+  `quant_linear` needs `w.buffer`, and the streamed arm passes none, so on a
+  `gemv.kq_fma` device a paged model decodes on the int8 or dequant route while
+  its resident twin runs fp32. `quant_linear`'s doc lists its exceptions and
+  omits this one. Inherited from PR 107.
+- **About 55 GPU tests still skip silently.** `gpu_or_skip` now fails when
+  `INFR_DEV` names a device that does not open, but tests that call
+  `VulkanBackend::new()` themselves and return on an error do not go through it
+  (unit tests in `adapter.rs`, `lib.rs`, `pager.rs`, `kq_gemm_tests.rs`, and
+  `infr-llama`'s `seam/runner.rs` and `seam/weights.rs`).
+- **The AMD integrated `queue.family` row cannot be limited to Windows.** The
+  tuning table's `Match` has no OS field, so an AMD integrated GPU on a Linux
+  driver reporting the same driver id would get the compute-only family,
+  unmeasured. The row also rests on one integrated GPU.
+- **`the_chunks_cover_each_key_once` cannot fail.** It checks a helper defined
+  in the test. The GPU test `attn_split_host` is the real cover check.
+- **`precise` does not cover every add in the kq_fma kernels.** `hsum`, the
+  accumulator adds, the cross-subgroup sum and `subgroupAdd` are undecorated. No
+  multiply is uncovered. The per-device parity tests are the guard.
+- **Smaller:** the two Q4_K kernels do not spell identical float operations (one
+  multiplies by a power of two where the other shifts; equal except at subnormal
+  products); `QueueOutcome::reason` can contradict the family printed beside it;
+  `docs/config.md` says an untimed compute-only family is never picked, while
+  under `graphics` nothing warns and it is the last resort; bare literals for
+  the floor defaults and in several comments; `honour_env` carries `INFR_TUNE`
+  but not the `INFR_KQ_FMA_GEMV` and `INFR_GFX_QUEUE` aliases; the changelog
+  cites a depth-2048 figure as a floor effect where the chunk is the same at
+  either floor.
+
+### B209 — gemma-3-1b's mid-sequence CPU distance is int8 noise, not outliers (2026-11-18)
+
+**Tag:** cpu · accuracy · **Kind:** finding, needs a decision
+
+Found while fixing the first-token defect (`docs/cpu-activations.md`). Against
+the CPU reference, teacher-forced, gemma-3-1b Q4_K_M's production CPU has single
+positions at KL 0.40 to 0.67 well past position 0 (its prompts' last positions;
+the GPU-tolerance review saw 1.35 at position 13 and 0.97 on another prompt),
+while its position 0 is ordinary. Those rows are not outlier rows: they split
+the fewest activation blocks of any (`cpu_act_quant`'s
+`localise_the_position_0_error` with `INFR_AQ_ROWS`), every op's own error on
+them is ordinary, and the distance builds up through the layers (final hidden
+state 0.09 to 0.17 relative distance against 0.04 at a quieter row). Simulated
+in the reference (`linear_tap::simulate`): int16 activations on the 256-block
+weights alone take the worst row from 0.52 to 0.09, on the 32-block weights
+alone (gemma's Q5_0 and Q8_0 projections at width 1152) to 0.32, on both to
+1e-5. So it is the int8 activations' ordinary rounding on a model that amplifies
+it, on both activation paths. Options: 16-element activation scales (simulated
+0.14 worst on that prompt, a rewrite of every kernel's epilogue), int16 for the
+32-block path only, or accept it as gemma's sensitivity and score gemma's CPU
+with a looser tolerance. Not measured: what llama.cpp's CPU gives on the same
+rows.
+
+### B210 — the activation split's ratio: speed against margin (2026-11-18)
+
+**Tag:** cpu · accuracy · perf · **Kind:** decision taken, alternatives recorded
+
+`quant::HI_RATIO` is 16 (`docs/cpu-activations.md`). The figure that costs is
+the per-row one on the FFN-down inputs, where the split fires all through a
+sequence (measured by the review: 5.4% / 16.1% of rows on Qwen3-1.7B's Q4_K /
+Q6_K down inputs on the bench prompt, 32% / 38% on gemma-3-1b; about 1,930 and
+7,100 split blocks per forward), not the per-block rate this entry first quoted
+(0 to 1.1% of all projection-input blocks past position 0 on the bench prompt).
+As first landed, each split block cost a one-block kernel call per weight row
+(about 70 to 90 ns, 15 to 20 times a block of the packed GEMM): 3.5% of
+Qwen3-1.7B pp512 and 1.9% of gemma-3-1b's on a native build, 1.65% and 1.5% on a
+baseline build, and 2.9% of ERNIE-4.5-21B-A3B's MoE prefill (quiet machine,
+2026-11-19). The exact sparse dot (`kernels/hi.rs`, 2026-11-19) evaluates the
+same expression from the codes' weight elements alone, with no output bit
+changed, and brought every prefill back to within the noise of the build before
+the split, native and baseline (`docs/cpu-activations.md`, "Speed with the exact
+sparse dot": medians -0.69% to +1.43% against `1b16e66b`, against an A-against-A
+noise of up to 1.22%). What is left: gemma-3-1b's FFN-down layers at about 5 ms
+of an 850 ms forward in the per-op profile, and the grid formats (B223). At 8
+the split is somewhat better (ERNIE-4.5-0.3B's position 1, which attends to
+position 0's value row, reaches 0.029 against 0.13 at 16 and 0.19 before) but
+measured 14 to 17% slower Qwen3-1.7B pp512 in three disturbed pairs with the
+one-block kernel calls; it fires on several times as many blocks, and what that
+costs with the exact sparse dot is not measured. At 32 Qwen3-1.7B pp512 was
+level in this branch's rounds, but 32 is the last ratio that still fixes ERNIE's
+and SmolLM3's first tokens (64 leaves them at 0.61 and 0.30), so it has no
+margin. Do not raise the ratio; whether 8 is now affordable is open (a
+measurement, then the owner's call: it changes output bits).
+
+**One position the split made worse, looked at (2026-11-19).** Qwen3-0.6B
+position 18 of `cpu_act_quant`'s first prompt (KL 0.109 before the split, 0.402
+after) is the `assistant` token after `<|im_start|>`; the same token is the
+worst row of the two other chat prompts (prompt 1's position 23: 0.033 to 0.203;
+prompt 2's position 23: 0.097 to 0.087, better). "Before" here is a scratch
+build with `HI_RATIO` infinite, which never splits and so quantizes exactly as
+before; it reproduced the review's 0.109 and 0.033.
+`localise_the_position_0_error` on rows 17 and 18, before against after, per
+`Op::Linear`:
+
+- Row 18's own blocks barely split: 0.1% of its blocks over all ops at ratio 16,
+  0.6 to 0.7% at ratio 8 (so about six times as many sit at 8 to 16 times their
+  next magnitude as split, the review's proportion, but on a tiny base). Each
+  op's own error on the row (`local`) is the same before and after to within
+  ±10% all the way down (ratios 0.85 to 1.15, apart from one op that is smaller
+  after: layer 7's FFN down, 0.56), and identical through the first two layers.
+- The first difference is at op 17, layer 2's attention output projection (its
+  input mixes earlier positions' values), and there the row's drift from the
+  reference is smaller after (0.038 against 0.043). Drift moves both ways (0.66
+  to 1.34 times its old value) until layer 24, then grows through the last four
+  layers: the attention output inputs 0.118 to 0.170 (layer 24) and 0.116 to
+  0.167 (layer 27), the output head's input 0.093 to 0.127.
+- Row 17 (control) ends lower after (output head input 0.082 to 0.079).
+
+So the worse KL is not this row's own quantization near the 16x threshold; it
+arrives through attention from other positions whose keys and values the split
+changed (position 0 the likeliest; no per-position ablation was run), and grows
+in the last layers on a row the model is likely very sensitive on. A hint, not a
+proof: the reference with the old 256-block quantizer simulated
+(`linear_tap::simulate`, `256:0:0:127`) scores the same position at 0.484, four
+times the real old production's 0.109. That simulation runs in reference mode
+(weights decoded to f32, f32 dots, the simulated quantizer applied to `Linear`
+inputs only), so the two differ in more than activation rounding, and part of
+the gap may be that difference rather than the row's sensitivity alone.
+Controlled here: the same prompt, tokens and teacher forcing, and the same
+production code with only the split switched off. Not controlled: which of the
+other positions' changes reach row 18 (no per-position ablation was run). Input
+for the ratio question above, not a defect to fix.
+
+### B211 — the 32-element activation path is not split (2026-11-18)
+
+**Tag:** cpu · accuracy · **Kind:** open
+
+`quantize_q8_32` (Q4_0, Q4_1, Q5_0, Q5_1, IQ4_NL, MXFP4, NVFP4, Q2_0, and Q8_0
+at a width that is not a multiple of 256) has one scale per 32 elements and no
+split. Its blocks are small enough that the first token's outliers cost less
+(gemma-3-1b's position 0 is at KL 2e-4 to 7e-4), but its row-0 local error is
+still about twice the other rows' (gemma's Q5_0 projections: 1.6e-2 against
+8e-3). The same split would apply (a one-block `Q8x32` part per split block).
+Not measured on a model whose 32-block weights meet a large first-token outlier.
+
+### B212 — llama.cpp parity at position 0 now differs by design (2026-11-18)
+
+**Tag:** cpu · parity · **Kind:** behaviour to know
+
+llama.cpp's CPU quantizes K-quant activations to `Q8_K` (256 elements, one
+scale), the scheme infr used before the split, and has the same first-token
+error: SmolLM3-3B's position 0 is at KL 1.85 from infr's reference in llama.cpp
+and was 1.92 in infr. After the split infr's position 0 is close to its
+reference and therefore 9.5 from llama.cpp's (Qwen3-0.6B 0.075, ERNIE BOS 0.094;
+the first draft of this entry quoted 9.2, 0.073 and 0.085, measured at ratio 8,
+before the committed ratio of 16). A parity test against a llama.cpp dump that
+reads position 0 (a one-token prompt) will now see that distance; later
+positions agree as before.
+
+### B223 — the activation split's sparse dot on the grid formats (2026-11-19)
+
+**Tag:** cpu · perf · **Kind:** open, small
+
+The sparse part's dot (`kernels/hi.rs`, `docs/cpu-activations.md`, "How a part
+is dotted") reads only the weight elements at a part's codes for the K-quants,
+IQ4_XS, the TQ formats and Q8_0, about 6 ns per part and weight row against 115
+ns for the old one-block kernel call (`kernels::hi::tests::microbench`,
+single-threaded). The grid formats (IQ2_S, IQ2_XS, IQ2_XXS, IQ3_S, IQ3_XXS,
+IQ1_S, IQ1_M) still expand the part's whole 256-element block
+(`*_expand_row(blk, 256)`, two allocations and 32 grid lookups) for each part
+and weight row, then sum only the codes' groups: 97 to 181 ns against 252 to 292
+ns for the old call, so 1.6 to 2.7 times faster, not 20. A per-group decoder for
+each grid format (the grid index, signs and scale of the one 8-element group a
+code sits in) would bring them in line; it duplicates each `*_expand_row`'s
+per-group logic unless those are refactored to call it, which touches the IQ
+batch kernels' hot path. Not measured on a model: no grid-format model is in the
+bench set.
+
+Also left as it was: a split block still costs `quant::split_off`'s sort of 256
+indices in the quantizer (a first-token row with two split blocks, 2048 wide,
+6.9 µs against 1.3 for an ordinary row), and the first-token row's parts in the
+attention and FFN-in projections each read their weight elements in a pass of
+their own on the o-major routes (the packed VNNI GEMM adds them in its group
+tasks).
+
+### B224 — measurements that drift with the date or the binary's file (2026-11-19)
+
+**Tag:** cpu · tests · perf · **Kind:** open, protocol
+
+- **Date-stamped chat templates.** SmolLM3's template writes
+  `Today Date: {{ strftime_now("%d %B %Y") }}` into its default system block,
+  and `infr-chat`'s `strftime_now` (`template.rs`) formats
+  `std::time::SystemTime::now()` through `infr_plat::localtime::strftime_local`
+  with no way to fix the clock: no parameter, environment variable or test hook.
+  So `cpu_act_quant`'s chat prompts on SmolLM3 tokenize differently every day,
+  and its per-position KL after the date (positions 0 to 240 of those prompts
+  are the shared system preamble that follows it) is comparable only within one
+  day: on 2026-11-18 the worst chat position was 229 at 0.33 (240 at 0.22); on
+  2026-11-19, on `origin/main` and the exact sparse dot alike, 240 at 0.691 (229
+  at 0.027, the review's run). Nothing regressed. Fix: a way to pin the date for
+  tests and measurements (a render option or a test-only clock in `infr-chat`),
+  then use it in `cpu_act_quant`; not done here, to add no production surface in
+  a CPU slice. Goldens checked (2026-11-19): `cpu_golden_smollm3` renders
+  through `smollm3_render`, whose `/system_override` system message replaces the
+  dated block, and asserts the render has no `Today Date`; of the cached GGUFs
+  the CPU goldens use (Qwen3, Qwen3.5, gemma-3-1b, ERNIE, LFM3, Qwen3-30B-A3B,
+  ERNIE-21B), only SmolLM3's template contains `strftime_now`. gemma-4-E2B's
+  template was not checked (not cached here; its golden skips).
+- **The binary's file.** In the 2026-11-19 rounds (`docs/cpu-activations.md`,
+  "Speed with the exact sparse dot") a copy of the native binary ran 1.22% ahead
+  of the original in 12 of 12 Qwen3-1.7B prefill rounds although the order was
+  reversed every other round: an offset tied to the file, not its position. Next
+  time, rotate the physical copies between rounds (each build as several copies,
+  a different one each round) or take an A-against-A pair per build; until then
+  a paired difference under about 1.2% is unresolved however many rounds agree.
+
+### B214 — CPU goldens the activation split could not re-bless or confirm (2026-11-18)
+
+**Tag:** cpu · tests · goldens · **Kind:** verification gaps
+
+- **`QWEN3_QUANT_GOLDEN`** (`cpu_golden_qwen3_quants`) skips a row whose file is
+  not cached, and that is how three rows went stale unseen (all eight were
+  re-checked on 2026-11-19, Windows and WSL agreeing). CI's golden job caches
+  only Q4_K_M, so CI runs that one row; the other seven run only on a machine
+  that has their files (3.8 GB in all). The test now prints which rows ran and
+  which were skipped. Closing the gap means caching the seven files in CI (cache
+  cost, B204) or accepting a local-only check.
+- CI does not run the MoE goldens (`cpu_golden_qwen3moe`,
+  `cpu_golden_ernie4_5_moe`); both give the same hash on Windows and under WSL
+  (`qwen3moe` checked 2026-11-19).
+- Not run under WSL: the MoE models' chunk-height identity
+  (`cpu_rows_give_the_same_bits_in_any_chunks`, which loads ERNIE-4.5-21B-A3B
+  and Qwen3-30B-A3B one after the other; Windows passed). WSL here has a 30 GB
+  limit, and the one 18.6 GB `qwen3moe` run took Windows free memory from 31 GB
+  to 14 GB through the VM's file reads; the two in one process were not
+  attempted.
+
+### B226 — the work bound (plan 12 S2): what it leaves out, and what was not verified (2026-11-22)
+
+**Tag:** vulkan · submit · watchdog · **Kind:** coverage gaps, decisions
+
+`crate::work` estimates the GPU time of the heavy prefill dispatches and cuts by
+it (`submit.budget_ms`): a dispatch estimated past the budget is recorded as
+ranges of its grid, each in its own submit, and a submit is closed at the next
+op boundary once its estimated work reaches the budget. Plan 12 sections 0d and
+0e have the measurements behind it. What it does not do:
+
+- **The budget is where cutting starts, not a ceiling.** A submit is closed at
+  the next op boundary after its estimate reaches the budget, so one that was
+  just under it takes one more op and can hold about twice the budget; and a
+  dispatch has no more ranges than workgroups along the dimension that is cut
+  (`WorkModel::pieces`), so a range of a coarse grid can pass the budget on its
+  own. The defaults are set for the first: twice the budget is a quarter of the
+  2 s limit on the devices that get reset and half of it elsewhere (500 ms since
+  the second fix round; it was 1000, which with estimates corrected to real time
+  made a full submit the whole limit). The second was not seen to matter.
+- **Whether a fast discrete card is reset at 2 s was not tested.** The 500 ms
+  default assumes it: Windows' `TdrDelay` is a system setting, not a per-adapter
+  one, and `infr_core::SUBMIT_DANGER_NS` already treats a 1 s forward as
+  dangerous on any device. No submit of 2 s was run on the RX 7900 XTX to see it
+  reset; the measured resets are the integrated GPU's (plan 12 section 0d) and
+  the reporter's RX 580.
+- **Kernels that carry no estimate count as free.** Only these say what they
+  cost (`Recorder::work_next`), and only over more than one row: the GEMMs
+  recorded by `matmul_native_off`, `matmul_native_cm8`, `matmul_native_f16a`,
+  `matmul_native_f32a`, `matmul_native_splitk`, `matmul_i8cm_kq`,
+  `matmul_dp4a_kq`, `matmul_mmq_q4k`, `matmul_mmq_q6k`, `matmul_mmq_at` and
+  `matmul_fma_at` (`tag_gemm`'s call sites), the per-row GEMV
+  (`linear_native_at`'s multi-row dispatch), the fork's multi-row
+  `native_gemv_kq_fma_mrow`, and the non-coopmat flash prefill attention
+  (`attention_prefill_nc_fa`). Everything else is bounded by the dispatch cap
+  alone. That includes prefill GEMMs, which the docs first described as all
+  tagged: the cooperative-matrix GEMM of f16 weights outside the split-K plan
+  (`matmul_proj_at`), the BF16 one (`matmul_bf16cm`), the opt-in Q8_0
+  cooperative-matrix tiers (`matmul_i8cm_q8_0*`, `matmul_f8cm_q8_0*`) and the
+  batched MoE expert GEMM (`matmul_mmq_experts`, `matmul_mmq_experts_paged`).
+  And the rest: the multi-row GEMVs of the 2-to-16 row band
+  (`native_mmv_mrow*`), every other attention kernel (the cooperative-matrix
+  flash prefill, `attention_kv*`, MLA, the split-K decode kernels),
+  convolutions, the DeltaNet and hyper kernels, MoE routing and scatter,
+  embedding gathers, norms and activations. None of the second group was seen
+  heavy in the profiles of plan 12 section 0d (the heaviest untagged dispatch
+  there is under 4 ms, `rope_f16`); the untagged GEMMs were not profiled on a
+  slow device. A model whose prefill is dominated by one of them there gets no
+  cut from the work bound. To add one: tag it where it is recorded, with its
+  FLOPs and `work::Split` (`Flat` only if the shader does not read
+  `gl_NumWorkGroups`, which `record_dispatch` checks against the SPIR-V), and
+  add its kernel to `tests/work_split_parity.rs`.
+- **A batched MoE layer is one op with most of its work untagged.** Checked
+  because a submit is only closed between ops: one `Op::MoeFfn` records ONE
+  tagged dispatch, the router GEMV (`linear_native`), and its expert GEMMs
+  through `matmul_mmq_experts`, which carry no estimate. No op records several
+  tagged dispatches (`quant_linear`, `float_linear` and `nc_prefill_gemm` record
+  one GEMM per `Op::Linear`, read 2026-11-22), so no op can run a submit far
+  past the budget by estimate; but a MoE layer's real work is outside the
+  estimate altogether. On the RX 7900 XTX, Qwen3-30B-A3B Q4_K_M at
+  `-u 1024 -p 1024` was estimated at 151 ms a forward against 270 to 288 ms of
+  GPU time, with no work cut and nothing learned (a segment that runs slower
+  than its estimate corrects nothing). Not run on a slow device.
+- **Refusing an uncuttable dispatch was removed (2026-11-22).** The first
+  version refused, before submit, a dispatch that could not be cut and had been
+  measured far past the budget on a reset-prone device. No tagged kernel is
+  uncuttable, so nothing reached it and it had no GPU test; it went, with
+  `work::Split::No`. A kernel that cannot be cut the way its tag says (a `Flat`
+  tag on a shader that reads `gl_NumWorkGroups`, a `WideGrid` kernel on a
+  three-dimensional grid) is recorded whole. If such a kernel is ever tagged and
+  heavy, a refusal needs a GPU test that produces it.
+- **A recording that cannot open submits keeps heavy dispatches whole.** A
+  persistent recording (the decode replay tape, replayed whole) and every
+  recording under `device.submit_dispatches = 0` record a tagged dispatch as
+  one, whatever its estimate. No decode recording carries a multi-row GEMM heavy
+  enough to matter in what was measured; a batched decode over many sequences on
+  a slow device is the case to look at.
+- **The estimate follows timestamps around one dispatch, which other dispatches
+  can overlap.** A timed dispatch is bracketed by two timestamps with no barrier
+  before the first, so a dispatch that started while earlier work was still
+  running can read short. The model keeps the slowest of a kernel's last four
+  timed samples (`work::TIMED_WINDOW`), which the first dispatch of an
+  overlapping group always is, and on the integrated GPU eight independent GEMV
+  dispatches in one submit read the same throughput as one alone (29.2 to 29.9
+  GFLOP/s over the four probe points). Not shown: a kernel whose every dispatch
+  overlaps a heavier one of another kernel. What bounds the damage is the gain
+  bound (`work::max_prior_gain`): no reading takes a kernel's throughput past
+  it, and a reading of no time is dropped. A barrier before the opening stamp
+  would make the reading exact at the cost of serialising those dispatches; not
+  done, since it would change what a slow device runs.
+- **A segment's time is shared among its UNTIMED kernels by their priors, and a
+  segment of mostly timed work corrects nothing.** `WorkModel::calibrate` treats
+  the kernels without a timed dispatch as if they had taken the whole segment,
+  and scales them by one factor when even so they ran faster than estimated.
+  That can only err slow for the group, and a timed kernel latched on a slow
+  sample no longer pushes the others down (the first version set the measured
+  time against the whole estimate, timed kernels included, and did). Subtracting
+  the timed kernels' estimate from the measured time, as review suggested, was
+  not done: their rate is the slowest of a few samples, so it overstates them,
+  and the overstatement would be handed to the untimed kernels as speed (a timed
+  kernel estimated at 100 ms that really took 50, beside an untimed one whose
+  200 ms prior is exact: measured 250 less 100 leaves 150, and the untimed
+  kernel would be scaled to three quarters of its true time). Two costs. Within
+  the group one factor is shared, so a kernel much slower against its prior than
+  its neighbours still comes out too fast, by at most the gain bound, and only a
+  timed dispatch raises it; nothing was built to provoke that on a GPU. And
+  where a timed kernel carries most of a segment, the untimed ones stay on their
+  priors: on the RX 7900 XTX with SmolLM3-3B at `-u 4096` only
+  `native_gemm_i8cm_q4k_l` is learned, and the forward is estimated at 1098 ms
+  against about 850 ms of GPU time.
+- **The gain bound holds estimates above real time wherever a kernel is more
+  than that much faster than its prior.** It is 3 at the integrated GPU's 250 ms
+  budget (it was a constant 8, which let a full submit at the floor run 4 s if
+  the prior was exact) and 2 at 500 ms. On the integrated GPU the int8 GEMMs are
+  held at 384 GFLOP/s (timed at 502 to 770 before the bound) and the flash
+  prefill attention at 48 (170 before), so its estimates read about twice the
+  GPU time: Qwen3-1.7B `pp512` 1018 to 1253 ms a forward against 510 to 594,
+  SmolLM3-3B `-u 2048` 55.8 s against 27.4 to 27.6. More cuts by work, no
+  failure and no throughput seen lost: SmolLM3 takes 216 work cuts a forward
+  where it took 180, and Qwen3-1.7B is cut by work where the dispatch cap cut
+  it, four cuts a forward either way (pp512 231.0 t/s). On the RX 7900 XTX the
+  timed matrix GEMM is held at 24576 GFLOP/s (27100 to 34952 measured before the
+  bound). Raising the int8 and attention priors toward what was measured would
+  remove the clamp on this GPU, at the price of a less pessimistic first forward
+  on devices nobody measured; not done.
+- **The prior's margin is thin for one shape.** `submit.prior_gflops` is 16 on
+  the 2-CU integrated GPU; its per-row GEMV measured 29.9 GFLOP/s on a 2048 x
+  22016 weight and 18.8 on 22016 x 2048 (the slow-class test's shapes). The
+  budget's eighth of 2 s is what absorbs a prior that is wrong.
+- **No 14B-class dense model was run.** The review asked for Qwen3-14B at
+  `-u 1024` on the RX 7900 XTX; it is not in the cache and is larger than the
+  download allowance. SmolLM3-3B at `-u 4096` stood in (about the same FLOPs a
+  forward, by the prior 1875 ms of estimated work): plan 12's S2 status has the
+  cut counts and the A/B.
+- **The dispatch-cap loop still judges a forward the work bound already cut.**
+  `observe_forward` divides a forward's whole GPU time by its dispatch count
+  (`submit_cap_from_measurement`), heavy tagged dispatches included, and lowers
+  the cap to what would have put that average at 250 ms a submit. With the count
+  now every range of every recorder (2026-11-22, second fix round), on the
+  integrated GPU: SmolLM3-3B `-u 2048` reports 802 dispatches for 27.4 to 27.6
+  s, 34 ms each, which asks for a cap of 7; `-u 512` with `INFR_NO_I8DOT=1`
+  reports 874 for 100.4 s, 115 ms each, a cap of 2. Both land on the floor of 16
+  (`submit split/16`), as they did with the short counts of before. So the cap
+  goes as low as it can although the heavy dispatches are already held by the
+  work bound, and the light ones (norms, activations, the quantisation passes)
+  are then cut every 16 for the rest of the process: more submits than needed,
+  no failure. It is not double counting in the count any more; it is one average
+  over two kinds of dispatch. Feeding the loop the forward's time less its
+  estimated work, over its untagged dispatches only, would fix it; not done,
+  because the estimate reads about twice the real time on this GPU (the gain
+  bound, above), so the remainder would be negative here.
+- **The integrated GPU's first prefill forward takes three submits by work** at
+  default settings where it took none before the work bound (the pessimistic
+  prior): Qwen3-1.7B, `pp512`, counted from the `RUST_LOG=infr_vulkan=debug`
+  forward lines. Since the second fix round its later forwards are cut by work
+  too, in place of the dispatch cap's cuts and as many (four a forward).
+- **SmolLM3-3B `-u 2048 -p 2048` on the integrated GPU reads in two states,
+  about 76 and about 89 t/s, and which one a run gets is not explained.** The
+  first S2 run recorded 91.3 to 91.9 t/s; on 2026-11-22, later, three runs of
+  the final binary gave 72.3, 72.5 and 71.7 and one of the binary from before
+  the fix round 73.6, with the same cuts per forward as the first run (72
+  dispatches cut, 180 work cuts), so the same work took longer on the GPU (about
+  28 s a forward). An interleaved A/B of the two binaries then (six rounds, one
+  run each of two copies per round, `-r 1`) read 72.6 to 81.0 t/s in its first
+  three rounds and mostly 87.0 to 90.3 from the fourth on, with single runs of
+  either binary in the other state among them (one binary 76.7 then the other
+  87.0 in consecutive runs; three runs at 89 to 90 then one at 76.5). Means:
+  81.22 t/s after the fix round against 82.06 before, with the two copies of one
+  binary 3.3% and 1.4% apart, so that set does not compare the binaries. Under
+  one busy core of 32 throughout but for one round at 1.07 (Windows'
+  `CompatTelRunner`). The second fix round's three runs read 73.8, 73.8 and 79.2
+  t/s, the third with forwards of 23.2 to 26.9 s where the other two took 27.4
+  to 28.4. Qwen3-1.7B `pp512` on the same GPU is steady (231.03 against 231.07
+  t/s over six rounds). To separate the binaries on this workload the state has
+  to be found first: memory bandwidth taken by another process is the first
+  thing to rule out, since this GPU reads its weights from DRAM [I].
+- **`device.submit_dispatches = N` moves where the cap starts, not where it
+  ends** (issue 94: 128 and 256 both ended on 62). The docs now say so. A
+  DECISION for the owner: whether an explicit N should instead pin the cap,
+  which would let a user raise it past what the measured loop allows, at their
+  own risk now that the work bound holds the heavy dispatches. Not changed.
+- **The RX 580's limit on the compute ring is not known.** PR 106 moved a
+  discrete card's submits to a compute-only queue family, and amdgpu's
+  `lockup_timeout` gives compute jobs a longer default than the 2 s the reporter
+  measured on the graphics ring. The budget still assumes 2 s. Asked on
+  issue 94.
+- **The ordering barrier of a cut dispatch's later submits is not covered by a
+  test.** `Recorder::rollover` opens each fresh command buffer with
+  `seed_barrier`; removing it left every parity test green on the RX 7900 XTX,
+  whose queue runs submits in order anyway. It is kept because Vulkan requires
+  it.
+- **The dispatch count of a cut forward was fixed in two steps, and one path has
+  no test.** The first fix round counted every buffer a recorder submitted
+  itself for a segment finished without waiting (`PendingSegment::dispatches`)
+  and said the forward's count was then whole. It was not: the recorder a
+  forward ends with is finished by a blocking `Recorder::finish`, and for it
+  `execute_static` still took the open buffer's count. The second round added
+  `Recorder::total_dispatches` for that one. `tests/work_split_parity.rs` now
+  asserts the count a forward reports (`VulkanBackend::last_forward_dispatches`)
+  against the uncut forward's count and the ranges recorded; its forwards end in
+  the recorder that made the cuts, so it covers the blocking path (it failed
+  four of six with the old line: 99 reported where 104 were recorded). The
+  pipelined path has no assertion: it was read off the debug line (SmolLM3-3B
+  `-u 2048` on the integrated GPU, 766 dispatches a forward where the first
+  branch reported 397, the same with `INFR_PROF_OPS`).
+- **The paged paths leave their submits out of a forward's dispatch count.**
+  `rotate_stream` and `sync_stream` in `adapter.rs` submit the open segment (a
+  ring rotation, or the blocking drain before a router readback) without adding
+  its dispatches to the count `execute_static` hands the dispatch-cap loop,
+  while those segments' GPU time is in the forward's sum. So a paged MoE forward
+  reports too few dispatches for its time, the loop sees too much time per
+  dispatch, and the cap comes out lower than it should: more splitting, not
+  less. It predates this branch (both functions are on `main` as they are) and
+  was not changed.
+- **The timed window's first-sample rule was not run on a GPU.** Since the third
+  review the prior stands in for the samples a kernel does not have yet, so its
+  rate comes down only after `work::TIMED_WINDOW` fast readings. Host tests
+  cover it; the cut counts and throughputs recorded in plan 12 are from the
+  binary before it.
+- **`Recorder::free_transient`'s wait has no test.** It now waits for the
+  buffers a cut dispatch already submitted before it destroys the profiling
+  query pool they write to (a discarded recorder under `INFR_PROF_OPS`). It
+  needs a shutdown during a cut forward under profiling and was only read.
+- **`INFR_PROF_OPS` across a cut dispatch was checked once, by a run.**
+  SmolLM3-3B `-u 2048 -r 1` on the integrated GPU, profiled: the per-op tables
+  of the measured forward (73 of them, one a recorder) sum to 27311.6 ms against
+  27266.0 ms of GPU time for that forward, no stamp was dropped, and a cut
+  dispatch is counted once, with all its ranges under its one label (the tables
+  count 694 dispatches where the forward reports 802; the difference fits the
+  extra ranges, which were not counted separately). The warm-up forwards are not
+  profiled. No test asserts any of it.
+- **A timestamp counter that wraps is handled in the arithmetic only.**
+  `work::ticks_between` takes an interval under the queue's
+  `timestampValidBits`, with a unit test; no device here was seen to wrap, and
+  the per-op profile's own differences (`Recorder::report_timestamps`) still
+  subtract over 64 bits.
+- **A `LiveKernelEvent` 0x141 entry does not always mean dropped work.** Two
+  were logged during runs all of whose segments wrote their closing timestamps
+  (plan 12 section 0d), so counting those entries over-reports.
+- **Not run:** GCN itself (the reporter's card); `INFR_FORCE_WAVE64` on the
+  integrated GPU beyond the work-split parity tests; a model with a
+  cooperative-matrix prefill on a device slow enough to cut it (the RX 7900 XTX
+  cuts those kernels only under the tests' forced budget of 1 ms).
+
+### B227 — PRs 105 to 107 as tuning parameters: what was measured here, and what was not (2026-11-22)
+
+**Tag:** vulkan · tuning · attention · gemv · submit · **Kind:** decisions,
+coverage gaps
+
+Three pull requests from the fork of plan 12, written and measured on an RX 580
+under RADV, were merged as they stood and each changed a default on every
+device. On top of them (branch `fix/pr-followups`) each choice is a tuning
+parameter. `gemv.kq_fma` (PR 107: the fp32 decode GEMVs) and
+`attn_split.decode_min_chunk` (PR 105: 16 against 64) default to the contributed
+behaviour on that class of device only, so on the RX 7900 XTX and the integrated
+GPU they resolve to what ran before the merges, and `gpu_seam_golden_qwen3`,
+which PR 105's floor had moved, passes unchanged. `queue.family` (PR 106) is
+`auto` by default on every discrete device and, by a table row, on an integrated
+GPU under the AMD Windows driver, and `auto` takes a compute-only queue family:
+the project owner's decision, for a responsive desktop.
+
+**Measured here.** `infr bench` of Qwen3-1.7B Q4_K_M, the parameter forced each
+way with `INFR_TUNE`, 6 interleaved rounds, one process per sample, two copies
+of one binary rotated between the arms, context 8192. Each cell is the mean with
+the lowest and highest sample; the load column is the machine's total CPU over 3
+s before and after the row. `Vulkan0` is the RX 7900 XTX and `Vulkan1` the Ryzen
+integrated GPU, both under the AMD Windows driver, with the Windows desktop
+running on the machine.
+
+| Device    | What, t/s                  | First value                               | Second value                             | Change | Load before / after |
+| --------- | -------------------------- | ----------------------------------------- | ---------------------------------------- | ------ | ------------------- |
+| `Vulkan0` | floor, tg128 at depth 16   | 64: 469.06 (465.46 to 471.96)             | 16: 488.36 (485.96 to 492.29)            | +4.1%  | 0.7% / 2.0%         |
+| `Vulkan0` | floor, tg128 at depth 64   | 64: 464.17 (461.33 to 465.64)             | 16: 485.65 (479.86 to 489.07)            | +4.6%  | 1.7% / 1.1%         |
+| `Vulkan0` | floor, tg128 at depth 256  | 64: 458.27 (456.26 to 459.51)             | 16: 474.52 (471.32 to 476.39)            | +3.5%  | 1.7% / 0.7%         |
+| `Vulkan0` | floor, tg128 at depth 1024 | 64: 449.79 (447.41 to 451.51)             | 16: 449.33 (445.67 to 451.13)            | -0.1%  | 2.2% / 1.5%         |
+| `Vulkan0` | floor, tg128 at depth 4096 | 64: 379.85 (379.24 to 380.52)             | 16: 379.20 (377.64 to 380.88)            | -0.2%  | 1.7% / 0.8%         |
+| `Vulkan0` | `gemv.kq_fma`, tg128       | off: 473.20 (467.43 to 475.37)            | on: 428.54 (425.17 to 434.90)            | -9.4%  | 1.9% / 1.8%         |
+| `Vulkan0` | `queue.family`, tg128      | graphics: 474.86 (474.34 to 475.66)       | compute: 454.79 (454.20 to 455.17)       | -4.2%  | 1.7% / 2.2%         |
+| `Vulkan0` | `queue.family`, pp512      | graphics: 11611.42 (11508.54 to 11743.71) | compute: 11482.28 (11426.91 to 11527.87) | -1.1%  | 1.5% / 2.4%         |
+| `Vulkan1` | floor, tg128 at depth 16   | 64: 27.07 (26.92 to 27.31)                | 16: 26.93 (26.80 to 27.02)               | -0.5%  | 1.2% / 1.7%         |
+| `Vulkan1` | floor, tg128 at depth 64   | 64: 26.84 (26.76 to 26.92)                | 16: 26.72 (26.49 to 26.94)               | -0.4%  | 2.0% / 0.9%         |
+| `Vulkan1` | floor, tg128 at depth 256  | 64: 26.30 (26.26 to 26.34)                | 16: 25.87 (25.76 to 25.94)               | -1.6%  | 1.2% / 1.4%         |
+| `Vulkan1` | floor, tg128 at depth 1024 | 64: 24.44 (24.36 to 24.58)                | 16: 23.95 (23.92 to 23.97)               | -2.0%  | 0.6% / 2.7%         |
+| `Vulkan1` | floor, tg128 at depth 4096 | 64: 19.08 (18.98 to 19.18)                | 16: 19.13 (19.05 to 19.19)               | +0.3%  | 1.6% / 2.0%         |
+| `Vulkan1` | `gemv.kq_fma`, tg128       | off: 27.15 (27.06 to 27.36)               | on: 22.75 (22.64 to 22.80)               | -16.2% | 2.6% / 3.9%         |
+| `Vulkan1` | `queue.family`, tg128      | graphics: 27.12 (26.98 to 27.22)          | compute: 27.12 (27.07 to 27.15)          | +0.0%  | 3.6% / 1.3%         |
+| `Vulkan1` | `queue.family`, pp512      | graphics: 230.94 (230.67 to 231.16)       | compute: 230.84 (230.58 to 231.25)       | -0.0%  | 0.6% / 1.8%         |
+
+**The compute-only family here.** Both devices have one (queue family 1) and it
+reports 64 valid timestamp bits, read from the startup log. The `queue.family`
+rows above compare `graphics` with `compute`; they were taken while the
+parameter was still a switch, whose two positions are those two families. On the
+compute-only family, on each device, `first_forward_split`, `work_split_parity`,
+`gpu_seam_golden_qwen3` (the hash unchanged, so the queue does not change
+generated output) and `gpu_seam_tolerance_qwen3` / `_qwen35` passed. Timestamps
+work on it: a profiled `pp512` on `Vulkan0` (`INFR_PROF_OPS=1`) reported a
+device total of 42.1 ms for a forward of 47.0 ms wall on the compute-only
+family, against 41.3 ms of 46.7 ms on the universal one. The integrated GPU's
+row in `table.toml` (`amd-proprietary-integrated-compute-queue`) rests on the
+two `Vulkan1` rows above. Not measured: how long a submit may run on that family
+before Windows resets the device (the `Vulkan1` figures of plan 12 section 0d
+are from the universal family).
+
+**Forced configurations, `Vulkan0`.** The slice's GPU test set (49 tests: the
+golden, `gpu_seam_tolerance_*`, the split and parity binaries, the new kernel
+tests) passed whole at the defaults on both devices and under `INFR_NO_I8DOT=1`,
+`INFR_NO_COOPMAT=1`, both together and `INFR_FORCE_WAVE64=1`. The two capability
+masks do not reach the whole-model tests of `infr-llama`
+(`docs/gpu-tolerance.md`), so those runs exercise them in `infr-vulkan`'s tests
+only. Under `INFR_TUNE=gemv.kq_fma=true`, which does reach them, 48 passed and
+`gpu_seam_golden_qwen3` did not: the fp32 decode kernels give the continuation
+`0x94f246b09d34db5d`, the same one the 16-key floor gives, where the blessed
+hash is of the int8 decode path. Every tolerance test passed with it on, so the
+fp32 path is inside the CPU-reference tolerance; the golden is a hash of one
+device's default path and is not expected to hold under a forced kernel.
+
+**Decisions that need a call:**
+
+- **The decode floor on the RX 7900 XTX.** 16 measured faster there at depths
+  16, 64 and 256 and the same at 1024 and 4096 (table above), so by speed alone
+  it should be 16. It stays 64 because 16 changes decode's attention sums for
+  every context under 2048 keys, and `gpu_seam_golden_qwen3` then generates a
+  different continuation (hash `0x94f246b09d34db5d` where the blessed one is
+  `0xcf56ba8c4bb5c455`, from the test's failure message; the text it printed
+  reads as a normal answer). That golden is retired since 2026-11-23 (plan 11's
+  G4: the chained and the replayed decode are held to the per-token path bit for
+  bit instead, B207), so no hash holds the floor any more. Measured that day on
+  the RX 7900 XTX under RADV with
+  `INFR_TUNE=gemv.kq_fma=true,attn_split.decode_min_chunk=16` (both forced
+  together; the built kernels show `native_gemv_kq_fma_*`): every model's
+  `gpu_seam_tolerance_*` case passes, greedy check included. One test of the set
+  fails under the two together,
+  `gpu_seam_tolerance_float_runs_build_no_int8_kernel`, at its own guard: with
+  `gemv.kq_fma` forced the shipped configuration builds no int8 kernel under
+  RADV (the int8 prefill GEMM does not run there either, B231), so the check
+  says it cannot fail. Each alone, the same day, device and driver, with
+  `infr tune check` on Qwen3-0.6B Q4_K_M (every check of the model's six
+  configurations and the greedy check; no default was changed):
+
+  | Forced                                                     | Verdict | Closest to a bound                                                          | Decode worst KL, `gpu` (Int8) | Decode worst KL, `gpu-float` (Float, bound 8.5e-5) |
+  | ---------------------------------------------------------- | ------- | --------------------------------------------------------------------------- | ----------------------------- | -------------------------------------------------- |
+  | nothing                                                    | PASS    | 0.49 of it: `gpu-float` prefill mean KL 3.575e-6 against 7.3e-6             | 4.626e-3                      | 1.602e-5                                           |
+  | `--set kernels.vulkan.tune.attn_split.decode_min_chunk=16` | PASS    | 0.53 of it: `gpu-float-ub32` decode logit deviation 1.014e-3 against 1.9e-3 | 7.588e-3                      | 1.411e-5                                           |
+  | `INFR_TUNE=gemv.kq_fma=true`                               | PASS    | 0.57 of it: `gpu-float-ub32` decode logit deviation 1.091e-3 against 1.9e-3 | 1.564e-5                      | 1.564e-5                                           |
+
+  Each override is seen in the values. Against the unforced run's table, 27
+  decode lines, one prefill line (`gpu-ub32`'s logit deviation) and one greedy
+  token count differ with the floor at 16; 23 decode lines, the same prefill
+  line and one token count with `gemv.kq_fma`, where the shipped configuration's
+  decode lands at the int8-free one's distance (its decode GEMVs are then the
+  fp32 ones). So on this device and driver, for this model, each is inside the
+  rows on its own. Still to do before the default changes: the whole GPU gate
+  with the floor at 16 alone, on the Windows driver the speed was measured on;
+  neither was run. To try it: `INFR_TUNE=attn_split.decode_min_chunk=16`, which
+  reaches the tests too, and `infr tune check <model>` under it for one model at
+  a time. If it is taken, a class row in `table.toml` for
+  `vendor = "amd", driver = "AMD_PROPRIETARY", integrated = false` is the place,
+  with these figures as its source.
+
+- **The decode floor on the integrated GPU** stays 64: 16 measured slower there
+  at depths 256 and 1024 and within the samples' spread elsewhere.
+- **The compute-only family on the RX 7900 XTX** is the default
+  (`queue.family = auto`) by the owner's decision and costs 4.2% of decode
+  there; whether that buys a more responsive desktop on Windows was not measured
+  (no frame-time or compositor statistic was taken while a forward ran). B228
+  has the conditional follow-up.
+- **`gemv.kq_fma` on devices with an accelerated dot** stays off: the table
+  above has what on costs.
+
+**Left inline, measured on Polaris only (PR 107):** the rows-per-workgroup
+picker `Recorder::kq_fma_gemv_rows` (8 rows only when that fills the last pass
+at least 1.1 times better and still leaves 4 workgroups per compute unit) and
+`Recorder::linear_f32_at`'s threads-per-output choice for `linear_f32_mo` (64,
+or 32 when a row has under 128 vec4s). Both are hardware-shaped numbers of the
+kind plan 10 makes tuning parameters; neither was swept here, because on both
+devices here the kernels they shape are off by default.
+`Recorder::linear_native_routed_at`'s bf16 arm also still requires
+`out_f <= MAX_GROUP_COUNT_X`, which `linear_bf16_at` no longer needs (it splits
+its grid); a wider one-row bf16 weight takes the generic GEMV.
+
+**Changed on top of the PRs without the RX 580 to check them:**
+
+- **`precise` in `native_gemv_kq_fma.comp` and its `_mrow` twin.** It was needed
+  for the verify twin to be bit-identical to the decode kernel on the RX 7900
+  XTX. It can only cost speed where the compiler was contracting multiply-adds.
+  `kq_fma_gemv_bw` on the RX 7900 XTX: one run before and three after, single
+  shapes between 15% lower and 36% higher, which is that bench's own spread from
+  run to run, so no cost was established and none excluded. Not measured on GCN,
+  the class the kernels are on for.
+- **Decode takes the fp32 K-quant kernel ahead of the int8 GEMV at the plain
+  (non-fused) `Linear` site.** As merged, `mmv_mw_choice` ran first there, so on
+  a device with an int8 dot a plain decode `Linear` of 2M elements or more kept
+  the int8 kernel (the fused-residual site already had the fp32 one first). PR
+  107's commit message describes the order now in the tree, and its figures were
+  taken in the fork; whether the merged order was ever what ran on the RX 580 is
+  not known here.
+- **A device that reports no facts** (the `unknown` fixture: no matrix units, no
+  accelerated dot, not integrated) gets all three contributed defaults:
+  `gemv.kq_fma` on, floor 16, compute-only queue. That follows the class rule;
+  nothing was run on such a device.
+
+**Not verified:**
+
+- **No whole-model MTP run with a parameter forced.** At the defaults, on RADV
+  (2026-11-23, Linux, Mesa 26.3.1, headless, Qwen3.5-4B-MTP),
+  `mtp_head_cpu_vulkan_parity` passes on the RX 7900 XTX and the integrated GPU.
+  `mtp_spec_matches_target_only_greedy`, ignored as "MTP parked", passes on the
+  RX 7900 XTX and fails on the integrated GPU, where the speculative stream
+  differs from plain greedy from its first words; its doc comment expects a
+  failure while MTP is parked, and it was not looked into. No term of the GPU
+  gate's filter (`docs/gpu-tolerance.md`) selects that test, so a gate run never
+  shows its state on either device. Neither was run with
+  `attn_split.decode_min_chunk=16` or `gemv.kq_fma=true` forced, the two
+  settings the PRs brought, nor on Windows.
+- **The work bound's 2 s on the compute ring.** `crate::work` assumes a submit
+  is reset after about 2 s (plan 12 section 0d), measured on the universal
+  family of the integrated GPU under Windows. No reset was provoked on a
+  compute-only family on any device or driver, so whether the limit there is the
+  same, longer (amdgpu's documented compute-ring timeout) or tighter (what
+  `docs/igpu.md` records for an integrated part under RADV) is unknown. The
+  dispatch-budget probe (`tests/dispatch_budget_probe.rs`) with
+  `INFR_TUNE=queue.family=compute` would measure it here; on Linux it needs the
+  RX 580.
+- **The compute-only family on other drivers.** NVIDIA, Intel, and RDNA under
+  RADV were not run. `VulkanBackend::pick_queue_family` refuses a family with no
+  valid timestamp bits; both devices here report 64 for theirs, so the refusal
+  is covered by its unit test only.
+- **A verify batch and decode agree bit for bit only where the chunk is the
+  floor.** Past 32 times the floor the chunk is `span / 32`, and a batch's rows
+  share the batch's span while each decode step has its own, so the two cut
+  differently. That was so before the PRs (from 2048 keys); at floor 16 it
+  starts at 512 keys.
+- **Static and replay decode cut differently past `floor * 1024` rows of cache
+  capacity.** The replay path bakes a floor that rises with the capacity
+  (`attn_chunk::baked_min_chunk`), the static path (`INFR_SEAM_NO_REPLAY`, and
+  every verify batch) does not. Before the PRs that began at 65537 rows; at
+  floor 16 it begins at 16385, so a slow-class device with a context past 16384
+  is in it. `replay_cuts_a_span_like_the_static_path` pins where the two agree.
+- **`linear_f32_mo_covers_a_vocabulary_wide_output` does not fail without the
+  grid split on the RX 7900 XTX**: with the kernel put back on a one-dimensional
+  dispatch the driver ran 65536 workgroups anyway. The split is held by
+  `elementwise_ops_split_wide_grids`, which lowers the split point; the
+  vocabulary test fails when the kernel's flat-index recovery is removed.
+
+### B228 — the compute-only queue on Linux: what to measure; display detection declined (2026-11-22)
+
+**Tag:** vulkan · submit · tuning · linux · **Kind:** measurement to run,
+decision
+
+infr submits on a COMPUTE-only queue family by default where a device has one
+(tuning parameter `queue.family`, default `auto`;
+`VulkanBackend::pick_queue_family`). The reason is a responsive desktop: the
+compositor renders on the universal family's ring, and a long forward on that
+ring stalls its frames. Nothing about it has been measured on Linux by the
+project. The owner has a Linux machine and will run this.
+
+**What is unmeasured.** The cost or gain of the compute-only queue on Linux
+under RADV (amdgpu), on whatever GPU that machine has, in two states:
+**headless** (no compositor or display server running) and **with a desktop
+session running**. The owner's hypothesis is that headless it costs nothing. The
+only Linux figure is the contributor's, on an RX 580 under RADV (Polaris10), in
+the description of pull request 106 under "Cost": qwen2.5-0.5b Q4_K_M, pp512
+1311.6 to 1299.9 t/s and tg256 161.6 to 152.2 t/s, "about 6% decode", prefill
+unchanged; and in the same description and the changelog, zeta-2.1 Q4_K_M,
+prefill 153 to 166 tok/s and decode 31.2 to 30.7 tok/s while glxgears held 130
+fps where it had dropped to 7. Whether a desktop was running during the qwen2.5
+re-measurement is not stated (glxgears implies one for the zeta run).
+
+**Measured on Windows** (this slice; AMD proprietary driver, desktop running,
+Qwen3-1.7B Q4_K_M, 6 interleaved rounds, the universal family against the
+compute-only one):
+
+| Device                  | tg128, t/s       | pp512, t/s           |
+| ----------------------- | ---------------- | -------------------- |
+| RX 7900 XTX             | 474.86 to 454.79 | 11611.42 to 11482.28 |
+| Ryzen integrated, RDNA2 | 27.12 to 27.12   | 230.94 to 230.84     |
+
+So on Windows it costs 4.2% of decode and 1.1% of prefill on the discrete card
+and nothing measurable on the integrated one (B227 has the samples' ranges and
+the load). **Desktop responsiveness was not measured there**: no objective
+method was found in that session (no frame-time or compositor statistic was
+taken while a forward ran), so on Windows the benefit the default is for is
+unmeasured, and with a desktop running on Linux it is too, beyond the
+contributor's glxgears figure.
+
+**A confound in the Windows table, not controlled.** Which GPU drove the desktop
+during those runs was not recorded. The owner's reading is that the integrated
+GPU showed no cost because it was not driving any display, while the RX 7900
+XTX, which was, showed 4.2%. If that is right, the cost follows the display, not
+the device: it is one more reason the default is the compute-only queue (below),
+and it means the tuning row that sets `queue.family = auto` for AMD integrated
+GPUs on the proprietary driver rests on a measurement of an integrated GPU with
+no display attached. To settle it on Windows: repeat the A/B with the monitor on
+the integrated GPU's output, and again with the RX 7900 XTX driving nothing.
+
+**Commands.** Build `infr` in release. The model is `Qwen3-1.7B-Q4_K_M.gguf`
+from the `unsloth/Qwen3-1.7B-GGUF` repository (`$M` below). Pick the device with
+`infr devices` and put its name in `$DEV` (`Vulkan0`, ...).
+
+```sh
+infr devices
+infr tune show --dev $DEV    # the queue.family line: value, source, family picked
+
+# The same setting from each of its three places (use any one):
+#   config file:   [kernels.vulkan.tune]
+#                  "queue.family" = "graphics"     # auto | compute | graphics
+#   environment:   INFR_TUNE=queue.family=graphics
+#   command line:  --set kernels.vulkan.tune.queue.family=graphics
+infr tune show --dev $DEV --set kernels.vulkan.tune.queue.family=compute  | grep queue.family
+infr tune show --dev $DEV --set kernels.vulkan.tune.queue.family=graphics | grep queue.family
+
+# Interleave the two arms, at least 6 rounds, one process per sample.
+for r in 1 2 3 4 5 6; do
+  for q in graphics compute; do
+    echo "round $r queue.family=$q"
+    INFR_TUNE=queue.family=$q infr bench $M --dev $DEV -p 512 -n 0 -r 1 --json
+    INFR_TUNE=queue.family=$q infr bench $M --dev $DEV -p 0 -n 128 -r 1 --json
+  done
+done
+```
+
+Run the whole loop twice: once headless (stop the display manager, or boot to a
+text console, and check that no compositor is running) and once inside a desktop
+session. Alternate which arm goes first between rounds if the samples drift.
+Record with the numbers: the GPU, the Mesa version and the kernel version
+(`uname -r`), whether a display server was running and which, whether the
+measured GPU is the one driving the display, and the machine's load
+(`top -b -n 2 -d 3`) before and after. A figure taken beside another build or
+benchmark is labelled with that load or retaken.
+
+**What else to check there.**
+
+- **The family in use.** The startup log line
+  `[infr] vulkan: queue.family = auto, picked queue family N (compute-only, timestampValidBits B): ...`
+  names it and says why, and the `queue.family` line of `infr tune show` carries
+  the same text after the value's source. Use `compute` for the measured arm,
+  not `auto`, so that a fallback to the universal family is a warning and not a
+  silent second `graphics` arm. `B` must not be 0: a compute-only family with no
+  valid timestamp bits is refused with a warning that says so, and the universal
+  family is used.
+- **Timestamps on it.**
+  `INFR_PROF_OPS=1 infr bench $M --dev $DEV -p 512 -n 0 -r 1` prints a per-op
+  device report; its `device total` should be a little under the forward's wall
+  time (512 divided by the reported t/s). On the RX 7900 XTX under Windows it
+  was 42.1 ms of 47.0 ms on the compute-only family and 41.3 ms of 46.7 ms on
+  the universal one. A total far off the wall time, or zero, means the segment
+  timing the submit splitter and the work bound (`crate::work`) rely on is wrong
+  on that family.
+- **The work bound's times.** `crates/infr-vulkan/tests/work_split_parity.rs`
+  and `first_forward_split.rs` pass on that family
+  (`INFR_DEV=$DEV cargo nextest run --release --run-ignored all -E 'binary(work_split_parity) | binary(first_forward_split)'`;
+  the first builds its config from the environment without `INFR_TUNE`, so it
+  follows the device's default, which is `auto` on a discrete card).
+- **The watchdog that applies.** amdgpu's `lockup_timeout` module parameter
+  takes per-ring values (graphics, compute, and others; `modinfo amdgpu`
+  describes the order, and `/sys/module/amdgpu/parameters/lockup_timeout` holds
+  what is set; neither was read in the session that wrote this). The work bound
+  assumes a submit is reset after about 2 s (`submit.budget_ms`, plan 12 section
+  0d), which was measured on a graphics ring. Record the value that applies to
+  the compute ring on that kernel. If it is longer, the bound is merely
+  conservative there; if a reset is ever seen on the compute ring, the time the
+  submit had run is the missing number (a failure lists the last forward
+  segments with their GPU times).
+
+**Measured on Linux, headless (2026-11-23).** infr at `a66f3d06`, RADV (Mesa
+26.3.1, kernel 7.3.5), no display server running (Hyprland closed; the monitor
+is cabled to the RX 7900 XTX and nothing drew to it), Qwen3-1.7B Q4_K_M, context
+8192, 6 interleaved rounds with the first arm alternating, one process per
+sample, `graphics` against `compute`. Each cell is the mean with the lowest and
+highest sample. The machine's CPU was between 89.8% and 96.8% idle over 3 s
+before each sample; no build, test or GPU work of ours was running, and what
+used the rest was not identified.
+
+| Device                                    | What, t/s | `graphics`                      | `compute`                       | Change |
+| ----------------------------------------- | --------- | ------------------------------- | ------------------------------- | ------ |
+| RX 7900 XTX (RADV NAVI31)                 | tg128     | 476.53 (476.07 to 477.22)       | 466.97 (466.56 to 467.36)       | -2.0%  |
+| RX 7900 XTX (RADV NAVI31)                 | pp512     | 15155.32 (15106.65 to 15308.38) | 15122.66 (14917.06 to 15278.53) | -0.2%  |
+| Ryzen integrated (RADV RAPHAEL_MENDOCINO) | tg128     | 28.84 (28.68 to 28.88)          | 28.86 (28.85 to 28.87)          | +0.1%  |
+| Ryzen integrated (RADV RAPHAEL_MENDOCINO) | pp512     | 240.44 (240.03 to 240.61)       | 240.28 (240.02 to 240.36)       | -0.1%  |
+
+So the owner's hypothesis, that the compute-only queue costs nothing headless,
+does not hold on the RX 7900 XTX: decode is 2.0% slower with samples that do not
+overlap, so part of the cost is the ring and not contention with a compositor.
+Prefill and the integrated GPU show nothing beyond the samples' spread. On both
+devices `compute` picked queue family 1 (compute-only, `timestampValidBits` 64),
+read from the startup line. A profiled pp512 (`INFR_PROF_OPS=1`) reported a
+device total of 31.8 ms on the universal family and 33.1 ms on the compute-only
+one on the RX 7900 XTX, and 2.12 s on both on the integrated GPU, so timestamps
+work on the compute-only family under RADV. `lockup_timeout` reads empty in
+`/sys/module/amdgpu/parameters`, and `modinfo amdgpu` gives its default as 2000
+ms with the format `[GFX,Compute,SDMA,Video]`: on this kernel one default covers
+every ring.
+
+**Still not measured on Linux:** the same loop inside a desktop session (the
+script and the pinned binary are in `~/.cache/infr-queue-ab` on the Linux
+machine, `run.sh desktop`), any measure of desktop responsiveness, and the work
+bound's tests on the compute-only family. llama.cpp makes the same default
+choice (`ggml-vulkan.cpp`, `ggml_vk_find_queue_family_index` avoiding the
+graphics bit) and has the same escape hatch, `GGML_VK_ALLOW_GRAPHICS_QUEUE`,
+commented "it can increase performance on RADV"; it does nothing else about the
+cost.
+
+**Decided (owner, 2026-11-22): no display detection.** The compute-only queue is
+the default, and a user who wants the last of the throughput at the desktop's
+expense sets `queue.family = graphics` (the model runs faster, the desktop may
+lag while it does). `docs/config.md` states that trade-off. Detecting whether a
+GPU drives a display, and switching queues on it, was **considered and
+declined**: the setting already gives the choice to the one person who knows
+which they want, and detection would be per-platform code (Vulkan has no direct
+query; `VK_KHR_display`, DRM connector status and DXGI outputs were the
+candidates, none researched) for a queue family that is chosen once, at device
+creation. The measurements above are still worth taking, as figures for the
+docs, not to decide a mechanism.
+
+**Left to do, code, not started:** the integrated-GPU rule. By rule an
+integrated GPU still defaults to `graphics` (the contributor's reason: under
+RADV the compute ring's hang budget measured tighter on one), with a table row
+setting `auto` for the AMD proprietary driver. The decision above reads as
+`auto` everywhere a usable compute-only family exists. Before changing the rule
+(`queue.family`'s default in `tuning/families.rs`, the snapshots and
+`queue_family_follows_the_device_facts`), check the contributor's hang-budget
+finding on an integrated GPU under RADV, since the work bound assumes 2 s.
+
+### B230 — a second queue for transfers, as llama.cpp has: a candidate for the streaming work (2026-11-23)
+
+**Tag:** vulkan · streaming · pager · submit · **Kind:** candidate, not
+researched past the reference
+
+infr submits everything on one queue. llama.cpp's Vulkan backend (checkout at
+`57291f2`) also creates a transfer queue: `ggml_vk_find_queue_family_index`
+looks for a family with the transfer bit that has neither the compute nor the
+graphics bit, falls back to any other family than the compute one, and its
+copies can then go out on that queue (`async_use_transfer_queue`, on by default
+only for AMD discrete, non-GCN devices when the graphics queue is avoided, else
+by `GGML_VK_ASYNC_USE_TRANSFER_QUEUE`).
+
+**Where it could matter here.** Not decode: infr's pipeline is GPU-resident and
+a decode step moves almost nothing between host and device, so a transfer queue
+would not touch the compute-only queue's decode cost (B228). The candidate is
+streaming (plans 05, 06 and 08): the pager's weight uploads on a queue of their
+own while a forward runs on the compute queue, where today they share one submit
+stream.
+
+**What is known.** Read with `vulkaninfo` on the Linux machine under RADV (Mesa
+26.3.1): neither the RX 7900 XTX nor the Ryzen integrated GPU has a
+transfer-only family. Each has a universal family (1 queue), a compute and
+transfer family (4 queues), video decode, video encode, and a sparse-binding
+family with no timestamp bits. So on RADV the choices are a second queue of the
+compute-only family, or the universal family, which is where llama.cpp's
+fallback lands there.
+
+**Not known, needed before building anything:** whether the AMD Windows driver,
+NVIDIA or Intel expose a transfer-only family (not read); whether uploads on a
+second queue overlap a running forward at all on one device, or the hardware
+serialises them; what the cross-queue synchronisation costs (a buffer written on
+one queue and read on another needs a semaphore or a fence between the two); and
+how it sits with the work bound, which times and cuts one queue's submits. The
+measurement that decides it: a streamed model that does not fit, uploads on one
+queue against two, tokens per second and the pager's upload time.
+
+### B222 — what the bounded GPU waits did not verify (2026-11-18)
+
+**Tag:** vulkan · tests · **Kind:** coverage gaps
+
+- **Dropped work is detected on one kind of submit only.** After a watchdog
+  reset AMD's Windows driver signals the fence of work it threw away (plan 12
+  section 0c). The backend catches that by the segment's closing timestamp
+  (`recorder::account_segment`), which exists only on a forward segment from a
+  non-persistent recorder (`Recorder::finish`, `PendingSegment::wait`) on a
+  queue that writes timestamps (`segment_ts_period`). NOT checked:
+  `RecordedCmd::replay` and `replay_n` (every replayed decode token and the
+  chained decode: persistent recorders carry no timestamps), `one_shot`
+  (uploads, downloads through staging, fills, probes), the weight staging ring,
+  the tensor-parallel copies, and every submit on a queue without timestamps.
+  After such a wait returns, the decode reads its logits from mapped memory, so
+  a reset during a replay can hand back wrong logits; the lost device is
+  reported only by the next submit (in every harness run of section 0c the next
+  submit did report it). That error now also lists the last forward segments
+  submitted, with their GPU times (`gpu_wait::RecentSegment`), so the forward
+  that was cut can be told from it; it still cannot say that a decode replay was
+  the one. A general detector was considered and not built: a completion marker
+  the last command of every submit writes (the host clears a mapped word before
+  the submit and checks it after the fence) would cover every path, at a
+  transfer write and a barrier per submit, and on the persistent replays the
+  value must change per replay, which the recorded command buffer cannot do
+  without re-recording or a host-side reset per token. Worth doing with a decode
+  A/B to show its cost; until then this is the gap.
+- **The bounded wait costs decode about 0.4%; accepted for now (2026-11-19).** A
+  returned error is a better failure than a hang or a killed process.
+  Interleaved A/B against `main` (`086ebff0`), Qwen3-1.7B Q4_K_M, six rounds
+  each, no other session on the machine: tg128 476.87 against 478.59 t/s on the
+  RX 7900 XTX (branch lower in all six rounds) and 27.20 against 27.31 on the
+  integrated GPU (lower in five of six); pp512 11910 against 11970 and 231.38
+  against 231.66 (lower in four and six of six). About 7.5 µs per decode token
+  on the XTX and about 80 to 150 µs on the integrated GPU (two A/Bs). **The
+  cause is the fence wait itself on AMD's Windows driver, on both GPUs:** with
+  the fence still on the work's own submit but waited by `vkQueueWaitIdle`
+  instead, decode matched `main` (XTX 478.52 against 478.28, five rounds;
+  integrated GPU 27.31 against 27.30 with the branch at 27.24, six rounds). On
+  the XTX, waiting on the fence with no timeout (475.64), spinning on
+  `vkGetFenceStatus` for up to 5 ms first (476.45) and waiting on a timeline
+  semaphore (`vkWaitSemaphores`, no fence reset; 475.90) all cost the same as
+  the bounded wait, so it is how late the driver reports a fence or semaphore
+  signalled, not the timeout, the reset or a wake-up; the device-fault extension
+  made no difference (475.76 without it). Those four variants ran on the XTX
+  only. Why the integrated GPU pays ten to twenty times more per token is not
+  known. Alternatives for later:
+  - `vkQueueWaitIdle` for the decode replay only, bounded from outside: a
+    watchdog thread that, past the bound, reports the stuck submit and ends the
+    process (the waiting thread cannot be released).
+  - One watchdog for every wait: each wait stores a deadline in an atomic before
+    it blocks in `vkQueueWaitIdle` and clears it after, and one monitor thread
+    wakes about once a second and ends the process with the report when a
+    deadline has passed. The same failure mode as the first, cheaper and simpler
+    than two wait styles.
+  - Not an option: bounding only every Nth token, because the others stay
+    unbounded.
+
+  The experiment code is not in the tree.
+
+- **The missing-closing-timestamp check has no automated test.** It fired on
+  real hardware in the three production runs of plan 12 section 0c (`infr bench`
+  on `Vulkan1`), never in the harness runs, where the next submit reported the
+  lost device first; nothing forces a fence to signal without its work. The
+  queries are reset from the host at creation (`hostQueryReset`, enabled where
+  offered: both GPUs here), so a dropped command buffer leaves them reliably
+  unavailable; without that feature they are reset inside the command buffer,
+  and a dropped buffer leaves them undefined. The timeout path has a forced test
+  (`gpu_wait::tests::gpu_wait_timeout_poisons_the_backend_and_drops_cleanly`; on
+  2026-11-18 it failed with the bound replaced by `u64::MAX`, "a 1 ms bound must
+  time out", and passed with it restored); the lost-device path only the real
+  reproduction.
+- **`infr serve` with a poisoned backend was read, not run.** A request fails
+  with the error (500, or the stream's error frame) and so does every later one
+  on that model, as a lost device already did; the server keeps running, so
+  other models it hosts stay usable and an operator restarts it. `/health` does
+  not report the poisoned backend.
+- **Teardown after a timeout leaks the device** (`VulkanShared::drop` skips
+  every destroy once poisoned). Process exit was checked on Windows (the
+  reproduction exits and `infr devices` lists both GPUs afterwards); a
+  long-lived embedder that recreates backends after a failure would keep the
+  leaked one.
+- **Metal's waits were not reviewed** for the same unbounded-wait pattern.

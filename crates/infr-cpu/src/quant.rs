@@ -4,6 +4,15 @@
 /// Activation quantized to Q8 over 256-element super-blocks: `qs[i] = round(x[i]/d[blk])` (int8),
 /// `d[blk] = max|x|/127`. Quantize the activation ONCE per matvec, then integer-dot it against the
 /// quantized weight rows (llama.cpp's q8_K path) — no per-row f32 weight expansion.
+///
+/// A block whose largest one or two magnitudes stand far above the rest ([`HI_KEEP`],
+/// [`HI_RATIO`]) is split in two: those elements move to a sparse part ([`Self::hi`]), and the
+/// dense codes take the scale of what is left. Without the split such a block's scale is set by
+/// its outliers and every other element rounds to 0 or ±1. The first token of a sequence carries
+/// such rows into every projection (its massive-activation dimensions, whose keys and values feed
+/// every later token); the inputs of the FFN down projections carry them all through a sequence,
+/// so there the split works as a general two-scale quantizer (`docs/cpu-activations.md`). A
+/// block with nothing to split is quantized as it always was, to the same bits.
 #[derive(Clone)]
 pub(crate) struct Q8 {
     pub(crate) qs: Vec<i8>,
@@ -21,33 +30,141 @@ pub(crate) struct Q8 {
     /// Only the x86 SIMD kernel reads it — dead code on aarch64 (macOS CI builds with -D warnings).
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     pub(crate) bsums16: Vec<i32>,
+    /// The sparse part, in block order: each [`HiPart`] adds a few codes on a scale of their own
+    /// to one block. A block can have up to [`HI_LEVELS`] parts, each holding what the ones before
+    /// it left of those elements. The activation this `Q8` stands for is the dense codes plus every
+    /// part; a dot over it is the dense dot plus each part's one-block dot against the weight's
+    /// matching block ([`crate::kernels::vec_dot_hi`]).
+    pub(crate) hi: Vec<HiPart>,
 }
 
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn quantize_q8(x: &[f32]) -> Q8 {
-    let nb = x.len() / 256;
-    let mut qs = vec![0i8; nb * 256];
-    let mut d = vec![0f32; nb];
-    for b in 0..nb {
-        let blk = &x[b * 256..b * 256 + 256];
-        let amax = blk.iter().fold(0f32, |m, &v| m.max(v.abs()));
-        let dd = amax / 127.0;
-        let id = if dd > 0.0 { 1.0 / dd } else { 0.0 };
-        d[b] = dd;
-        for (i, &v) in blk.iter().enumerate() {
-            qs[b * 256 + i] = (v * id).round().clamp(-127.0, 127.0) as i8;
+/// One sparse part of a split block ([`Q8::hi`]): the one-block activation whose codes are
+/// [`Self::codes`] at their indices and zero everywhere else, on the scale [`Self::d`].
+#[derive(Clone, Debug)]
+pub(crate) struct HiPart {
+    /// The 256-element block it adds to.
+    pub(crate) b: usize,
+    /// Its scale.
+    pub(crate) d: f32,
+    /// Its nonzero codes as `(index in the block, code)`, the first `len` of them used.
+    at: [(u8, i8); HI_KEEP],
+    len: u8,
+}
+
+impl HiPart {
+    /// The part's nonzero codes, `(index in the block, code)`, in index order.
+    pub(crate) fn codes(&self) -> &[(u8, i8)] {
+        &self.at[..self.len as usize]
+    }
+
+    /// The part as the one-block `Q8` it stands for (256 codes, its scale, its sub-block sums):
+    /// what the sparse part was before it was stored compactly, which the one-row kernels dot
+    /// in the reference the fast sparse dot is tested against.
+    #[cfg(test)]
+    pub(crate) fn to_q8(&self) -> Q8 {
+        let mut qs = vec![0i8; 256];
+        for &(i, q) in self.codes() {
+            qs[i as usize] = q;
+        }
+        from_codes(qs, vec![self.d])
+    }
+}
+
+/// The most elements of a 256-element block that can move to the sparse part ([`Q8::hi`]).
+pub(crate) const HI_KEEP: usize = 2;
+
+/// An element moves to the sparse part only when its magnitude exceeds this many times the
+/// largest magnitude outside the block's top [`HI_KEEP`]. A power of two, so the test multiplies
+/// exactly. Measured in `docs/cpu-activations.md`: at this ratio the first token's rows split in
+/// every projection, and FFN-down inputs split all through a sequence (a few to a few tens of
+/// percent of their rows, by model), which is where the split's prefill cost is (each split
+/// block is a second one-block dot per weight row); half of it costs far more, and four times it
+/// misses ERNIE-4.5's first token.
+pub(crate) const HI_RATIO: f32 = 16.0;
+
+/// The most sparse parts one block can take. Each part takes its largest element to within f32
+/// rounding and leaves at most half its scale, `1/254` of its largest, of every other one; parts
+/// continue while a remainder still exceeds the rest of the block and the f32 resolution of the
+/// block maximum. Two parts settle [`HI_KEEP`] elements; the third is for rounding.
+pub(crate) const HI_LEVELS: usize = 3;
+
+/// The largest magnitude in `blk`; NaN is passed over.
+#[inline]
+fn block_max(blk: &[f32]) -> f32 {
+    blk.iter().fold(0f32, |m, &v| m.max(v.abs()))
+}
+
+/// The largest magnitude in `blk` (NaN passed over, as [`block_max`] does) and the f32 sum of all
+/// magnitudes (NaN when an element is NaN), from one pass in 16 lanes.
+#[inline]
+fn block_max_sum(blk: &[f32]) -> (f32, f32) {
+    let (mut m, mut s) = ([0f32; 16], [0f32; 16]);
+    for c in blk.as_chunks::<16>().0 {
+        for k in 0..16 {
+            let a = c[k].abs();
+            m[k] = m[k].max(a);
+            s[k] += a;
         }
     }
-    // Precompute per-16- and per-32-elem sub-block sums (Q6_K offset term / Q4_K min-scale term).
-    let mut bsums16 = vec![0i32; nb * 16];
-    for b in 0..nb {
-        for s in 0..16usize {
-            bsums16[b * 16 + s] = qs[b * 256 + s * 16..b * 256 + s * 16 + 16]
-                .iter()
-                .map(|&q| q as i32)
-                .sum();
-        }
+    (m.iter().fold(0f32, |x, &v| x.max(v)), s.iter().sum())
+}
+
+/// Whether no element of a 256-element block can split ([`split_off`]), from its largest
+/// magnitude `amax` and the f32 sum `sum` of its magnitudes ([`block_max_sum`]). A split needs
+/// `a1 = amax` above [`HI_RATIO`] times the third largest magnitude `a3`. The 254 magnitudes
+/// after the top two are at most `a3` each, so `Σ − 2·a1 ≤ Σ − a1 − a2 ≤ 254·a3`, and
+/// `HI_RATIO·(Σ − 2·a1) ≥ 254·a1` gives `HI_RATIO·a3 ≥ a1`: no split. `sum` is a 256-term f32 sum
+/// of non-negative terms, so in any order it is at most `γ = 255·2^-24/(1 − 255·2^-24)` (under
+/// 1.6e-5) above the exact `Σ ≤ 256·a1`, which overstates `HI_RATIO·Σ` by under `0.07·a1` at a
+/// ratio of 16. The test asks for `254.25·a1`, a margin of `0.25·a1`, evaluated in f64, where
+/// both products are exact and the subtraction's rounding is far below the margin. So `true` is
+/// never wrong, and `false` only sends the block to [`split_off`]. A NaN or infinite `sum` (an
+/// element NaN or infinite, or the sum overflowing) gives `false`.
+#[inline]
+fn cannot_split(amax: f32, sum: f32) -> bool {
+    sum.is_finite() && HI_RATIO as f64 * (sum as f64 - 2.0 * amax as f64) >= 254.25 * amax as f64
+}
+
+/// Quantize `blk` to codes in `q` on the scale `amax/127` (`amax` its [`block_max`]), returning
+/// the scale.
+#[inline]
+fn quantize_block(blk: &[f32], amax: f32, q: &mut [i8]) -> f32 {
+    let dd = amax / 127.0;
+    let id = if dd > 0.0 { 1.0 / dd } else { 0.0 };
+    for (o, &v) in q.iter_mut().zip(blk) {
+        *o = (v * id).round().clamp(-127.0, 127.0) as i8;
     }
+    dd
+}
+
+/// The elements of a 256-element block that move to the sparse part, in magnitude order (lowest
+/// index first on a tie): of the block's [`HI_KEEP`] largest magnitudes, those above [`HI_RATIO`]
+/// times the next largest. NaN counts as magnitude zero, as it does for the block maximum `amax`.
+fn split_off(blk: &[f32], amax: f32) -> Vec<usize> {
+    let mag = |v: f32| if v.is_nan() { 0.0 } else { v.abs() };
+    // When HI_KEEP + 1 elements reach amax / HI_RATIO, the (HI_KEEP+1)-th largest does, and
+    // nothing can stand HI_RATIO above it: the common case, decided in one pass. (A NaN fails
+    // the comparison and is not counted, so the count can only be short, which sends a block to
+    // the exact rule below, never past it.)
+    let near = blk.iter().filter(|&&v| v.abs() * HI_RATIO >= amax).count();
+    if near > HI_KEEP {
+        return Vec::new();
+    }
+    let mut order: Vec<usize> = (0..blk.len()).collect();
+    order.sort_by(|&a, &b| mag(blk[b]).total_cmp(&mag(blk[a])).then(a.cmp(&b)));
+    let next = mag(blk[order[HI_KEEP]]);
+    order.truncate(HI_KEEP);
+    order.retain(|&i| mag(blk[i]) > HI_RATIO * next);
+    order
+}
+
+/// A `Q8` over the codes `qs` and per-block scales `d`, with its sub-block sums and no sparse part.
+fn from_codes(qs: Vec<i8>, d: Vec<f32>) -> Q8 {
+    // Per-16- and per-32-elem sub-block sums (Q6_K offset term / Q4_K min-scale term).
+    let bsums16: Vec<i32> = qs
+        .chunks(16)
+        .map(|c| c.iter().map(|&q| q as i32).sum())
+        .collect();
     let bsums = bsums16
         .as_chunks::<2>()
         .0
@@ -59,7 +176,85 @@ pub(crate) fn quantize_q8(x: &[f32]) -> Q8 {
         d,
         bsums,
         bsums16,
+        hi: Vec::new(),
     }
+}
+
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn quantize_q8(x: &[f32]) -> Q8 {
+    let nb = x.len() / 256;
+    let mut qs = vec![0i8; nb * 256];
+    let mut d = vec![0f32; nb];
+    let mut hi = Vec::new();
+    for b in 0..nb {
+        let blk = &x[b * 256..b * 256 + 256];
+        let q = &mut qs[b * 256..b * 256 + 256];
+        let (amax, sum) = block_max_sum(blk);
+        if cannot_split(amax, sum) {
+            d[b] = quantize_block(blk, amax, q);
+            continue;
+        }
+        let kept = split_off(blk, amax);
+        if kept.is_empty() {
+            d[b] = quantize_block(blk, amax, q);
+            continue;
+        }
+        // The split-off elements, quantized on their own scale level by level; what the last
+        // level leaves of them stays in the dense block with the rest.
+        let mut dense: [f32; 256] = blk.try_into().expect("a 256-element block");
+        let rest = (0..256)
+            .filter(|i| !kept.contains(i))
+            .fold(0f32, |m, i| m.max(blk[i].abs()));
+        for _ in 0..HI_LEVELS {
+            let a = kept.iter().fold(0f32, |m, &i| m.max(dense[i].abs()));
+            if !(a > rest && a > amax * f32::EPSILON && a.is_finite()) {
+                break;
+            }
+            let dh = a / 127.0;
+            let id = 1.0 / dh;
+            let mut part = HiPart {
+                b,
+                d: dh,
+                at: [(0, 0); HI_KEEP],
+                len: 0,
+            };
+            for &i in &kept {
+                let q = (dense[i] * id).round().clamp(-127.0, 127.0) as i8;
+                dense[i] -= q as f32 * dh;
+                if q != 0 {
+                    part.at[part.len as usize] = (i as u8, q);
+                    part.len += 1;
+                }
+            }
+            part.at[..part.len as usize].sort_unstable_by_key(|&(i, _)| i);
+            hi.push(part);
+        }
+        d[b] = quantize_block(&dense, block_max(&dense), q);
+    }
+    Q8 {
+        hi,
+        ..from_codes(qs, d)
+    }
+}
+
+/// The activation a `Q8` stands for: each element's dense code times its block scale, plus its
+/// codes in every sparse part times theirs, summed in [`Q8::hi`]'s order.
+pub(crate) fn dequantize_q8(q8: &Q8) -> Vec<f32> {
+    let mut x: Vec<f32> = q8
+        .qs
+        .iter()
+        .enumerate()
+        .map(|(i, &q)| q as f32 * q8.d[i / 256])
+        .collect();
+    // A zero code would add `+0.0`, which changes no element: none is `-0.0` (each starts as a
+    // code times a non-negative scale, and a sum that cancels rounds to `+0.0`). So only the
+    // part's nonzero codes are added.
+    for part in &q8.hi {
+        for &(i, q) in part.codes() {
+            x[part.b * 256 + i as usize] += q as f32 * part.d;
+        }
+    }
+    x
 }
 
 /// Horizontal reduction: sum 8 × i32 in a ymm register to a scalar i32.
@@ -119,4 +314,156 @@ pub(crate) fn quantize_q8_32(x: &[f32]) -> Q8x32 {
         bsum[b] = s;
     }
     Q8x32 { qs, d, bsum }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The quantizer before the split, kept here for the microbenchmark below to time against.
+    fn quantize_q8_unsplit(x: &[f32]) -> Q8 {
+        let nb = x.len() / 256;
+        let mut qs = vec![0i8; nb * 256];
+        let mut d = vec![0f32; nb];
+        for b in 0..nb {
+            let blk = &x[b * 256..b * 256 + 256];
+            d[b] = quantize_block(blk, block_max(blk), &mut qs[b * 256..b * 256 + 256]);
+        }
+        from_codes(qs, d)
+    }
+
+    /// [`cannot_split`] never clears a block that splits: blocks at the edge of the bound (two
+    /// magnitudes a few ulps either side of `HI_RATIO` times the other 254, which are all equal,
+    /// where `HI_RATIO·(Σ − 2·a1)` is within a few ulps of `254·a1`), at magnitudes from
+    /// subnormal to near overflow and with the large pair placed anywhere, and blocks with NaN or
+    /// infinite elements. The edge blocks above the ratio do split, so the check has teeth, and an
+    /// ordinary block is cleared, so the bound is used.
+    #[test]
+    fn the_no_split_bound_never_clears_a_block_that_splits() {
+        let mut split = 0usize;
+        for a3 in [1e-42f32, 1e-30, 0.37, 1.0, 3.0e3, 1.0e35] {
+            for k in -6i32..=6 {
+                let a1 = HI_RATIO * a3 * (1.0 + k as f32 * f32::EPSILON);
+                for (i, j) in [(0usize, 1usize), (17, 255), (128, 129)] {
+                    for second in [a1, -a1, a3] {
+                        let mut blk = [a3; 256];
+                        for (n, v) in blk.iter_mut().enumerate() {
+                            if n % 3 == 1 {
+                                *v = -*v;
+                            }
+                        }
+                        blk[i] = a1;
+                        blk[j] = second;
+                        let amax = block_max(&blk);
+                        let (m, s) = block_max_sum(&blk);
+                        assert_eq!(m.to_bits(), amax.to_bits());
+                        let splits = !split_off(&blk, amax).is_empty();
+                        split += usize::from(splits);
+                        if cannot_split(m, s) {
+                            assert!(!splits, "a3 {a3:e} k {k} at {i},{j}: cleared a split");
+                        }
+                    }
+                }
+            }
+        }
+        assert!(split > 0, "no edge block split");
+        let mut odd = [0.5f32; 256];
+        odd[3] = f32::NAN;
+        let (m, s) = block_max_sum(&odd);
+        assert!(!cannot_split(m, s), "a NaN element was cleared");
+        odd[3] = f32::INFINITY;
+        let (m, s) = block_max_sum(&odd);
+        assert!(!cannot_split(m, s), "an infinite element was cleared");
+        let ordinary: Vec<f32> = (0..256)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) / 7.0)
+            .collect();
+        let (m, s) = block_max_sum(&ordinary);
+        assert!(cannot_split(m, s), "an ordinary block was not cleared");
+    }
+
+    /// An ordinary row: no block splits, and the quantizer gives the codes it gave before the
+    /// split existed.
+    #[test]
+    fn an_ordinary_row_quantizes_as_before() {
+        let x: Vec<f32> = (0..2048)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) / 7.0)
+            .collect();
+        let (new, old) = (quantize_q8(&x), quantize_q8_unsplit(&x));
+        assert!(new.hi.is_empty());
+        assert_eq!((new.qs, new.d, new.bsums16), (old.qs, old.d, old.bsums16));
+    }
+
+    /// Microbenchmark: ns per activation row for the quantizer before and after the split on
+    /// ordinary rows, and for a Q4_K one-row dot over 2048 inputs against an ordinary row and
+    /// against a first-token row (two blocks split). Prints; asserts only that it timed.
+    ///
+    /// `cargo test --release -p infr-cpu --lib quant::tests::microbench -- --ignored --nocapture`
+    #[test]
+    #[ignore = "measurement: run in release with --nocapture"]
+    fn microbench() {
+        use crate::kernels::{vec_dot_hi, vec_dot_q8_any};
+        use infr_core::tensor::DType;
+        let time = |name: &str, reps: usize, f: &mut dyn FnMut()| {
+            for _ in 0..reps / 10 {
+                f();
+            }
+            let t = std::time::Instant::now();
+            for _ in 0..reps {
+                f();
+            }
+            let ns = t.elapsed().as_nanos() as f64 / reps as f64;
+            println!("{name:<44} {ns:>10.1} ns");
+            assert!(ns > 0.0);
+        };
+        for n in [2048usize, 11008] {
+            let x: Vec<f32> = (0..n)
+                .map(|i| ((i * 37 % 101) as f32 - 50.0) / 7.0)
+                .collect();
+            time(&format!("quantize unsplit, {n} wide"), 20_000, &mut || {
+                std::hint::black_box(quantize_q8_unsplit(std::hint::black_box(&x)));
+            });
+            time(
+                &format!("quantize split, ordinary row, {n} wide"),
+                20_000,
+                &mut || {
+                    std::hint::black_box(quantize_q8(std::hint::black_box(&x)));
+                },
+            );
+        }
+        let n = 2048;
+        let ordinary: Vec<f32> = (0..n)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) / 7.0)
+            .collect();
+        let mut first = ordinary.clone();
+        first[13] = 900.0;
+        first[300] = -420.0;
+        let w = crate::test_util::det_quant_rows(64, n / 256, 144, &[0, 2], 9);
+        let bpr = w.len() / 64;
+        for (name, x) in [("ordinary", &ordinary), ("first-token", &first)] {
+            let q8 = quantize_q8(x);
+            time(
+                &format!("quantize split, {name} row, {n} wide"),
+                20_000,
+                &mut || {
+                    std::hint::black_box(quantize_q8(std::hint::black_box(x)));
+                },
+            );
+            time(
+                &format!("Q4_K dot x64 rows, {name} ({} parts)", q8.hi.len()),
+                20_000,
+                &mut || {
+                    for o in 0..64 {
+                        let row = &w[o * bpr..(o + 1) * bpr];
+                        let dense = vec_dot_q8_any::<false>(DType::Q4K, row, &q8, n);
+                        let y = if q8.hi.is_empty() {
+                            dense
+                        } else {
+                            dense + vec_dot_hi(DType::Q4K, row, &q8, n)
+                        };
+                        std::hint::black_box(y);
+                    }
+                },
+            );
+        }
+    }
 }

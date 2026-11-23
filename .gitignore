@@ -16,3 +16,6 @@ Cargo.lock.bak
 /ref/
 target-prof/
 .cache/
+
+# Agents
+.claude/

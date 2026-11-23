@@ -32,3 +32,17 @@ driver = "AMD Windows driver (AMD_PROPRIETARY); RADV unmeasured (int8 coopmat hu
 date = "2026-11-15"
 command = "infr bench <model> -p 512 -n 0 -r 3, two interleaved runs against the previous build"
 evidence = "pp512 Qwen3-1.7B Q4_K_M 7580.6/7504.5 -> 11901.5/11869.9 t/s; LFM3-1.7B 7165.3/7045.8 -> 12098.1/12075.9; SmolLM3-3B 4000.9/3994.2 -> 6258.9/6253.3 (commit 9d197bb1, CHANGELOG)"
+
+[[row]]
+id = "amd-proprietary-integrated-compute-queue"
+match = { vendor = "amd", driver = "AMD_PROPRIETARY", integrated = true }
+verified = "maintainer"
+params = { "queue.family" = "auto" }
+
+[row.source]
+by = "infr maintainers"
+device = "AMD Radeon(TM) Graphics (Ryzen 9 9950X3D integrated, RDNA2, 2 CUs)"
+driver = "AMD Windows driver (AMD_PROPRIETARY); RADV not run, and docs/igpu.md records a tighter hang budget on the compute ring of an integrated part there"
+date = "2026-11-22"
+command = "infr bench Qwen3-1.7B-Q4_K_M -p 0 -n 128 -r 1 and -p 512 -n 0 -r 1, the universal family against the compute-only one (INFR_TUNE=queue.family=graphics against compute), 6 interleaved rounds"
+evidence = "tg128 27.12 -> 27.12 t/s, pp512 230.94 -> 230.84 t/s; the family writes 64 timestamp bits; first_forward_split, work_split_parity, gpu_seam_golden_qwen3 and gpu_seam_tolerance_qwen3/qwen35 pass on it (docs/backlog.md B227)"

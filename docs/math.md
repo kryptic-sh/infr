@@ -134,16 +134,18 @@ contracted or reordered anything.
 **Capping the tier.** The slices run at `infr_core::simd::active`'s tier, the
 one every SIMD dispatch in the CPU backend asks too: the widest the CPU has,
 under the ceiling `kernels.cpu.max_tier` (`INFR_CPU_MAX_TIER`: `scalar`, `avx2`,
-`avx512`, `avx512vnni`). The slices have no VNNI form, so `avx512vnni` runs
-their AVX-512 loops, and `scalar` their baseline ones. It is a process-wide
-debug switch: every CPU backend applies its value when it is built
-(`simd::set_max`; unset means no ceiling), so the backend built last decides for
-every backend in the process, and a backend built without the setting lifts an
-earlier one's ceiling rather than inheriting it. A ceiling above what the CPU
-has runs the CPU's widest tier. A misspelt name is a configuration error at
-load, from the file, `--set` or the environment alike. It changes only speed; it
-exists so the narrow paths every aarch64 machine and every pre-AVX2 x86 CPU runs
-can be measured and tested on a machine with wider ones. In a
+`avx512`, `avx512vnni`, and on aarch64 `dotprod`). The slices have no VNNI form,
+so `avx512vnni` runs their AVX-512 loops, and `scalar` and `dotprod` their
+baseline ones. It is a process-wide debug switch: every CPU backend applies its
+value when it is built (`simd::set_max`; unset means no ceiling), so the backend
+built last decides for every backend in the process, and a backend built without
+the setting lifts an earlier one's ceiling rather than inheriting it. A ceiling
+above what the CPU has runs the CPU's widest tier, and so does another
+architecture's tier: every name loads on every architecture, and a foreign tier
+ranks above all of this architecture's. A misspelt name is a configuration error
+at load, from the file, `--set` or the environment alike. It changes only speed;
+it exists so the narrow paths every aarch64 machine and every pre-AVX2 x86 CPU
+runs can be measured and tested on a machine with wider ones. In a
 `target-cpu=native` build `baseline` is the native code, so a baseline
 measurement needs a baseline build (`RUSTFLAGS="-C target-cpu=x86-64"`).
 
@@ -187,16 +189,20 @@ Plan 11's S3 and S4 extend the guarantee from this module to the whole CPU
 backend. What is proven, and how:
 
 - **Every SIMD tier.** `kernels.cpu.max_tier` (`scalar`, `avx2`, `avx512`,
-  `avx512vnni`; `infr_core::simd`) caps every run-time dispatch in the CPU
-  backend and the slices above. `crates/infr-cpu/src/kernels/tier_tests.rs` runs
-  every quantized kernel family (one-row and batch, Q2_K to Q8_0, the IQ and
-  ternary formats, the native-32-block family, MXFP4, NVFP4, Q4_K's 2- and 8-row
-  tiles, the 8-row Q8_0/Q5_0 tile) through its dispatcher at each tier the host
-  has and holds it to the scalar tier's bits, on inputs that reach the int8
-  extremes, both zero signs, subnormals and every code pattern, and checks which
-  tier each dispatcher took. One family differed (AVX-512 Q8_0, fixed in S4; see
-  the golden table below). The f32/f16/bf16 dots have no run-time dispatch: one
-  source fixes the order of every `mul_add` and of the lane sum.
+  `avx512vnni`, `dotprod`; `infr_core::simd`) caps every run-time dispatch in
+  the CPU backend and the slices above.
+  `crates/infr-cpu/src/kernels/tier_tests.rs` runs every quantized kernel family
+  (one-row and batch, Q2_K to Q8_0, the IQ and ternary formats, the
+  native-32-block family, MXFP4, NVFP4, Q4_K's 2- and 8-row tiles, the 8-row
+  Q8_0/Q5_0 tile) through its dispatcher at each tier the host has and holds it
+  to the scalar tier's bits, on inputs that reach the int8 extremes, both zero
+  signs, subnormals and every code pattern, and checks which tier each
+  dispatcher took. One family differed (AVX-512 Q8_0, fixed in S4; see the
+  golden table below). The f32 dots (`dot`, `dot_n`, `dot_mn`, `dot_f16`,
+  `dot_bf16`, `axpy`, `mul_add_into`, `dequant_dot_rows`) have one source that
+  fixes the order of every `mul_add` and of the lane sum; on a build without FMA
+  they run an FMA compilation of it (below), held to the scalar bits the same
+  way and checked to be fused at every tier.
 - **Every op, tier and thread count.** `crates/infr-cpu/tests/op_hashes.rs`:
   every `Op` variant, one checked-in hash per case at every tier and at 1, 2, 3,
   7, 33 and the machine's threads. The packed VNNI GEMMs and the MoE expert
@@ -206,11 +212,12 @@ backend. What is proven, and how:
   (`crates/infr-llama/tests/support/row_identity.rs`): the same ids and the same
   bits in everything the last position and the decode steps write, at heights
   512, 7, 3 and 1, on Qwen3, gemma-3, Qwen3.5, LFM3, ERNIE-4.5 and SmolLM3 and
-  on the synthetic LFM3 file in CI. **Exception, by design:** `Op::MoeFfn`
-  quantizes expert activations to int8 for two rows or more and not for one
-  (docs/backlog.md, B203).
+  on the synthetic LFM3 file in CI, and since one-row `Op::MoeFfn` takes int8
+  activations (2026-11-18) on ERNIE-4.5-21B-A3B and Qwen3-30B-A3B (Windows).
 - **Windows and Linux** reproduce all of the above with the same values. aarch64
-  runs the scalar kernels and is the first thing CI's macOS jobs check.
+  runs the scalar kernels and, for Q4_K, Q6_K and Q8_0, the NEON `dotprod`
+  kernels (below); CI's macOS jobs run `tier_tests` and `op_hashes` at both
+  tiers there.
 
 **What "L2 proven" covers, exactly.** Run on one AVX-512 VNNI machine (Ryzen 9
 9950X3D), Windows and Linux under WSL:
@@ -228,7 +235,8 @@ backend. What is proven, and how:
   the synthetic LFM3 with f32 weights and with Q4_K, Q5_0 and Q8_0 weights;
 - `f32::mul_add` correctly rounded on native and baseline builds
   (`tests/mul_add_exact.rs`), which the f32 dots' identity across builds rests
-  on.
+  on, and the f32 dots' FMA tier equal to the C runtime's `fmaf` path and fused
+  on a baseline build (`tier_tests`).
 
 **By reading only:** that no parallel split reduces across tasks for shapes
 larger than the suite's (the threshold cases cross each threshold once, not
@@ -317,6 +325,265 @@ difference of -4.0 t/s (-1.1%), middle values 372.9 against 377.3; Qwen3-1.7B
 pp512 is below in 6 of 8, mean -1.5 t/s (-0.4%), middle values 328.9 against
 329.9; decode level. Both lean toward `main` by less than the protocol resolves,
 so a cost of about 1% on baseline builds is neither shown nor ruled out.
+
+### aarch64: the `dotprod` tier
+
+aarch64 has two tiers: `scalar` and `dotprod`, NEON with Armv8.2's dot-product
+extension (`sdot`), which every Apple M-series core and recent Arm server cores
+have. On macOS (`aarch64-apple-darwin`) `dotprod` is part of the target's
+baseline features, so the uncapped dispatch is a compile-time constant there, as
+on an x86-64 `target-cpu=native` build; on other aarch64 targets (Linux, and
+iOS, whose target has only `neon`) it is the standard library's cached run-time
+test. There is no separate `neon` tier because no kernel needs NEON without
+`sdot`, and no `i8mm` tier: its intrinsics (`vusdotq_s32`, `vmmlaq_s32`) are not
+stable Rust yet, and `sdot` already takes Q4_K's and Q6_K's unsigned codes as
+signed bytes.
+
+The NEON kernels (`crates/infr-cpu/src/kernels/neon.rs`) cover Q4_K, Q6_K and
+Q8_0, one-row and batch; the Q4_K 2- and 8-row tiles run the batch kernel row by
+row. Each turns the weight codes into signed bytes (Q4_K nibbles as they are,
+Q6_K codes less 32, Q8_0 bytes as they are), takes each sub-block's integer dot
+with `sdot`, and finishes with the scalar kernel's own integer and float lines,
+so the bits are the scalar kernel's (each helper states its integer bound;
+nothing wraps). The batch kernels decode the weight row once and dot four
+activation rows per weight load. Every other family (Q2_K, Q3_K, Q5_K, IQ4_XS,
+the grid and ternary formats, the native-32-block family, MXFP4, NVFP4) and the
+f32 dots still run their scalar kernels on aarch64, and there is no packed GEMM
+there (the packed layout is the VNNI kernels'); `docs/backlog.md` B206 lists
+them.
+
+**Speed**, scalar against `dotprod` on one machine. CI prints both figures on
+every run, each line with a fixed prefix to `grep` for: the kernels as `kbench:`
+lines in the macOS test job (`cargo test (macos-15)`, step "Kernel timings by
+SIMD tier"), the whole model as `mbench:` lines in the separate
+`infr bench (macOS arm64 CPU, scalar vs NEON)` job. Both only report: a slow run
+fails neither, and the bench job never fails the workflow. On a Mac, from a
+checkout:
+
+```sh
+# The kernels, every tier in one process.
+cargo test --release -p infr-cpu --lib kernels::bench -- --ignored --nocapture
+# The whole model: the scalar kernels, then the NEON ones (no ceiling).
+cargo build --release -p infr-cli
+INFR_CPU_MAX_TIER=scalar ./target/release/infr bench unsloth/Qwen3-0.6B-GGUF:Q4_K_M --dev cpu -p 512 -n 0 -r 3
+./target/release/infr bench unsloth/Qwen3-0.6B-GGUF:Q4_K_M --dev cpu -p 512 -n 0 -r 3
+```
+
+(and the same pair with `-p 0 -n 64` for decode; alternate the two runs a few
+times rather than taking one of each.)
+
+`kernel_speed_by_tier` times each kernel's dispatcher at every tier the CPU has
+in one process: 256 weight rows of 2048 elements against one activation row
+(one-row kernels) or a batch of 16 (batch kernels), nine interleaved rounds,
+reporting each tier's median. For a batch kernel `ns/row` is per weight row and
+activation row pair, so the two kinds' absolute figures are comparable.
+
+Two runs so far, both on CI's `macos-15` (GitHub-hosted Apple Silicon) runner on
+2026-11-19, release. The first at commit `a9bbc3ed`, the second at `bd599f6a`
+(after the batch tiles' scale unpacking was hoisted out of the per-activation
+loop):
+
+| Kernel     | run 1 `scalar` ns/row | run 1 `dotprod` ns/row | run 1 speed | run 2 `scalar` ns/row | run 2 `dotprod` ns/row | run 2 speed |
+| ---------- | --------------------: | ---------------------: | ----------: | --------------------: | ---------------------: | ----------: |
+| q4k        |                 450.9 |                   81.3 |       5.54x |                 551.6 |                   72.3 |       7.63x |
+| q6k        |                1546.8 |                   86.5 |      17.88x |                2112.0 |                   91.8 |      23.00x |
+| q8_0       |                  74.8 |                   61.4 |       1.22x |                 127.9 |                   87.4 |       1.46x |
+| q4k_batch  |                 196.5 |                   76.6 |       2.57x |                 312.8 |                  103.0 |       3.04x |
+| q6k_batch  |                 237.5 |                   51.5 |       4.61x |                 284.6 |                   56.0 |       5.08x |
+| q8_0_batch |                  85.6 |                   50.8 |       1.68x |                  95.2 |                   74.8 |       1.27x |
+
+Shared runners: the ratio within a run is the result; the nanoseconds are not
+comparable across runs or machines. The two runs show why: they ran on different
+runner sessions whose scalar baselines differ by 20 to 70% (450.9 against 551.6,
+1546.8 against 2112.0, 74.8 against 127.9 ns/row). Q6_K gains most (18 to 23x
+one-row, about 5x batch) because its scalar one-row kernel decodes the 6-bit
+codes slowly, element by element; Q4_K gains 5.5 to 7.6x one-row and 2.6 to 3.0x
+batch; Q8_0 gains little either way (1.2 to 1.5x one-row, 1.3 to 1.7x batch),
+its scalar kernel being a plain byte product the compiler already vectorizes
+well. Between the runs the Q4_K and Q6_K batch ratios rose (2.57 to 3.04, 4.61
+to 5.08), Q8_0's batch ratio fell (1.68 to 1.27) and its one-row ratio rose
+(1.22 to 1.46). With baselines moving this much from run to run, two runs cannot
+attribute those moves to the hoist: its own effect is unresolved by this data
+(`docs/backlog.md` B206 records the controlled comparison that would settle it).
+
+**Whole model**, the bench job of the second run: `unsloth/Qwen3-0.6B-GGUF`
+Q4_K_M, `infr bench --dev cpu`, release, three interleaved rounds of `-r 2`,
+`scalar` = `INFR_CPU_MAX_TIER=scalar`, `uncapped` = the `dotprod` tier, in
+tokens per second:
+
+| Test  | `scalar` rounds     | `uncapped` rounds     | Medians        | Ratio |
+| ----- | ------------------- | --------------------- | -------------- | ----: |
+| pp512 | 51.39, 54.07, 61.94 | 88.26, 101.80, 105.04 | 54.07 → 101.80 | 1.88x |
+| tg64  | 5.88, 8.45, 10.58   | 63.76, 78.30, 72.10   | 8.45 → 72.10   | 8.53x |
+
+On a shared GitHub Apple Silicon runner, one model, three rounds: decode about
+8.5x and prefill about 1.9x faster than with the scalar kernels. The scalar
+decode figures range from 5.88 to 10.58 t/s between rounds, so the decode ratio
+is roughly 7 to 11x, not a precise number. Decode runs the one-row kernels,
+where the ratios are largest. Prefill gains less, presumably (an inference, not
+measured: no per-op profile was taken) because aarch64 has no packed or tiled
+GEMM yet, so its batch kernels are the weaker ones, and the families still
+scalar and the work outside the int8 kernels take a larger share; about 100 t/s
+of pp512 on Qwen3-0.6B is low next to x86, which also points at the GEMM as
+where prefill time still is. B206 lists what is left. The job took about 11
+minutes, most of it the cold release build. A real Mac's numbers are requested
+on issue 100, with the commands above.
+
+## The f32 dots on baseline builds: the FMA tier (plan 11 S6)
+
+The f32 dots (`kernels::Dots`: `dot`, `dot_n`, `dot_mn`, `dot_f16`, `dot_bf16`,
+the value sums `axpy` and `mul_add_into`, and `dequant_dot_rows`, the
+f32-activation expert GEMM) are `mul_add` chains in one fixed order: 8 lanes,
+lane `i % 8` taking element `i`, the lanes folded by `iter().sum()`, an `n % 8`
+tail done serially. On a build whose target has FMA (`target-cpu=native` here,
+and aarch64) `mul_add` is the instruction. On a baseline x86-64 build (the
+released binaries and CI) it is a call to the C runtime's `fmaf` per element:
+exact, so the bits are the same, but attention's scores and value sums,
+reference mode, MLA's value sum and every f16/bf16/f32 weight ran several times
+slower than a native build on the same CPU.
+
+**What changed.** Each dot's body is written out twice (`fma_twin!` in
+`kernels.rs`): once as the scalar function, once inside
+`#[target_feature(enable = "avx2,fma,f16c")]`. Same operations in the same
+order, all fused, so the same bits. Which one runs is chosen once per graph, not
+per call: the interpreter resolves a `Dots` token at its start
+(`Dots::resolve::<CAP>()`, which reads one cached CPU flag and, under a
+`kernels.cpu.max_tier` ceiling, asks the ceiling) and every op's loops call its
+methods, a branch on a register. A kernel task that runs outside the interpreter
+(the MoE expert GEMM, the lightning indexer) resolves its own. Only `resolve`
+can make a `Dots` that selects the FMA code, after checking the CPU, so the
+`unsafe` call behind it cannot be reached on a CPU without AVX2, FMA and F16C. A
+build with FMA compiles no dispatch at all: `Dots` is empty there and every
+method is the scalar function.
+
+The first version tested three CPU features inside every call, in attention's
+per-key and per-value loops and `Linear`'s per-row loop; the token removes that.
+
+**Tier placement.** The FMA code belongs to the `avx2` tier: it runs at a
+ceiling of `avx2` or above and not at `scalar`. Rather than adding FMA and F16C
+to what the `avx2` tier requires (which would push a CPU that reports AVX2
+without them, a VM that hides FMA say, down to the scalar kernels for every
+family), the flag tests AVX2, FMA and F16C together: such a CPU keeps its AVX2
+int8 kernels and runs the dots' scalar code. No shipped Intel or AMD CPU with
+AVX2 lacks either.
+
+**Why not wider.** The 8 accumulators fill one ymm register; a 16-lane AVX-512
+form would be a different association and different bits, so there is none.
+
+**f16 in both directions.** `dot_f16` widens each chunk of eight weights with
+one `vcvtph2ps` on any build that has F16C, native included: `half`'s
+per-element `to_f32` is not merged into one wide conversion by the compiler, and
+the native f16 dot had been three times slower than the baseline FMA tier. The
+f16 KV write (`Op::WriteKv` into an f16 cache) narrows eight values with one
+`vcvtps2ph` (round to nearest even) instead of `half::f16::from_f32` per
+element, which on a baseline build also tested for F16C per element. Both
+conversions give `half`'s bits: the widening is exact, and the narrowing was
+compared with `half`'s software conversion (`from_f32_const`, which never uses
+F16C) on all 2^32 f32 inputs at every tier and uncapped, on Windows native and
+baseline and WSL native and baseline: 21,474,836,480 conversions per run, every
+result equal, NaNs included (the hardware quiets a signalling NaN and keeps the
+top of the payload, as the software path does).
+
+**Two codegen traps, measured.** Writing each body once as an
+`#[inline(always)]` function behind both entry points made rustc inline the
+whole body into every call site on the native build, and `Op::Attention`'s time
+in a Qwen3-1.7B pp512 doubled (3.0 to 6.0 ms per call) while every other op
+stayed level; the scalar functions keep the inlining attribute the dots always
+had. And the bf16 dot indexed its weight bytes and activations one at a time,
+with a bounds check each; reading them in eight-element chunks (same operations,
+same bits) made it four times faster on both builds (below).
+
+**Tests.** `kernels/tier_tests.rs` runs every dot (and the f16 narrowing) at
+every tier this CPU has and uncapped, against the scalar tier's bits, on lengths
+that leave every remainder of 8, with both zeros, subnormals, values that
+cancel, and pairs where `a·b + c` rounded twice differs from the fused result;
+it also asserts each dot returns the fused value on those pairs at every tier.
+On a baseline build that holds the FMA code to the C runtime's `fmaf`. Planted:
+an unfused lane loop in the FMA `dot` failed both tests at `avx2` and above; an
+unfused `axpy`, and an unfused tail in `dot`, failed the fused test at every
+tier. A bit flipped in the FMA `dot`'s result was seen by `op_hashes` in 23
+cases (attention, every KV format, the f32 `Linear`s, reference mode, MLA) and
+one in `dot_n`'s in 24 (attention, the KV formats, the MoE router), each at
+`avx2`, `avx512` and `avx512vnni` (uncapped) and at 1, 2, 3, 7, 33 and 32
+threads, never at `scalar`. No op hash and no golden changed.
+
+**Speed of the dots** (`bench_float_dots` in `tier_tests.rs`, one thread, median
+ns per element of 15 interleaved rounds, 2026-11-18, with the other agent's GPU
+test spinning one core; "C runtime" is the scalar code on a baseline build,
+which calls `fmaf` or tests for F16C per element; on the native build both
+columns are the same code):
+
+| Kernel, length                | baseline, C runtime | baseline, FMA tier | native |
+| ----------------------------- | ------------------: | -----------------: | -----: |
+| `dot`, 128                    |                1.07 |              0.252 |  0.243 |
+| `dot_n::<4>`, 128             |                1.01 |             0.0620 | 0.0574 |
+| `dot_f16`, 4096               |                2.00 |             0.0869 | 0.0837 |
+| `dot_bf16`, 4096              |               0.959 |             0.0867 | 0.0839 |
+| `axpy`, 128                   |                1.08 |              0.127 | 0.0355 |
+| `dequant_dot_rows` Q4_K, 4096 |                1.09 |              0.179 |  0.115 |
+| f16 KV narrowing, 4096        |                1.64 |             0.0867 | 0.0540 |
+
+Before the token and the f16 changes (an earlier quiet window): the FMA tier's
+lone `dot` cost 0.243 against the native 0.226 (7% more, from the three feature
+tests per call; now 4%, the call the baseline caller cannot inline), the native
+`dot_f16` 0.321 and `dot_bf16` 0.362, and the f16 narrowing on the native build
+0.155 (the C-runtime column above is the baseline build before). The short
+`axpy` and `dequant_dot_rows` still trail the native build: their FMA copies are
+separate calls, and `dequant_dot_rows` decodes its spans in baseline code.
+
+**What it buys a forward.** Per-op profile of one Qwen3-1.7B Q4_K_M pp512
+(`INFR_PROF_OPS=1`, the last of two reps, 16 threads, three alternations, the
+other agent's GPU test spinning one core): `Attention` per call, baseline build
+39.0-40.3 ms before and 3.09-3.19 ms after, native 2.90-3.10 (`origin/main`) and
+2.93-3.14 (this branch); `WriteKv` baseline 744-794 µs before and 128-142 after,
+native 202-224 before and 134-139 after.
+
+`infr bench --dev cpu` (three reps a run, tok/s), Windows, re-measured on a
+quiet machine on 2026-11-19: no other build, test or model run, the process list
+read before every round (only an idle, hung `cargo test` of another project was
+present, at no CPU). "Before" is `f8b70055` (the parent of `65c99e45`, which
+added the tier), "after" is `1b16e66b` (the tier and its follow-ups, before the
+activation split; `docs/cpu-activations.md` measures the split from the same
+rounds). Release builds, native (`target-cpu=native`) and baseline
+(`-C target-cpu=x86-64`); six binaries in each of twelve rounds, their order
+reversed every other round:
+
+| Model, run                | baseline before                                                                    | baseline after                                                                                 | native before                                                                                  | native after                                                                                   |
+| ------------------------- | ---------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| Qwen3-1.7B pp512          | 334.2, 333.2, 334.1, 334.2, 332.5, 333.7, 335.2, 331.7, 332.2, 333.6, 332.5, 334.8 | 1028.5, 1025.8, 1042.2, 1023.9, 1030.8, 1027.3, 1032.0, 1041.0, 1044.8, 1021.7, 1032.5, 1025.2 | 1141.6, 1105.5, 1152.5, 1140.3, 1114.8, 1136.4, 1112.8, 1151.6, 1113.2, 1112.2, 1100.2, 1160.6 | 1125.5, 1158.2, 1149.8, 1147.5, 1151.7, 1140.4, 1146.9, 1145.5, 1145.9, 1144.0, 1114.2, 1121.7 |
+| gemma-3-1b-it pp512       | 369.3, 378.5, 380.2, 380.9, 383.2, 374.3, 378.4, 381.4, 380.5, 383.9, 381.9, 380.8 | 580.7, 590.1, 592.5, 592.7, 592.4, 578.8, 586.3, 581.6, 589.3, 588.4, 592.2, 587.8             | 591.8, 586.2, 595.9, 587.7, 583.9, 596.0, 592.1, 590.8, 601.5, 592.9, 597.8, 598.0             | 595.6, 596.6, 596.6, 590.9, 590.0, 596.6, 588.7, 597.5, 594.8, 590.9, 601.0, 601.7             |
+| Qwen3-1.7B tg64           | 52.2, 52.1, 51.9, 52.2, 52.2, 52.2, 52.5, 52.3, 51.8, 52.7, 52.0, 51.9             | 53.7, 52.5, 52.6, 53.2, 53.6, 53.2, 52.7, 52.0, 52.2, 52.9, 52.6, 52.6                         | 57.5, 58.7, 58.0, 57.8, 57.6, 57.9, 58.1, 58.1, 58.1, 57.4, 58.0, 58.1                         | 57.8, 57.4, 57.2, 57.9, 57.0, 58.0, 57.4, 57.4, 57.8, 58.3, 57.6, 57.7                         |
+| Qwen3-0.6B tg64 reference | 14.8, 15.0, 14.8, 14.9, 14.8, 14.8, 14.8, 14.8, 14.8, 14.8, 14.7, 14.9             | 28.3, 28.4, 28.3, 27.9, 28.2, 28.2, 28.2, 28.4, 28.2, 28.1, 27.8, 28.1                         | 26.0, 26.2, 26.3, 25.8, 26.1, 25.6, 25.8, 26.1, 25.9, 26.1, 25.9, 26.0                         | 25.9, 26.2, 26.2, 25.9, 26.2, 26.1, 25.7, 26.0, 26.1, 25.7, 25.8, 26.0                         |
+
+**The noise.** The same native binary against a copy of itself, five paired
+rounds of the same protocol: paired differences of -1.8 to +3.2% on single
+rounds, medians -0.9% (Qwen3-1.7B pp512), +0.2% (gemma-3-1b pp512), +1.05%
+(Qwen3-1.7B tg64), +0.2% (gemma-3-1b tg64), +0.4% (reference tg64). Here and
+below, differences and medians are computed from the values as the table shows
+them. So a median under about 1% is no measurable change here.
+
+**The native build is level.** Paired after against before, median of the
+twelve: Qwen3-1.7B pp512 +0.95% (after lower in 4 of 12), gemma-3-1b pp512 +0.5%
+(3 of 12), Qwen3-1.7B tg64 -0.7% (8 of 12), reference tg64 -0.2% (6 of 12 lower,
+2 tied).
+
+**The baseline build** gains 3.1x on Qwen3-1.7B prefill (median paired +207.9%),
+1.55x on gemma-3-1b prefill (+54.9%) and 1.9x on reference-mode decode (+90.5%);
+production decode is level (+1.25%). Against the native build of the same commit
+it is at 90% on Qwen3-1.7B prefill (median paired -9.6%, 12 of 12), 99% on
+gemma-3-1b prefill (-1.0%), 92% on Qwen3-1.7B decode (-8.4%) and 90% on
+gemma-3-1b decode (-9.7%); what is left is outside the f32 dots (backlog B208).
+
+**Reference mode runs faster on the baseline build**, 8.1% (median paired, 12 of
+12), and the native build was as slow before the tier (median 26.0 on both), so
+the tier did not introduce it. The cause is the weight decode, not the dot: with
+each reference-mode `Linear`'s two halves timed separately (a scratch build; the
+per-op profile does not time that branch at all, it `continue`s past the timer),
+the f32 dots take the same time on both builds and `bytes_to_f32` (the per-row
+Q4_K and Q6_K dequantization to f32) takes 8 to 17% more on the native one:
+summed over threads per decode call, the 1024x3072 Q4_K rows 2.0-2.1 ms native
+against 1.8 ms baseline, the Q6_K output head 115-117 ms against 106-107 (four
+rounds each, Qwen3-0.6B tg64).
 
 ## The determinism rule
 

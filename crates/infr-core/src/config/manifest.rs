@@ -130,6 +130,7 @@ knobs! {
     "INFR_UBATCH"               => "device.ubatch",            Int,  Ignored, "512",     migrated;
     "INFR_UBATCH_PARALLEL"      => "device.ubatch_parallel",   Int,  Ignored, "128",     migrated;
     "INFR_SUBMIT_DISPATCHES"    => "device.submit_dispatches", Int,  Error,   "64",      migrated;
+    "INFR_GPU_WAIT_TIMEOUT_MS"  => "device.gpu_wait_timeout_ms", Int, Error,  "30000",   migrated;
     "INFR_SG"                   => "device.subgroup_pref",     Literal, Error, "16",     migrated;
 
     // ── sampling ─────────────────────────────────────────────────────────────
@@ -354,6 +355,12 @@ knobs! {
     "INFR_SERVE_STATS_SECS" => "serve.stats_interval_secs", Int, Ignored, "10", migrated;
     "INFR_MMPROJ" => "serve.mmproj", Path, Ignored, "/tmp/mmproj.gguf", migrated;
     "INFR_IMAGE_MAX_TOKENS" => "serve.image_max_tokens", Int, Ignored, "560", migrated;
+    // `*` disables the Host check; an empty value leaves the default policy, as `--set` does.
+    // See `ServeCfg::allowed_hosts`.
+    "INFR_SERVE_ALLOWED_HOSTS" => "serve.allowed_hosts", Text, Ignored, "llm.example.com", migrated;
+    // `0` turns the keep-alive off, so the env layer keeps it.
+    "INFR_SERVE_SSE_KEEPALIVE_SECS" => "serve.sse_keepalive_secs", Int, Ignored, "30", migrated;
+    "INFR_SERVE_MAX_BODY_BYTES" => "serve.max_body_bytes", Int, Ignored, "8388608", migrated;
 
     // ── hub ──────────────────────────────────────────────────────────────────
     // Same "`0` is a VALUE" grammar as the two `serve` knobs above: `0` means "one connection",

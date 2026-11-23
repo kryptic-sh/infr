@@ -7,8 +7,9 @@
 //! only if, on the HOST'S pairing, the two give the same bits. The op-level test
 //! (`tests/linear_batch_identity.rs`) checks the pairing of whatever host runs it; this checks
 //! each pairing an x86_64 host can land on by calling the tier kernels directly, so an AVX-512
-//! box also covers what an AVX2-only or AVX-512-without-VNNI runner runs. aarch64 runs the
-//! scalar pair, checked here as the `Scalar` host.
+//! box also covers what an AVX2-only or AVX-512-without-VNNI runner runs. This file is x86_64
+//! only: on aarch64 the `dotprod` one-row and batch kernels are each held to the scalar bits by
+//! `kernels::tier_tests`, which makes every pairing there equal too.
 //!
 //! The Q8x32-activation kernels (Q4_0, Q4_1, Q5_0, Q5_1, IQ4_NL, MXFP4, NVFP4, Q2_0, sub-256
 //! Q8_0) are absent: `Op::Linear` calls the same `*_batch` dispatcher at one row and at several,

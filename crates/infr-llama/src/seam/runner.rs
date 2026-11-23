@@ -2,6 +2,7 @@
 //! drives it through a [`Backend`]. This is the giant `generate_dense_backend` — the single
 //! forward every entry point in `super` (CPU/Vulkan/Metal, one-shot/session/verify/denoise) funnels
 //! through. Pure-move split of `seam.rs` — see `super` for the module overview.
+use super::routing::{emit_route, RouteAsk, RouteBufs, RouteHandles, RouteTap};
 use super::sc::{
     build_sc_embt, diffusion_self_cond, DenoiseCache, DenoiseReq, EbReduced, SelfCondWeights,
 };
@@ -413,6 +414,9 @@ pub(super) struct DecodeHandles {
     // compressor plan: APE row ids, gather indices, block rope positions), with those values. The
     // driver uploads each into a buffer of its own and binds it (`upload_step_i32`).
     step_i32: Vec<(TensorId, Vec<i32>)>,
+    // The teacher-forced harness's routing handles (`RouteTap`), one per router-selected layer
+    // the graph holds, in layer order. Empty on every other build.
+    route: Vec<RouteHandles>,
     weights: Vec<TensorId>, // flat, in declaration == upload order
 }
 
@@ -526,7 +530,21 @@ pub(crate) fn generate_dense_backend(
         h_out,
         denoise_req,
         req,
+        None, // prefill_logits
+        None, // route
     )
+}
+
+/// What the teacher-forced harness asks the batched prefill for (see
+/// `generate_dense_backend_bound`'s `prefill_logits`), and what it got back.
+#[derive(Default)]
+pub(crate) struct PrefillTap {
+    /// Run the head over each chunk's last row only, rather than over every row.
+    pub(crate) last_only: bool,
+    /// `[positions.len() * vocab]` logits.
+    pub(crate) logits: Vec<f32>,
+    /// The position each row of `logits` is the next-token distribution after.
+    pub(crate) positions: Vec<usize>,
 }
 
 /// The dense forward. `prebound`, when given, is what an earlier call on this same `be` bound (see
@@ -590,12 +608,34 @@ pub(crate) fn generate_dense_backend_bound(
     // resolves purely from the env, no abort latch is polled, and no gate is taken — byte-for-byte
     // the pre-existing behavior.
     req: Option<&crate::sampling::RequestCtx>,
+    // Teacher-forced scoring (`crate::tolerance`): when `Some`, every ORDINARY batched-prefill
+    // chunk also runs the LM head over all of its rows, or over its last row only
+    // (`PrefillTap::last_only`), and appends their logits and positions to the tap, in position
+    // order. The layer ops are the production prefill's unchanged; only the head is added. Left
+    // empty when the prompt takes no batched prefill (a suffix of two tokens or fewer, or a model
+    // without one). `None` everywhere but that harness: no head, no buffer, no download.
+    mut prefill_logits: Option<&mut PrefillTap>,
+    // Teacher-forced scoring of a routed-expert model: when `Some`, every graph the ordinary
+    // prefill and the per-token decode build also reads back each router-selected layer's own
+    // selection (`Op::MoeRoute`), and with `RouteTap::forced` runs those layers on the supplied
+    // selection instead of their own. `None` everywhere but that harness: no op, no input, no
+    // buffer, no download.
+    mut route: Option<&mut RouteTap>,
 ) -> AResult<(Vec<u32>, GenStats)> {
     let c = cfg;
     // Qwen4-Exp must never silently take the qwen35 forward: that would ignore its HC
     // residual streams, n-gram embeddings, indexed mask and different GDN output gate.
     // Refuse before session derivation, binding weights, or allocating recurrent/KV state.
     crate::qwen4_exp::ensure_forward_supported(c)?;
+    let route_ask = route.as_deref().map(|t| RouteAsk {
+        forced: t.forced.is_some(),
+        scores: t.scores,
+    });
+    if route_ask.is_some() && (verify.is_some() || denoise_req.is_some()) {
+        return Err(anyhow!(
+            "the routing tap covers the ordinary prefill and the per-token decode only"
+        ));
+    }
     // Backend capabilities are a per-backend invariant; query ONCE (each call clones an owned
     // struct with a heap `String name`) and read fields off the cached copy below.
     let caps = be.capabilities();
@@ -2122,6 +2162,8 @@ pub(crate) fn generate_dense_backend_bound(
         // no autoregressive decode loop — its per-prefill decode is exactly one token — so this
         // costs nothing while making both modes bit-identical.
         g.no_decode_replay = c.diffusion_gemma;
+        #[cfg(feature = "mutations")]
+        crate::mutation::opt_out_of_replay(c, &mut g);
         let f32d = |n: usize| TensorDesc::new(vec![n], DType::F32);
         // KV cache dtype: f16 by default (halves memory vs f32, tightens CPU↔GPU parity); Q8_0
         // per-side when the runner enabled it (see `k_fmt`/`v_fmt` at the cache alloc). ONLY the
@@ -2248,6 +2290,13 @@ pub(crate) fn generate_dense_backend_bound(
         // The compressor plan of this graph's positions, per tier, with the per-step inputs it
         // declares (`super::dsv4_emit::Dsv4Tiers`).
         let mut step_i32: Vec<(TensorId, Vec<i32>)> = Vec::new();
+        let mut route_h: Vec<RouteHandles> = Vec::new();
+        // The positions the query rope reads: `positions`, unless a test planted a bug there.
+        #[cfg(feature = "mutations")]
+        let q_positions =
+            crate::mutation::query_positions(c, &mut g, positions, start_pos, batch, &mut step_i32);
+        #[cfg(not(feature = "mutations"))]
+        let q_positions = positions;
         let dsv4_tiers = c.deepseek4.then(|| {
             super::dsv4_emit::Dsv4Tiers::new(
                 &mut g,
@@ -4284,7 +4333,7 @@ pub(crate) fn generate_dense_backend_bound(
                         g.push(Op::QkNormRope {
                             x: q_src,
                             weight: qn,
-                            positions,
+                            positions: q_positions,
                             dst: q16,
                             rows: batch as u32,
                             n_head: nh as u32,
@@ -4317,7 +4366,7 @@ pub(crate) fn generate_dense_backend_bound(
                         // llama: Q roped to the f16 scratch (the attention kernels read f16 q).
                         g.push(Op::Rope {
                             x: q,
-                            positions,
+                            positions: q_positions,
                             dst: q16,
                             rows: batch as u32,
                             n_head: nh as u32,
@@ -4345,19 +4394,23 @@ pub(crate) fn generate_dense_backend_bound(
                         q16
                     }
                 };
+                #[cfg(feature = "mutations")]
+                let (attn_pos, kv_len) = crate::mutation::attention_span(c, start_pos, batch);
+                #[cfg(not(feature = "mutations"))]
+                let (attn_pos, kv_len) = (start_pos as u32, (start_pos + batch) as u32);
                 g.push(Op::Attention {
                     q: q_attn,
                     k_cache: k_cache[kv_src],
                     v_cache: v_cache[kv_src],
                     dst: attn,
                     rows: batch as u32,
-                    kv_len: (start_pos + batch) as u32,
+                    kv_len,
                     n_head: nh as u32,
                     n_kv: nkv as u32,
                     head_dim: hd as u32,
                     scale,
                     mask,
-                    pos: start_pos as u32,
+                    pos: attn_pos,
                     sinks: None,
                     key_bias: None,
                     comp: None,
@@ -4463,12 +4516,18 @@ pub(crate) fn generate_dense_backend_bound(
                     eps,
                 });
             } else {
-                g.push(Op::Add {
-                    a: hidden,
-                    b: sub,
-                    dst: hidden,
-                    n: (batch * ne) as u32,
-                });
+                #[cfg(feature = "mutations")]
+                let keep_residual = crate::mutation::keeps_attn_residual(c, l);
+                #[cfg(not(feature = "mutations"))]
+                let keep_residual = true;
+                if keep_residual {
+                    g.push(Op::Add {
+                        a: hidden,
+                        b: sub,
+                        dst: hidden,
+                        n: (batch * ne) as u32,
+                    });
+                }
                 // ffn
                 g.push(Op::RmsNorm {
                     x: hidden,
@@ -4610,6 +4669,33 @@ pub(crate) fn generate_dense_backend_bound(
                         });
                         sel
                     });
+                    // The teacher-forced harness (`RouteTap`): read the router's own selection
+                    // back and, on a forced run, take the reference's in its place. A selection
+                    // that is supplied leaves the bias and the groups nothing to rank, which is
+                    // also what the op requires then.
+                    let forced = match (route_ask, expert_ids) {
+                        (Some(ask), None) => emit_route(
+                            &mut g,
+                            ask,
+                            &mut route_h,
+                            l,
+                            batch,
+                            ne,
+                            &mc,
+                            hn,
+                            router,
+                            exp_probs_b,
+                        ),
+                        _ => None,
+                    };
+                    let (expert_ids, exp_probs_b, groups) = match forced {
+                        Some(ids) => (Some(ids), None, (0, 0)),
+                        None => (
+                            expert_ids,
+                            exp_probs_b,
+                            (mc.n_expert_groups, mc.n_expert_groups_used),
+                        ),
+                    };
                     g.push(Op::MoeFfn {
                         x: hn,
                         router_x: hn, // qwen3moe/qwen35moe: router reads the SAME normed input as the experts
@@ -4631,11 +4717,12 @@ pub(crate) fn generate_dense_backend_bound(
                         weight_before: mc.weight_before,
                         ep_band: None, // set per-rank by ExpertParallelBackend's lowering
                         exp_probs_b,
-                        n_expert_groups: mc.n_expert_groups,
-                        n_expert_groups_used: mc.n_expert_groups_used,
+                        n_expert_groups: groups.0,
+                        n_expert_groups_used: groups.1,
                         swiglu_clamp: clamp_exp,
-                        // `Some` only on a DeepSeek V4 hash-routed layer (see the gather above);
-                        // `None` everywhere else, which is the router's own top-k.
+                        // `Some` on a DeepSeek V4 hash-routed layer (see the gather above) and on
+                        // a teacher-forced run's supplied selection; `None` everywhere else, which
+                        // is the router's own top-k.
                         expert_ids,
                     });
                     if let Some(MoeSharedW {
@@ -4851,6 +4938,22 @@ pub(crate) fn generate_dense_backend_bound(
                         dim: ne as u32,
                         eps,
                     });
+                    // The router's own top-k, unless a teacher-forced run supplies the selection
+                    // (`RouteTap`).
+                    let forced = route_ask.and_then(|ask| {
+                        emit_route(
+                            &mut g,
+                            ask,
+                            &mut route_h,
+                            l,
+                            batch,
+                            ne,
+                            &mc,
+                            router_tmp,
+                            router,
+                            None,
+                        )
+                    });
                     g.push(Op::MoeFfn {
                         x: moe_in,
                         router_x: router_tmp,
@@ -4875,7 +4978,7 @@ pub(crate) fn generate_dense_backend_bound(
                         n_expert_groups: 0,
                         n_expert_groups_used: 0,
                         swiglu_clamp: None,
-                        expert_ids: None,
+                        expert_ids: forced,
                     });
                     g.push(Op::RmsNorm {
                         x: moe_out,
@@ -5189,6 +5292,7 @@ pub(crate) fn generate_dense_backend_bound(
                 comp,
                 hc_resid: hc_carry.then_some(hcr[0]),
                 step_i32,
+                route: route_h,
                 weights,
             },
         )
@@ -5636,6 +5740,7 @@ pub(crate) fn generate_dense_backend_bound(
                 n_cached: 0,
                 ctx_full: false,
                 natural_stop: false,
+                n_chained: 0,
             },
         ));
     }
@@ -5815,6 +5920,7 @@ pub(crate) fn generate_dense_backend_bound(
                 n_cached: 0,
                 ctx_full: false,
                 natural_stop: false,
+                n_chained: 0,
             },
         ));
     }
@@ -5889,6 +5995,8 @@ pub(crate) fn generate_dense_backend_bound(
     let mut prompt_t = std::time::Duration::ZERO;
     let mut decode_t = std::time::Duration::ZERO;
     let mut decode_n = 0usize;
+    // Of `decode_n`, the tokens that came back from chained submits (`GenStats::n_chained`).
+    let mut chained_n = 0usize;
     // Set where the decode loop ends because the model finished (EOS, or a constrained span
     // completing) rather than on the budget or an abort — see `GenStats::natural_stop`.
     let mut natural_stop = false;
@@ -6189,10 +6297,22 @@ pub(crate) fn generate_dense_backend_bound(
                     // never taps `h`. The MTP catch-up driver needs `h` for EVERY prefill row; wiring
                     // that requires this path to carry `logits_rows == pf_m` on demand, which Phase 2
                     // will add alongside the actual head forward.
+                    // The teacher-forced harness's head (see `prefill_logits`), on the span that
+                    // ends the stack: a partial span has no finished residual to run it on.
+                    let head_rows = match &prefill_logits {
+                        Some(tap) if span.end == c.n_layer => {
+                            if tap.last_only {
+                                1
+                            } else {
+                                ch.m
+                            }
+                        }
+                        _ => 0,
+                    };
                     let (mut pf_g, pf_h) = build(
                         ch.m,
                         cstart,
-                        0,
+                        head_rows,
                         false,
                         None,
                         false,
@@ -6217,7 +6337,19 @@ pub(crate) fn generate_dense_backend_bound(
                     let pf_plan = be.compile(&pf_g).map_err(|e| anyhow!("{e}"))?;
                     let t_compile = pf_t0.elapsed();
                     let step_bufs = upload_step_i32(be, &pf_h)?;
+                    let pf_route = match (route.as_deref(), &c.moe) {
+                        (Some(tap), Some(mc)) if !pf_h.route.is_empty() => {
+                            let layers = pf_h.route.iter().map(|r| r.layer).collect();
+                            let bufs = RouteBufs::alloc(be, layers, ch.m, mc, tap)?;
+                            bufs.upload(be, tap, cstart)?;
+                            Some(bufs)
+                        }
+                        _ => None,
+                    };
                     let mut pf_b = Bindings::new();
+                    if let Some(bufs) = &pf_route {
+                        bufs.bind(&mut pf_b, &pf_h.route);
+                    }
                     if let Some(ids) = pf_h.tok_ids {
                         pf_b.bind(ids, ch.ids.as_deref().unwrap_or(ch.input.as_ref()));
                     }
@@ -6252,13 +6384,42 @@ pub(crate) fn generate_dense_backend_bound(
                         &wbufs[..],
                         pg_table,
                     );
-                    debug_assert!(
-                        pf_h.logits.is_none(),
-                        "headless prefill build has no logits"
+                    debug_assert_eq!(
+                        pf_h.logits.is_some(),
+                        head_rows > 0,
+                        "a prefill build has logits exactly when the harness asked for them"
                     );
+                    let pf_logits_buf = match pf_h.logits {
+                        Some(lg) => {
+                            let buf = be
+                                .alloc(head_rows * c.vocab * 4, BufferUsage::Staging)
+                                .map_err(|e| anyhow!("{e}"))?;
+                            Some((lg, buf))
+                        }
+                        None => None,
+                    };
+                    if let Some((lg, buf)) = &pf_logits_buf {
+                        pf_b.bind(*lg, buf.as_ref());
+                    }
                     *written_end = (*written_end).max(cstart + ch.m);
                     be.execute(pf_plan.as_ref(), &pf_b)
                         .map_err(|e| anyhow!("{e}"))?;
+                    if let (Some(bufs), Some(tap)) = (&pf_route, route.as_deref_mut()) {
+                        bufs.download(be, tap, cstart)?;
+                    }
+                    if let (Some(tap), Some((_, buf))) =
+                        (prefill_logits.as_deref_mut(), &pf_logits_buf)
+                    {
+                        let at = tap.logits.len();
+                        tap.logits.resize(at + head_rows * c.vocab, 0.0);
+                        be.download(
+                            buf.as_ref(),
+                            bytemuck::cast_slice_mut(&mut tap.logits[at..]),
+                        )
+                        .map_err(|e| anyhow!("{e}"))?;
+                        tap.positions
+                            .extend(cstart + ch.m - head_rows..cstart + ch.m);
+                    }
                     // INFR_PROF_STAGES: split the per-dispatch prefill wall time into host graph
                     // build, plan compile, and execute (record + submit + GPU) — where a small-batch
                     // chunk's fixed cost lives decides whether to attack recording or kernels. `l` is
@@ -6349,6 +6510,22 @@ pub(crate) fn generate_dense_backend_bound(
         // express. Force the ordinary per-token rebuild path below when a caller wants the tap —
         // slower, but this is a validation-only hook (see `h_out`'s doc), never a hot path.
         && h_out.is_none();
+    // The routing tap's buffers for the per-token graphs (`RouteTap`), one row each: the
+    // record-once plan and every per-token rebuild bind these, and each step uploads the
+    // reference's selection into them and reads the router's own back.
+    let dec_route = match (route.as_deref(), &c.moe) {
+        (Some(tap), Some(mc)) => {
+            let _gp = req.and_then(|r| r.gate_pass());
+            Some(RouteBufs::alloc(
+                be,
+                super::routing::router_selected_layers(c),
+                1,
+                mc,
+                tap,
+            )?)
+        }
+        _ => None,
+    };
     let ro = if dyn_replay {
         // Held across the build and compile like any step's turn. No tape is recorded here:
         // Vulkan records on the plan's first execute, and Metal's `compile` drops any tape it
@@ -6374,6 +6551,9 @@ pub(crate) fn generate_dense_backend_bound(
         b.bind(h.positions, pos_buf.as_ref());
         if let (Some(pid), Some(ib)) = (h.pl_tok_in, &ipl_buf) {
             b.bind(pid, ib.as_ref());
+        }
+        if let Some(bufs) = &dec_route {
+            bufs.bind(&mut b, &h.route);
         }
         bind_layer_io(
             &mut b,
@@ -6428,6 +6608,9 @@ pub(crate) fn generate_dense_backend_bound(
     // per-token fallback's draws for the SAME tokens (argmax draws nothing, so it's harmless there).
     let can_chain = gpu_embed
         && (gpu_argmax || gpu_sample)
+        // A chain feeds each step's sampled id on the device, with no host step between them to
+        // upload a selection or read one back.
+        && route_ask.is_none()
         && ro.is_some()
         && chain_n >= 2
         && ipl_buf.is_none()
@@ -6519,11 +6702,12 @@ pub(crate) fn generate_dense_backend_bound(
                 // sampled id is already there device-side, but forced/first tokens aren't) and
                 // the position (read ONCE, at replay-record time — the chain may be the very
                 // first decode step, before the per-token path ever wrote pos_buf).
-                be.upload(
-                    dec_ids_buf.as_ref(),
-                    bytemuck::cast_slice(&[cur[pos] as i32]),
-                )
-                .map_err(|e| anyhow!("{e}"))?;
+                #[cfg(feature = "mutations")]
+                let seed = crate::mutation::fed_token(c, &cur, pos, pos > decode_start);
+                #[cfg(not(feature = "mutations"))]
+                let seed = cur[pos];
+                be.upload(dec_ids_buf.as_ref(), bytemuck::cast_slice(&[seed as i32]))
+                    .map_err(|e| anyhow!("{e}"))?;
                 be.upload(pos_buf.as_ref(), bytemuck::cast_slice(&[pos as i32]))
                     .map_err(|e| anyhow!("{e}"))?;
                 // GPU stochastic sampling: draw this chunk's `n` uniforms from the SAME xorshift
@@ -6555,6 +6739,7 @@ pub(crate) fn generate_dense_backend_bound(
                     for &id in &ids {
                         out.push(id);
                         decode_n += 1;
+                        chained_n += 1;
                         fed += 1;
                         let is_eos = !ignore_eos && (c.eos_ids.contains(&id) || id == c.eos);
                         if is_eos {
@@ -6597,6 +6782,11 @@ pub(crate) fn generate_dense_backend_bound(
             }
         }
         let step_t0 = std::time::Instant::now();
+        // The loop's first step is the first execution of the record-once plan in this call.
+        #[cfg(feature = "mutations")]
+        let tok =
+            crate::mutation::fed_token(c, &cur, pos, ro.is_some() && pos > decode_start) as usize;
+        #[cfg(not(feature = "mutations"))]
         let tok = cur[pos] as usize;
         // The 4-byte token id, uploaded whenever the graph declared the ids Input: for the embed
         // gather (`gpu_embed`), and for a deepseek4 hash-routed layer's `ffn_gate_tid2eid`
@@ -6654,6 +6844,9 @@ pub(crate) fn generate_dense_backend_bound(
         } else {
             None
         };
+        if let (Some(bufs), Some(tap)) = (&dec_route, route.as_deref()) {
+            bufs.upload(be, tap, pos)?;
+        }
         let t_setup = std::time::Instant::now();
         let (setup_el, exec_el);
         *written_end = (*written_end).max(pos + 1);
@@ -6682,6 +6875,9 @@ pub(crate) fn generate_dense_backend_bound(
             b.bind(h.positions, pos_buf.as_ref());
             if let (Some(pid), Some(ib)) = (h.pl_tok_in, &ipl_buf) {
                 b.bind(pid, ib.as_ref());
+            }
+            if let Some(bufs) = &dec_route {
+                bufs.bind(&mut b, &h.route);
             }
             bind_layer_io(
                 &mut b,
@@ -6720,6 +6916,9 @@ pub(crate) fn generate_dense_backend_bound(
         // excluded from `last_written` — the fix for the `max_new==0` frontier and the
         // constrained-break unfed-forced-token cache-corruption cases.
         last_written = Some(pos);
+        if let (Some(bufs), Some(tap)) = (&dec_route, route.as_deref_mut()) {
+            bufs.download(be, tap, pos)?;
+        }
         if prof_dec && pos + 1 >= prompt.len() {
             dec_setup += setup_el;
             dec_exec += exec_el;
@@ -6839,6 +7038,24 @@ pub(crate) fn generate_dense_backend_bound(
     // So take one last turn and drop it deliberately. (The prefill chunk plans are declared INSIDE
     // their gated scope, so they already drop before that scope's baton is released — drop order is
     // reverse-declaration and `_gp` is declared first.)
+    #[cfg(feature = "mutations")]
+    if let (Some(_), Some(last)) = (&ro, last_written) {
+        if crate::mutation::negates_last_row(c, last > decode_start) {
+            if v_fmt != DType::F16 {
+                return Err(anyhow!(
+                    "the planted row negation is written for an f16 V cache, not {v_fmt:?}"
+                ));
+            }
+            let _gp = req.and_then(|r| r.gate_pass());
+            let row = infr_core::budget::kv_fmt_bytes(v_fmt, super::kv_row_elems(c, 0).1);
+            let mut rows = vec![0u8; (last + 1) * row];
+            be.download(vbufs[0].as_ref(), &mut rows)
+                .map_err(|e| anyhow!("{e}"))?;
+            crate::mutation::negate_f16(&mut rows[last * row..]);
+            be.upload(vbufs[0].as_ref(), &rows)
+                .map_err(|e| anyhow!("{e}"))?;
+        }
+    }
     {
         let _gp = req.and_then(|r| r.gate_pass());
         drop(ro);
@@ -6932,6 +7149,7 @@ pub(crate) fn generate_dense_backend_bound(
         // Only the callers that lower `max_new` to the context left know it was lowered.
         ctx_full: false,
         natural_stop,
+        n_chained: chained_n,
     };
     Ok((out, stats))
 }

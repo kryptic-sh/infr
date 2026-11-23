@@ -2855,6 +2855,7 @@ fn generate_mtp_spec_core(
             n_cached: 0,
             ctx_full: false,
             natural_stop: false,
+            n_chained: 0,
         },
         timing,
     ))

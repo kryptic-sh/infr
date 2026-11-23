@@ -1138,6 +1138,12 @@ impl SeamModel {
         Ok(stats)
     }
 
+    /// The engine configuration this model was loaded with, which every backend and session it
+    /// opens shares.
+    pub fn engine_config(&self) -> &std::sync::Arc<crate::EngineConfig> {
+        &self.ecfg
+    }
+
     pub fn config(&self) -> &Config {
         &self.cfg
     }
@@ -1648,6 +1654,94 @@ impl SeamModel {
             self.per_layer_embd.as_ref(),
             tokens,
         )
+    }
+
+    /// Teacher-forced logits (see `crate::tolerance`): `prompt` through a fresh backend `on`,
+    /// then `n_steps` decode steps, each feeding the token `next(step, row)` picks from the row
+    /// just produced, with the logits captured at every position — the batched prefill's rows
+    /// and each decode step's. `edit` adjusts a copy of this model's engine configuration for the
+    /// run (a prefill chunk height, a tuning switch, a KV format), so one loaded model serves
+    /// every configuration a comparison needs.
+    ///
+    /// `route` forces a routed-expert (MoE) model's routing as well: every router-selected layer
+    /// then runs, at every position, on the experts `route` holds for it (another run's
+    /// [`crate::seam::ForcedLogits::routing`], the reference's) instead of its own router's, so
+    /// two backends cannot part ways at a router near tie. The run's own selections come back in
+    /// its `routing` either way. `None` for a dense model, and for the run that sets the routing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forced_logits(
+        &self,
+        on: crate::seam::ForcedOn,
+        edit: impl FnOnce(&mut crate::EngineConfig),
+        prompt: &[u32],
+        n_steps: usize,
+        head: crate::seam::PrefillHead,
+        route: Option<&crate::seam::Routing>,
+        next: impl FnMut(usize, &[f32]) -> u32,
+    ) -> Result<crate::seam::ForcedLogits> {
+        let mut ec = (*self.ecfg).clone();
+        edit(&mut ec);
+        let ec = std::sync::Arc::new(ec);
+        let (g, c, embd, ple) = (
+            self.gguf(),
+            &self.cfg,
+            self.embd(),
+            self.per_layer_embd.as_ref(),
+        );
+        match on {
+            crate::seam::ForcedOn::CpuReference | crate::seam::ForcedOn::Cpu => {
+                crate::seam::forced_run_cpu(
+                    on == crate::seam::ForcedOn::CpuReference,
+                    g,
+                    c,
+                    &ec,
+                    embd,
+                    ple,
+                    prompt,
+                    n_steps,
+                    head,
+                    route,
+                    next,
+                )
+            }
+            crate::seam::ForcedOn::Vulkan => crate::seam::forced_run_vulkan(
+                g, c, &ec, embd, ple, prompt, n_steps, head, route, next,
+            ),
+        }
+    }
+
+    /// A production greedy generation of `n` tokens after `prompt` on a fresh Vulkan backend, and
+    /// the logits of one more per-token step on its session
+    /// ([`crate::seam::GreedyTail`]). `edit` adjusts a copy of this model's engine
+    /// configuration for the run, as in [`forced_logits`](Self::forced_logits):
+    /// `spec.decode_chain` picks between the chained decode and one replay per token. Together
+    /// with a [`forced_logits`](Self::forced_logits) run along the same tokens this is how the
+    /// chained and the replayed decode, which no teacher-forced run exercises, are held to the
+    /// per-token path one does.
+    pub fn greedy_tail_vulkan(
+        &self,
+        edit: impl FnOnce(&mut crate::EngineConfig),
+        prompt: &[u32],
+        n: usize,
+    ) -> Result<crate::seam::GreedyTail> {
+        let mut ec = (*self.ecfg).clone();
+        edit(&mut ec);
+        crate::seam::greedy_tail_vulkan(
+            self.gguf(),
+            &self.cfg,
+            &std::sync::Arc::new(ec),
+            self.embd(),
+            self.per_layer_embd.as_ref(),
+            prompt,
+            n,
+        )
+    }
+
+    /// Plant `bug` in this model (`mutations` feature only): every graph it builds from now on, on
+    /// every backend, carries it; no other loaded model does. One bug per model.
+    #[cfg(feature = "mutations")]
+    pub fn plant(&mut self, bug: crate::mutation::Planted) {
+        crate::mutation::plant(&mut self.cfg, bug);
     }
 
     /// Open a Phase-2 DiffusionGemma denoise session on the CPU reference backend (see
@@ -2396,6 +2490,7 @@ impl SeamModel {
             n_cached: 0,
             ctx_full: false,
             natural_stop: false,
+            n_chained: 0,
         })
     }
 

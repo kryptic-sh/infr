@@ -70,6 +70,7 @@ impl CompletionRequest {
             reasoning_effort: None,
             chat_template_kwargs: None,
             think: None,
+            response_format: None,
         }
     }
 
@@ -205,6 +206,7 @@ pub(crate) async fn completions_handler(
         model_id: entry.id.to_string(),
         created: unix_ts(),
         deadline: request_timeout(&state.cfg),
+        keep_alive: sse_keep_alive(&state.cfg),
         stream: req.stream,
         include_usage: req
             .sampling_shape()
@@ -216,10 +218,10 @@ pub(crate) async fn completions_handler(
     };
     log_request_start(
         ctx.id,
-        "/v1/completions",
         &ctx.model_id,
         1,
         prompt.len(),
+        None,
         params.max_tokens,
         ctx.stream,
     );
@@ -248,6 +250,7 @@ async fn non_streaming(
         include_usage: _,
         stats,
         activity,
+        keep_alive: _,
     } = ctx;
     let queued = QueuedGuard::new(stats.clone());
     let Ok(permit) = entry.slots.clone().acquire_owned().await else {
@@ -356,6 +359,7 @@ async fn streaming(
         include_usage,
         stats,
         activity,
+        keep_alive: _,
     } = ctx;
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<Event, Infallible>>();
 

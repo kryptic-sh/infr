@@ -37,15 +37,22 @@ The standing goal: any model size on any hardware, disk to DRAM to VRAM.
 Priority: phase 11 goes ahead of the rest of phase 10, which needs the fixed CPU
 reference to judge tuned values against.
 
-| Phase | What                                                                                               | Status                                |
-| ----- | -------------------------------------------------------------------------------------------------- | ------------------------------------- |
-| 11    | [CPU output bit-identical on every platform, GPUs within tolerance of it](11-cpu-bit-identical.md) | S0-S4 done (S5 in S2); S6, G1-G4 left |
+| Phase | What                                                                                               | Status                                                                                                                                                          |
+| ----- | -------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 11    | [CPU output bit-identical on every platform, GPUs within tolerance of it](11-cpu-bit-identical.md) | S0-S4 and S6 done (S5 in S2), G1-G3 done; G4 partly done (the Qwen3 golden retired, `infr tune check` done); **the tests of G4 that need a row first are next** |
 
 ## Vulkan backend
 
-| Phase | What                                                                                  | Status  |
-| ----- | ------------------------------------------------------------------------------------- | ------- |
-| 10    | [Kernels with per-device tunable parameters](10-tunable-kernels.md), one tuning table | S1 done |
+| Phase | What                                                                                            | Status                                                                                                                                              |
+| ----- | ----------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 10    | [Kernels with per-device tunable parameters](10-tunable-kernels.md), one tuning table           | S1 done                                                                                                                                             |
+| 12    | [Vulkan devices without matrix units or fast int8 dot (GCN class)](12-low-capability-vulkan.md) | S0 answered by the reporter; S1 and S2 done; the fork's PRs 105 to 107 (the subjects of S5, S3 and S7) merged, their review pending; S4 and S6 open |
+
+## Caps, refusals and open decisions
+
+| Phase | What                                                                                                    | Status                         |
+| ----- | ------------------------------------------------------------------------------------------------------- | ------------------------------ |
+| 13    | [Replace the caps, refusals and open decisions with implementations](13-caps-refusals-and-decisions.md) | S1 done; S2 onward not started |
 
 ## Notes on the model phases
 

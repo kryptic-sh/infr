@@ -23,7 +23,8 @@ mod tools;
 pub use logprob::{TokenLogprob, TokenLogprobAlt};
 pub use stream::{prompt_prefills_think, ChatStream, Delta};
 pub use template::{
-    render_chat_jinja, render_chat_oai, render_chat_user, render_template, TemplateError,
+    render_chat_jinja, render_chat_oai, render_chat_oai_thinking, render_chat_user,
+    render_template, thinking_enabled, TemplateError,
 };
 pub use tools::{
     parse_any_tool_calls, parse_hermes_tool_calls, parse_tool_calls, split_channels,

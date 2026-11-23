@@ -11,10 +11,11 @@
 //! same bytes, then `Σ w·x` in f64) under an error bound derived from the arithmetic the kernels
 //! do, so a mistake both routes share cannot pass as "identical".
 //!
-//! What the routes cannot be forced to here: the scalar and AVX2-only kernel tiers (chosen by
-//! runtime CPU feature detection, with no config switch) and aarch64 (no SIMD kernels there; the
-//! scalar ones run). This file runs on whatever tier the host has; `kernels::batch_tier_tests`
-//! checks each x86_64 one-row/batch tier pairing directly.
+//! What the routes are not forced to here: the narrower kernel tiers. This file runs on whatever
+//! tier the host has (on aarch64 with the dot-product extension, the NEON kernels for Q4_K, Q6_K
+//! and Q8_0 and the scalar ones for the rest); `kernels::batch_tier_tests` checks each x86_64
+//! one-row/batch tier pairing directly, and `kernels::tier_tests` holds every tier's one-row and
+//! batch kernels, aarch64's included, to the scalar bits.
 //!
 //! Run: `cargo nextest run -p infr-cpu --test linear_batch_identity`
 
@@ -203,11 +204,30 @@ impl<'a> LinearRun<'a> {
     }
 }
 
+/// `infr_cpu`'s `quant::HI_KEEP` and `quant::HI_RATIO`, mirrored: of a 256-element block's two
+/// largest magnitudes, those above sixteen times the next largest move to the activation's sparse
+/// part, and the block's dense codes take the scale of what is left.
+const HI_KEEP: usize = 2;
+const HI_RATIO: f32 = 16.0;
+
+/// The elements of a 256-element activation block the production quantizer splits off — its
+/// `quant::split_off`, mirrored.
+fn split_off(blk: &[f32]) -> Vec<usize> {
+    let mag = |v: f32| if v.is_nan() { 0.0 } else { v.abs() };
+    let mut order: Vec<usize> = (0..blk.len()).collect();
+    order.sort_by(|&a, &b| mag(blk[b]).total_cmp(&mag(blk[a])).then(a.cmp(&b)));
+    let next = mag(blk[order[HI_KEEP]]);
+    order.truncate(HI_KEEP);
+    order.retain(|&i| mag(blk[i]) > HI_RATIO * next);
+    order
+}
+
 /// The f64 reference for one output and the error bound the kernels' arithmetic allows there.
 ///
 /// int8 activations: `quantize_q8*` sets a block's scale `d = max|x|/127` and its codes
 /// `round(x/d)`, so each activation moves by at most `d/2`, and the dot by at most
-/// `Σ|w|·d/2` over the block. When `1/d` overflows (a subnormal block maximum) every nonzero
+/// `Σ|w|·d/2` over the block. A 256-element block that splits ([`split_off`]) carries its
+/// outliers in sparse parts, and `d` is the scale of what is left instead. When `1/d` overflows (a subnormal block maximum) every nonzero
 /// value takes the full code and moves by up to `max|x|`; the bound takes that. On top, the
 /// kernels' f32 arithmetic: per-block products and partial sums (scale × integer dot, the K-quant
 /// min term) rounded `O(blocks)` times, bounded by `in_f·ε` times the sum of the magnitudes those
@@ -231,11 +251,27 @@ fn reference(w: &[f32], x: &[f32], acts: Acts) -> (f64, f64) {
             let mut carried = 0f64;
             for (wb, xb) in w.chunks(blk).zip(x.chunks(blk)) {
                 let amax = xb.iter().fold(0f32, |m, &v| m.max(v.abs()));
-                let d = amax / 127.0;
+                // The scale the block's dense codes take: its maximum, or after a split what
+                // is left (the rest of the block, or a remainder of the split-off elements at
+                // the f32 resolution of the maximum).
+                let kept = if blk == 256 {
+                    split_off(xb)
+                } else {
+                    Vec::new()
+                };
+                let dense_max = if kept.is_empty() {
+                    amax
+                } else {
+                    let rest = (0..blk)
+                        .filter(|i| !kept.contains(i))
+                        .fold(0f32, |m, i| m.max(xb[i].abs()));
+                    rest.max(amax * f32::EPSILON)
+                };
+                let d = dense_max / 127.0;
                 let step = if d > 0.0 && (1.0 / d).is_finite() {
                     d as f64 / 2.0
                 } else {
-                    amax as f64
+                    dense_max as f64
                 };
                 let wsum: f64 = wb.iter().map(|&v| v.abs() as f64).sum();
                 quant += wsum * step;
@@ -356,4 +392,99 @@ fn reference_prefill_linear_matches_one_row_linear_bitwise_for_every_dtype() {
             s.elems, s.worst
         );
     }
+}
+
+/// The first token's row: a few massive-activation dimensions (two in one 256-element block, one
+/// in another, none in the last two) over ordinary values, the shape transformer LMs give position 0.
+/// Unsplit, each spike sets its block's int8 scale and the rest of the block rounds to 0 or ±1;
+/// the production quantizer splits the spikes off ([`split_off`]) and quantizes the rest on its
+/// own scale. Every 256-block weight dtype, as row 0 of a prefill beside ordinary rows and alone:
+/// each output's error must be what quantizing the REST of each block at its own scale gives — a
+/// statistical bound, six standard deviations of `Σ w·δ` with `δ` uniform over half a step,
+/// plus the f32 arithmetic's share. The unsplit quantizer misses it (measured with `infr_cpu`'s
+/// `HI_RATIO` set beyond reach: the first dtype checked fails, an error 29 times the bound), which
+/// [`reference`]'s worst-case bound cannot show: its f32 term scales with the spikes.
+#[test]
+fn first_token_spikes_keep_the_rest_of_their_block() {
+    let (in_f, out_f) = (1024usize, 16usize);
+    let spikes = [(13usize, 310.0f32), (200, -185.0), (300, 95.0)];
+    let row0: Vec<f32> = (0..in_f)
+        .map(|i| {
+            spikes
+                .iter()
+                .find(|s| s.0 == i)
+                .map_or(uniform(0x5eed, i) * 0.5, |s| s.1)
+        })
+        .collect();
+    let rows: Vec<Vec<f32>> = std::iter::once(row0.clone())
+        .chain((1..4).map(|r| (0..in_f).map(|i| uniform(0x77 + r, i) * 0.5).collect()))
+        .collect();
+    // Each element's quantization step on the split quantizer: the scale of its block's rest.
+    let step: Vec<f64> = row0
+        .chunks(256)
+        .flat_map(|b| {
+            let kept = split_off(b);
+            let rest = (0..256)
+                .filter(|i| !kept.contains(i))
+                .fold(0f32, |m, i| m.max(b[i].abs()));
+            std::iter::repeat_n(rest as f64 / 127.0, 256)
+        })
+        .collect();
+    assert!(
+        row0.chunks(256).take(2).all(|b| !split_off(b).is_empty()),
+        "the spikes do not split their blocks"
+    );
+    let be = CpuBackend::new_with(Arc::new(Config::default()));
+    let mut checked = 0;
+    for &dt in WEIGHT_QUANTS {
+        if acts(dt, in_f, false) != Acts::Int8(256) {
+            continue;
+        }
+        let wbytes = weight(dt, in_f, out_f, 0x3d);
+        let wvals = infr_testkit::dequant_oracle(dt, &wbytes);
+        let wbuf = be
+            .alloc(wbytes.len(), BufferUsage::Weights)
+            .expect("alloc w");
+        be.upload(wbuf.as_ref(), &wbytes).expect("upload w");
+        let alone = LinearRun::new(&be, dt, 1, in_f, out_f).run(wbuf.as_ref(), &row0);
+        let batch =
+            LinearRun::new(&be, dt, rows.len(), in_f, out_f).run(wbuf.as_ref(), &rows.concat());
+        for o in 0..out_f {
+            let w = &wvals[o * in_f..(o + 1) * in_f];
+            let exact: f64 = w
+                .iter()
+                .zip(&row0)
+                .map(|(&a, &b)| a as f64 * b as f64)
+                .sum();
+            let mag: f64 = w
+                .iter()
+                .zip(&row0)
+                .map(|(&a, &b)| (a as f64 * b as f64).abs())
+                .sum();
+            let sigma = w
+                .iter()
+                .zip(&step)
+                .map(|(&a, &s)| (a as f64 * s).powi(2) / 12.0)
+                .sum::<f64>()
+                .sqrt();
+            let bound = 6.0 * sigma + 64.0 * f32::EPSILON as f64 * mag;
+            let got = batch[o];
+            let err = (got as f64 - exact).abs();
+            assert!(
+                err <= bound,
+                "{dt:?} o={o}: {got:e} vs exact {exact:e}: error {err:e} over {bound:e} (sigma {sigma:e})"
+            );
+            assert_eq!(
+                got.to_bits(),
+                alone[o].to_bits(),
+                "{dt:?} o={o}: row 0 of the prefill {got:e} != alone {:e}",
+                alone[o]
+            );
+        }
+        checked += 1;
+    }
+    assert!(
+        checked >= 10,
+        "only {checked} dtypes take 256-element int8 activations"
+    );
 }

@@ -233,12 +233,15 @@ fn resident_verdict_skips_only_what_starves_a_unified_host() {
 
 // ─── CPU-only correctness (no GPU) ───────────────────────────────────────────────
 //
-// The CPU and GPU goldens use SEPARATE hashes: the CPU does the math in f32 while the GPU uses f16 +
-// native-quant kernels, so greedy decode can split on near-ties (precision, not a bug) — comparing
-// the two token-for-token is brittle. Instead each backend locks its own FNV-1a golden, captured
-// with `INFR_BLESS=1` and read to confirm it's coherent + correct, so any op regression flips the
-// hash. Kernel-level math (the Q4_K/Q6_K dot vs the f32 reference) is unit-tested in
-// `src/seam.rs`.
+// The CPU backend gives the same bits on every system, so each CPU case locks an FNV-1a golden of
+// its greedy text, captured with `INFR_BLESS=1` and read to confirm it is coherent and correct: any
+// op regression flips the hash. A GPU does not reproduce those bits, and its kernels are tunable
+// per device, so `gpu_tolerance.rs` holds a model with a row in the tolerance table to the CPU
+// reference instead (`docs/gpu-tolerance.md`): its logits within the row, its chained and replayed
+// decode to its per-token one bit for bit, its greedy tokens to the reference's outside near
+// ties. The GPU-against-CPU tests in this file are the ones that page records as kept, each
+// with its reason (a model, a quantization or a KV format with no row, or a row Windows has not
+// run), beside the GPU-against-GPU comparisons.
 
 /// Stable FNV-1a-64 over a string. (`std::hash::DefaultHasher` is NOT stable across toolchains, so we
 /// roll our own for golden values.)
@@ -301,23 +304,6 @@ fn check_golden_with(
     }
 }
 
-/// Assert (or, with `INFR_BLESS=1`, print) the GPU golden hash for each `(prompt, n, fnv1a)` case.
-fn check_gpu_golden(gen: impl Fn(&str, usize) -> String, cases: &[(&str, usize, u64)]) {
-    let bless = std::env::var("INFR_BLESS").is_ok();
-    for (prompt, n, want) in cases {
-        let out = gen(prompt, *n);
-        let h = fnv1a(&out);
-        if bless {
-            println!("    ({prompt:?}, {n}, 0x{h:016x}),  // {out:?}");
-        } else {
-            assert_eq!(
-                h, *want,
-                "GPU golden changed for {prompt:?} (n={n})\n  out: {out:?}\n  got 0x{h:016x} want 0x{want:016x}"
-            );
-        }
-    }
-}
-
 // ─── Qwen3-0.6B (dense) ───────────────────────────────────────────────────────────
 
 fn qwen3_06b() -> Option<PathBuf> {
@@ -367,8 +353,11 @@ fn gpu_seam_matches_cpu_qwen2() {
 // platform: the CPU's transcendental functions are `infr_core::math`'s, not the C runtime's, so
 // Windows and Linux compute the same bits (re-blessed 2026-11-17, identical natively on Windows
 // and under WSL; before that the last two cases had a Windows and a Linux hash).
+// Re-blessed 2026-11-18 for the int8 activation split (`docs/cpu-activations.md`): the France and ocean
+// cases changed wording ("I need to make sure I recall" became "Let me think. I know that"); identical
+// natively on Windows and under WSL.
 const QWEN3_GOLDEN: &[(&str, usize, u64)] = &[
-    ("The capital of France is", 32, 0xfd63781ea3bfa785),
+    ("The capital of France is", 32, 0x9e2c6fdd3c0e685c),
     (
         "Explain how a computer works in simple terms.",
         48,
@@ -377,7 +366,7 @@ const QWEN3_GOLDEN: &[(&str, usize, u64)] = &[
     (
         "Write a short paragraph about the ocean.",
         48,
-        0x92ef4b86905d27dc,
+        0x4633cde866aac685,
     ),
 ];
 
@@ -858,65 +847,6 @@ fn cpu_kv_mainline_quants_coherent() {
     assert_kv_formats_track_the_f32_cache(&path, &formats[1..]);
 }
 
-// Captured + verified coherent on the Vulkan backend via the agnostic compute seam (the SAME dense
-// `Graph` the CPU oracle builds, mapped op-for-op to GPU kernels). Should reproduce the production
-// GPU path (QWEN3_GPU_GOLDEN).
-const QWEN3_SEAM_GOLDEN: &[(&str, usize, u64)] = &[
-    (
-        "The capital of France is",
-        32,
-        // RE-BLESSED (2026-07-13) for `de987d7`: **Q6_K** joined the AMD int8-activation DECODE
-        // tier (`mmv_int8_decode_dtypes`). unsloth's Qwen3-0.6B-**Q4_K_M** is a MIXED GGUF — its
-        // tied lm_head/embed is Q6_K — so flipping Q6_K moved that tensor's decode GEMV from
-        // f32-exact dequant to int8 dp4a. Same class of real-but-benign numerics shift as the
-        // Q4_K re-blessing this comment used to describe: int8-activation rounding shifts a
-        // close-margin greedy argmax and the token path diverges, while the answer stays right.
-        //
-        // Verified coherent AND correct before re-blessing (greedy, same prompt):
-        //   "<think>\nOkay, the user is asking about the capital of France. I need to make sure I
-        //    recall the correct answer. France's capital is Paris. …"
-        //   → "The capital of France is **Paris**."
-        //
-        // MY PROCESS FAILURE, recorded so it isn't repeated: `de987d7` shipped this numerics flip
-        // and I did NOT re-bless — this golden has been RED on main ever since (found only when a
-        // later agent tripped over it). A precision-policy flip is exactly the change that stales a
-        // golden; re-bless it IN THE SAME COMMIT, with the generated text pasted in as proof, or
-        // don't ship the flip.
-        0xfd63781ea3bfa785,
-    ),
-    (
-        "Explain how a computer works in simple terms.",
-        48,
-        // RE-BLESSED for the same reason as the France case above. Verified coherent: "<think>
-        // \nOkay, the user wants an explanation of how a computer works in simple terms. Let me
-        // start by breaking down the basic components. First, there's the hardware, like the CPU,
-        // RAM, and storage. Then the software," (coincidentally now bit-for-bit the same trajectory
-        // as the CPU-only oracle's QWEN3_GOLDEN second case, 0xcf56ba8c4bb5c455 — not required to
-        // match, just a real outcome of the shifted numerics).
-        0xcf56ba8c4bb5c455,
-    ),
-];
-
-/// End-to-end dense parity: run the full Qwen3-0.6B dense forward on the **Vulkan** backend through
-/// the agnostic compute seam ([`SeamModel::generate_dense_vulkan`]) and lock its golden. The seam runs
-/// the identical `Graph` the CPU reference builds; this proves the dense forward maps faithfully to
-/// the GPU and reproduces the production GPU path (`gpu_golden_qwen3`).
-#[test]
-#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
-fn gpu_seam_golden_qwen3() {
-    let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
-    let mut _tlk = test_serial_lock();
-    let model = model_default(&path);
-    check_gpu_golden(
-        |p, n| {
-            model
-                .generate_dense_vulkan(&model.render_chat(p).expect("render chat"), n)
-                .expect("seam gen")
-        },
-        QWEN3_SEAM_GOLDEN,
-    );
-}
-
 /// IQ4_XS (non-linear 4-bit codebook quant: 4-bit codes index KV_IQ4NL → signed int8, per-32 scale)
 /// through the Vulkan seam vs the CPU oracle. The GPU IQ4_XS decode/prefill runs the word-parallel
 /// `dqblk` (whole-u32 code loads + hoisted codebook gather) and — on ≥48M/≥8M weights (none on this
@@ -975,53 +905,14 @@ fn gpu_seam_matches_cpu_qwen3_q8_0_i8coopmat() {
     );
 }
 
-/// Flash-attention prefill parity: a prompt LONG ENOUGH (>64 tokens) that the seam's batched prefill
-/// takes the FlashAttention-2 path (`attention_prefill_flash`, rows≥64) + the tiled GEMM/mmq Linear,
-/// must generate the SAME greedy continuation as the CPU reference oracle (which uses the naive
-/// per-token attention). Guards the m>1 prefill kernels the short-prompt goldens never exercise.
-#[test]
-#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
-fn gpu_seam_flash_matches_cpu() {
-    let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
-    let mut _tlk = test_serial_lock();
-    let model = model_default(&path);
-    // ~100+ tokens → pf_m ≥ 64 → flash prefill on the seam.
-    let long = "Photosynthesis is the process by which green plants, algae, and some bacteria \
-        convert light energy into chemical energy stored in glucose, using carbon dioxide and water \
-        and releasing oxygen as a byproduct. It happens in two connected stages: the light-dependent \
-        reactions in the thylakoid membranes, and the light-independent Calvin cycle in the stroma. \
-        Explain each stage carefully, name the key molecules involved, and then summarize in one \
-        sentence why this process is essential for life on Earth.";
-    let mut cpu_txt = String::new();
-    model
-        // REFERENCE oracle — see `seam_vulkan_matches_cpu`'s doc.
-        .generate_cpu_reference(long, 24, None, |p| cpu_txt.push_str(p))
-        .expect("cpu gen");
-    let gpu_txt = model.generate_dense_vulkan(long, 24).expect("seam gen");
-    // The f16 GPU flash/GEMM kernels and the f32 CPU oracle accumulate in different precision, so a
-    // long greedy continuation eventually hits a near-tie argmax and forks into an equally-coherent
-    // alternative (the exact split `seam_vulkan_matches_cpu`'s doc predicts). What the flash-prefill
-    // kernels must guarantee is a LONG shared prefix — a real attention bug corrupts the context and
-    // diverges immediately, not 20 tokens in. Assert a substantial common prefix instead of full
-    // bit-identity; print both on failure.
-    let (ct, gt) = (cpu_txt.trim(), gpu_txt.trim());
-    let common = ct
-        .char_indices()
-        .zip(gt.chars())
-        .take_while(|((_, a), b)| a == b)
-        .count();
-    assert!(
-        common >= 60,
-        "flash-prefill seam diverged from the CPU oracle too early (common prefix {common} chars):\n\
-         cpu: {ct:?}\ngpu: {gt:?}"
-    );
-}
-
 /// Vulkan-seam vs CPU-oracle parity for one model: greedy `n`-token continuation of `prompt`
 /// (rendered through the model's chat template) must match token-for-token. Proves the arch's ops
 /// lower correctly through the Vulkan adapter — the CPU seam runs the IDENTICAL Graph. A near-tie
 /// argmax split (f16 GPU kernels vs f32 CPU) would show here as an early divergence; none of the
 /// covered models exhibit one on these prompts today, so keep the strict compare until it flakes.
+/// `gpu_tolerance.rs` holds the greedy tokens of every model with a row in the tolerance table to
+/// the same oracle outside near ties (`docs/gpu-tolerance.md`, "The greedy check"); the callers
+/// here are the cases that page lists as kept.
 ///
 /// The oracle is the REFERENCE CPU backend (`CpuBackend::reference`: weights decoded to f32, f32
 /// dot), NOT the production int8-activation kernels. Those carry ~4e-3 relative error on every
@@ -1461,7 +1352,7 @@ fn gpu_seam_matches_cpu_gemma3() {
 /// the f16-GPU/f32-CPU split forks it into an equally-coherent alternative — verified forking
 /// IDENTICALLY on the pre-IQ4_NL-warp tree, so it's the model, not the kernels. A real dequant
 /// or GEMM bug corrupts the context and diverges immediately; assert a substantial common prefix
-/// instead (the `flash_prefill_seam_matches_cpu` precedent).
+/// instead.
 #[test]
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_matches_cpu_gemma3_q2k_iq4nl() {
@@ -1733,40 +1624,61 @@ fn gpu_seam_bf16_matches_cpu() {
 
 // CPU quant coverage: the SAME prompt through every available quantization of Qwen3-0.6B — legacy
 // round (Q4_0), k-quants (Q2_K/Q4_K/Q5_K/Q6_K), high-bit (Q8_0), i-quant codebook (IQ4_XS), and float
-// (BF16). Each exercises a different dequant/dot path; the per-quant golden hash is locked (each
-// verified coherent at capture). Missing quants are skipped. Refresh with `INFR_BLESS=1`.
-// All verified coherent at capture — every quant recalls "France's capital is Paris" (Q2_K is a
-// touch repetitive, as expected for 2-bit; the float-ish quants still converge: Q5_K==Q8_0==BF16).
-const QWEN3_QUANT_GOLDEN: &[(&str, usize, u64)] = &[
-    ("IQ4_XS", 32, 0xd028ff03b524cb28),
-    ("Q2_K", 32, 0x6442c2818c12ca56),
-    ("Q4_0", 32, 0x88221dcfca820246),
-    ("Q4_K_M", 32, 0xfd63781ea3bfa785),
-    ("Q5_K_M", 32, 0x4e510646d603bc03),
-    ("Q6_K", 32, 0xb68f96c3aa8d22fe),
-    ("Q8_0", 32, 0xb68f96c3aa8d22fe),
-    ("BF16", 32, 0xb68f96c3aa8d22fe),
+// (BF16). Each exercises a different dequant/dot path; the per-quant golden hash is locked.
+// Missing quants are skipped, except a row marked required (below). Refresh with `INFR_BLESS=1`.
+// Re-blessed 2026-11-18 for the int8 activation split (`docs/cpu-activations.md`): Q4_K_M changed
+// with `QWEN3_GOLDEN`'s France case, identical natively on Windows and under WSL.
+// Every row re-checked 2026-11-19 with all eight files cached, identical natively on Windows and
+// under WSL: Q5_K_M, Q6_K and Q8_0 were stale (their files had not been cached at the earlier
+// re-blesses) and changed; the other five kept their values. Six of the eight name Paris within
+// their 32 tokens; Q6_K stops at "...Let me think. France's capital", and Q2_K opens with a
+// doubled `<think>`, repeats the question and never answers. Q5_K_M and BF16 give the same text.
+//
+// The last field marks a row CI must run: CI's golden job (`INFR_TEST_REQUIRE_MODELS`) downloads
+// only `Qwen3-0.6B-Q4_K_M.gguf`, so with that variable set a skipped Q4_K_M row fails, and the
+// others may skip.
+const QWEN3_QUANT_GOLDEN: &[(&str, usize, u64, bool)] = &[
+    ("IQ4_XS", 32, 0xd028ff03b524cb28, false),
+    ("Q2_K", 32, 0x6442c2818c12ca56, false),
+    ("Q4_0", 32, 0x88221dcfca820246, false),
+    ("Q4_K_M", 32, 0x9e2c6fdd3c0e685c, true),
+    ("Q5_K_M", 32, 0xb68f96c3aa8d22fe, false),
+    ("Q6_K", 32, 0x48871156fbdd0a4c, false),
+    ("Q8_0", 32, 0x925b523a6f67356b, false),
+    ("BF16", 32, 0xb68f96c3aa8d22fe, false),
 ];
 
 #[test]
 fn cpu_golden_qwen3_quants() {
     let mut _tlk = test_serial_lock();
     let bless = std::env::var("INFR_BLESS").is_ok();
+    let require = std::env::var_os("INFR_TEST_REQUIRE_MODELS").is_some();
     let prompt = "The capital of France is";
-    for (quant, n, want) in QWEN3_QUANT_GOLDEN {
+    // A row whose file is not cached is skipped, not failed, unless it is required and
+    // `INFR_TEST_REQUIRE_MODELS` is set. The ran/skipped line below shows only with
+    // `--nocapture` (a passing test's output is hidden), so it is for a person running the
+    // test by hand; the required row is what CI enforces.
+    let (mut ran, mut skipped) = (Vec::new(), Vec::new());
+    for (quant, n, want, required) in QWEN3_QUANT_GOLDEN {
         let Some(path) = qwen3_quant(quant) else {
-            eprintln!("skip {quant}: not downloaded");
+            assert!(
+                !(require && *required),
+                "Qwen3-0.6B {quant} is not in the HF cache, and INFR_TEST_REQUIRE_MODELS requires it"
+            );
+            skipped.push(*quant);
             continue;
         };
         let model = model_default(&path);
         let out = cpu_gen(&model, prompt, *n);
         let h = fnv1a(&out);
         if bless {
-            println!("    ({quant:?}, {n}, 0x{h:016x}),  // {out:?}");
+            println!("    ({quant:?}, {n}, 0x{h:016x}, {required}),  // {out:?}");
         } else {
             assert_eq!(h, *want, "quant {quant} golden changed\n  out: {out:?}");
         }
+        ran.push(*quant);
     }
+    eprintln!("qwen3 quant goldens: ran {ran:?}, skipped (not in the HF cache) {skipped:?}");
 }
 
 // ─── Gemma 3 (dense) ────────────────────────────────────────────────────────────
@@ -1809,12 +1721,15 @@ fn llama32_1b() -> Option<PathBuf> {
 // Re-blessed the same day for `infr_core::math` (correctly rounded transcendentals in place of
 // the C runtime's): the knight story's text changed, the France case kept its hash; identical
 // natively on Windows and under WSL.
+// Re-blessed 2026-11-18 for the int8 activation split (`docs/cpu-activations.md`): the knight story's
+// stated tone changed ("melancholic and thoughtful" became "melancholic but ultimately hopeful"); identical
+// natively on Windows and under WSL.
 const GEMMA3_GOLDEN: &[(&str, usize, u64)] = &[
     ("The capital of France is", 32, 0xe5a37ab078db3a2c),
     (
         "Tell me a short story about a brave knight.",
         48,
-        0x4f1efdec82f477e5,
+        0x46bc4897f81235db,
     ),
 ];
 
@@ -1849,17 +1764,20 @@ fn smollm3_render(model: &infr_llama::SeamModel, prompt: &str) -> String {
         .expect("render chat")
 }
 
-// Captured + verified coherent: "The capital of France is Paris." (infr ends the turn there), and
-// an ocean paragraph ("The ocean is a vast and mysterious world, teeming with life …"). Both cases
-// are the short length that stays OS-stable for the other models here; captured on Windows only.
+// Captured + verified coherent: "The capital of France is Paris. Paris is a city known for its rich
+// history, art, fashion, and cuisine. …", and an ocean paragraph ("The ocean is a vast and
+// mysterious world, teeming with life …"). Re-blessed 2026-11-18 for the int8 activation split
+// (`docs/cpu-activations.md`): the France case used to end the turn after "Paris."; the ocean case
+// kept its hash. Identical natively on Windows and under WSL.
 //
 // Against llama.cpp on the same prompt ids: the ocean case matches for all 32 tokens. The France
 // case matches for 7 and then sits on a near tie between end-of-turn and " Paris": both engines'
 // prefill of that prefix rank end-of-turn first, while llama.cpp's token-by-token decode ranks
 // " Paris" first, which is what `llama-completion` prints ("Paris. Paris is a city …"). The
-// measured margins are in docs/backlog.md (B161).
+// measured margins are in docs/backlog.md (B161). Since the activation split infr's text starts
+// the same way.
 const SMOLLM3_GOLDEN: &[(&str, usize, u64)] = &[
-    ("The capital of France is", 32, 0x8bfd779284f134df),
+    ("The capital of France is", 32, 0x96c3bb546e0336bf),
     (
         "Write a short paragraph about the ocean.",
         32,
@@ -2034,12 +1952,15 @@ fn ernie4_5_tokenizes_as_llama_cpp() {
 // infr's greedy output compares with llama.cpp's is in docs/plan/02-ernie4-5.md. The rendered
 // prompt opens with the template's `<|begin_of_sentence|>` and no `<s>`, as the reference's
 // input does; llama.cpp adds an `<s>` for this file and answers differently (B166).
+// Re-blessed 2026-11-18 for the int8 activation split (`docs/cpu-activations.md`): the ocean case's
+// second line changed ("a vast, dynamic body of water" became "a vast, vast body of saltwater"); identical
+// natively on Windows and under WSL.
 const ERNIE4_5_GOLDEN: &[(&str, usize, u64)] = &[
     ("The capital of France is", 32, 0xfd644a0cebde4e73),
     (
         "Write a short paragraph about the ocean.",
         32,
-        0x055f6196af273214,
+        0xc89d65e468805b5b,
     ),
 ];
 
@@ -2367,33 +2288,6 @@ fn gpu_seam_ernie4_5_moe_decode_replays_from_one_recording() {
     );
 }
 
-/// The Vulkan seam must match the CPU oracle token-for-token on ERNIE 4.5 0.3B. Run on the F16
-/// file: at Q4_K_M, after "The ocean is a vast,", the f32-activation oracle picks " vast" where
-/// the Vulkan seam, infr's production CPU path and llama.cpp's CPU all pick " dynamic" and then
-/// agree for the rest of the 32 tokens, so the Q4_K_M weights put this prompt on a near tie
-/// between the two activation regimes rather than on an arch difference.
-#[test]
-#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
-fn gpu_seam_matches_cpu_ernie4_5() {
-    let path = need_model!(ernie4_5_03b_f16(), "ERNIE-4.5-0.3B-PT F16");
-    let mut _tlk = test_serial_lock();
-    seam_vulkan_matches_cpu(&path, "Write a short paragraph about the ocean.", 32);
-}
-
-/// The Vulkan quantized kernels on ERNIE's shapes (Q4_K/Q6_K projections, 128-wide heads over a
-/// 1024-wide residual) against the CPU oracle, on the Q4_K_M file. The prompt was picked for its
-/// margins: along the whole 9-token answer ("The chemical symbol for gold is **Au**.") the top-1
-/// logit leads the runner-up by at least 1.46 on infr's production CPU prefill and on both GPUs'
-/// prefill (measured 2026-11-13, docs/plan/02-ernie4-5.md), far above the int8-activation error
-/// that splits the ocean prompt above. Past the ninth token the answer reaches a near tie.
-#[test]
-#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
-fn gpu_seam_matches_cpu_ernie4_5_q4_k_m() {
-    let path = need_model!(ernie4_5_03b(), "ERNIE-4.5-0.3B-PT");
-    let mut _tlk = test_serial_lock();
-    seam_vulkan_matches_cpu(&path, "What is the chemical symbol for gold?", 9);
-}
-
 /// ERNIE 4.5 writes every K through the rope→WriteKv pair the replay fuses, so its decode is one
 /// record-once replay, as Qwen3's is (see [`gpu_seam_qwen3_decode_replays_from_one_recording`]).
 #[test]
@@ -2409,18 +2303,15 @@ fn gpu_seam_ernie4_5_decode_replays_from_one_recording() {
     );
 }
 
-/// Row-count identity on the cached dense models (`support/row_identity.rs`): a chat prompt
-/// prefilled in one chunk, in chunks of 7 and 3, and one row at a time gives the same 8 ids and
-/// the same bits in every tensor the prompt's last position and the decode steps write. The
-/// families: Qwen3 (Q4_K/Q6_K, QK-norm RoPE), gemma-3 (sliding window, Q5_0 on int8), Qwen3.5
-/// (gated DeltaNet and its convolution, gated attention), LFM3 (short convolution, head gates),
-/// ERNIE-4.5 and SmolLM3.
-///
-/// The MoE models are left out on purpose: `Op::MoeFfn` takes f32 activations for one row and
-/// int8 ones for several (`moe::expert_acts_kind`, `int8_ok = rows >= 2`), so a prompt prefilled
-/// in chunks and one prefilled a row at a time differ by design there (docs/backlog.md, B203).
+/// Row-count identity on the cached models (`support/row_identity.rs`): a chat prompt prefilled
+/// in one chunk, in chunks of 7 and 3, and one row at a time gives the same 8 ids and the same
+/// bits in every tensor the prompt's last position and the decode steps write. The families:
+/// Qwen3 (Q4_K/Q6_K, QK-norm RoPE), gemma-3 (sliding window, Q5_0 on int8), Qwen3.5 (gated
+/// DeltaNet and its convolution, gated attention), LFM3 (short convolution, head gates),
+/// ERNIE-4.5 and SmolLM3, and the MoE models ERNIE-4.5-21B-A3B and Qwen3-30B-A3B, whose
+/// `Op::MoeFfn` quantizes expert activations to int8 at every row count, each row on its own.
 #[test]
-#[ignore = "needs the dense CPU golden models in the HF cache"]
+#[ignore = "needs the CPU golden models in the HF cache"]
 fn cpu_rows_give_the_same_bits_in_any_chunks() {
     let mut _tlk = test_serial_lock();
     let mut ran = 0;
@@ -2431,6 +2322,8 @@ fn cpu_rows_give_the_same_bits_in_any_chunks() {
         ("LFM3-1.7B", lfm3_17b()),
         ("ERNIE-4.5-0.3B", ernie4_5_03b()),
         ("SmolLM3-3B", smollm3_3b()),
+        ("ERNIE-4.5-21B-A3B", ernie4_5_21b_a3b()),
+        ("Qwen3-30B-A3B", qwen3moe_30b()),
     ] {
         let Some(path) = path else {
             println!("skip: {what} is not cached");
@@ -2450,7 +2343,7 @@ fn cpu_rows_give_the_same_bits_in_any_chunks() {
         row_identity::assert_row_count_identity(what, &load, &base, &prompt, 8, &[512, 7, 3, 1]);
         ran += 1;
     }
-    assert!(ran > 0, "no dense model is cached; nothing was checked");
+    assert!(ran > 0, "no model is cached; nothing was checked");
 }
 
 // ─── Qwen3.5 / Qwen3-Next (gated DeltaNet) ──────────────────────────────────────
@@ -2462,6 +2355,9 @@ fn qwen35_08b() -> Option<PathBuf> {
 // Captured + verified coherent (qwen35 / Qwen3-Next: gated-DeltaNet + gated full-attention): "The
 // capital of France is **Paris**. It is the largest city …", a knight story ("Elara … Aethelgard").
 // Renders with thinking ON (the infr-wide default; INFR_NO_THINK turns it off).
+// Re-blessed 2026-11-18 for the int8 activation split (`docs/cpu-activations.md`): the knight
+// case's first line changed ("that could lead to" became "that leads to"); identical natively on
+// Windows and under WSL.
 const QWEN35_GOLDEN: &[(&str, usize, u64)] = &[
     (
         "The capital of France is",
@@ -2471,7 +2367,7 @@ const QWEN35_GOLDEN: &[(&str, usize, u64)] = &[
     (
         "Tell me a short story about a brave knight.",
         48,
-        0x0a0d2a6554ca9f21, // prefilled-think reasoning (story planning process)
+        0x18a492d3e79d00a9, // prefilled-think reasoning (story planning process)
     ),
 ];
 
@@ -2496,18 +2392,6 @@ fn cpu_golden_qwen35() {
 // branch (see `docs/qwen35.md`) — so `SeamModel::load` on a qwen35 GGUF drives the SAME shared
 // runner every other arch uses, and production routing (`infr run`/`serve`/`bench` in infr-cli)
 // sends qwen35 through this path unconditionally.
-
-/// The unified Vulkan seam (`SeamModel::generate_dense_vulkan`) must match the unified CPU oracle
-/// (`SeamModel::generate_cpu`) token-for-token — the seam twin of every other arch's
-/// `gpu_seam_matches_cpu_*` test, now exercising `MixerW::DeltaNet` (Conv1dSilu/DeltaNet ops) AND
-/// the qwen35 attention layers' interleaved q+gate split + sigmoid output gate through Vulkan.
-#[test]
-#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
-fn unified_qwen35_gpu_seam_matches_cpu() {
-    let path = need_model!(qwen35_08b(), "Qwen3.5-0.8B");
-    let mut _tlk = test_serial_lock();
-    seam_vulkan_matches_cpu(&path, "What is bash? Answer briefly.", 24);
-}
 
 /// qwen35's gated-DeltaNet recurrent state is an APPEND-ONLY summary — it can't rewind to an
 /// arbitrary shared prefix the way a real KV cache can (see docs/qwen35.md and the no-rewind rule
@@ -3186,12 +3070,15 @@ fn lfm3_17b_f16() -> Option<PathBuf> {
 // Captured + verified coherent; both render with thinking on (the template's default), so the
 // text is the model's reasoning. How infr's output compares with llama.cpp's is in
 // docs/plan/03-lfm3.md.
+// Re-blessed 2026-11-18 for the int8 activation split (`docs/cpu-activations.md`): both cases' reasoning
+// changed wording from the first clause, same answers; identical
+// natively on Windows and under WSL.
 const LFM3_GOLDEN: &[(&str, usize, u64)] = &[
-    ("The capital of France is", 32, 0xcaeef40f04920074),
+    ("The capital of France is", 32, 0x8d3a3dd9844d239f),
     (
         "Tell me a short story about a lighthouse keeper.",
         32,
-        0x6e5098d3a5bec173,
+        0x5fd5b5d01bc889bf,
     ),
 ];
 
@@ -3204,26 +3091,6 @@ fn cpu_golden_lfm3() {
     let mut _tlk = test_serial_lock();
     let model = model_default(&path);
     check_golden(&model, LFM3_GOLDEN);
-}
-
-/// The Vulkan seam against the CPU oracle on the LFM3 F16 file, token for token: prefill and then
-/// decode one token at a time, so the short convolution's history is carried through both the
-/// batch and the token-serial kernels.
-#[test]
-#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
-fn gpu_seam_matches_cpu_lfm3() {
-    let path = need_model!(lfm3_17b_f16(), "LFM3-1.7B F16");
-    let mut _tlk = test_serial_lock();
-    seam_vulkan_matches_cpu(&path, "Write a short paragraph about the ocean.", 32);
-}
-
-/// The same on the Q4_K_M file, whose quantized kernels the F16 run does not reach.
-#[test]
-#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
-fn gpu_seam_matches_cpu_lfm3_q4_k_m() {
-    let path = need_model!(lfm3_17b(), "LFM3-1.7B");
-    let mut _tlk = test_serial_lock();
-    seam_vulkan_matches_cpu(&path, "What is the chemical symbol for gold?", 16);
 }
 
 /// LFM3's decode is one record-once replay: the short convolution and the head gate carry no
@@ -3335,9 +3202,14 @@ fn qwen3moe_30b() -> Option<PathBuf> {
 // capital of France is\". I need to provide the correct answer.") — re-blessed for the
 // attention-SIMD reassociation (numerics policy: match-or-beat llama.cpp CPU precision).
 // Since `infr_core::math` (2026-11-17) Windows and Linux give the same text, the one Windows
-// gave before.
+// gave before. Re-blessed 2026-11-18 for the int8 activation split (`docs/cpu-activations.md`):
+// the quoted question now ends in "is..." where it ended in "is"; identical natively on Windows
+// and under WSL. Re-blessed the same day when one-row `Op::MoeFfn` (every decode step) moved
+// onto the int8 expert kernels: the text forks after "is...\"", which is now followed by "and then
+// it cuts off. I need", and stays coherent. The same hash under WSL (checked 2026-11-19), but CI
+// does not run the MoE goldens.
 const QWEN3MOE_GOLDEN: &[(&str, usize, u64)] =
-    &[("The capital of France is", 24, 0xe1a4ed6cecc5eb14)];
+    &[("The capital of France is", 24, 0xa68ab7f4d15ad931)];
 
 /// Whole-vector cosine similarity (f64 accumulation) — used by the CPU/Vulkan cross-backend
 /// logits check below.
@@ -3378,8 +3250,9 @@ fn cpu_golden_qwen3moe() {
 /// exercises REAL mixed-dtype paged execution (the down role resolves through two pools), on top
 /// of what `gpu_seam_paged_moe_matches_scout_oracle` proves for the uniform split-bank shape.
 ///
-/// `INFR_UBATCH=1`: pins every prefill chunk to rows=1, so EVERY MoeFfn call — CPU, resident GPU
-/// alike — takes the small-m id-indexed dequant GEMV path (exact f32-equivalent math). Without it
+/// `INFR_UBATCH=1`: pins every prefill chunk to rows=1, so EVERY MoeFfn call on the GPU — resident
+/// and paged alike — takes the small-m id-indexed dequant GEMV path (exact f32-equivalent math;
+/// the production CPU quantizes expert activations to int8 at every row count). Without it
 /// the resident run would default to the BATCHED int8-dp4a prefill path (Q4_K_M is mmq-eligible) —
 /// a coarser-precision route that `gpu_seam_golden_qwen3moe`'s own doc notes CAN diverge from the
 /// f32 CPU oracle on a near-tie greedy pick, which would make any divergence here ambiguous

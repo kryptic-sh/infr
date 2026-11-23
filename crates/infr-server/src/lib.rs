@@ -15,6 +15,9 @@
 //! (tokens — see `clamp_max_tokens`) and `serve.request_timeout_secs` (wall clock — see
 //! `request_timeout`). Both are `serve.*` config, never read from the environment here.
 //!
+//! Every route but `/health` also passes the `Host` check (`host::host_gate`,
+//! `serve.allowed_hosts`), which guards a keyless loopback server against DNS rebinding.
+//!
 //! Delta mapping:
 //!   `Delta::Reasoning`  -> `delta.reasoning_content`
 //!   `Delta::Content`    -> `delta.content`
@@ -31,11 +34,11 @@ use std::{
 };
 
 use axum::{
-    extract::{rejection::JsonRejection, Request, State},
+    extract::{rejection::JsonRejection, DefaultBodyLimit, Request, State},
     http::{HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{
-        sse::{Event, Sse},
+        sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
     },
     routing::{get, post},
@@ -48,6 +51,7 @@ use subtle::ConstantTimeEq;
 use tokio::sync::Semaphore;
 
 mod completions;
+mod host;
 mod idle;
 #[cfg(test)]
 mod idle_tests;
@@ -185,6 +189,109 @@ pub trait ChatGenerator: Send + Sync {
     /// goes out before generation starts. It is read on the request path, so return a value
     /// computed once rather than counting the vocabulary each time.
     fn vocab_size(&self) -> usize;
+
+    /// Ready a request before it waits for a slot, and before a stream's `200` goes out: render
+    /// its prompt, count it, build whatever it needs to generate, and hand all of that back as a
+    /// [`PreparedRequest`] the server passes to [`chat_prepared`](Self::chat_prepared), so the
+    /// work is done once per request.
+    ///
+    /// The server logs [`PreparedRequest::prompt_tokens`] on the arrival line and answers a
+    /// prompt longer than [`PreparedRequest::context_length`] with `400 context_length_exceeded`
+    /// — on a stream too, so the client gets a real `400` rather than a `200` and an error frame,
+    /// and an over-long prompt never takes a slot. An error is answered before the request is
+    /// queued, as [`chat`](Self::chat)'s would be: a [`ParamError`] or [`ContextLengthExceeded`]
+    /// is a `400`, anything else a `500`.
+    ///
+    /// Never wait on a generation here: it runs while other requests generate. The default,
+    /// `Ok(None)`, prepares nothing, and the server calls [`chat`](Self::chat) as it always has.
+    fn prepare(
+        &self,
+        _messages: &[ChatMessage],
+        _tools: Option<&serde_json::Value>,
+        _tool_choice: Option<&str>,
+        _params: &GenParams,
+    ) -> anyhow::Result<Option<PreparedRequest>> {
+        Ok(None)
+    }
+
+    /// Run a turn [`prepare`](Self::prepare) readied, with the same request it was prepared from.
+    /// A generator that implements `prepare` implements this too; the default ignores `prepared`
+    /// and calls [`chat`](Self::chat).
+    #[allow(clippy::too_many_arguments)]
+    fn chat_prepared(
+        &self,
+        prepared: PreparedRequest,
+        messages: &[ChatMessage],
+        tools: Option<&serde_json::Value>,
+        tool_choice: Option<&str>,
+        params: &GenParams,
+        cancel: &Arc<AtomicBool>,
+        on_delta: &mut dyn FnMut(Delta),
+    ) -> anyhow::Result<ChatOutcome> {
+        drop(prepared);
+        self.chat(messages, tools, tool_choice, params, cancel, on_delta)
+    }
+}
+
+/// A request a [`ChatGenerator`] has readied in [`prepare`](ChatGenerator::prepare): what the
+/// server reads before queueing it, plus the generator's own state for
+/// [`chat_prepared`](ChatGenerator::chat_prepared), which the server carries without looking at.
+pub struct PreparedRequest {
+    /// The rendered prompt, in tokens, exactly as generation will see it.
+    pub prompt_tokens: u32,
+    /// The longest prompt the model accepts — what OpenAI's error calls the model's "maximum
+    /// context length". `None` when the generator has no fixed limit or does not know it yet.
+    pub context_length: Option<u32>,
+    state: Box<dyn std::any::Any + Send>,
+}
+
+impl PreparedRequest {
+    /// A prepared request carrying `state` for the generator that made it.
+    pub fn new(
+        prompt_tokens: u32,
+        context_length: Option<u32>,
+        state: impl std::any::Any + Send,
+    ) -> Self {
+        Self {
+            prompt_tokens,
+            context_length,
+            state: Box::new(state),
+        }
+    }
+
+    /// The state [`Self::new`] was given, or `None` when it is not a `T` — a request prepared by
+    /// another generator, which the caller then treats as unprepared.
+    pub fn into_state<T: std::any::Any>(self) -> Option<T> {
+        self.state.downcast::<T>().ok().map(|b| *b)
+    }
+}
+
+impl std::fmt::Debug for PreparedRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedRequest")
+            .field("prompt_tokens", &self.prompt_tokens)
+            .field("context_length", &self.context_length)
+            .finish_non_exhaustive()
+    }
+}
+
+/// One turn on `engine`: through [`ChatGenerator::chat_prepared`] when the request was prepared,
+/// else [`ChatGenerator::chat`].
+#[allow(clippy::too_many_arguments)]
+fn generate(
+    engine: &dyn ChatGenerator,
+    prepared: Option<PreparedRequest>,
+    messages: &[ChatMessage],
+    tools: Option<&serde_json::Value>,
+    tool_choice: Option<&str>,
+    params: &GenParams,
+    cancel: &Arc<AtomicBool>,
+    on_delta: &mut dyn FnMut(Delta),
+) -> anyhow::Result<ChatOutcome> {
+    match prepared {
+        Some(p) => engine.chat_prepared(p, messages, tools, tool_choice, params, cancel, on_delta),
+        None => engine.chat(messages, tools, tool_choice, params, cancel, on_delta),
+    }
 }
 
 /// What one [`ChatGenerator::chat`] call produced: why it ended, plus the real token counts the
@@ -212,6 +319,20 @@ pub struct ContextLengthExceeded {
     pub message: String,
 }
 
+impl ContextLengthExceeded {
+    /// A prompt of `prompt_tokens` that is longer than `context_length`, in OpenAI's own wording
+    /// (client-side error mappers match on it).
+    pub fn prompt_too_long(context_length: usize, prompt_tokens: usize) -> Self {
+        Self {
+            message: format!(
+                "This model's maximum context length is {context_length} tokens. However, your \
+                 messages resulted in {prompt_tokens} tokens. Please reduce the length of the \
+                 messages."
+            ),
+        }
+    }
+}
+
 impl std::fmt::Display for ContextLengthExceeded {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.message)
@@ -227,7 +348,7 @@ impl std::error::Error for ContextLengthExceeded {}
 /// Top-level chat completion request (OpenAI wire format).
 ///
 /// Unknown fields are IGNORED (no `deny_unknown_fields`) — an OpenAI client sending `user`,
-/// `response_format`, … must not 400. Known-but-invalid VALUES do 400, via
+/// `logprobs: false`, … must not 400. Known-but-invalid VALUES do 400, via
 /// [`GenParams::from_request`], and so do the known fields asking for a feature the server does
 /// not have (`n > 1`), rather than being answered as if they had been honoured.
 #[derive(Debug, Deserialize)]
@@ -299,6 +420,106 @@ pub struct ChatRequest {
     /// Ollama: `true`/`false`, or an effort level string (thinking on).
     #[serde(default)]
     pub think: Option<serde_json::Value>,
+    /// OpenAI `response_format`, as sent; validated into [`GenParams::response_format`], so a
+    /// malformed one is a `400` naming the field rather than a body rejection.
+    #[serde(default)]
+    pub response_format: Option<serde_json::Value>,
+}
+
+/// What the reply must look like — a validated OpenAI `response_format`. `{"type":"text"}`, like an
+/// absent field, asks for nothing and never becomes a value.
+///
+/// Either kind is enforced by grammar: the reply CONTENT is one JSON value and nothing else, so a
+/// generator runs it with the model's reasoning off. `json_schema.strict` is accepted and changes
+/// nothing: the schema's keywords are enforced either way, and a keyword the grammar engine does
+/// not implement is a `400` rather than dropped.
+///
+/// Also a `400`, for the schema and for each tool's `parameters` alike: a `$ref` that is not a
+/// plain local pointer (`#` or `#/…`, no percent-encoding — `#/$defs/…` relative to a tool's
+/// own `parameters` works), and any `$id`, `$anchor`, `$dynamicRef`/`$dynamicAnchor` or
+/// `$recursiveRef`/`$recursiveAnchor`; a schema nested too deep (counting references followed),
+/// with too many references or JSON values, or too many distinct `multipleOf` steps; a step too
+/// fine or too large for the engine to match quickly, or two steps anywhere in one schema whose
+/// combination would be (checked pairwise whether or not they meet, so a few schemas are refused
+/// that could have compiled); and an integer bound the engine's arithmetic cannot hold.
+///
+/// The grammar is narrower than the schema in one respect, as llama.cpp's is: a number the schema
+/// leaves unbounded is limited in magnitude and in fraction digits (infr-llama's `NUMBER_LIMIT`
+/// and `NUMBER_STEP`, in its grammar module), and is not written in exponent form, so a model
+/// cannot spin a digit string out to `max_tokens`. Where the schema's own shape prevents that the
+/// number stays as the schema bounds it: in subschemas the engine intersects (`allOf`,
+/// applicators beside sibling keywords, a property matching a pattern property, definitions
+/// referenced from such places), and without the fraction limit where the range is narrower than
+/// its step or the schema's own `multipleOf` cannot combine with it. Bounds, `multipleOf`,
+/// `const` and `enum` the schema sets itself are kept. Strings, array lengths and nesting are not
+/// bounded, as in llama.cpp.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ResponseFormat {
+    /// `{"type":"json_object"}`: one JSON object, of any shape.
+    JsonObject,
+    /// `{"type":"json_schema","json_schema":{"schema":{..}}}` — or llama.cpp's
+    /// `{"type":"json_object","schema":{..}}` — one JSON value matching the schema. A
+    /// `json_schema` without a schema (or with a `null` one) is any JSON value, the empty schema
+    /// `{}`, as OpenAI and llama.cpp read it.
+    JsonSchema(serde_json::Value),
+}
+
+impl ResponseFormat {
+    /// The JSON schema the reply must match.
+    pub fn schema(&self) -> serde_json::Value {
+        match self {
+            ResponseFormat::JsonObject => serde_json::json!({"type": "object"}),
+            ResponseFormat::JsonSchema(schema) => schema.clone(),
+        }
+    }
+
+    /// Validate a request's `response_format`: `Ok(None)` for none or `text`, a [`ParamError`]
+    /// for a shape or `type` this server does not do.
+    fn from_request(v: Option<&serde_json::Value>) -> Result<Option<Self>, ParamError> {
+        let bad = |message: String| ParamError {
+            param: "response_format",
+            message,
+        };
+        let Some(v) = v.filter(|v| !v.is_null()) else {
+            return Ok(None);
+        };
+        let kind = v
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| bad("response_format must be an object with a string `type`".into()))?;
+        // An absent or `null` schema is `None`; anything else must be a schema object.
+        let schema_at = |v: Option<&serde_json::Value>, path: &str| match v {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(s) if s.is_object() => Ok(Some(s.clone())),
+            _ => Err(bad(format!("{path} must be a JSON schema object"))),
+        };
+        match kind {
+            "text" => Ok(None),
+            "json_object" => Ok(Some(
+                match schema_at(v.get("schema"), "response_format.schema")? {
+                    Some(s) => Self::JsonSchema(s),
+                    None => Self::JsonObject,
+                },
+            )),
+            "json_schema" => {
+                let wrapper = v.get("json_schema").filter(|j| !j.is_null());
+                if wrapper.is_some_and(|j| !j.is_object()) {
+                    return Err(bad("response_format.json_schema must be an object".into()));
+                }
+                let schema = schema_at(
+                    wrapper.and_then(|j| j.get("schema")),
+                    "response_format.json_schema.schema",
+                )?;
+                Ok(Some(Self::JsonSchema(
+                    schema.unwrap_or_else(|| serde_json::json!({})),
+                )))
+            }
+            other => Err(bad(format!(
+                "response_format type must be \"text\", \"json_object\" or \"json_schema\", \
+                 got {other:?}"
+            ))),
+        }
+    }
 }
 
 /// A request's `logit_bias` as the client sent it: the object's entries in order with a repeated
@@ -422,13 +643,16 @@ pub struct GenParams {
     /// [`infr_engine::IMAGE_MARKER`]s appear in the flattened messages. Filled by the
     /// handler, not by [`GenParams::from_request`] (the messages are flattened separately).
     pub images: Vec<Arc<[u8]>>,
+    /// `None` for free text. Not sampling, but the same "what this request asked for" the rest of
+    /// this struct carries to the generator.
+    pub response_format: Option<ResponseFormat>,
 }
 
 /// An OpenAI-shaped 400: `{"error":{"message":..,"type":"invalid_request_error","param":..}}`.
 ///
-/// Also an error a [`ChatGenerator`] may return from [`chat`](ChatGenerator::chat) for a request
-/// it cannot honour: the server answers it as this `400` (a terminal error frame when streaming),
-/// not a `500`.
+/// Also an error a [`ChatGenerator`] returns (as the `anyhow` error) for a request it cannot
+/// honour — a `response_format` schema its grammar engine rejects, a constraint its backend cannot
+/// apply: the server answers it as this `400` (a terminal error frame when streaming), not a `500`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParamError {
     pub param: &'static str,
@@ -583,6 +807,7 @@ impl GenParams {
             stop,
             think,
             images: Vec::new(),
+            response_format: ResponseFormat::from_request(req.response_format.as_ref())?,
         })
     }
 
@@ -872,6 +1097,31 @@ fn tool_choice_str(v: &serde_json::Value) -> Result<Option<String>, ParamError> 
 
 /// The three `tool_choice` values that are POLICIES rather than tool names.
 const TOOL_CHOICE_POLICIES: [&str; 3] = ["auto", "none", "required"];
+
+/// The request's `tools`, if any, are an array of function tools each with a string
+/// `function.name` — the one field every use of a tool reads. A malformed tool is the request's
+/// fault, refused here as a `400` naming `tools` rather than failing a grammar build later.
+fn validate_tools(tools: Option<&serde_json::Value>) -> Result<(), ParamError> {
+    let bad = |message: String| ParamError {
+        param: "tools",
+        message,
+    };
+    let tools = match tools {
+        None | Some(serde_json::Value::Null) => return Ok(()),
+        Some(serde_json::Value::Array(a)) => a,
+        Some(_) => return Err(bad("tools must be an array".into())),
+    };
+    for (i, t) in tools.iter().enumerate() {
+        if t.get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(serde_json::Value::as_str)
+            .is_none()
+        {
+            return Err(bad(format!("tools[{i}] has no string `function.name`")));
+        }
+    }
+    Ok(())
+}
 
 /// Cross-check a normalised `tool_choice` against the request's `tools`, which
 /// [`tool_choice_str`] cannot do on its own — it never sees `tools`.
@@ -1489,29 +1739,32 @@ fn log_request_done(req_id: u64, model: &str, stream: bool, rec: &ReqRecord) {
 
 /// Emit one request's arrival line at INFO.
 ///
-/// `prompt_chars` and not prompt TOKENS, and that is a real limitation rather than an oversight:
-/// the tokenizer lives behind [`ChatGenerator`], so at arrival the server genuinely does not know
-/// how many tokens the messages are. The true count is on the completion line, from
-/// [`ChatOutcome`]; the char count is the arrival-time proxy for "how big is this".
+/// `prompt_tokens` is the rendered prompt's real count from [`ChatGenerator::prepare`], and
+/// absent for a generator that cannot count before generating — `prompt_chars`, the size of the
+/// messages, is the proxy that is always there. The completion line carries the count
+/// [`ChatOutcome`] reports either way.
 ///
 /// **No prompt text, ever.** Counts only. Putting user prompt text into an operator's logs is a
 /// privacy decision that has been made in the negative — do not add a preview here, not even
 /// truncated, not even behind a flag.
 fn log_request_start(
     req_id: u64,
-    route: &'static str,
     model: &str,
     messages: usize,
     prompt_chars: usize,
+    prompt_tokens: Option<u32>,
     max_tokens: Option<u32>,
     stream: bool,
 ) {
     tracing::info!(
         req = req_id,
-        route,
+        // The one route that generates.
+        route = "/v1/chat/completions",
         model,
         messages,
         prompt_chars,
+        // Left off the line, rather than printed as a placeholder, when the generator cannot count.
+        prompt_tokens,
         max_tokens = ?max_tokens,
         stream,
         "request start"
@@ -1595,6 +1848,12 @@ struct ModelEntry {
     /// how many are AVAILABLE but not how many exist, and occupancy is the difference — so the
     /// capacity has to be remembered here or the periodic line cannot say `2/4`.
     capacity: usize,
+    /// Admission to [`ChatGenerator::prepare`], with as many permits as `slots`. Preparation —
+    /// template render, tokenization, grammar compile — runs on a blocking thread before a request
+    /// queues for a slot, so without a bound a burst of requests would be that many threads
+    /// competing with generation. The model can generate no more than `capacity` requests at
+    /// once, so preparing more than that at once only prepares work that must wait anyway.
+    prepares: Arc<Semaphore>,
 }
 
 impl ModelEntry {
@@ -1605,6 +1864,7 @@ impl ModelEntry {
             engine,
             slots: Arc::new(Semaphore::new(capacity)),
             capacity,
+            prepares: Arc::new(Semaphore::new(capacity)),
         }
     }
 
@@ -1635,6 +1895,10 @@ pub struct AppState {
     activity: Arc<idle::Activity>,
     /// When this state was built, for `/status`'s uptime.
     started: Instant,
+    /// The address the listener is bound to, which the `Host` check (`host::host_gate`) reads.
+    /// `None` for a router served some other way, which is then checked only when
+    /// `serve.allowed_hosts` is set.
+    bind: Option<SocketAddr>,
 }
 
 impl AppState {
@@ -1657,6 +1921,7 @@ impl AppState {
             stats: Arc::default(),
             activity: Arc::default(),
             started: Instant::now(),
+            bind: None,
         }
     }
 
@@ -1682,6 +1947,7 @@ impl AppState {
             stats: Arc::default(),
             activity: Arc::default(),
             started: Instant::now(),
+            bind: None,
         }
     }
 
@@ -1695,6 +1961,7 @@ impl AppState {
             stats: Arc::default(),
             activity: Arc::default(),
             started: Instant::now(),
+            bind: None,
         }
     }
 
@@ -1721,13 +1988,13 @@ impl AppState {
 // Router
 // ---------------------------------------------------------------------------
 
-/// Request body ceiling (see the `DefaultBodyLimit` layer in [`build_router`]).
-const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
-
 /// Build the axum [`Router`].  Extracted so tests can call it with a [`AppState::headless`] state.
+///
+/// The `Host` check is layered over every route but `/health`, which is added after it: a layer
+/// wraps only the routes already on the router.
 pub fn build_router(state: AppState) -> Router {
+    let body_limit = max_body_bytes(&state.cfg);
     Router::new()
-        .route("/health", get(health_handler))
         .route("/v1/models", get(models_handler))
         .route("/metrics", get(metrics::metrics_handler))
         .route("/status", get(status::status_handler))
@@ -1743,9 +2010,14 @@ pub fn build_router(state: AppState) -> Router {
         )
         // Images arrive inline as base64 data URIs, so a chat request can be megabytes; axum's
         // default 2 MB cap would turn one phone photo into a 413.
-        .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
-        .layer(axum::middleware::from_fn(idle::track))
+        .layer(DefaultBodyLimit::max(body_limit))
+        .layer(middleware::from_fn(idle::track))
         .layer(Extension(state.activity.clone()))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            host::host_gate,
+        ))
+        .route("/health", get(health_handler))
         .with_state(state)
 }
 
@@ -1793,7 +2065,8 @@ pub async fn serve_multi(
 }
 
 /// Serve an inherited TCP listener or bind `addr`, draining requests on shutdown.
-async fn serve_state(state: AppState, addr: SocketAddr) -> anyhow::Result<()> {
+async fn serve_state(mut state: AppState, addr: SocketAddr) -> anyhow::Result<()> {
+    host::check_allowed_hosts(&state.cfg)?;
     let listener = match infr_plat::socket::activated_tcp_listener()? {
         Some(listener) => {
             tracing::info!(addr = %listener.local_addr()?, "using systemd socket");
@@ -1801,6 +2074,9 @@ async fn serve_state(state: AppState, addr: SocketAddr) -> anyhow::Result<()> {
         }
         None => tokio::net::TcpListener::bind(addr).await?,
     };
+    // The bound address, not the requested one: with port 0 only the listener knows the port a
+    // client's `Host` will name.
+    state.bind = Some(listener.local_addr()?);
     serve_listener(state, listener).await
 }
 
@@ -1944,7 +2220,9 @@ async fn chat_completions_handler(
     // …and a WELL-FORMED forced choice the server cannot honour is a 400 too: the constraint
     // builder ignores `tool_choice` entirely when `tools` is absent, so without this the request
     // would quietly generate ordinary text instead (B22).
-    if let Err(e) = validate_tool_choice(tool_choice.as_deref(), tools.as_ref()) {
+    if let Err(e) = validate_tools(tools.as_ref())
+        .and_then(|()| validate_tool_choice(tool_choice.as_deref(), tools.as_ref()))
+    {
         return param_error(Some(e.param), e.message);
     }
 
@@ -2017,25 +2295,84 @@ async fn chat_completions_handler(
         // Resolved HERE, once, so both paths see the same policy and neither reaches for the config
         // from inside a blocking task. `None` (the default) = no deadline, exactly as before.
         deadline: request_timeout(&state.cfg),
+        keep_alive: sse_keep_alive(&state.cfg),
         stream: req.stream,
         include_usage: req.stream_options.as_ref().is_some_and(|o| o.include_usage),
         stats: state.stats.clone(),
         activity,
     };
+    let prompt_chars = messages.iter().map(|m| m.content.len()).sum();
+    let n_messages = messages.len();
+
+    // Prepare the request before queueing for a slot and before a stream's `200`: the arrival
+    // line gets the real prompt count, and an over-long or unservable request is refused here
+    // instead of after it waited for a slot (or, streamed, as an error frame after a `200`).
+    let (messages, tools, tool_choice, params, prepared) = match entry.engine.clone() {
+        None => (messages, tools, tool_choice, params, Ok(None)),
+        Some(engine) => {
+            // A client that hangs up while waiting here drops this future, and its place in the
+            // queue with it; the permit is held for exactly the preparation.
+            let Ok(permit) = entry.prepares.clone().acquire_owned().await else {
+                ctx.stats.fold_failure();
+                return json_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "server shutting down".into(),
+                );
+            };
+            let joined = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                let prepared =
+                    engine.prepare(&messages, tools.as_ref(), tool_choice.as_deref(), &params);
+                (messages, tools, tool_choice, params, prepared)
+            })
+            .await;
+            match joined {
+                Ok(parts) => parts,
+                Err(e) => {
+                    ctx.stats.fold_failure();
+                    tracing::warn!(req = ctx.id, error = %e, "request preparation failed");
+                    return json_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+                }
+            }
+        }
+    };
+    let prompt_tokens = prepared
+        .as_ref()
+        .ok()
+        .and_then(|p| p.as_ref().map(|p| p.prompt_tokens));
+    let (prepared, refused) = match prepared {
+        Err(e) => (None, Some(e)),
+        Ok(Some(PreparedRequest {
+            prompt_tokens,
+            context_length: Some(max),
+            ..
+        })) if prompt_tokens > max => (
+            None,
+            Some(
+                ContextLengthExceeded::prompt_too_long(max as usize, prompt_tokens as usize).into(),
+            ),
+        ),
+        Ok(p) => (p, None),
+    };
     log_request_start(
         ctx.id,
-        "/v1/chat/completions",
         &ctx.model_id,
-        messages.len(),
-        messages.iter().map(|m| m.content.len()).sum(),
+        n_messages,
+        prompt_chars,
+        prompt_tokens,
         params.max_tokens,
         ctx.stream,
     );
+    if let Some(e) = refused {
+        ctx.stats.fold_failure();
+        tracing::warn!(req = ctx.id, error = %e, "request refused before generation");
+        return error_response(&e);
+    }
 
     if ctx.stream {
-        streaming(entry, messages, tools, tool_choice, params, ctx).await
+        streaming(entry, prepared, messages, tools, tool_choice, params, ctx).await
     } else {
-        non_streaming(entry, messages, tools, tool_choice, params, ctx).await
+        non_streaming(entry, prepared, messages, tools, tool_choice, params, ctx).await
     }
 }
 
@@ -2054,6 +2391,8 @@ struct ReqCtx {
     model_id: String,
     created: i64,
     deadline: Option<Duration>,
+    /// How long a stream may go quiet before a keep-alive comment; `None` sends none.
+    keep_alive: Option<Duration>,
     stream: bool,
     /// `stream_options.include_usage`: end the stream with a `usage` chunk.
     include_usage: bool,
@@ -2067,6 +2406,7 @@ struct ReqCtx {
 
 async fn non_streaming(
     entry: ModelEntry,
+    prepared: Option<PreparedRequest>,
     messages: Vec<ChatMessage>,
     tools: Option<serde_json::Value>,
     tool_choice: Option<String>,
@@ -2079,6 +2419,7 @@ async fn non_streaming(
         model_id,
         created,
         deadline,
+        keep_alive: _,
         stream,
         include_usage: _,
         stats,
@@ -2133,7 +2474,9 @@ async fn non_streaming(
         // Per-request tally: plain locals, folded into the shared counters once at the end.
         let mut tally = ReqTally::new();
 
-        let outcome = engine.chat(
+        let outcome = generate(
+            &*engine,
+            prepared,
             &messages,
             tools.as_ref(),
             tool_choice.as_deref(),
@@ -2200,10 +2543,7 @@ async fn non_streaming(
         Err(e) => {
             stats.fold_failure();
             tracing::warn!(req = req_id, error = %e, "request failed");
-            match request_error_body(&e) {
-                Some(body) => (StatusCode::BAD_REQUEST, Json(body)).into_response(),
-                None => json_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-            }
+            error_response(&e)
         }
         Ok((reasoning, content, tool_calls, logprobs, outcome, tally)) => {
             // A deadline hit is a TRUNCATION, not a failure: the client keeps the partial reply
@@ -2269,6 +2609,7 @@ async fn non_streaming(
 
 async fn streaming(
     entry: ModelEntry,
+    prepared: Option<PreparedRequest>,
     messages: Vec<ChatMessage>,
     tools: Option<serde_json::Value>,
     tool_choice: Option<String>,
@@ -2281,6 +2622,7 @@ async fn streaming(
         model_id,
         created,
         deadline,
+        keep_alive,
         stream,
         include_usage,
         stats,
@@ -2387,7 +2729,9 @@ async fn streaming(
         // Per-request tally: plain locals inside the generation, folded in once below.
         let mut tally = ReqTally::new();
 
-        let res = engine.chat(
+        let res = generate(
+            &*engine,
+            prepared,
             &messages,
             tools.as_ref(),
             tool_choice.as_deref(),
@@ -2506,7 +2850,11 @@ async fn streaming(
         rx.recv().await.map(|item| (item, rx))
     });
 
-    Sse::new(stream).into_response()
+    let sse = Sse::new(stream);
+    match keep_alive {
+        Some(d) => sse.keep_alive(KeepAlive::new().interval(d)).into_response(),
+        None => sse.into_response(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2693,6 +3041,14 @@ fn request_error_body(e: &anyhow::Error) -> Option<serde_json::Value> {
         .map(|p| invalid_request_body(Some(p.param), None, &p.message))
 }
 
+/// A generator error as an HTTP response: its typed body with a `400`, else a `500`.
+fn error_response(e: &anyhow::Error) -> Response {
+    match request_error_body(e) {
+        Some(body) => (StatusCode::BAD_REQUEST, Json(body)).into_response(),
+        None => json_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
 /// A body the JSON extractor refused. Malformed JSON and wrong field types are a `400` (not axum's
 /// default `422`, which no OpenAI client expects); a body over the size limit keeps its `413` and a
 /// missing JSON content type its `415`, because those say something a client can fix differently.
@@ -2776,6 +3132,27 @@ fn max_tokens_cap(cfg: &Config) -> u32 {
 fn clamp_max_tokens(requested: Option<u32>, cap: u32) -> Option<u32> {
     requested.map(|v| v.min(cap))
 }
+
+/// The configured request body limit: `serve.max_body_bytes` if positive, else the default (the
+/// env layer drops a zero, and this guard gives a config FILE's zero the same meaning).
+fn max_body_bytes(cfg: &Config) -> usize {
+    let n = match cfg.serve.max_body_bytes {
+        0 => Config::default().serve.max_body_bytes,
+        n => n,
+    };
+    usize::try_from(n).unwrap_or(usize::MAX)
+}
+
+/// The configured SSE keep-alive interval, or `None` when `serve.sse_keepalive_secs` is `0`.
+fn sse_keep_alive(cfg: &Config) -> Option<Duration> {
+    let secs = cfg.serve.sse_keepalive_secs;
+    (secs > 0).then(|| Duration::from_secs(secs).min(MAX_SSE_KEEPALIVE))
+}
+
+/// The longest keep-alive interval honoured. axum arms the timer as `Instant::now() + interval`,
+/// which panics on overflow for an interval near `u64::MAX` seconds; a quiet stream is never
+/// worth keeping open longer than this anyway.
+const MAX_SSE_KEEPALIVE: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// The configured per-request wall-clock deadline, or `None` for "unbounded" — which is the
 /// DEFAULT (`serve.request_timeout_secs` = 0) and today's behaviour.
@@ -4738,6 +5115,7 @@ mod tests {
             model_id: "m".into(),
             created: 0,
             deadline,
+            keep_alive: None,
             stream,
             include_usage: false,
             stats: Arc::default(),
@@ -4767,6 +5145,7 @@ mod tests {
         let started = std::time::Instant::now();
         let resp = non_streaming(
             deadline_entry(Arc::new(LoopGen)),
+            None,
             user_msg(),
             None,
             None,
@@ -4798,6 +5177,7 @@ mod tests {
         for _ in 0..2 {
             let resp = non_streaming(
                 entry.clone(),
+                None,
                 user_msg(),
                 None,
                 None,
@@ -4823,6 +5203,7 @@ mod tests {
     async fn generation_inside_the_deadline_is_untouched() {
         let resp = non_streaming(
             deadline_entry(Arc::new(EchoGen("alpha"))),
+            None,
             user_msg(),
             None,
             None,
@@ -4841,6 +5222,7 @@ mod tests {
     async fn streaming_deadline_finishes_with_length() {
         let resp = streaming(
             deadline_entry(Arc::new(LoopGen)),
+            None,
             user_msg(),
             None,
             None,
@@ -5386,6 +5768,7 @@ mod tests {
         };
         let resp = non_streaming(
             deadline_entry(Arc::new(EchoGen("alpha"))),
+            None,
             user_msg(),
             None,
             None,
@@ -5418,6 +5801,7 @@ mod tests {
         };
         let resp = non_streaming(
             deadline_entry(Arc::new(FailGen)),
+            None,
             user_msg(),
             None,
             None,
@@ -5767,7 +6151,7 @@ mod tests {
     async fn oversized_and_untyped_bodies_keep_their_status() {
         let huge = format!(
             r#"{{"model":"m","messages":[{{"role":"user","content":"{}"}}]}}"#,
-            "x".repeat(MAX_BODY_BYTES + 1024)
+            "x".repeat(max_body_bytes(&Config::default()) + 1024)
         );
         let resp = post_chat(router_for(Arc::new(EchoGen("a"))), &huge).await;
         assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
@@ -5958,5 +6342,623 @@ mod tests {
     #[tokio::test]
     async fn a_streaming_hang_up_during_prefill_cancels_the_generation() {
         assert!(hang_up_reaches_the_generator(true).await);
+    }
+
+    // --- response_format, prompt counting, keep-alive, body limit ------------------------------
+
+    fn format_of(raw: &str) -> Result<Option<ResponseFormat>, ParamError> {
+        GenParams::from_request(&req(&format!(
+            r#"{{"model":"m","messages":[],"response_format":{raw}}}"#
+        )))
+        .map(|p| p.response_format)
+    }
+
+    /// B137: `response_format` is validated into a value the generator acts on — `text` is no
+    /// constraint, the two JSON kinds carry their schema — and a type or shape this server does
+    /// not do is a `400` naming the field, never a quietly unconstrained reply.
+    #[test]
+    fn response_format_parses_and_refuses_what_it_cannot_do() {
+        let schema =
+            serde_json::json!({"type": "object", "properties": {"a": {"type": "integer"}}});
+        assert_eq!(format_of("null"), Ok(None));
+        assert_eq!(format_of(r#"{"type":"text"}"#), Ok(None));
+        assert_eq!(
+            format_of(r#"{"type":"json_object"}"#),
+            Ok(Some(ResponseFormat::JsonObject))
+        );
+        assert_eq!(
+            format_of(&format!(
+                r#"{{"type":"json_schema",
+                     "json_schema":{{"name":"x","strict":true,"schema":{schema}}}}}"#
+            )),
+            Ok(Some(ResponseFormat::JsonSchema(schema.clone())))
+        );
+        // llama.cpp's spelling: a schema beside `json_object`.
+        assert_eq!(
+            format_of(&format!(r#"{{"type":"json_object","schema":{schema}}}"#)),
+            Ok(Some(ResponseFormat::JsonSchema(schema)))
+        );
+        assert_eq!(
+            ResponseFormat::JsonObject.schema(),
+            serde_json::json!({"type": "object"})
+        );
+        // `json_schema` with no schema, or a `null` one, is any JSON value.
+        for any in [
+            r#"{"type":"json_schema"}"#,
+            r#"{"type":"json_schema","json_schema":{"name":"x"}}"#,
+            r#"{"type":"json_schema","json_schema":{"name":"x","schema":null}}"#,
+            r#"{"type":"json_schema","json_schema":null}"#,
+        ] {
+            assert_eq!(
+                format_of(any),
+                Ok(Some(ResponseFormat::JsonSchema(serde_json::json!({})))),
+                "{any}"
+            );
+        }
+        for bad in [
+            r#"{"type":"xml"}"#,
+            r#"{"type":"json_schema","json_schema":"x"}"#,
+            r#"{"type":"json_schema","json_schema":{"schema":"object"}}"#,
+            r#"{"type":"json_object","schema":[]}"#,
+            r#""json_object""#,
+            r#"{"kind":"json_object"}"#,
+        ] {
+            let e = format_of(bad).expect_err(bad);
+            assert_eq!(e.param, "response_format", "{bad}");
+        }
+        assert!(format_of(r#"{"type":"xml"}"#)
+            .unwrap_err()
+            .message
+            .contains("\"xml\""));
+    }
+
+    /// Records the `response_format` each `chat` call was handed.
+    #[derive(Default)]
+    struct FormatProbe(std::sync::Mutex<Vec<Option<ResponseFormat>>>);
+    impl ChatGenerator for FormatProbe {
+        fn status(&self) -> GeneratorStatus {
+            cpu_status()
+        }
+
+        fn vocab_size(&self) -> usize {
+            TEST_VOCAB
+        }
+
+        fn chat(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: Option<&serde_json::Value>,
+            _tool_choice: Option<&str>,
+            params: &GenParams,
+            _cancel: &Arc<AtomicBool>,
+            on_delta: &mut dyn FnMut(Delta),
+        ) -> anyhow::Result<ChatOutcome> {
+            self.0.lock().unwrap().push(params.response_format.clone());
+            on_delta(Delta::Content("{}".into()));
+            Ok(ChatOutcome {
+                finish: Finish::Stop,
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                cached_tokens: 0,
+            })
+        }
+    }
+
+    /// Through the router: the validated format reaches the generator, and a bad one is a `400`
+    /// before it does — on a stream as well, which must not open.
+    #[tokio::test]
+    async fn response_format_reaches_the_generator_or_is_a_400() {
+        let probe = Arc::new(FormatProbe::default());
+        let router = router_for(probe.clone());
+        let ok = r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                     "response_format":{"type":"json_object"}}"#;
+        assert_eq!(post_chat(router.clone(), ok).await.status(), StatusCode::OK);
+        for stream in [false, true] {
+            let bad = format!(
+                r#"{{"model":"m","messages":[{{"role":"user","content":"hi"}}],"stream":{stream},
+                     "response_format":{{"type":"yaml"}}}}"#
+            );
+            let resp = post_chat(router.clone(), &bad).await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "stream={stream}");
+            let v = body_json(resp).await;
+            assert_eq!(v["error"]["type"], "invalid_request_error");
+            assert_eq!(v["error"]["param"], "response_format");
+        }
+        assert_eq!(
+            *probe.0.lock().unwrap(),
+            vec![Some(ResponseFormat::JsonObject)]
+        );
+    }
+
+    /// A generator that refuses every request as the client's fault, either before generating
+    /// (`prepare`) or — like a generator without a count — only from `chat`.
+    struct RefuseGen {
+        in_count: bool,
+        chats: AtomicU64,
+    }
+    impl RefuseGen {
+        fn refusal() -> anyhow::Error {
+            ParamError {
+                param: "response_format",
+                message: "response_format cannot be enforced: unsupported keyword".into(),
+            }
+            .into()
+        }
+    }
+    impl ChatGenerator for RefuseGen {
+        fn status(&self) -> GeneratorStatus {
+            cpu_status()
+        }
+
+        fn vocab_size(&self) -> usize {
+            TEST_VOCAB
+        }
+
+        fn prepare(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: Option<&serde_json::Value>,
+            _tool_choice: Option<&str>,
+            _params: &GenParams,
+        ) -> anyhow::Result<Option<PreparedRequest>> {
+            if self.in_count {
+                Err(Self::refusal())
+            } else {
+                Ok(None)
+            }
+        }
+
+        fn chat(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: Option<&serde_json::Value>,
+            _tool_choice: Option<&str>,
+            _params: &GenParams,
+            _cancel: &Arc<AtomicBool>,
+            _on_delta: &mut dyn FnMut(Delta),
+        ) -> anyhow::Result<ChatOutcome> {
+            self.chats.fetch_add(1, Ordering::Relaxed);
+            Err(Self::refusal())
+        }
+    }
+
+    /// A [`ParamError`] from a generator is the client's fault: a `400` naming the field. Raised
+    /// by `prepare` it is answered before the request is queued — a streamed request gets a
+    /// real `400`, and `chat` never runs. Raised only by `chat` (a generator that cannot count)
+    /// it is still a `400` unstreamed, and a typed error frame on a stream.
+    #[tokio::test]
+    async fn a_generator_param_error_is_a_400() {
+        let body = |stream: bool| {
+            format!(
+                r#"{{"model":"m","messages":[{{"role":"user","content":"hi"}}],"stream":{stream}}}"#
+            )
+        };
+        let early = Arc::new(RefuseGen {
+            in_count: true,
+            chats: AtomicU64::new(0),
+        });
+        for stream in [false, true] {
+            let resp = post_chat(router_for(early.clone()), &body(stream)).await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "stream={stream}");
+            let v = body_json(resp).await;
+            assert_eq!(v["error"]["param"], "response_format");
+            assert_eq!(v["error"]["type"], "invalid_request_error");
+        }
+        assert_eq!(early.chats.load(Ordering::Relaxed), 0);
+
+        let late = Arc::new(RefuseGen {
+            in_count: false,
+            chats: AtomicU64::new(0),
+        });
+        let resp = post_chat(router_for(late.clone()), &body(false)).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(resp).await["error"]["param"], "response_format");
+        let frames = sse_frames(post_chat(router_for(late), &body(true)).await).await;
+        let err: serde_json::Value = frames
+            .iter()
+            .filter_map(|f| serde_json::from_str::<serde_json::Value>(f).ok())
+            .find(|v| v.get("error").is_some())
+            .expect("an error frame");
+        assert_eq!(err["error"]["type"], "invalid_request_error");
+        assert_eq!(err["error"]["param"], "response_format");
+    }
+
+    /// A generator that prepares every request — its prompt `tokens` long against a context of
+    /// `limit` — and counts what the server calls: `prepares`, `prepared` (`chat_prepared` handed
+    /// back its own state) and `chats` (plain `chat`).
+    #[derive(Default)]
+    struct CountGen {
+        tokens: u32,
+        limit: Option<u32>,
+        prepares: AtomicU64,
+        prepared: AtomicU64,
+        chats: AtomicU64,
+    }
+
+    /// The state [`CountGen`] prepares, which `chat_prepared` must get back.
+    struct CountState(u32);
+    impl ChatGenerator for CountGen {
+        fn status(&self) -> GeneratorStatus {
+            cpu_status()
+        }
+
+        fn vocab_size(&self) -> usize {
+            TEST_VOCAB
+        }
+
+        fn prepare(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: Option<&serde_json::Value>,
+            _tool_choice: Option<&str>,
+            _params: &GenParams,
+        ) -> anyhow::Result<Option<PreparedRequest>> {
+            self.prepares.fetch_add(1, Ordering::Relaxed);
+            Ok(Some(PreparedRequest::new(
+                self.tokens,
+                self.limit,
+                CountState(self.tokens),
+            )))
+        }
+
+        fn chat_prepared(
+            &self,
+            prepared: PreparedRequest,
+            _messages: &[ChatMessage],
+            _tools: Option<&serde_json::Value>,
+            _tool_choice: Option<&str>,
+            _params: &GenParams,
+            _cancel: &Arc<AtomicBool>,
+            on_delta: &mut dyn FnMut(Delta),
+        ) -> anyhow::Result<ChatOutcome> {
+            let CountState(tokens) = prepared.into_state().expect("our own prepared state");
+            self.prepared.fetch_add(1, Ordering::Relaxed);
+            on_delta(Delta::Content("ok".into()));
+            Ok(ChatOutcome {
+                finish: Finish::Stop,
+                prompt_tokens: tokens,
+                completion_tokens: 1,
+                cached_tokens: 0,
+            })
+        }
+
+        fn chat(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: Option<&serde_json::Value>,
+            _tool_choice: Option<&str>,
+            _params: &GenParams,
+            _cancel: &Arc<AtomicBool>,
+            on_delta: &mut dyn FnMut(Delta),
+        ) -> anyhow::Result<ChatOutcome> {
+            self.chats.fetch_add(1, Ordering::Relaxed);
+            on_delta(Delta::Content("ok".into()));
+            Ok(ChatOutcome {
+                finish: Finish::Stop,
+                prompt_tokens: self.tokens,
+                completion_tokens: 1,
+                cached_tokens: 0,
+            })
+        }
+    }
+
+    /// B10a/B82: an over-long prompt is refused from its count — `400 context_length_exceeded`
+    /// in OpenAI's wording, on a stream too (no `200` and error frame), and before it takes a
+    /// slot: here the only slot is held throughout, and the refusal still arrives at once. A
+    /// prompt that fits, or a generator that knows no limit, generates as before.
+    #[tokio::test]
+    async fn an_over_long_prompt_is_refused_before_it_takes_a_slot() {
+        let long = Arc::new(CountGen {
+            tokens: 100,
+            limit: Some(99),
+            ..Default::default()
+        });
+        let state = AppState::new(long.clone(), "m", 1, Arc::new(Config::default()));
+        let held = state.models[0].slots.clone().acquire_owned().await.unwrap();
+        let router = build_router(state);
+        for stream in [false, true] {
+            let body = format!(
+                r#"{{"model":"m","messages":[{{"role":"user","content":"hi"}}],"stream":{stream}}}"#
+            );
+            let resp =
+                tokio::time::timeout(Duration::from_secs(2), post_chat(router.clone(), &body))
+                    .await
+                    .expect("an over-long prompt waited for a slot");
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "stream={stream}");
+            let v = body_json(resp).await;
+            assert_eq!(v["error"]["code"], "context_length_exceeded");
+            assert_eq!(v["error"]["param"], "messages");
+            assert_eq!(
+                v["error"]["message"],
+                "This model's maximum context length is 99 tokens. However, your messages \
+                 resulted in 100 tokens. Please reduce the length of the messages."
+            );
+        }
+        drop(held);
+        assert_eq!(long.prepared.load(Ordering::Relaxed), 0);
+        assert_eq!(long.chats.load(Ordering::Relaxed), 0);
+
+        for (tokens, limit) in [(99, Some(99)), (100_000, None)] {
+            let g = Arc::new(CountGen {
+                tokens,
+                limit,
+                ..Default::default()
+            });
+            let resp = post_chat(
+                router_for(g.clone()),
+                r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK, "{tokens} / {limit:?}");
+            assert_eq!(body_json(resp).await["usage"]["prompt_tokens"], tokens);
+        }
+    }
+
+    /// Sleeps before its one delta: a long prefill, as the client sees it.
+    struct SlowFirstToken(Duration);
+    impl ChatGenerator for SlowFirstToken {
+        fn status(&self) -> GeneratorStatus {
+            cpu_status()
+        }
+
+        fn vocab_size(&self) -> usize {
+            TEST_VOCAB
+        }
+
+        fn chat(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: Option<&serde_json::Value>,
+            _tool_choice: Option<&str>,
+            _params: &GenParams,
+            _cancel: &Arc<AtomicBool>,
+            on_delta: &mut dyn FnMut(Delta),
+        ) -> anyhow::Result<ChatOutcome> {
+            std::thread::sleep(self.0);
+            on_delta(Delta::Content("late".into()));
+            Ok(ChatOutcome {
+                finish: Finish::Stop,
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                cached_tokens: 0,
+            })
+        }
+    }
+
+    /// The raw SSE body of a streamed reply with `sse_keepalive_secs = secs`, over a first token
+    /// that takes longer than one interval.
+    async fn slow_stream_body(secs: u64) -> String {
+        let mut cfg = Config::default();
+        cfg.serve.sse_keepalive_secs = secs;
+        let g: Arc<dyn ChatGenerator> = Arc::new(SlowFirstToken(Duration::from_millis(1600)));
+        let resp = post_chat(
+            build_router(AppState::new(g, "m", 1, Arc::new(cfg))),
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+        )
+        .await;
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    /// B137: a stream that goes quiet past the keep-alive interval carries an SSE comment line,
+    /// which parsers ignore and idle-timeout proxies count as traffic; `0` sends none. The reply
+    /// itself is the same either way.
+    #[tokio::test]
+    async fn a_quiet_stream_carries_keep_alive_comments_unless_disabled() {
+        let comment = |body: &str| body.lines().any(|l| l.starts_with(':'));
+        let on = slow_stream_body(1).await;
+        assert!(comment(&on), "no keep-alive comment: {on:?}");
+        let off = slow_stream_body(0).await;
+        assert!(!comment(&off), "keep-alive sent while disabled: {off:?}");
+        for body in [&on, &off] {
+            assert!(body.contains("\"late\""), "{body:?}");
+            assert!(body.contains("[DONE]"), "{body:?}");
+        }
+        assert_eq!(
+            sse_keep_alive(&Config::default()),
+            Some(Duration::from_secs(15))
+        );
+    }
+
+    /// A keep-alive interval too large for axum's timer (`Instant::now() + interval` overflows)
+    /// is held to [`MAX_SSE_KEEPALIVE`] rather than panicking the stream.
+    #[tokio::test]
+    async fn a_huge_keep_alive_interval_is_bounded_not_a_panic() {
+        let mut cfg = Config::default();
+        cfg.serve.sse_keepalive_secs = u64::MAX;
+        assert_eq!(sse_keep_alive(&cfg), Some(MAX_SSE_KEEPALIVE));
+        let g: Arc<dyn ChatGenerator> = Arc::new(EchoGen("a"));
+        let frames = sse_frames(
+            post_chat(
+                build_router(AppState::new(g, "m", 1, Arc::new(cfg))),
+                r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            frames.last().map(String::as_str),
+            Some("[DONE]"),
+            "{frames:?}"
+        );
+    }
+
+    /// A request is prepared ONCE — the server hands the prepared state back
+    /// through `chat_prepared` and never calls `chat`, streamed or not. A generator that
+    /// prepares nothing keeps being served by `chat`.
+    #[tokio::test]
+    async fn a_request_is_prepared_once_and_generated_from_its_preparation() {
+        for stream in [false, true] {
+            let g = Arc::new(CountGen {
+                tokens: 7,
+                ..Default::default()
+            });
+            let body = format!(
+                r#"{{"model":"m","messages":[{{"role":"user","content":"hi"}}],"stream":{stream}}}"#
+            );
+            let resp = post_chat(router_for(g.clone()), &body).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let _ = resp.into_body().collect().await.unwrap();
+            let counts = |c: &AtomicU64| c.load(Ordering::Relaxed);
+            assert_eq!(
+                (counts(&g.prepares), counts(&g.prepared), counts(&g.chats)),
+                (1, 1, 0),
+                "stream={stream}"
+            );
+        }
+        let probe = Arc::new(FormatProbe::default());
+        let resp = post_chat(
+            router_for(probe.clone()),
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            probe.0.lock().unwrap().len(),
+            1,
+            "a non-preparing generator still chats"
+        );
+    }
+
+    /// A malformed tool is a `400` naming `tools`, and a named `tool_choice` for a tool not
+    /// offered a `400` naming `tool_choice` — both before the generator sees the request.
+    #[tokio::test]
+    async fn malformed_tools_and_unknown_tool_choices_are_400s_naming_the_field() {
+        let probe = Arc::new(FormatProbe::default());
+        for (extra, param) in [
+            (r#""tools":[{"type":"function","function":{}}]"#, "tools"),
+            (r#""tools":{"a":1}"#, "tools"),
+            (
+                r#""tools":[{"type":"function","function":{"name":"f"}}],
+                   "tool_choice":{"type":"function","function":{"name":"g"}}"#,
+                "tool_choice",
+            ),
+        ] {
+            let body =
+                format!(r#"{{"model":"m","messages":[{{"role":"user","content":"hi"}}],{extra}}}"#);
+            let resp = post_chat(router_for(probe.clone()), &body).await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{extra}");
+            assert_eq!(body_json(resp).await["error"]["param"], param, "{extra}");
+        }
+        assert!(probe.0.lock().unwrap().is_empty());
+    }
+
+    /// B82: `serve.max_body_bytes` is the body limit — a body over it is a `413`, one under it is
+    /// served — and a zero from a file means the default rather than refusing everything.
+    #[tokio::test]
+    async fn the_body_limit_is_configurable() {
+        let mut cfg = Config::default();
+        cfg.serve.max_body_bytes = 1024;
+        let router = build_router(AppState::new(Arc::new(EchoGen("a")), "m", 1, Arc::new(cfg)));
+        let body = |n: usize| {
+            format!(
+                r#"{{"model":"m","messages":[{{"role":"user","content":"{}"}}]}}"#,
+                "x".repeat(n)
+            )
+        };
+        let resp = post_chat(router.clone(), &body(2048)).await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            body_json(resp).await["error"]["type"],
+            "invalid_request_error"
+        );
+        assert_eq!(post_chat(router, &body(512)).await.status(), StatusCode::OK);
+
+        let mut zero = Config::default();
+        zero.serve.max_body_bytes = 0;
+        assert_eq!(max_body_bytes(&zero), 2 << 20);
+    }
+
+    /// Counts the preparations running at once and the most there ever were; each takes a while,
+    /// so simultaneous requests overlap if nothing bounds them.
+    #[derive(Default)]
+    struct SlowPrepare {
+        running: AtomicU64,
+        most: AtomicU64,
+        prepares: AtomicU64,
+    }
+    impl ChatGenerator for SlowPrepare {
+        fn status(&self) -> GeneratorStatus {
+            cpu_status()
+        }
+
+        fn vocab_size(&self) -> usize {
+            TEST_VOCAB
+        }
+
+        fn prepare(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: Option<&serde_json::Value>,
+            _tool_choice: Option<&str>,
+            _params: &GenParams,
+        ) -> anyhow::Result<Option<PreparedRequest>> {
+            self.prepares.fetch_add(1, Ordering::Relaxed);
+            let now = self.running.fetch_add(1, Ordering::SeqCst) + 1;
+            self.most.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(150));
+            self.running.fetch_sub(1, Ordering::SeqCst);
+            Ok(None)
+        }
+
+        fn chat(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: Option<&serde_json::Value>,
+            _tool_choice: Option<&str>,
+            _params: &GenParams,
+            _cancel: &Arc<AtomicBool>,
+            on_delta: &mut dyn FnMut(Delta),
+        ) -> anyhow::Result<ChatOutcome> {
+            on_delta(Delta::Content("ok".into()));
+            Ok(ChatOutcome {
+                finish: Finish::Stop,
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                cached_tokens: 0,
+            })
+        }
+    }
+
+    /// Preparation is admitted per model, as many at once as the model has slots: a burst of
+    /// requests never runs more preparations than that, though it does run that many.
+    #[tokio::test]
+    async fn concurrent_preparations_are_bounded_by_the_slots() {
+        let g = Arc::new(SlowPrepare::default());
+        let router = build_router(AppState::new(
+            g.clone(),
+            "m",
+            2,
+            Arc::new(Config::default()),
+        ));
+        let body = r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#;
+        let all = (0..5).map(|_| post_chat(router.clone(), body));
+        for resp in futures_util::future::join_all(all).await {
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+        assert_eq!(g.prepares.load(Ordering::Relaxed), 5);
+        assert_eq!(g.most.load(Ordering::SeqCst), 2, "the bound, and no less");
+    }
+
+    /// A request waiting to be prepared that the client abandons gives its place back: it is never
+    /// prepared, and the permits are all there afterwards.
+    #[tokio::test]
+    async fn an_abandoned_wait_for_preparation_is_cancelled() {
+        let g = Arc::new(SlowPrepare::default());
+        let state = AppState::new(g.clone(), "m", 1, Arc::new(Config::default()));
+        let prepares = state.models[0].prepares.clone();
+        let held = prepares.clone().acquire_owned().await.unwrap();
+        let waited = tokio::time::timeout(
+            Duration::from_millis(200),
+            post_chat(
+                build_router(state),
+                r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
+            ),
+        )
+        .await;
+        assert!(waited.is_err(), "the request must still be waiting");
+        drop(held);
+        assert_eq!(prepares.available_permits(), 1);
+        assert_eq!(g.prepares.load(Ordering::Relaxed), 0);
     }
 }

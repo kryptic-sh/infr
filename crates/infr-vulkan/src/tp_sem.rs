@@ -44,7 +44,10 @@ unsafe impl Sync for TpExportSemaphore {}
 
 impl Drop for TpExportSemaphore {
     fn drop(&mut self) {
-        unsafe { self.shared.device.destroy_semaphore(self.sem, None) };
+        // A submit that never completed may still wait on or signal it (see `gpu_wait`).
+        if !self.shared.poisoned() {
+            unsafe { self.shared.device.destroy_semaphore(self.sem, None) };
+        }
         if self.fd >= 0 {
             unsafe { libc::close(self.fd) };
         }
@@ -63,7 +66,10 @@ unsafe impl Sync for TpImportSemaphore {}
 
 impl Drop for TpImportSemaphore {
     fn drop(&mut self) {
-        unsafe { self.shared.device.destroy_semaphore(self.sem, None) };
+        // A submit that never completed may still wait on or signal it (see `gpu_wait`).
+        if !self.shared.poisoned() {
+            unsafe { self.shared.device.destroy_semaphore(self.sem, None) };
+        }
     }
 }
 
@@ -193,7 +199,7 @@ impl VulkanBackend {
         } {
             // Submit failed → the cmd never runs; free it so it does not leak the shared pool.
             self.tp_free_cmds(&[cmd]);
-            return Err(be(format!("tp_submit_copy_signal queue_submit: {e}")));
+            return Err(self.shared.submit_failed(e, "tp_submit_copy_signal"));
         }
         Ok(cmd)
     }
@@ -230,7 +236,7 @@ impl VulkanBackend {
                 .queue_submit(self.shared.queue, &[submit], vk::Fence::null())
         } {
             self.tp_free_cmds(&[cmd]);
-            return Err(be(format!("tp_submit_copies_wait queue_submit: {e}")));
+            return Err(self.shared.submit_failed(e, "tp_submit_copies_wait"));
         }
         Ok(cmd)
     }
@@ -273,11 +279,12 @@ impl VulkanBackend {
         };
         if let Err(e) = r {
             self.tp_free_cmds(&[cmd]);
-            return Err(be(format!("{what} queue_submit: {e}")));
+            return Err(self.shared.submit_failed(e, what));
         }
-        let wait = self.tp_queue_wait_idle();
+        // A failed wait leaves `cmd` to the GPU that may still be running it: leaked, not freed.
+        self.tp_queue_wait_idle()?;
         self.tp_free_cmds(&[cmd]);
-        wait
+        Ok(())
     }
 
     /// Allocate + record a one-time command buffer that copies each `(src, dst, bytes)`, optionally
@@ -292,6 +299,9 @@ impl VulkanBackend {
         acquire_external: &[&dyn Buffer],
         release_external: &[&dyn Buffer],
     ) -> Result<vk::CommandBuffer> {
+        // Every submit here records through this first: a poisoned backend records and submits
+        // nothing (see `gpu_wait`).
+        self.shared.live()?;
         // Same guard as `Backend::copy_buffer`, before anything is allocated or recorded: a region
         // past either end is a VUID violation, not an error the driver reports.
         for &(src, dst, bytes) in copies {
@@ -396,14 +406,15 @@ impl VulkanBackend {
     /// wait per all-reduce, after which the summed partials in scratch are safe for the reduce
     /// dispatch to read. All the cross-device ordering already happened GPU-side on the semaphores.
     pub fn tp_queue_wait_idle(&self) -> Result<()> {
-        unsafe { self.shared.device.queue_wait_idle(self.shared.queue) }
-            .map_err(|e| be(format!("tp_queue_wait_idle: {e}")))
+        self.shared
+            .wait_queue_idle(&|| "tensor-parallel copies and their all-reduce".to_string())
     }
 
     /// Free command buffers returned by the semaphore-submit primitives (call only after their work
-    /// has completed — i.e. after [`tp_queue_wait_idle`](Self::tp_queue_wait_idle)).
+    /// has completed — i.e. after [`tp_queue_wait_idle`](Self::tp_queue_wait_idle)). A backend
+    /// whose wait failed leaks them instead: the GPU may still be running them.
     pub fn tp_free_cmds(&self, cmds: &[vk::CommandBuffer]) {
-        if cmds.is_empty() {
+        if cmds.is_empty() || self.shared.poisoned() {
             return;
         }
         let pool = *self.shared.cmd_pool.lock().unwrap();

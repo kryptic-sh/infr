@@ -54,6 +54,8 @@ pub(crate) fn fixtures() -> Vec<(String, DeviceFacts)> {
                     subgroup_max: n("subgroup_max"),
                     wave64: b("wave64"),
                     max_shared_memory: n("max_shared_memory"),
+                    matrix_units: b("matrix_units"),
+                    dot_accelerated: b("dot_accelerated"),
                 },
             )
         })
@@ -285,6 +287,13 @@ fn every_parameter_is_in_range_and_round_trips() {
                         (Value::Uint(v), families::Ty::Uint { min, max }) => {
                             Value::Uint(if *v < max { v + 1 } else { min })
                         }
+                        (Value::Text(t), families::Ty::Choice(words)) => Value::Text(
+                            words
+                                .iter()
+                                .find(|w| **w != t.as_str())
+                                .expect("a choice has more than one word")
+                                .to_string(),
+                        ),
                         (Value::Text(_), _) => Value::Text("other".to_string()),
                         _ => unreachable!(),
                     };
@@ -691,6 +700,9 @@ fn every_alias_writes_the_old_value() {
             &[("INFR_MMV_MW_WARPS", "4")],
             &[("mmv_mw.warps@q4_k", "4"), ("mmv_mw.warps@q6_k", "4")],
         ),
+        (&[("INFR_GFX_QUEUE", "1")], &[("queue.family", "graphics")]),
+        (&[("INFR_KQ_FMA_GEMV", "1")], &[("gemv.kq_fma", "true")]),
+        (&[("INFR_KQ_FMA_GEMV", "0")], &[("gemv.kq_fma", "false")]),
         (&[("INFR_MOE_SMALL_M", "16")], &[("moe.small_m", "16")]),
         (&[("INFR_MOE_SMALL_M", "100000")], &[("moe.small_m", "64")]),
         (
@@ -1559,4 +1571,207 @@ fn rows_off_drops_the_driver_rows_and_says_so() {
         "{text}"
     );
     assert!(r.report.list(None).contains("INFR_TUNE_NO_ROWS"));
+}
+
+/// The first forward's submit cap follows the device facts (issue 94): the GCN fixture, a
+/// discrete card with neither matrix units nor an accelerated int8 dot, starts split at 64
+/// dispatches; the integrated GPU keeps its 128 and the RX 7900 XTX stays unsplit. Before the
+/// facts existed every discrete device started unsplit, the GCN card included.
+#[test]
+fn initial_submit_cap_follows_the_device_facts() {
+    let cap = |id: &str| fixture_tuning(id).submit_initial_dispatches;
+    assert_eq!(cap("rx580-gcn-radv"), 64);
+    assert_eq!(cap("raphael-igpu-amdwin"), 128);
+    assert_eq!(cap("rx7900xtx-amdwin"), 0);
+    assert_eq!(cap("rx7900xtx-radv"), 0);
+    assert!(fixture("rx580-gcn-radv").slow_class());
+    assert!(!fixture("rx7900xtx-amdwin").slow_class());
+    // Either fact alone keeps a discrete device out of the slow class; wave64 alone puts it in.
+    let mut f = fixture("rx7900xtx-amdwin");
+    f.matrix_units = false;
+    assert!(!f.slow_class(), "an accelerated dot is enough");
+    f.dot_accelerated = false;
+    assert!(f.slow_class());
+    let mut w = fixture("rx7900xtx-amdwin");
+    w.wave64 = true;
+    assert!(w.slow_class());
+    // A user value wins over the derived default.
+    let r = resolve_fixture(
+        "rx580-gcn-radv",
+        &env_cfg(&[("INFR_TUNE", "submit.initial_dispatches=16")]),
+    );
+    assert_eq!(r.tuning.submit_initial_dispatches, 16);
+}
+
+/// `queue.family` is `auto` by default on every discrete device, so inference leaves the ring
+/// the compositor renders on wherever a usable compute-only family exists. An integrated GPU is
+/// `graphics` by rule (the compute ring's hang budget measured tighter there under RADV,
+/// `docs/igpu.md`) and `auto` only through the row of a driver it was measured on.
+#[test]
+fn queue_family_follows_the_device_facts() {
+    use super::QueueFamily::{Auto, Compute, Graphics};
+    let of = |id: &str| fixture_tuning(id).queue_family;
+    for discrete in [
+        "rx580-gcn-radv",
+        "rx7900xtx-amdwin",
+        "rx7900xtx-radv",
+        "nvidia-rtx2080ti",
+        "intel-arc-a770-anv",
+        "unknown",
+    ] {
+        assert_eq!(of(discrete), Auto, "{discrete}");
+    }
+    // The integrated GPU: `auto` by the AMD Windows driver's row, `graphics` without the rows
+    // and under any other driver.
+    let r = resolve_fixture("raphael-igpu-amdwin", &Config::default());
+    assert_eq!(r.tuning.queue_family, Auto);
+    assert_eq!(
+        value_of(&r, "queue.family"),
+        (
+            "auto".into(),
+            "row amd-proprietary-integrated-compute-queue".into()
+        )
+    );
+    let igpu = fixture("raphael-igpu-amdwin");
+    let r = resolve_with(&igpu, &Config::default(), &[], None).unwrap();
+    assert_eq!(r.tuning.queue_family, Graphics);
+    let mut radv = igpu.clone();
+    radv.driver = Some("MESA_RADV".to_string());
+    let r = resolve_with(&radv, &Config::default(), table::builtin(), None).unwrap();
+    assert_eq!(r.tuning.queue_family, Graphics);
+    // The alias, and a user's value on an integrated device.
+    let r = resolve_fixture("rx580-gcn-radv", &env_cfg(&[("INFR_GFX_QUEUE", "1")]));
+    assert_eq!(r.tuning.queue_family, Graphics);
+    let r = resolve_with(
+        &radv,
+        &env_cfg(&[("INFR_TUNE", "queue.family=compute")]),
+        table::builtin(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(r.tuning.queue_family, Compute);
+}
+
+/// The three surfaces a user sets `queue.family` from all reach the resolver, each labelled
+/// with where it came from and the later one winning: the config file's `[kernels.vulkan.tune]`
+/// table, `INFR_TUNE`, and `--set kernels.vulkan.tune.queue.family=...` on the command line.
+#[test]
+fn queue_family_is_set_from_config_env_and_command_line() {
+    use super::QueueFamily::{Compute, Graphics};
+    let facts = fixture("rx7900xtx-amdwin");
+    let file = file_layer("[kernels.vulkan.tune]\n\"queue.family\" = \"graphics\"\n");
+    let env = env_layer(&[("INFR_TUNE", "queue.family=compute")]);
+    let cli = cli_layer(&["kernels.vulkan.tune.queue.family=graphics"]);
+    let resolve = |layers: &[PartialConfig]| {
+        resolve_with(
+            &facts,
+            &Config::load_from_layers(layers),
+            table::builtin(),
+            None,
+        )
+        .unwrap()
+    };
+    let r = resolve(std::slice::from_ref(&file));
+    assert_eq!(r.tuning.queue_family, Graphics);
+    assert!(
+        value_of(&r, "queue.family").1.starts_with("config"),
+        "{:?}",
+        value_of(&r, "queue.family")
+    );
+    let r = resolve(&[file.clone(), env.clone()]);
+    assert_eq!(r.tuning.queue_family, Compute);
+    assert!(
+        value_of(&r, "queue.family").1.starts_with("env INFR_TUNE"),
+        "{:?}",
+        value_of(&r, "queue.family")
+    );
+    let r = resolve(&[file, env, cli]);
+    assert_eq!(r.tuning.queue_family, Graphics);
+    assert!(
+        value_of(&r, "queue.family").1.starts_with("cli --set"),
+        "{:?}",
+        value_of(&r, "queue.family")
+    );
+}
+
+/// `queue.family` takes exactly its three words: every one parses to its value and prints back
+/// as itself, and anything else (the old on/off spellings, `none`, another case) is an error
+/// that names the three.
+#[test]
+fn queue_family_takes_its_three_words_only() {
+    let facts = fixture("rx7900xtx-amdwin");
+    for (word, value) in super::QueueFamily::ALL {
+        let cfg = env_cfg(&[("INFR_TUNE", &format!("queue.family={word}"))]);
+        let r = resolve_with(&facts, &cfg, &[], None).unwrap();
+        assert_eq!(r.tuning.queue_family, value, "{word}");
+        assert_eq!(value_of(&r, "queue.family").0, word);
+        assert_eq!(value.name(), word);
+        assert_eq!(super::QueueFamily::from_name(word), Some(value));
+    }
+    assert_eq!(super::QueueFamily::from_name("gfx"), None);
+    for bad in ["true", "on", "none", "Auto", "gfx"] {
+        let cfg = env_cfg(&[("INFR_TUNE", &format!("queue.family={bad}"))]);
+        let e = resolve_with(&facts, &cfg, &[], None).unwrap_err();
+        assert!(
+            e.contains("queue.family") && e.contains("auto|compute|graphics"),
+            "{bad:?}: {e}"
+        );
+    }
+}
+
+/// `attn_split.decode_min_chunk` keeps PR 105's 16 on the class it was measured on, a discrete
+/// device in the slow class, and the 64 every other device ran before it; `infr tune show` reads
+/// the same field the attention lowering does. A floor above the policy's ceiling is refused.
+#[test]
+fn decode_chunk_floor_follows_the_device_facts() {
+    let floor = |id: &str| fixture_tuning(id).attn_decode_min_chunk;
+    assert_eq!(floor("rx580-gcn-radv"), 16);
+    assert_eq!(floor("rx7900xtx-amdwin"), 64);
+    assert_eq!(floor("rx7900xtx-radv"), 64);
+    assert_eq!(floor("raphael-igpu-amdwin"), 64);
+    let r = resolve_fixture(
+        "rx7900xtx-amdwin",
+        &env_cfg(&[("INFR_TUNE", "attn_split.decode_min_chunk=16")]),
+    );
+    assert_eq!(r.tuning.attn_decode_min_chunk, 16);
+    assert_eq!(value_of(&r, "attn_split.decode_min_chunk").0, "16");
+    let cfg = env_cfg(&[("INFR_TUNE", "attn_split.decode_min_chunk=513")]);
+    let e = resolve_with(&fixture("rx7900xtx-amdwin"), &cfg, &[], None).unwrap_err();
+    assert!(e.contains("out of range"), "{e}");
+}
+
+/// `gemv.kq_fma` is on only where the driver does not report an accelerated packed int8 dot,
+/// which is where the fp32 decode GEMVs were measured (an RX 580 under RADV). The RX 7900 XTX and
+/// the integrated GPU keep the kernels they were tuned with; `INFR_KQ_FMA_GEMV` and `INFR_TUNE`
+/// set it either way.
+#[test]
+fn kq_fma_follows_the_dot_fact() {
+    let on = |id: &str| fixture_tuning(id).gemv_kq_fma;
+    assert!(on("rx580-gcn-radv"));
+    assert!(!on("rx7900xtx-amdwin"));
+    assert!(!on("rx7900xtx-radv"));
+    assert!(!on("raphael-igpu-amdwin"));
+    // The dot fact alone decides: matrix units do not turn it on or off.
+    let mut f = fixture("rx7900xtx-amdwin");
+    f.matrix_units = false;
+    assert!(
+        !resolve_with(&f, &Config::default(), &[], None)
+            .unwrap()
+            .tuning
+            .gemv_kq_fma
+    );
+    f.dot_accelerated = false;
+    assert!(
+        resolve_with(&f, &Config::default(), &[], None)
+            .unwrap()
+            .tuning
+            .gemv_kq_fma
+    );
+    let r = resolve_fixture("rx7900xtx-amdwin", &env_cfg(&[("INFR_KQ_FMA_GEMV", "1")]));
+    assert!(r.tuning.gemv_kq_fma);
+    let r = resolve_fixture(
+        "rx580-gcn-radv",
+        &env_cfg(&[("INFR_TUNE", "gemv.kq_fma=false")]),
+    );
+    assert!(!r.tuning.gemv_kq_fma);
 }

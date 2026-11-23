@@ -40,10 +40,20 @@
 # Prefill chunk for a sequence sharing the GPU (`serve --parallel N`).
 ubatch_parallel = 256
 
-# Submit-splitter cap; 0 = never split. Raise only to chase an iGPU watchdog
-# reset. Default: unset = the measured per-device cap. A bad value is a HARD
-# error, not a fallback.
+# Dispatches per submit a forward STARTS with; the splitter only lowers it from
+# there, to what each measured forward needed, so a larger value does not raise
+# where it ends. 0 = never split: one submit per forward, by dispatch count and
+# by the work bound (`submit.budget_ms` under [kernels.vulkan.tune]) alike.
+# Default: unset = the per-device value (`infr tune show`,
+# `submit.initial_dispatches`). A bad value is a HARD error, not a fallback.
 # submit_dispatches = 64
+
+# Longest one host wait for GPU work, in milliseconds, before the Vulkan
+# backend reports the submit it was waiting on and refuses further work (the
+# process should then exit). 0 = wait forever, for debugging; any other value
+# must be at least 5000. Default: unset = 120000. A bad value is a HARD error,
+# not a fallback.
+# gpu_wait_timeout_ms = 120000
 
 # Subgroup-size preference — exactly 16 or 32; anything else is a HARD error.
 # Default: unset = vendor-derived.
@@ -173,9 +183,8 @@ flash_min_rows = 24
 # Misc.
 push_desc = true
 pipeline_cache_disk = true
-# Submit on the compositor's graphics ring instead of a compute-only one. A
-# discrete GPU defaults to the compute ring so a long prefill does not stall the
-# desktop; set this when that ring misbehaves on the device.
+# Submit on the universal (graphics) queue family instead of a compute-only one.
+# Alias of `"queue.family" = "graphics"` under [kernels.vulkan.tune] below.
 gfx_queue = false
 gpu_pos = true
 fuse_add = true
@@ -185,8 +194,19 @@ no_replay = false # sanctioned negative: true DISABLES the decode replay tape
 # says where each value on a device comes from. A value here beats the built-in
 # table's rows; INFR_TUNE and --set kernels.vulkan.tune.<key>=<value> beat it.
 # [kernels.vulkan.tune]
+# Which queue family inference submits on: auto (a compute-only family when the
+# device has a usable one, so a long forward does not stall the desktop),
+# compute (the same, warning when it has to fall back), or graphics (always the
+# universal family; a little faster on some devices, see docs/config.md).
+# "queue.family" = "auto"
 # "gemv_sg.rows" = 4
 # "mmv_mw.warps@q4_k" = 1
+# "submit.budget_ms" = 250   # estimated GPU time, in ms, past which work is cut:
+#                            # a heavier prefill GEMM is recorded as ranges,
+#                            # each its own submit, and a submit closes at the
+#                            # next op once it holds this much. 0 = off.
+#                            # Default: 250 integrated or slow-class, else 500
+# "submit.prior_gflops" = 16 # throughput assumed before a kernel is measured
 #
 # [kernels.vulkan.tuning]
 # rows = true            # false: generic defaults only, no table rows. On AMD's
@@ -203,9 +223,10 @@ spinpool = true
 repack_mb = 4096 # repack-cache budget, MiB
 reference = false # bit-reference kernels (no env twin)
 core_spread = true # pool threads off each other's SMT siblings (Windows; no env twin)
-# max_tier = "scalar" # SIMD ceiling for the kernels and math slices (scalar/avx2/avx512/
-#                     # avx512vnni); debug only, same bits at every tier; process-wide: the
-#                     # last CPU backend built sets it (unset = the CPU's widest)
+# max_tier = "scalar" # SIMD ceiling for the kernels and math slices (scalar; x86-64: avx2/
+#                     # avx512/avx512vnni; aarch64: dotprod; another arch's tier = no ceiling);
+#                     # debug only, same bits at every tier; process-wide: the last CPU
+#                     # backend built sets it (unset = the CPU's widest)
 
 # ── Profiling ──────────────────────────────────────────────────────────────────
 # wmma_tile = "2x2"   # exactly 1x1 / 2x1 / 2x2; default: unset = shape-driven
@@ -291,6 +312,18 @@ idle_timeout_secs = 0
 # off. The line is ACTIVITY-ONLY: an interval in which nothing happened emits
 # nothing, so an idle server leaves a clean log.
 stats_interval_secs = 5
+
+# Host names a request's `Host` header may carry. Unset, only a keyless loopback
+# server is checked, and it accepts the loopback names on any port. Set, these
+# names are allowed as well and the check always applies. ["*"] turns it off.
+# allowed_hosts = ["llm.example.com"]
+
+# Seconds a streamed reply may stay silent before an SSE comment line is sent,
+# so an idle-timeout proxy does not cut a long prefill. 0 sends none.
+sse_keepalive_secs = 15
+
+# Largest request body accepted, in bytes; a larger one is a 413.
+max_body_bytes = 2097152
 
 # ── debug ────────────────────────────────────────────────────────────────────
 

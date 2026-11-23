@@ -17,9 +17,10 @@
 //! kernels' row-pair and row-quad tails.
 //!
 //! Families with no SIMD tier (the grid-codebook and ternary formats) are listed too: they must
-//! report no tier at all. The f32/f16/bf16 dots (`dot`, `dot_n`, `dot_mn`, `dot_f16`,
-//! `dot_bf16`) have no run-time dispatch; their one source is compiled for the build's target
-//! and fixes the order of every `mul_add` and of the lane sum.
+//! report no tier at all. The f32 dots (`dot`, `dot_n`, `dot_mn`, `dot_f16`, `dot_bf16`, `axpy`,
+//! `dequant_dot_rows`) have their own tests at the end: on a build without FMA they dispatch to
+//! FMA code at the AVX2 tier, which must give the bits of the C runtime's `fmaf`, and every one
+//! of them must be fused at every tier.
 
 // The module is test-only (`kernels.rs` declares it under `cfg(test)`); the attribute says so
 // to `infr-core/tests/no_bare_print.rs` too, which scans a file down to its first one.
@@ -65,14 +66,51 @@ enum Form {
     Eight32(bool),
 }
 
-/// A kernel family: its name, its weight format, the tiers its dispatcher has besides scalar,
-/// and how to run it.
+/// A kernel family: its name, its weight format, the tiers its dispatcher has besides scalar on
+/// this architecture, and how to run it.
 type Family = (&'static str, DType, &'static [SimdTier], Form);
+
+/// The families with a NEON kernel at the aarch64 `dotprod` tier (`kernels/neon.rs`; the Q4_K
+/// 2- and 8-row tiles run its batch kernel row by row there).
+const NEON: [&str; 8] = [
+    "q4k",
+    "q6k",
+    "q8_0",
+    "q4k_batch",
+    "q4k_batch2",
+    "q4k_batch8",
+    "q6k_batch",
+    "q8_0_batch",
+];
+
+/// A family's tiers besides scalar on this architecture: [`families`]' table lists the x86-64
+/// ones; on aarch64 a family in [`NEON`] has `dotprod` and every other has none.
+fn here(name: &str, x86: &'static [SimdTier]) -> &'static [SimdTier] {
+    if cfg!(target_arch = "x86_64") {
+        x86
+    } else if cfg!(target_arch = "aarch64") && NEON.contains(&name) {
+        &[SimdTier::Dotprod]
+    } else {
+        &[]
+    }
+}
 
 /// Weight rows per case: one full 8-row tile.
 const ROWS: usize = 8;
 
+/// Every family, with its tiers on this architecture ([`here`]).
 fn families() -> Vec<Family> {
+    let all = x86_families();
+    for name in NEON {
+        assert!(all.iter().any(|f| f.0 == name), "no family {name}");
+    }
+    all.into_iter()
+        .map(|(name, dt, x86, form)| (name, dt, here(name, x86), form))
+        .collect()
+}
+
+/// Every family, with its tiers on x86-64.
+fn x86_families() -> Vec<Family> {
     use Form::*;
     let k: &[SimdTier] = &[Avx2, Avx512];
     let kv: &[SimdTier] = &[Avx2, Avx512, Vnni];
@@ -299,18 +337,7 @@ const SCALES: [(f32, f32); 7] = [
 /// `ROWS` weight rows of `in_f`: LCG payloads (every code pattern), the scales cycling through
 /// [`SCALES`] so neighbouring blocks differ.
 fn weights(dt: DType, in_f: usize, seed: u32) -> Vec<u8> {
-    let spec = block_spec(dt);
-    let (d, min) = infr_testkit::synth_scales(dt);
-    let nblk = ROWS * in_f / spec.block_elems;
-    let mut w = Vec::with_capacity(nblk * spec.block_bytes);
-    for b in 0..nblk {
-        let mut blk =
-            infr_testkit::lcg_bytes(seed ^ (b as u32).wrapping_mul(0x9e37), spec.block_bytes);
-        let (fd, fm) = SCALES[(b * 5 + b / 7) % SCALES.len()];
-        spec.write_scales(&mut blk, d * fd, min * fm);
-        w.extend_from_slice(&blk);
-    }
-    w
+    crate::test_util::synth_weights(dt, ROWS, in_f, seed, &SCALES)
 }
 
 /// Activation row `r` of `in_f`, from integers: ordinary values, zero, one spike, every element
@@ -436,6 +463,11 @@ fn every_kernel_family_gives_the_scalar_bits_at_every_tier() {
     if !lacking.is_empty() {
         eprintln!("tier_tests: this CPU lacks {lacking:?}; those tiers are not checked here");
     }
+    // A target whose baseline features include the dot-product extension (macOS on Apple
+    // Silicon, CI's macOS leg) must run the NEON kernels here, not skip them as a tier the host
+    // lacks.
+    #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+    assert!(host.contains(&SimdTier::Dotprod), "{host:?}");
     let mut ran = std::collections::BTreeMap::<SimdTier, usize>::new();
     let mut checked = 0usize;
     let mut uncapped = 0usize;
@@ -526,4 +558,855 @@ fn every_quantized_format_has_a_family() {
         let turbo = matches!(dt, DType::Turbo2 | DType::Turbo3 | DType::Turbo4);
         assert!(covered || turbo, "{dt:?}: no kernel family in tier_tests");
     }
+}
+
+/// The sparse part of a split activation (`Q8::hi`, dotted by `vec_dot_hi`) gives the scalar
+/// tier's bits at every tier, and so does the dense dot beside it, for every weight dtype that
+/// takes `Q8` activations, on rows that split: two spikes in the first block, and at the longer
+/// length one more in the last.
+#[test]
+fn the_sparse_activation_part_gives_the_scalar_bits_at_every_tier() {
+    let dts = [
+        DType::Q4K,
+        DType::Q6K,
+        DType::Q8_0,
+        DType::Q5K,
+        DType::Q2K,
+        DType::Q3K,
+        DType::Iq4Xs,
+        DType::Iq2S,
+        DType::Iq2Xs,
+        DType::Iq2Xxs,
+        DType::Iq1S,
+        DType::Iq1M,
+        DType::Iq3S,
+        DType::Iq3Xxs,
+        DType::Tq2_0,
+        DType::Tq1_0,
+    ];
+    let host: Vec<SimdTier> = SimdTier::ALL
+        .into_iter()
+        .filter(|t| t.supported())
+        .collect();
+    let mut checked = 0usize;
+    for dt in dts {
+        for in_f in [256usize, 768] {
+            let w = weights(dt, in_f, 0x51 ^ in_f as u32);
+            let bpr = w.len() / ROWS;
+            let x: Vec<f32> = (0..in_f)
+                .map(|i| match i {
+                    3 => 412.5,
+                    7 => -129.3,
+                    i if i == in_f - 9 => -3.0e4,
+                    _ => ((i * 29 % 97) as f32 - 48.0) / 31.0,
+                })
+                .collect();
+            let q8 = quantize_q8(&x);
+            assert!(
+                !q8.hi.is_empty(),
+                "{dt:?} in_f {in_f}: the row did not split"
+            );
+            let both = |cap: bool| -> Vec<(f32, f32)> {
+                (0..ROWS)
+                    .map(|o| {
+                        let row = &w[o * bpr..(o + 1) * bpr];
+                        if cap {
+                            (
+                                vec_dot_q8_any::<true>(dt, row, &q8, in_f),
+                                vec_dot_hi(dt, row, &q8, in_f),
+                            )
+                        } else {
+                            (
+                                vec_dot_q8_any::<false>(dt, row, &q8, in_f),
+                                vec_dot_hi(dt, row, &q8, in_f),
+                            )
+                        }
+                    })
+                    .collect()
+            };
+            let (want, _) = with_tier(SimdTier::Scalar, || both(true));
+            assert!(
+                want.iter().any(|&(_, h)| h != 0.0),
+                "{dt:?} in_f {in_f}: the sparse part dotted to zero on every row"
+            );
+            let bits = |v: &[(f32, f32)]| -> Vec<(u32, u32)> {
+                v.iter().map(|&(a, b)| (a.to_bits(), b.to_bits())).collect()
+            };
+            for &t in &host {
+                let (got, _) = with_tier(t, || both(true));
+                assert_eq!(
+                    bits(&got),
+                    bits(&want),
+                    "{dt:?} in_f {in_f} at {}",
+                    t.name()
+                );
+                checked += 1;
+            }
+            let (got, _) = with_tier(SimdTier::Scalar, || both(false));
+            assert_eq!(bits(&got), bits(&want), "{dt:?} in_f {in_f} uncapped");
+        }
+    }
+    assert_eq!(checked, dts.len() * 2 * host.len());
+}
+
+/// Scales for [`the_fast_sparse_dot_gives_the_one_row_kernels_bits`]: [`SCALES`]' finite set,
+/// then one where some blocks' scales are infinite or NaN, so a sparse dot that skipped such a
+/// block's term (whose `NaN` the one-row kernel keeps) would differ.
+const HI_SCALES: [&[(f32, f32)]; 2] = [
+    &SCALES,
+    &[
+        (1.0, 1.0),
+        (f32::INFINITY, 1.0),
+        (1.0, f32::NEG_INFINITY),
+        (f32::NAN, 0.5),
+        (-1.0, 0.5),
+    ],
+];
+
+/// The sparse part's fast dot (`vec_dot_hi`, which reads only the weight elements at the part's
+/// codes) gives the bits of the one-row kernels it replaced (`vec_dot_hi_reference`: each part
+/// made whole and dotted by `vec_dot_q8_any`) at every tier the host has, for every format that
+/// takes `Q8` activations: on every pattern of `test_util::spike_patterns` (one spike, two,
+/// several blocks, the first and last index of a block and of each sub-block size, the last
+/// block, equal and opposite spikes, a second part, a scale that overflows against an f16
+/// maximum), on weights with finite scales and with infinite and NaN ones.
+#[test]
+fn the_fast_sparse_dot_gives_the_one_row_kernels_bits() {
+    use crate::test_util::{spike_patterns, spiky_row, Q8_DTYPES};
+    let host: Vec<SimdTier> = SimdTier::ALL
+        .into_iter()
+        .filter(|t| t.supported())
+        .collect();
+    let in_f = 768usize;
+    let rows: Vec<Q8> = (0..spike_patterns(in_f).len())
+        .map(|r| quantize_q8(&spiky_row(r, in_f)))
+        .collect();
+    // The patterns reach what they are meant to: a part with two codes, a part in the last
+    // block, a block with two parts, a code at the last index of a block.
+    let parts = || rows.iter().flat_map(|q| &q.hi);
+    assert!(
+        rows.iter().all(|q| !q.hi.is_empty()),
+        "a pattern did not split"
+    );
+    assert!(parts().any(|p| p.codes().len() == 2));
+    assert!(parts().any(|p| p.b == in_f / 256 - 1));
+    assert!(parts().any(|p| p.codes().iter().any(|c| c.0 == 255)));
+    assert!(rows
+        .iter()
+        .any(|q| q.hi.windows(2).any(|w| w[0].b == w[1].b)));
+    let mut checked = 0usize;
+    for dt in Q8_DTYPES {
+        for (k, scales) in HI_SCALES.iter().enumerate() {
+            let w = crate::test_util::synth_weights(dt, ROWS, in_f, 0x61 + k as u32, scales);
+            let bpr = w.len() / ROWS;
+            for (r, q8) in rows.iter().enumerate() {
+                for o in 0..ROWS {
+                    let row = &w[o * bpr..(o + 1) * bpr];
+                    let got = vec_dot_hi(dt, row, q8, in_f).to_bits();
+                    for &t in &host {
+                        let (want, _) =
+                            with_tier(t, || vec_dot_hi_reference::<true>(dt, row, q8, in_f));
+                        assert_eq!(
+                            got,
+                            want.to_bits(),
+                            "{dt:?} scales {k} pattern {r} weight row {o} at {}: fast {} \
+                             reference {want}",
+                            t.name(),
+                            f32::from_bits(got)
+                        );
+                    }
+                    let want = vec_dot_hi_reference::<false>(dt, row, q8, in_f);
+                    assert_eq!(got, want.to_bits(), "{dt:?} {k} {r} {o} uncapped");
+                    checked += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(checked, Q8_DTYPES.len() * 2 * rows.len() * ROWS);
+}
+
+/// The fast sparse dot against its reference at EVERY element position of a block, for every
+/// format that takes `Q8` activations and every tier: a one-code part at each of the 256
+/// positions, and two-code parts at the pairs that meet each 8-element boundary (the last
+/// element of one group, sub-block or half with the first of the next) and at the pair just
+/// after it. [`the_fast_sparse_dot_gives_the_one_row_kernels_bits`]'s spike patterns reach a
+/// few dozen positions; a decode error confined to some positions of a block (one nibble lane,
+/// one quarter of a Q6_K half) passes them and fails here.
+#[test]
+fn the_fast_sparse_dot_is_exact_at_every_position_of_a_block() {
+    use crate::test_util::Q8_DTYPES;
+    let host: Vec<SimdTier> = SimdTier::ALL
+        .into_iter()
+        .filter(|t| t.supported())
+        .collect();
+    let in_f = 256usize;
+    let base = |i: usize| ((i * 29 % 97) as f32 - 48.0) / 31.0;
+    let row = |spikes: &[(usize, f32)]| -> Q8 {
+        let mut x: Vec<f32> = (0..in_f).map(base).collect();
+        for &(i, v) in spikes {
+            x[i] = v;
+        }
+        let q8 = quantize_q8(&x);
+        let codes: Vec<usize> = q8
+            .hi
+            .iter()
+            .flat_map(|p| p.codes().iter().map(|c| c.0 as usize))
+            .collect();
+        for &(i, _) in spikes {
+            assert!(codes.contains(&i), "no code at {i}: {codes:?}");
+        }
+        q8
+    };
+    let mut rows: Vec<Q8> = (0..in_f).map(|i| row(&[(i, 300.0)])).collect();
+    for b in (8..in_f).step_by(8) {
+        rows.push(row(&[(b - 1, 300.0), (b, -170.0)]));
+        rows.push(row(&[(b, -260.0), (b + 1, 190.0)]));
+    }
+    let mut checked = 0usize;
+    for dt in Q8_DTYPES {
+        let w = crate::test_util::synth_weights(dt, ROWS, in_f, 0x7e, &SCALES);
+        let bpr = w.len() / ROWS;
+        for (r, q8) in rows.iter().enumerate() {
+            for o in 0..ROWS {
+                let wr = &w[o * bpr..(o + 1) * bpr];
+                let got = vec_dot_hi(dt, wr, q8, in_f).to_bits();
+                for &t in &host {
+                    let (want, _) = with_tier(t, || vec_dot_hi_reference::<true>(dt, wr, q8, in_f));
+                    assert_eq!(
+                        got,
+                        want.to_bits(),
+                        "{dt:?} row {r} (codes {:?}) weight row {o} at {}",
+                        q8.hi.iter().map(|p| p.codes().to_vec()).collect::<Vec<_>>(),
+                        t.name()
+                    );
+                }
+                checked += 1;
+            }
+        }
+    }
+    assert_eq!(checked, Q8_DTYPES.len() * rows.len() * ROWS);
+}
+
+// ─── the f32 dots ──────────────────────────────────────────────────────────────────────────────
+
+/// The tier the f32 dots' dispatchers take under a ceiling: their FMA code (an AVX2-tier path)
+/// exists only on a build whose target lacks FMA, and runs only where the CPU has FMA and F16C.
+fn float_expected(ceiling: SimdTier) -> Option<SimdTier> {
+    #[cfg(all(target_arch = "x86_64", not(target_feature = "fma")))]
+    let fma_tier = is_x86_feature_detected!("fma") && is_x86_feature_detected!("f16c");
+    #[cfg(not(all(target_arch = "x86_64", not(target_feature = "fma"))))]
+    let fma_tier = false;
+    (fma_tier && ceiling >= Avx2).then_some(Avx2)
+}
+
+/// `a·b + c` fused and unfused differ on this pair: `W·X = 1 + 2^-6 + 2^-18 + 2^-24` is an exact
+/// halfway case at binary32, which rounds to even (dropping the `2^-24`) when the product is
+/// rounded on its own. Added to `-1` the fused result keeps it: [`FUSED`] against [`UNFUSED`].
+/// `W` is exact in f16 and bf16 (and as `65 · 2^-6` in Q8_0), so every dot can be fed it.
+const W: f32 = 1.0 + 1.0 / 64.0;
+const X: f32 = 1.0 + 1.0 / 262_144.0;
+const FUSED: f32 = 1.0 / 64.0 + 1.0 / 262_144.0 + 1.0 / 16_777_216.0;
+const UNFUSED: f32 = 1.0 / 64.0 + 1.0 / 262_144.0;
+
+/// A float input stream: ordinary values, both zeros, subnormals, huge values that cancel
+/// against their neighbours, and the values of the fused-or-not pairs ([`W`], [`X`], `-1`).
+fn float_vec(seed: usize, n: usize) -> Vec<f32> {
+    (0..n)
+        .map(|i| {
+            let k = i * 31 + seed * 7;
+            let sign = if (k / 11).is_multiple_of(2) {
+                1.0
+            } else {
+                -1.0
+            };
+            match k % 11 {
+                0 => 0.0,
+                1 => -0.0,
+                2 => f32::from_bits(1 + (k as u32 % 4096)) * sign,
+                3 => 3.0e30 * sign,
+                4 => W,
+                5 => X,
+                6 => -1.0,
+                _ => ((k * 29 % 97) as f32 - 48.0) / 13.0,
+            }
+        })
+        .collect()
+}
+
+/// The values compared bit for bit, every NaN folded to one (the C runtime's `fmaf` and the
+/// instruction need only agree on numbers; no input here makes a NaN).
+fn bits(v: &[f32]) -> Vec<u32> {
+    v.iter()
+        .map(|x| if x.is_nan() { 0x7fc0_0000 } else { x.to_bits() })
+        .collect()
+}
+
+/// Every f32 dot's results on one input set, through a `Dots` resolved in the `CAP` compilation.
+fn float_dots<const CAP: bool>(n: usize, seed: usize) -> Vec<f32> {
+    let a = float_vec(seed, n);
+    let bs: [Vec<f32>; 4] = std::array::from_fn(|k| float_vec(seed + 1 + k, n));
+    let br: [&[f32]; 4] = std::array::from_fn(|k| &bs[k][..]);
+    let a2 = float_vec(seed + 9, n);
+    let f16: Vec<u8> = (bs[0].iter())
+        .flat_map(|&v| half::f16::from_f32(v).to_le_bytes())
+        .collect();
+    let bf16: Vec<u8> = (bs[1].iter())
+        .flat_map(|&v| half::bf16::from_f32(v).to_le_bytes())
+        .collect();
+    let mut out = vec![Dots::resolve::<CAP>().dot(&a, &bs[0])];
+    out.extend(Dots::resolve::<CAP>().dot_n(&a, br));
+    out.extend(
+        Dots::resolve::<CAP>()
+            .dot_mn([&a, &a2], br)
+            .into_iter()
+            .flatten(),
+    );
+    out.push(Dots::resolve::<CAP>().dot_f16(&f16, &a));
+    out.push(Dots::resolve::<CAP>().dot_bf16(&bf16, &a));
+    let mut o = a2.clone();
+    Dots::resolve::<CAP>().axpy(&mut o, &bs[2], X);
+    out.extend(o);
+    let mut o = a2.clone();
+    Dots::resolve::<CAP>().mul_add_into(&mut o, &bs[3], &a);
+    out.extend(o);
+    // The f16 KV write's narrowing, its bits carried as small f32 values.
+    let mut h = vec![0u16; n];
+    Dots::resolve::<CAP>().f16_from_f32(&mut h, &bs[3]);
+    out.extend(h.iter().map(|&b| b as f32));
+    out
+}
+
+/// Every weight row of a few formats through `dequant_dot_rows` (the f32-activation expert
+/// GEMM's arm): affine formats it decodes itself, and one (IQ4_NL) that takes the `bytes_to_f32`
+/// fallback.
+fn dequant_dots<const CAP: bool>(in_f: usize) -> Vec<f32> {
+    let mut out = Vec::new();
+    for dt in [
+        DType::Q4K,
+        DType::Q5K,
+        DType::Q6K,
+        DType::Q8_0,
+        DType::Q2K,
+        DType::Q3K,
+        DType::Q4_0,
+        DType::Q5_1,
+        DType::Iq4Nl,
+    ] {
+        if !in_f.is_multiple_of(block_spec(dt).block_elems) {
+            continue;
+        }
+        let w = weights(dt, in_f, 0x5eed ^ in_f as u32);
+        let x: Vec<f32> = (0..3).flat_map(|r| act_row(r, in_f)).collect();
+        for row in w.chunks(w.len() / ROWS) {
+            let mut col = [0f32; 3];
+            let mut accs = Vec::new();
+            crate::dequant_row::dequant_dot_rows(
+                Dots::resolve::<CAP>(),
+                row,
+                dt,
+                &x,
+                in_f,
+                &mut col,
+                &mut accs,
+            );
+            out.extend(col);
+        }
+    }
+    out
+}
+
+/// The f32 dots (`dot`, `dot_n`, `dot_mn`, `dot_f16`, `dot_bf16`, `axpy`, `dequant_dot_rows`)
+/// give the scalar tier's bits at every tier this CPU has, through both compilations, on lengths
+/// that leave every kind of remainder of 8 and on inputs with both zeros, subnormals,
+/// cancellation and the fused-or-not values; and each dispatcher took the tier
+/// [`float_expected`] says. On a baseline x86-64 build that holds the FMA code to the C runtime's
+/// `fmaf`; on a build with FMA there is one code path, and the check is that no dispatcher grew a
+/// tier.
+#[test]
+fn float_dots_give_the_scalar_bits_at_every_tier() {
+    let host: Vec<SimdTier> = SimdTier::ALL
+        .into_iter()
+        .filter(|t| t.supported())
+        .collect();
+    eprintln!(
+        "tier_tests: the f32 dots' FMA tier {}",
+        if float_expected(SimdTier::best()).is_some() {
+            "runs on this build"
+        } else {
+            "is not compiled or not supported here"
+        }
+    );
+    let mut runs = 0;
+    let lens = [0usize, 1, 7, 8, 9, 15, 16, 17, 63, 64, 65, 128, 257];
+    for &n in &lens {
+        for seed in 0..3 {
+            let (want, took) = with_tier(SimdTier::Scalar, || float_dots::<true>(n, seed));
+            assert_eq!(took, None, "n {n}: a check passed at the scalar tier");
+            for &t in &host {
+                let (got, took) = with_tier(t, || float_dots::<true>(n, seed));
+                assert_eq!(took, float_expected(t), "n {n} at {}", t.name());
+                assert_eq!(bits(&got), bits(&want), "n {n} seed {seed} at {}", t.name());
+                runs += 1;
+            }
+            let (got, took) = with_tier(SimdTier::Scalar, || float_dots::<false>(n, seed));
+            assert_eq!(took, None, "the uncapped compilation asked the ceiling");
+            assert_eq!(bits(&got), bits(&want), "n {n} seed {seed} uncapped");
+        }
+    }
+    let widths = [32usize, 256, 512, 1056];
+    for in_f in widths {
+        let (want, _) = with_tier(SimdTier::Scalar, || dequant_dots::<true>(in_f));
+        assert!(!want.is_empty(), "in_f {in_f}: no format ran");
+        for &t in &host {
+            let (got, took) = with_tier(t, || dequant_dots::<true>(in_f));
+            assert_eq!(
+                took,
+                float_expected(t),
+                "dequant in_f {in_f} at {}",
+                t.name()
+            );
+            assert_eq!(
+                bits(&got),
+                bits(&want),
+                "dequant in_f {in_f} at {}",
+                t.name()
+            );
+            runs += 1;
+        }
+        let (got, _) = with_tier(SimdTier::Scalar, || dequant_dots::<false>(in_f));
+        assert_eq!(bits(&got), bits(&want), "dequant in_f {in_f} uncapped");
+    }
+    assert_eq!(runs, host.len() * (lens.len() * 3 + widths.len()));
+}
+
+/// Every f32 dot is FUSED at every tier and in both compilations: on inputs where `a·b + c`
+/// rounded twice gives [`UNFUSED`], each returns [`FUSED`]: inside a lane (element 8 after a `-1`
+/// at element 0, n = 16), in the serial tail (n = 9: the lanes sum to `-1`, then element 8), in
+/// `axpy`, and through `dequant_dot_rows` on Q8_0 codes `-64` and `65` at `d = 2^-6`. Turns red if
+/// a tier, or the scalar code, rounds the product and the sum separately.
+#[test]
+fn float_dots_are_fused_at_every_tier() {
+    assert_ne!(FUSED, UNFUSED);
+    assert_eq!(
+        W * X - 1.0,
+        UNFUSED,
+        "the pair is not a double-rounding case"
+    );
+    assert_eq!(W.mul_add(X, -1.0), FUSED);
+    let host: Vec<SimdTier> = SimdTier::ALL
+        .into_iter()
+        .filter(|t| t.supported())
+        .collect();
+    let mut checked = 0;
+    let mut check = |what: &str, f: &dyn Fn(bool) -> Vec<f32>| {
+        for &t in &host {
+            for cap in [true, false] {
+                for got in with_tier(t, || f(cap)).0 {
+                    assert_eq!(
+                        got.to_bits(),
+                        FUSED.to_bits(),
+                        "{what} at {} (capped {cap}): {got:e}, want the fused {FUSED:e}",
+                        t.name()
+                    );
+                    checked += 1;
+                }
+            }
+        }
+    };
+    for n in [9usize, 16] {
+        let (mut a, mut b) = (vec![0f32; n], vec![0f32; n]);
+        (a[0], b[0], a[8], b[8]) = (-1.0, 1.0, W, X);
+        let wf16: Vec<u8> = (a.iter())
+            .flat_map(|&v| half::f16::from_f32(v).to_le_bytes())
+            .collect();
+        let wbf16: Vec<u8> = (a.iter())
+            .flat_map(|&v| half::bf16::from_f32(v).to_le_bytes())
+            .collect();
+        check(&format!("dot n {n}"), &|cap| {
+            vec![if cap {
+                Dots::resolve::<true>().dot(&a, &b)
+            } else {
+                Dots::resolve::<false>().dot(&a, &b)
+            }]
+        });
+        check(&format!("dot_n n {n}"), &|cap| {
+            if cap {
+                Dots::resolve::<true>().dot_n(&a, [&b, &b]).to_vec()
+            } else {
+                Dots::resolve::<false>().dot_n(&a, [&b, &b]).to_vec()
+            }
+        });
+        check(&format!("dot_mn n {n}"), &|cap| {
+            let r = if cap {
+                Dots::resolve::<true>().dot_mn([&a, &a], [&b, &b, &b])
+            } else {
+                Dots::resolve::<false>().dot_mn([&a, &a], [&b, &b, &b])
+            };
+            r.into_iter().flatten().collect()
+        });
+        check(&format!("dot_f16 n {n}"), &|cap| {
+            vec![if cap {
+                Dots::resolve::<true>().dot_f16(&wf16, &b)
+            } else {
+                Dots::resolve::<false>().dot_f16(&wf16, &b)
+            }]
+        });
+        check(&format!("dot_bf16 n {n}"), &|cap| {
+            vec![if cap {
+                Dots::resolve::<true>().dot_bf16(&wbf16, &b)
+            } else {
+                Dots::resolve::<false>().dot_bf16(&wbf16, &b)
+            }]
+        });
+    }
+    check("mul_add_into", &|cap| {
+        let mut o = vec![-1f32; 19];
+        let (v, e) = (vec![W; 19], vec![X; 19]);
+        if cap {
+            Dots::resolve::<true>().mul_add_into(&mut o, &v, &e);
+        } else {
+            Dots::resolve::<false>().mul_add_into(&mut o, &v, &e);
+        }
+        o
+    });
+    check("axpy", &|cap| {
+        let mut o = vec![-1f32; 19];
+        let v = vec![W; 19];
+        if cap {
+            Dots::resolve::<true>().axpy(&mut o, &v, X);
+        } else {
+            Dots::resolve::<false>().axpy(&mut o, &v, X);
+        }
+        o
+    });
+    let mut blk = half::f16::from_f32(1.0 / 64.0).to_le_bytes().to_vec();
+    let mut codes = [0i8; 32];
+    (codes[0], codes[8]) = (-64, 65);
+    blk.extend(codes.iter().map(|&c| c as u8));
+    let mut x = vec![0f32; 32];
+    (x[0], x[8]) = (1.0, X);
+    check("dequant_dot_rows Q8_0", &|cap| {
+        let (mut col, mut accs) = ([0f32; 1], Vec::new());
+        if cap {
+            crate::dequant_row::dequant_dot_rows(
+                Dots::resolve::<true>(),
+                &blk,
+                DType::Q8_0,
+                &x,
+                32,
+                &mut col,
+                &mut accs,
+            );
+        } else {
+            crate::dequant_row::dequant_dot_rows(
+                Dots::resolve::<false>(),
+                &blk,
+                DType::Q8_0,
+                &x,
+                32,
+                &mut col,
+                &mut accs,
+            );
+        }
+        col.to_vec()
+    });
+    // 5 dots at 2 lengths (dot_n gives 2 values, dot_mn 6), mul_add_into's and axpy's 19, one
+    // dequant: per tier and compilation.
+    assert_eq!(
+        checked,
+        host.len() * 2 * (2 * (1 + 2 + 6 + 1 + 1) + 19 + 19 + 1)
+    );
+}
+
+/// Median ns per element of each f32 dot, single thread, interleaved rounds: its scalar definition
+/// (`*_scalar`, which on a build without FMA calls the C runtime's `fmaf` per element) against
+/// its dispatcher (uncapped: the FMA tier where the build lacks FMA and the CPU has it).
+/// Information for docs/math.md; run on a baseline build to see the FMA tier's gain, and on a
+/// native one, where both columns are the same code.
+#[test]
+#[ignore = "benchmark: run in release on a quiet machine"]
+fn bench_float_dots() {
+    use std::hint::black_box;
+    use std::time::Instant;
+    const ROUNDS: usize = 15;
+    const REPS: usize = 2000;
+    let a = float_vec(1, 4096);
+    let b: Vec<f32> = (0..4096)
+        .map(|i| ((i * 29 % 97) as f32 - 48.0) / 13.0)
+        .collect();
+    let bs: [&[f32]; 4] = std::array::from_fn(|k| &b[k * 128..k * 128 + 128]);
+    let wf16: Vec<u8> = (b.iter())
+        .flat_map(|&v| half::f16::from_f32(v).to_le_bytes())
+        .collect();
+    let wbf16: Vec<u8> = (b.iter())
+        .flat_map(|&v| half::bf16::from_f32(v).to_le_bytes())
+        .collect();
+    let q4k = weights(DType::Q4K, 4096, 3);
+    let q4k_row = &q4k[..q4k.len() / ROWS];
+    type Case<'a> = (&'a str, usize, Box<dyn Fn(bool) -> f32 + 'a>);
+    // Resolved once, as the interpreter does per graph.
+    let dots = Dots::resolve::<false>();
+    let src = &b[..];
+    let cases: Vec<Case> = vec![
+        (
+            "f16_from_f32, 4096",
+            4096,
+            Box::new(|fast| {
+                let mut h = [0u16; 4096];
+                let x = black_box(src);
+                if fast {
+                    dots.f16_from_f32(&mut h, x)
+                } else {
+                    for (o, &v) in h.iter_mut().zip(x) {
+                        *o = half::f16::from_f32(v).to_bits();
+                    }
+                }
+                black_box(&h)[7] as f32
+            }),
+        ),
+        (
+            "dot, 128",
+            128,
+            Box::new(|d| {
+                let (x, y) = (black_box(&a[..128]), black_box(&b[..128]));
+                if d {
+                    dots.dot(x, y)
+                } else {
+                    dot_scalar(x, y)
+                }
+            }),
+        ),
+        (
+            "dot_n<4>, 128",
+            512,
+            Box::new(|d| {
+                let x = black_box(&a[..128]);
+                let r = if d {
+                    dots.dot_n(x, bs)
+                } else {
+                    dot_n_scalar(x, bs)
+                };
+                r[0] + r[3]
+            }),
+        ),
+        (
+            "dot_f16, 4096",
+            4096,
+            Box::new(|d| {
+                let (w, x) = (black_box(&wf16[..]), black_box(&a[..]));
+                if d {
+                    dots.dot_f16(w, x)
+                } else {
+                    dot_f16_scalar(w, x)
+                }
+            }),
+        ),
+        (
+            "dot_bf16, 4096",
+            4096,
+            Box::new(|d| {
+                let (w, x) = (black_box(&wbf16[..]), black_box(&a[..]));
+                if d {
+                    dots.dot_bf16(w, x)
+                } else {
+                    dot_bf16_scalar(w, x)
+                }
+            }),
+        ),
+        (
+            "axpy, 128",
+            128,
+            Box::new(|d| {
+                let mut o = [0f32; 128];
+                let v = black_box(&b[..128]);
+                if d {
+                    dots.axpy(&mut o, v, 0.5)
+                } else {
+                    axpy_scalar(&mut o, v, 0.5)
+                }
+                black_box(&o)[7]
+            }),
+        ),
+        (
+            "dequant_dot_rows Q4_K, 4096",
+            4096,
+            Box::new(|d| {
+                let (mut col, mut accs) = ([0f32; 1], Vec::new());
+                let x = black_box(&a[..]);
+                if d {
+                    crate::dequant_row::dequant_dot_rows(
+                        Dots::resolve::<false>(),
+                        q4k_row,
+                        DType::Q4K,
+                        x,
+                        4096,
+                        &mut col,
+                        &mut accs,
+                    )
+                } else {
+                    crate::dequant_row::with_scalar_dot(
+                        q4k_row,
+                        DType::Q4K,
+                        x,
+                        4096,
+                        &mut col,
+                        &mut accs,
+                    )
+                }
+                col[0]
+            }),
+        ),
+    ];
+    println!("ns per element, median of {ROUNDS} interleaved rounds: scalar | dispatch");
+    for (name, elems, f) in &cases {
+        let mut t = [Vec::new(), Vec::new()];
+        for _ in 0..ROUNDS {
+            for (k, d) in [false, true].into_iter().enumerate() {
+                let s = Instant::now();
+                let mut acc = 0u32;
+                for _ in 0..REPS {
+                    acc ^= black_box(f(d)).to_bits();
+                }
+                black_box(acc);
+                t[k].push(s.elapsed().as_nanos() as f64 / (REPS * elems) as f64);
+            }
+        }
+        let med = |v: &mut Vec<f64>| {
+            v.sort_by(f64::total_cmp);
+            v[v.len() / 2]
+        };
+        println!("{name:30} {:8.4} | {:8.4}", med(&mut t[0]), med(&mut t[1]));
+    }
+}
+
+// ─── the f16 KV write ──────────────────────────────────────────────────────────────────────────
+
+/// `Dots::f16_from_f32` against `half`'s software conversion (`from_f32_const`, which never uses
+/// F16C) on the inputs `xs`, at every tier and uncapped, in slices of awkward lengths. Returns
+/// `(compared, NaN inputs whose bits differ)` and panics on any non-NaN difference.
+fn f16_store_check(xs: &[f32]) -> (usize, usize) {
+    let want: Vec<u16> = xs
+        .iter()
+        .map(|&x| half::f16::from_f32_const(x).to_bits())
+        .collect();
+    let mut nan_diff = 0;
+    let host: Vec<SimdTier> = SimdTier::ALL
+        .into_iter()
+        .filter(|t| t.supported())
+        .collect();
+    // Each tier this CPU has, capped, then `None`: the uncapped compilation.
+    let mut runs: Vec<Option<SimdTier>> = host.into_iter().map(Some).collect();
+    runs.push(None);
+    let run = |t: Option<SimdTier>, d: &mut [u16], x: &[f32]| match t {
+        Some(t) => {
+            with_tier(t, || Dots::resolve::<true>().f16_from_f32(d, x));
+        }
+        None => Dots::resolve::<false>().f16_from_f32(d, x),
+    };
+    let mut got = vec![0u16; xs.len()];
+    for &t in &runs {
+        // Lengths 13 and 8 leave a tail every way the 8-wide loop can.
+        let (mut at, mut k) = (0, 0);
+        while at < xs.len() {
+            let hi = (at + if k % 2 == 0 { 13 } else { 8 }).min(xs.len());
+            run(t, &mut got[at..hi], &xs[at..hi]);
+            (at, k) = (hi, k + 1);
+        }
+        for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
+            if g != w {
+                assert!(
+                    xs[i].is_nan(),
+                    "f16 of {:#010x}: {g:#06x}, software {w:#06x}",
+                    xs[i].to_bits()
+                );
+                nan_diff += 1;
+            }
+        }
+    }
+    (xs.len() * runs.len(), nan_diff)
+}
+
+/// The f16 KV write gives `half`'s software bits on every awkward input: both zeros, the f16
+/// subnormal range and its rounding boundary, overflow to infinity and the largest finite value,
+/// exact halfway cases, infinities, and NaNs of several payloads. Turns red if the wide path
+/// rounds differently (another rounding mode, flushing subnormals) from the scalar one.
+#[test]
+fn f16_store_matches_half_on_awkward_values() {
+    let mut xs: Vec<f32> = vec![
+        0.0,
+        -0.0,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        65504.0,
+        65519.99,
+        65520.0,
+        -65520.0,
+    ];
+    for e in -26i32..=16 {
+        let b = 2f32.powi(e);
+        // The value, and the two halfway points around it at f16's 11-bit precision.
+        for m in [1.0f32, 1.0 + 1.0 / 2048.0, 1.0 + 3.0 / 2048.0, 1.5, 1.999] {
+            xs.push(b * m);
+            xs.push(-b * m);
+        }
+    }
+    for bits in [
+        0x7fc0_0000u32,
+        0x7f80_0001,
+        0x7fbf_ffff,
+        0xffc0_1234,
+        0x7fff_ffff,
+        0x7f80_2000,
+    ] {
+        xs.push(f32::from_bits(bits));
+    }
+    let (n, nan_diff) = f16_store_check(&xs);
+    eprintln!("f16 store: {n} conversions, {nan_diff} NaN results with other bits");
+    assert_eq!(n, xs.len() * f16_store_runs());
+    assert_eq!(
+        nan_diff, 0,
+        "NaN inputs narrowed to other bits than half's software path"
+    );
+}
+
+/// How many paths [`f16_store_check`] runs: each tier this CPU has, and the uncapped one.
+fn f16_store_runs() -> usize {
+    SimdTier::ALL.into_iter().filter(|t| t.supported()).count() + 1
+}
+
+/// [`f16_store_matches_half_on_awkward_values`] over every one of the 2^32 f32 inputs, NaNs
+/// included: every result must have the software conversion's bits, and every input must have
+/// been converted on every path.
+#[test]
+#[ignore = "exhaustive: 2^32 inputs at every tier, minutes"]
+fn f16_store_matches_half_on_every_f32() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (total, nans) = (AtomicUsize::new(0), AtomicUsize::new(0));
+    const SPAN: u64 = 1 << 24;
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|sc| {
+        for _ in 0..std::thread::available_parallelism().map_or(4, |n| n.get()) {
+            sc.spawn(|| loop {
+                let k = next.fetch_add(1, Ordering::Relaxed) as u64;
+                if k * SPAN >= 1 << 32 {
+                    break;
+                }
+                let xs: Vec<f32> = (k * SPAN..(k + 1) * SPAN)
+                    .map(|b| f32::from_bits(b as u32))
+                    .collect();
+                let (n, d) = f16_store_check(&xs);
+                total.fetch_add(n, Ordering::Relaxed);
+                nans.fetch_add(d, Ordering::Relaxed);
+            });
+        }
+    });
+    let (total, nans) = (total.into_inner(), nans.into_inner());
+    eprintln!(
+        "f16 store: {total} conversions over all 2^32 inputs, {nans} NaN results with other bits"
+    );
+    assert_eq!(total, (1usize << 32) * f16_store_runs());
+    assert_eq!(
+        nans, 0,
+        "NaN inputs narrowed to other bits than half's software path"
+    );
 }

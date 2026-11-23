@@ -21,7 +21,10 @@ void main() {
     uint t = gl_LocalInvocationID.x;
     uint tpo = 1u << pc.tpo_log2;
     uint lane = t & (tpo - 1u);
-    uint o = gl_WorkGroupID.x * (256u >> pc.tpo_log2) + (t >> pc.tpo_log2);
+    // The flat workgroup index of a grid `dispatch_wide` may have split into two dimensions; a
+    // padding workgroup past the last output computes zeros and writes nothing (`o < out_f`).
+    uint wg = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    uint o = wg * (256u >> pc.tpo_log2) + (t >> pc.tpo_log2);
     uint nv = pc.in_f >> 2u;
     vec4 a0 = vec4(0.0);
     vec4 a1 = vec4(0.0);

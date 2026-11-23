@@ -292,6 +292,7 @@ pub(crate) fn static_walk_live_positions(
             | Op::Copy { .. }
             | Op::CopyStrided { .. }
             | Op::MoeFfn { .. }
+            | Op::MoeRoute { .. }
             | Op::Conv1dSilu { .. }
             | Op::ShortConv { .. }
             | Op::HeadGate { .. }

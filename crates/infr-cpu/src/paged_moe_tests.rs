@@ -5,7 +5,7 @@
 use super::test_util::det_quant_rows;
 use super::*;
 use infr_core::blockio::{BlockDesc, BlockIo};
-use infr_core::graph::WeightReuse;
+use infr_core::graph::{MoeGating, WeightReuse};
 use infr_core::tensor::TensorDesc;
 use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 use std::time::Duration;

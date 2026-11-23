@@ -117,6 +117,11 @@ impl ChatModel for MetalSeamChat {
         )
     }
 
+    /// One row of the session is kept for the first reply token (see `reply_budget`).
+    fn max_prompt_tokens(&self) -> Option<usize> {
+        self.session.as_ref().map(|s| s.max_ctx.saturating_sub(1))
+    }
+
     fn generate_constrained(
         &mut self,
         prompt: &str,
@@ -184,6 +189,11 @@ impl SpecMetalChat {
 impl ChatModel for SpecMetalChat {
     fn render_model(&self) -> &SeamModel {
         &self.target
+    }
+
+    /// The draft/verify loop has no grammar path.
+    fn supports_constraint(&self) -> bool {
+        false
     }
 
     fn warmup(&mut self) -> Result<()> {

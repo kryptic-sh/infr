@@ -44,6 +44,8 @@ pub(crate) enum Ty {
     Set(&'static [u64]),
     /// One of a fixed set of build names, or `none` for no build.
     Names(&'static [&'static str]),
+    /// Exactly one of a fixed set of words.
+    Choice(&'static [&'static str]),
 }
 
 impl Ty {
@@ -54,6 +56,7 @@ impl Ty {
             Ty::Bool => "true|false".to_string(),
             Ty::Set(v) => v.iter().map(u64::to_string).collect::<Vec<_>>().join("|"),
             Ty::Names(names) => format!("{}|none", names.join("|")),
+            Ty::Choice(words) => words.join("|"),
         }
     }
 
@@ -102,6 +105,13 @@ impl Ty {
                     Err(format!("must be one of {} (got {raw:?})", self.describe()))
                 }
             }
+            Ty::Choice(words) => {
+                if words.contains(&raw) {
+                    Ok(Value::Text(raw.to_string()))
+                } else {
+                    Err(format!("must be one of {} (got {raw:?})", self.describe()))
+                }
+            }
         }
     }
 
@@ -112,6 +122,7 @@ impl Ty {
             (Ty::Set(set), Value::Uint(x)) => set.contains(x),
             (Ty::Bool, Value::Bool(_)) => true,
             (Ty::Names(names), Value::Text(s)) => s == "none" || names.contains(&s.as_str()),
+            (Ty::Choice(words), Value::Text(s)) => words.contains(&s.as_str()),
             _ => false,
         }
     }
@@ -278,6 +289,22 @@ pub(crate) static PARAMS: &[Param] = &[
         set: |t, _, v| {
             t.gemv_variant = (v.text() != "none").then(|| v.text().to_string());
         },
+    },
+    Param {
+        family: "gemv",
+        name: "kq_fma",
+        kind: Kind::Variant,
+        ty: Ty::Bool,
+        axis: Axis::None,
+        doc: "the fp32 decode GEMVs written for devices without an accelerated int8 dot: the \
+              Q4_K/Q6_K GEMV on f32 activations (native_gemv_kq_fma, and its multi-row twin for \
+              MTP verify batches), the multi-output f32 GEMV (linear_f32_mo) and the bf16 \
+              reduction GEMV for one-row bf16 weights",
+        rule: "true where the driver does not report the packed int8 dot as accelerated, where \
+               they were measured; else false",
+        default: |f, _| Value::Bool(!f.dot_accelerated),
+        get: |t, _| Value::Bool(t.gemv_kq_fma),
+        set: |t, _, v| t.gemv_kq_fma = v.flag(),
     },
     Param {
         family: "gemv_rm",
@@ -631,11 +658,33 @@ pub(crate) static PARAMS: &[Param] = &[
         kind: Kind::Fixed,
         ty: uint(64, 64),
         axis: Axis::None,
-        doc: "decode split-K attention: fewest keys per chunk",
-        rule: "64 (fixed: attn_live.comp)",
+        doc: "split-K attention of a batched forward's rows: fewest keys per chunk (decode rows \
+              take attn_split.decode_min_chunk)",
+        rule: "64 (fixed: the host policy the small-batch prefill tiers were measured with)",
         default: |_, _| Value::Uint(crate::adapter::ATTN_SPLIT.min_chunk as u64),
         get: |_, _| Value::Uint(crate::adapter::ATTN_SPLIT.min_chunk as u64),
         set: fixed_set,
+    },
+    Param {
+        family: "attn_split",
+        name: "decode_min_chunk",
+        kind: Kind::Host,
+        ty: uint(1, crate::adapter::ATTN_SPLIT.max_chunk as u64),
+        axis: Axis::None,
+        doc: "decode split-K attention: fewest keys per chunk, for a decode row and for the MTP \
+              verify rows that must match it; it sets the chunk of every span under 32 times \
+              its value",
+        rule: "16 on a discrete device in the slow class (no matrix units and no accelerated \
+               int8 dot, or wave64-only), where it was measured; else 64",
+        default: |f, _| {
+            Value::Uint(if !f.integrated && f.slow_class() {
+                16
+            } else {
+                64
+            })
+        },
+        get: |t, _| Value::Uint(t.attn_decode_min_chunk as u64),
+        set: |t, _, v| t.attn_decode_min_chunk = v.usize(),
     },
     Param {
         family: "attn_split",
@@ -675,6 +724,86 @@ pub(crate) static PARAMS: &[Param] = &[
         default: |_, _| Value::Uint(8),
         get: |t, _| Value::Uint(t.moe_small_m as u64),
         set: |t, _, v| t.moe_small_m = v.usize(),
+    },
+    // ── queue ────────────────────────────────────────────────────────────────
+    Param {
+        family: "queue",
+        name: "family",
+        kind: Kind::Host,
+        ty: Ty::Choice(super::QueueFamily::NAMES),
+        axis: Axis::None,
+        doc: "which queue family inference submits on. auto: a COMPUTE-only family when the \
+              device has one that writes timestamps (amdgpu: the comp rings, scheduled beside \
+              the ring the compositor renders on, so the desktop stays responsive), else the \
+              universal family. compute: the same choice, with a warning that says why when it \
+              falls back. graphics: always the universal (graphics and compute) family",
+        rule: "auto on a discrete device; graphics on an integrated one, where the compute \
+               ring's hang budget measured tighter under RADV (a measured driver's row sets auto)",
+        default: |f, _| {
+            let v = if f.integrated {
+                super::QueueFamily::Graphics
+            } else {
+                super::QueueFamily::Auto
+            };
+            Value::Text(v.name().to_string())
+        },
+        get: |t, _| Value::Text(t.queue_family.name().to_string()),
+        set: |t, _, v| {
+            t.queue_family =
+                super::QueueFamily::from_name(v.text()).expect("validated as a queue family");
+        },
+    },
+    // ── submit splitter ──────────────────────────────────────────────────────
+    Param {
+        family: "submit",
+        name: "initial_dispatches",
+        kind: Kind::Host,
+        ty: uint(0, USIZE),
+        axis: Axis::None,
+        doc: "dispatches per submit before any forward has been measured (0 = never split); \
+              protects the first forward from a driver's job timeout until the measured \
+              splitter takes over. `device.submit_dispatches` overrides it",
+        rule: "128 integrated; 64 on a discrete device without matrix units and accelerated \
+               int8 dot, or wave64-only; else 0",
+        default: |f, _| {
+            Value::Uint(infr_core::initial_submit_dispatch_cap(f.integrated, f.slow_class()) as u64)
+        },
+        get: |t, _| Value::Uint(t.submit_initial_dispatches as u64),
+        set: |t, _, v| t.submit_initial_dispatches = v.usize(),
+    },
+    Param {
+        family: "submit",
+        name: "budget_ms",
+        kind: Kind::Host,
+        ty: uint(0, 60_000),
+        axis: Axis::None,
+        doc: "estimated GPU time, in ms, past which a forward's work is cut: a prefill GEMM or \
+              GEMV estimated above it is recorded as ranges of its grid, each in its own submit \
+              (at most one range per workgroup along the cut dimension), and a submit is closed \
+              at the next op boundary once its estimated work reaches it, so a submit can hold \
+              up to about twice this (0 = no work bound; the dispatch-count splitter still \
+              applies)",
+        rule: "on an integrated or slow-class device, the dispatch-count splitter's target for \
+               one submit (SUBMIT_BUDGET_NS); else the time from which that splitter treats a \
+               forward as dangerous (SUBMIT_DANGER_NS) over the budgets one submit can hold",
+        default: |f, _| Value::Uint(u64::from(crate::work::default_budget_ms(f.reset_prone()))),
+        get: |t, _| Value::Uint(u64::from(t.submit_budget_ms)),
+        set: |t, _, v| t.submit_budget_ms = v.u32(),
+    },
+    Param {
+        family: "submit",
+        name: "prior_gflops",
+        kind: Kind::Host,
+        ty: uint(1, U32),
+        axis: Axis::None,
+        doc: "throughput, in GFLOP/s for the whole device, the work estimate assumes for the \
+              slowest prefill kernel family before this process has measured the kernel \
+              (faster families scale it up; a timed dispatch or a segment's GPU time replaces \
+              it, within a bounded gain)",
+        rule: "8 per compute unit (2 units when the count is unknown)",
+        default: |f, _| Value::Uint(crate::work::prior_gflops(f.compute_units) as u64),
+        get: |t, _| Value::Uint(u64::from(t.submit_prior_gflops)),
+        set: |t, _, v| t.submit_prior_gflops = v.u32(),
     },
     // ── prefill GEMM ─────────────────────────────────────────────────────────
     Param {
@@ -958,6 +1087,27 @@ pub(crate) static ALIASES: &[Alias] = &[
         // Only OFF ever meant anything: `true` (the default) left the driver gate in charge.
         read: |c, _| {
             (!c.kernels.vulkan.i8cm_kq).then(|| vec![("gemm_i8cm_kq.enabled", Value::Bool(false))])
+        },
+    },
+    Alias {
+        path: "kernels.vulkan.kq_fma_gemv",
+        params: &["gemv.kq_fma"],
+        read: |c, _| {
+            c.kernels
+                .vulkan
+                .kq_fma_gemv
+                .map(|v| vec![("gemv.kq_fma", Value::Bool(v))])
+        },
+    },
+    Alias {
+        path: "kernels.vulkan.gfx_queue",
+        params: &["queue.family"],
+        // Only ON ever meant anything: unset leaves the device rule and the table in charge.
+        read: |c, _| {
+            c.kernels
+                .vulkan
+                .gfx_queue
+                .then(|| vec![("queue.family", Value::Text("graphics".to_string()))])
         },
     },
     Alias {

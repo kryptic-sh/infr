@@ -12,10 +12,10 @@
 //!
 //! So a case passes only if its result does not depend on the SIMD tier, the thread count or the
 //! way the pool chunks the work, and is the value Windows and Linux computed when it was blessed;
-//! CI runs it on Linux, Windows and macOS (aarch64, the scalar tier only), which makes the macOS
-//! run the architecture check. Print fresh values with `INFR_OP_HASH_BLESS=1 cargo test -p
-//! infr-cpu --test op_hashes -- --nocapture`, and bless them only when every system prints the
-//! same ones.
+//! CI runs it on Linux, Windows and macOS (aarch64: the scalar tier and the NEON `dotprod` one),
+//! which makes the macOS run the architecture check. Print fresh values with
+//! `INFR_OP_HASH_BLESS=1 cargo test -p infr-cpu --test op_hashes -- --nocapture`, and bless them
+//! only when every system prints the same ones.
 //!
 //! The ceiling is process-wide, so the cases run one after another in one test.
 
@@ -49,6 +49,18 @@ fn val(seed: u64, i: usize) -> f32 {
 
 fn vals(seed: u64, n: usize) -> Vec<f32> {
     (0..n).map(|i| val(seed, i)).collect()
+}
+
+/// [`val`] made inexact in every reduced-precision format: scaled by `1 + 2^-10 + 2^-20` and
+/// offset by a second stream's `val / 4096`, so most elements need all 24 bits of an f32 and a
+/// conversion to f16 or bf16 must round (a `val` alone, a multiple of 2^-9 in [-2, 2), fits f16
+/// exactly and hides how the KV write rounds). Plain binary32 arithmetic on integer-generated
+/// values: the same bits on every machine.
+fn inexact_vals(seed: u64, n: usize) -> Vec<f32> {
+    const SCALE: f32 = 1.0 + 1.0 / 1024.0 + 1.0 / 1_048_576.0;
+    (0..n)
+        .map(|i| val(seed, i) * SCALE + val(seed + 1000, i) / 4096.0)
+        .collect()
 }
 
 fn f32_bytes(v: &[f32]) -> Vec<u8> {
@@ -252,6 +264,125 @@ fn linear(dt: DType, m: usize, in_f: usize, out_f: usize, reference: bool) -> Ca
         out_f: out_f as u32,
         w_off: 0,
     })
+}
+
+/// Row `r` of an activation whose 256-element blocks carry outliers, for the production
+/// quantizer's split (`quant::quantize_q8`: of a block's two largest magnitudes, those above 16
+/// times the next largest move to a sparse part). The rest of each block is `val / 2`, in
+/// [-1, 1); block `b` of row `r` takes pattern `(r + b) % 9`: no spike; one spike; two of
+/// opposite signs; three (the two-element cap: nothing splits); a spike exactly 16 times the
+/// next largest (no split) and one just over it (a split); two spikes of equal magnitude; a
+/// spike over an all-zero rest; and two spikes far apart, whose second needs a second part.
+/// Every value is an integer or a short binary fraction: the same bits on every machine.
+///
+/// Planted faults these rows are known to catch (2026-11-19): a split ratio one below the
+/// committed one at the scalar tier only (every 256-block `Linear spiky` case and both rows-9 MoE
+/// cases), a tier-dependent sparse dot, and a changed sparse sum in each prefill route and in the
+/// MoE expert GEMM. Other tests caught the same plants: a tier-dependent sparse dot,
+/// `the_sparse_activation_part_gives_the_scalar_bits_at_every_tier` (each format's sparse part
+/// against the scalar tier's bits); a changed sparse sum in either prefill route,
+/// `prefill_linear_matches_one_row_linear_bitwise_for_every_dtype` and
+/// `first_token_spikes_keep_the_rest_of_their_block` (a prefill row against the same row alone);
+/// a changed MoE sparse add, `expert_gemm_range_matches_the_single_token_kernels_bitwise`.
+/// The index tie-break cannot change a result, so no case is owed for it: equal magnitudes are
+/// either both kept or neither exceeds the ratio over the other, and the kept indices are used
+/// only as a set (a reversed tie-break, planted, moved nothing).
+fn spiky_row(r: usize, in_f: usize) -> Vec<f32> {
+    let mut x: Vec<f32> = (0..in_f).map(|i| val(130 + r as u64, i) / 2.0).collect();
+    for (b, blk) in x.chunks_mut(256).enumerate() {
+        let p = (r * 37 + b * 11) % 190;
+        match (r + b) % 9 {
+            0 => {}
+            1 => blk[p] = 48.0,
+            2 => {
+                blk[p] = 48.0;
+                blk[p + 17] = -40.0;
+            }
+            3 => {
+                blk[p] = 48.0;
+                blk[p + 17] = 44.0;
+                blk[p + 40] = -40.0;
+            }
+            4 => {
+                blk[p] = 24.0;
+                blk[p + 40] = 1.5;
+                blk[p + 60] = -1.5;
+            }
+            5 => {
+                blk[p] = 24.0 + 1.0 / 64.0;
+                blk[p + 40] = 1.5;
+                blk[p + 60] = -1.5;
+            }
+            6 => {
+                blk[p] = 32.0;
+                blk[p + 17] = -32.0;
+            }
+            7 => {
+                blk.fill(0.0);
+                blk[p] = 37.0;
+            }
+            _ => {
+                blk[p] = 3000.0;
+                blk[p + 17] = 941.0625;
+            }
+        }
+    }
+    x
+}
+
+/// [`linear`] on [`spiky_row`] activations, 2048 wide (eight blocks a row).
+fn linear_spiky(dt: DType, m: usize) -> Case {
+    let (in_f, out_f) = (2048usize, 20usize);
+    let mut c = Case::new(format!("Linear spiky {dt:?} m{m} {in_f}x{out_f}"));
+    let xs: Vec<f32> = (0..m).flat_map(|r| spiky_row(r, in_f)).collect();
+    let x = c.input(vec![m, in_f], DType::F32, f32_bytes(&xs));
+    let w = c.weight_q(dt, out_f, in_f, 0x5eed ^ in_f as u32);
+    let dst = c.output(vec![m, out_f], DType::F32);
+    c.push(Op::Linear {
+        x,
+        weight: w,
+        dst,
+        m: m as u32,
+        in_f: in_f as u32,
+        out_f: out_f as u32,
+        w_off: 0,
+    })
+}
+
+/// The formats whose activations take the 256-element quantizer at width 2048.
+const SPLIT_FORMATS: [DType; 16] = [
+    DType::Q8_0,
+    DType::Q2K,
+    DType::Q3K,
+    DType::Q4K,
+    DType::Q5K,
+    DType::Q6K,
+    DType::Iq1S,
+    DType::Iq1M,
+    DType::Iq2Xxs,
+    DType::Iq2Xs,
+    DType::Iq2S,
+    DType::Iq3Xxs,
+    DType::Iq3S,
+    DType::Iq4Xs,
+    DType::Tq1_0,
+    DType::Tq2_0,
+];
+
+/// Outlier rows through every route that dots a `Q8`: one row, a small batch, and 19 rows (the
+/// tiles and, at AVX-512 VNNI, the packed GEMM). The 32-element quantizer (`Q4_0`, `Q5_0` here)
+/// does not split; its cases pin how it meets the same rows.
+fn spiky_linear_cases() -> Vec<Case> {
+    let mut v = Vec::new();
+    for dt in SPLIT_FORMATS {
+        for m in [1usize, 5, 19] {
+            v.push(linear_spiky(dt, m));
+        }
+    }
+    for dt in [DType::Q4_0, DType::Q5_0] {
+        v.push(linear_spiky(dt, 5));
+    }
+    v
 }
 
 fn linear_cases() -> Vec<Case> {
@@ -521,7 +652,14 @@ fn kv_cache_len(dt: DType, n: usize) -> usize {
 fn kv_format_cases() -> Vec<Case> {
     let (rows, nh, nkv, hd, cap) = (5usize, 4usize, 2usize, 64usize, 8usize);
     let width = nkv * hd;
-    let src = |seed: u64| -> Vec<f32> {
+    // The float formats get values they cannot hold exactly, so the write's rounding shows; the
+    // quantized ones round every value anyway.
+    let src = |seed: u64, dt: DType| -> Vec<f32> {
+        let body = if matches!(dt, DType::F16 | DType::Bf16) {
+            inexact_vals(seed, rows * width)
+        } else {
+            vals(seed, rows * width)
+        };
         (0..rows * width)
             .map(|i| match i / width {
                 0 => {
@@ -532,7 +670,7 @@ fn kv_format_cases() -> Vec<Case> {
                     }
                 }
                 1 => 0.75,
-                _ => val(seed, i),
+                _ => body[i],
             })
             .collect()
     };
@@ -552,8 +690,8 @@ fn kv_format_cases() -> Vec<Case> {
         DType::Turbo4,
     ] {
         let mut c = Case::new(format!("KV {dt:?} write and attend"));
-        let ks = c.input(vec![rows, width], DType::F32, f32_bytes(&src(130)));
-        let vs = c.input(vec![rows, width], DType::F32, f32_bytes(&src(131)));
+        let ks = c.input(vec![rows, width], DType::F32, f32_bytes(&src(130, dt)));
+        let vs = c.input(vec![rows, width], DType::F32, f32_bytes(&src(131, dt)));
         let bytes = vec![0u8; kv_cache_len(dt, cap * width)];
         let kc = c.state(vec![cap * width], dt, bytes.clone());
         let vc = c.state(vec![cap * width], dt, bytes);
@@ -778,10 +916,21 @@ fn attention_cases() -> Vec<Case> {
         }),
     }));
 
-    for dt in [DType::F16, DType::Q4_0] {
-        let (rows, cap, w, pos) = (3usize, 16usize, 64usize, 5usize);
-        let mut c = Case::new(format!("WriteKv {dt:?}"));
-        let src = c.input_f32(vec![rows, w], 38);
+    // F16 on inexact values, at a width of 64 and at 61, where the 8-wide narrowing leaves a
+    // tail in every row.
+    for (dt, w, name) in [
+        (DType::F16, 64usize, "WriteKv F16"),
+        (DType::F16, 61, "WriteKv F16 width 61"),
+        (DType::Q4_0, 64, "WriteKv Q4_0"),
+    ] {
+        let (rows, cap, pos) = (3usize, 16usize, 5usize);
+        let mut c = Case::new(name);
+        let x = if dt == DType::F16 {
+            inexact_vals(38, rows * w)
+        } else {
+            vals(38, rows * w)
+        };
+        let src = c.input(vec![rows, w], DType::F32, f32_bytes(&x));
         let cache = c.state(vec![cap * w], dt, kv_bytes(dt, cap, w, pos, 39));
         v.push(c.push(Op::WriteKv {
             src,
@@ -1292,6 +1441,41 @@ fn moe(name: &str, dt: DType, rows: usize, gating: MoeGating, variant: u8) -> Ca
     })
 }
 
+/// The router's selection alone, for `rows` tokens over `n_expert` experts: the ids, and with
+/// `biased` the selection bias, group-limited routing and the scores the experts were ranked by.
+fn moe_route(name: &str, rows: usize, gating: MoeGating, biased: bool) -> Case {
+    let (ne, n_expert, n_used) = (256usize, 8usize, 3usize);
+    let mut c = Case::new(format!("MoeRoute {name} rows {rows}"));
+    let x = c.input_f32(vec![rows, ne], 120);
+    let router = c.weight_f32(vec![n_expert, ne], 121);
+    let exp_probs_b = biased.then(|| c.weight_f32(vec![n_expert], 125));
+    let dst_ids = c.output(vec![rows, n_used], DType::F32);
+    let dst_scores = biased.then(|| c.output(vec![rows, n_expert], DType::F32));
+    c.push(Op::MoeRoute {
+        router_x: x,
+        router,
+        exp_probs_b,
+        dst_ids,
+        dst_scores,
+        ne: ne as u32,
+        n_expert: n_expert as u32,
+        n_used: n_used as u32,
+        gating,
+        n_expert_groups: if biased { 4 } else { 0 },
+        n_expert_groups_used: if biased { 2 } else { 0 },
+    })
+}
+
+/// [`moe`] on [`spiky_row`] activations (one block a row, row `r` taking pattern `r + 1`, so the
+/// one-row case has a spike), through the expert banks' `Q8` route.
+fn moe_spiky(dt: DType, rows: usize) -> Case {
+    let mut c = moe("spiky", dt, rows, MoeGating::Softmax, 0);
+    let xs: Vec<f32> = (0..rows).flat_map(|r| spiky_row(r + 1, 256)).collect();
+    // The layer's input is the case's first bound tensor (`moe` binds it first).
+    c.bound[0].1 = f32_bytes(&xs);
+    c
+}
+
 fn moe_cases() -> Vec<Case> {
     let mut v = Vec::new();
     for dt in [DType::Q4K, DType::Q6K, DType::Q8_0, DType::Q5_0, DType::F16] {
@@ -1308,12 +1492,20 @@ fn moe_cases() -> Vec<Case> {
         2,
     ));
     v.push(moe("weight before", DType::Q4K, 5, MoeGating::Sigmoid, 3));
+    v.push(moe_route("softmax", 9, MoeGating::Softmax, false));
+    v.push(moe_route("grouped biased", 5, MoeGating::Sigmoid, true));
+    v.push(moe_spiky(DType::Q4K, 1));
+    v.push(moe_spiky(DType::Q4K, 9));
+    v.push(moe_spiky(DType::Q6K, 9));
+    v.push(moe_spiky(DType::Q5K, 9));
+    v.push(moe_spiky(DType::Q8_0, 9));
     v
 }
 
 fn cases() -> Vec<Case> {
     let mut v = Vec::new();
     v.extend(linear_cases());
+    v.extend(spiky_linear_cases());
     v.extend(norm_cases());
     v.extend(rope_cases());
     v.extend(attention_cases());
@@ -1365,6 +1557,7 @@ fn op_name(op: &Op) -> &'static str {
         Op::Copy { .. } => "Copy",
         Op::CopyStrided { .. } => "CopyStrided",
         Op::MoeFfn { .. } => "MoeFfn",
+        Op::MoeRoute { .. } => "MoeRoute",
         Op::Conv1dSilu { .. } => "Conv1dSilu",
         Op::ShortConv { .. } => "ShortConv",
         Op::HeadGate { .. } => "HeadGate",
@@ -1497,13 +1690,14 @@ const EXPECTED: &[(&str, u64)] = &[
     ("Attention window q4_0 kv", 0x573a8ad55fac6f70),
     ("Attention sinks key_bias", 0x99db266e7d4a5969),
     ("Attention comp segment", 0xd06093c9b9126d06),
-    ("WriteKv F16", 0x28d40a2f25abc3be),
+    ("WriteKv F16", 0x9251f37837f52d3f),
+    ("WriteKv F16 width 61", 0xdc0f7d67cec92a2d),
     ("WriteKv Q4_0", 0x4f536590c43efedc),
     ("Mla", 0x555b78feb583f984),
     ("LightningIndexer TopkMask", 0x0ec80ae09928fb74),
     ("KV F32 write and attend", 0x094d8912d2db3f8d),
-    ("KV F16 write and attend", 0xa5b6c5eb76c83ff5),
-    ("KV Bf16 write and attend", 0x0b8b1483b43a97c6),
+    ("KV F16 write and attend", 0xea88366b6189a0a9),
+    ("KV Bf16 write and attend", 0x880d37e4101d5a1b),
     ("KV Q8_0 write and attend", 0x93ad98142cd777ee),
     ("KV Q4_0 write and attend", 0xc65665a1b22b10fa),
     ("KV Q4_1 write and attend", 0x3af6531a77ec0857),
@@ -1543,19 +1737,76 @@ const EXPECTED: &[(&str, u64)] = &[
     ("Conv1dSilu", 0x0352fc2a7484d21a),
     ("ShortConv", 0x67a6bd345ba46fa4),
     ("DeltaNet", 0x2f0a40475d4b4085),
-    ("MoeFfn softmax Q4K rows 1", 0x87ab6eb2eb5edbf2),
+    ("MoeFfn softmax Q4K rows 1", 0x1d2a2edb4078ed10),
     ("MoeFfn softmax Q4K rows 9", 0x7dbc267c9f2ef97c),
-    ("MoeFfn softmax Q6K rows 1", 0x7c46a6a6c71b0396),
+    ("MoeFfn softmax Q6K rows 1", 0xfd869ffe8d226e93),
     ("MoeFfn softmax Q6K rows 9", 0x0804efa239fe3838),
-    ("MoeFfn softmax Q8_0 rows 1", 0x02ded759525c7353),
+    ("MoeFfn softmax Q8_0 rows 1", 0xa2ea513858997419),
     ("MoeFfn softmax Q8_0 rows 9", 0xf18bdb7f12b96ab3),
-    ("MoeFfn softmax Q5_0 rows 1", 0x56b84a160160c72f),
+    ("MoeFfn softmax Q5_0 rows 1", 0xa6222d3ef4e12f54),
     ("MoeFfn softmax Q5_0 rows 9", 0xf274033123784d70),
     ("MoeFfn softmax F16 rows 1", 0x7ada78c4c40cc59d),
     ("MoeFfn softmax F16 rows 9", 0x975c267fd160643e),
     ("MoeFfn grouped biased Q4K rows 5", 0x10423bc2d8e420c5),
     ("MoeFfn hash routed Q4K rows 5", 0x187b3a67fc5c9f74),
     ("MoeFfn weight before Q4K rows 5", 0x900aebc15c5f130a),
+    ("MoeRoute softmax rows 9", 0xf53a2f7458baa5a4),
+    ("MoeRoute grouped biased rows 5", 0x5cdbb9b7690ae42f),
+    ("Linear spiky Q8_0 m1 2048x20", 0x40f8b4137666ffa0),
+    ("Linear spiky Q8_0 m5 2048x20", 0x2cd687dc906069cd),
+    ("Linear spiky Q8_0 m19 2048x20", 0x7bd1efa8a4761e11),
+    ("Linear spiky Q2K m1 2048x20", 0xf6a57637771b38fd),
+    ("Linear spiky Q2K m5 2048x20", 0xe1aba5d8f30dfa02),
+    ("Linear spiky Q2K m19 2048x20", 0x029bcd428eee348d),
+    ("Linear spiky Q3K m1 2048x20", 0xfd4ea2d127dba5e1),
+    ("Linear spiky Q3K m5 2048x20", 0xa19b7e08a0105a61),
+    ("Linear spiky Q3K m19 2048x20", 0x4c01e6beb4501263),
+    ("Linear spiky Q4K m1 2048x20", 0xf70c14002b9cb703),
+    ("Linear spiky Q4K m5 2048x20", 0x43ed01d564835580),
+    ("Linear spiky Q4K m19 2048x20", 0xc2bec0e54bcb7017),
+    ("Linear spiky Q5K m1 2048x20", 0x7e1a7ef2e5a582df),
+    ("Linear spiky Q5K m5 2048x20", 0x2f0491aad9181277),
+    ("Linear spiky Q5K m19 2048x20", 0xb22b4e8b02a2ae6a),
+    ("Linear spiky Q6K m1 2048x20", 0x417e374fdaa356f6),
+    ("Linear spiky Q6K m5 2048x20", 0x1c07fb95f87f85a1),
+    ("Linear spiky Q6K m19 2048x20", 0xfcac95ccc0a55536),
+    ("Linear spiky Iq1S m1 2048x20", 0xe5bbd9ca8de1bf3f),
+    ("Linear spiky Iq1S m5 2048x20", 0x304c03d16cb34269),
+    ("Linear spiky Iq1S m19 2048x20", 0xec4da9138e935cde),
+    ("Linear spiky Iq1M m1 2048x20", 0x5821199a71e8fcb0),
+    ("Linear spiky Iq1M m5 2048x20", 0x58ea59c623ec61e8),
+    ("Linear spiky Iq1M m19 2048x20", 0x941c47e9bc2df9a1),
+    ("Linear spiky Iq2Xxs m1 2048x20", 0x8d168bedc22f9a30),
+    ("Linear spiky Iq2Xxs m5 2048x20", 0xbfb0a7f3c796773c),
+    ("Linear spiky Iq2Xxs m19 2048x20", 0x90ce408837e1396e),
+    ("Linear spiky Iq2Xs m1 2048x20", 0x8ca9c6bb8a1edbba),
+    ("Linear spiky Iq2Xs m5 2048x20", 0xc4d777fa3f234846),
+    ("Linear spiky Iq2Xs m19 2048x20", 0x8feb44204f4d0c19),
+    ("Linear spiky Iq2S m1 2048x20", 0x17fd468283b0fcbc),
+    ("Linear spiky Iq2S m5 2048x20", 0xa8f89a402432f477),
+    ("Linear spiky Iq2S m19 2048x20", 0xb296454308c0c894),
+    ("Linear spiky Iq3Xxs m1 2048x20", 0x85558358df003261),
+    ("Linear spiky Iq3Xxs m5 2048x20", 0xc54d2656b8ec3b1a),
+    ("Linear spiky Iq3Xxs m19 2048x20", 0x7a0ab86fbdcaa96e),
+    ("Linear spiky Iq3S m1 2048x20", 0x932f4a6fcbebb571),
+    ("Linear spiky Iq3S m5 2048x20", 0x0b48f2ddc5802f5a),
+    ("Linear spiky Iq3S m19 2048x20", 0x3d6644a122ac789d),
+    ("Linear spiky Iq4Xs m1 2048x20", 0xaaf4758a5ee8edf1),
+    ("Linear spiky Iq4Xs m5 2048x20", 0x35409e9c3dfaa5dc),
+    ("Linear spiky Iq4Xs m19 2048x20", 0xa8ef0a52333b3848),
+    ("Linear spiky Tq1_0 m1 2048x20", 0x042c500c0185e8e6),
+    ("Linear spiky Tq1_0 m5 2048x20", 0x1873b7fec8495ff0),
+    ("Linear spiky Tq1_0 m19 2048x20", 0xe032ca3b24e2cccb),
+    ("Linear spiky Tq2_0 m1 2048x20", 0x4e80f8113381b3e2),
+    ("Linear spiky Tq2_0 m5 2048x20", 0xcf6b12c6b8bff7e4),
+    ("Linear spiky Tq2_0 m19 2048x20", 0x852341c157b979ff),
+    ("Linear spiky Q4_0 m5 2048x20", 0x0d7f967eecaa70d3),
+    ("Linear spiky Q5_0 m5 2048x20", 0x135f583fad126509),
+    ("MoeFfn spiky Q4K rows 1", 0x4af77004ed01ec62),
+    ("MoeFfn spiky Q4K rows 9", 0x3ebab35b901e370a),
+    ("MoeFfn spiky Q6K rows 9", 0x1cc32f28e1efc6e5),
+    ("MoeFfn spiky Q5K rows 9", 0x5c65cc5affb55a8d),
+    ("MoeFfn spiky Q8_0 rows 9", 0xfe1f98233dede073),
 ];
 
 /// Every case gives its one checked-in hash at every tier this CPU has and at every thread

@@ -26,10 +26,10 @@ ignore = [
   # `paste`, archived by its author with no successor selected. Reaches us
   # through `tokenizers` (via `macro_rules_attribute`) and `metal`; the
   # suggested replacements are other people's crates to adopt, not ours.
-  "RUSTSEC-2025-0119",
+  "RUSTSEC-2024-0436",
   # `number_prefix`, unmaintained. A transitive dependency of `indicatif`, the
   # progress-bar crate the weight loader draws with.
-  "RUSTSEC-2024-0436",
+  "RUSTSEC-2025-0119",
 ]
 
 [licenses]

@@ -69,6 +69,18 @@ impl TuningReport {
         }
     }
 
+    /// Append `note` to the source text of the parameter `key`: what became of a value that the
+    /// device decides at the end (which queue family `queue.family` picked). The hash covers
+    /// keys and values only, so a note does not change it.
+    pub(crate) fn note(&mut self, key: &str, note: &str) {
+        let p = self
+            .params
+            .iter_mut()
+            .find(|p| p.key == key)
+            .unwrap_or_else(|| panic!("no parameter `{key}` to note"));
+        p.source = format!("{}; {note}", p.source);
+    }
+
     /// The facts a row can match on, as `key=value` pairs.
     pub fn match_key(&self) -> String {
         let d = &self.device;

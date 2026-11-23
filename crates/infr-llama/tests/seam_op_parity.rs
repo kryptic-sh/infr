@@ -5234,7 +5234,7 @@ fn attention_comp_segment_skips_masked_keys() {
         (c.window, c.cap, c.sinks, c.bias) = (64, 70, sinks, true);
         let mut d = comp_data(&c);
         let mut kept = [0usize; 4];
-        for t in 0..c.rows {
+        for (t, kept) in kept.iter_mut().enumerate().take(c.rows) {
             let n_vis = (c.pos + t + 1) / c.ratio;
             for j in 0..c.len {
                 let keep = match t {
@@ -5249,7 +5249,7 @@ fn attention_comp_segment_skips_masked_keys() {
                 } else if !b.is_finite() {
                     *b = 0.25;
                 }
-                kept[t] += usize::from(keep && j < n_vis);
+                *kept += usize::from(keep && j < n_vis);
             }
         }
         assert!(

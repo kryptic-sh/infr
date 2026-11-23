@@ -17,6 +17,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `ChatRequest` / `GenParams` now accept `logprobs` and `top_logprobs` (`0..=20`,
   default 20 when `logprobs` is true), where `logprobs: true` used to be a `400`.
 
+- **`infr serve` checks the `Host` header on a keyless loopback server.** A
+  request whose `Host` is not a loopback name (`localhost`, `*.localhost`,
+  `127.0.0.1`, `[::1]`, or the bind host, on any port) now gets a `403` naming
+  `serve.allowed_hosts`. A same-host reverse proxy that forwards the public
+  hostname, or a container reaching the server as `host.docker.internal`, must
+  list that name in `serve.allowed_hosts` (`INFR_SERVE_ALLOWED_HOSTS`), set an
+  API key, or set `["*"]`. A request with no `Host` passes. `/health` is never
+  checked.
+- **`infr_server` request types gained public fields.**
+  `ChatRequest::response_format` and `GenParams::response_format` are new, so a
+  struct literal of either must set one or use `..Default::default()`.
+  `infr_llama::ChatModel::generate_constrained`'s default now fails with the
+  typed `grammar::ConstraintUnsupported`, and `ConstraintEnv::constraint` fails
+  with `grammar::GrammarRejected` for a schema the grammar engine refuses.
 - **Host paging API.** `infr_cpu::paged::plan_pools` takes the model's weights
   as `Pageable`s (size and read pattern, an expert bank's with its layer)
   instead of `TensorInfo`s; `PoolPlan` gains a public `experts` field, so struct
@@ -64,40 +78,172 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   The EOS token is not included, and a grammar-forced tool-call span produces no
   entries because the model did not sample it.
 
-- **`kernels.vulkan.gfx_queue` (`INFR_GFX_QUEUE`): keep inference off the
-  compositor's graphics ring.** A discrete Vulkan GPU now submits on a
-  COMPUTE-only queue family (amdgpu's `comp` rings) instead of the universal
-  `gfx` family the compositor renders its frames on, so a multi-second prefill
-  delays the desktop's frame instead of blocking it: on the RX 580 with
-  zeta-2.1 Q4_K_M, glxgears held 130 fps through a prefill that used to drop it
-  to 7 (153 → 166 tok/s prefill, 31.2 → 30.7 tok/s decode). Integrated GPUs and
-  devices without a COMPUTE-only family keep the universal family, where the
-  `comp` ring's measured hang budget was tighter; `gfx_queue = true` forces it
-  everywhere, and the startup log names the ring the backend bound. The choice
-  itself is now a testable `VulkanBackend::pick_queue_family` rather than an
-  inline scan.
+- **`infr tune check <model>`: is this GPU still within tolerance of the CPU
+  reference?** It scores a Vulkan device, under the tuning in effect (table
+  rows, the tuning file, `INFR_TUNE`, `--set kernels.vulkan.tune.…`), against
+  the CPU reference on a model that has rows in the GPU tolerance table, and
+  prints every limit with the measured value, its bound and a verdict: the
+  logits at every position of the gate's prompts, in each of the model's gate
+  configurations, then the device's greedy decode held to its per-token path and
+  its tokens to the reference. It is the evaluation the `gpu_seam_tolerance_*`
+  tests run, for a changed tuning parameter or a new driver, without the test
+  suite. The report also says which of your settings a configuration ran without
+  (each configuration sets the ones it is about), what the verdict does not
+  cover on the device (an integrated GPU has no chained decode to compare), and
+  which row it matched: rows are found by the GGUF's file name alone, so a
+  renamed or re-quantized file is scored against another file's rows, and only a
+  float file under a quantized model's name (or the reverse) is refused.
+  `--json` prints one document; the exit status is 0 within tolerance, 3 outside
+  it, 1 when the check could not run (a model with no row is an error, never a
+  pass, and is refused before any download when the reference names its file)
+  and 2 on a usage error. `--against cpu-reference` is the default and the only
+  reference. See `docs/gpu-tolerance.md`, "The command". For developers, the
+  evaluation is public as `infr_llama::tolerance::gate` and
+  `infr_llama::tolerance::greedy`, with `SeamModel::engine_config`,
+  `tolerance::lookup` and `tolerance::{Check, Limit}`.
+- **`response_format` is enforced by `infr serve`.** `{"type":"json_object"}`
+  constrains the reply to a JSON object and
+  `{"type":"json_schema","json_schema":{"schema":…}}` to that schema, streamed
+  or not, through the grammar engine that already forces tool calls. With tools
+  offered and `tool_choice` unset or `auto`, the model may answer in the format
+  or call a tool; a forced `tool_choice` wins; `none` leaves only the format. A
+  `json_schema` with no schema means any JSON value, and `oneOf` is read as
+  `anyOf`. Thinking is switched off for such a request. A number the schema
+  leaves unbounded is limited in length and exponent form is not produced, so a
+  reply cannot run digits to `max_tokens`; strings and nesting are not bounded.
+  A type infr does not know, a schema the grammar engine cannot enforce or a
+  backend that cannot constrain (DiffusionGemma, a Metal speculative draft) is a
+  `400` naming the field. It was accepted and ignored before.
+- **Schemas are checked before they reach the grammar engine**, for
+  `response_format` and for every tool's `parameters`. A `400` naming the field
+  now answers: a schema nested too deep counting the references it follows, or
+  with too many references or values (a long `$ref` chain in a small request
+  used to overflow the compiler's stack and take the server down); a `$ref` that
+  is not a plain local pointer (`#` or `#/…`), and `$id`, `$anchor` and the
+  dynamic and recursive reference keywords; a `$schema` other than draft-06,
+  draft-07, 2019-09 or 2020-12; a keyword the engine does not implement, such as
+  `not` or `if`; a `multipleOf` too fine or too large for it to match, alone or
+  combined with another in the same schema; and an integer bound past what its
+  arithmetic holds. Grammars compile on a thread with its own large stack.
+- **`serve.allowed_hosts`, `serve.sse_keepalive_secs`, `serve.max_body_bytes`**
+  (`INFR_SERVE_ALLOWED_HOSTS`, `INFR_SERVE_SSE_KEEPALIVE_SECS`,
+  `INFR_SERVE_MAX_BODY_BYTES`). The first extends or disables the `Host` check
+  above; an entry that could never match stops the server at startup. The second
+  sets how long a streamed reply may stay silent before the server sends an SSE
+  comment line, so an idle-timeout proxy does not cut a long prefill; it is on
+  by default and `0` turns it off. The third is the largest request body
+  accepted, defaulting to the limit that already applied.
+- **A request is prepared before it takes a slot.** New defaulted
+  `infr_server::ChatGenerator::prepare` and `chat_prepared`, with
+  `PreparedRequest`: the prompt is rendered and counted and any grammar built
+  once, up front, and generation starts from that result. A generator that
+  implements only `chat` keeps working. New in `infr_llama`:
+  `ChatModel::supports_constraint` and `max_prompt_tokens` (both defaulted),
+  `ToolConstrainer::response_constraint`, `grammar::forces_tool_call`, and
+  `OaiRenderer::{render_no_think, response_constraint, count_tokens}`; in
+  `infr_chat`, `render_chat_oai_thinking` and a public `thinking_enabled`.
+
+- **Tuning parameter `queue.family`: which queue family inference submits on,
+  `auto` by default.** Three values. `auto` takes a COMPUTE-only queue family
+  where the device has one that writes timestamps (amdgpu's `comp` rings), and
+  otherwise the universal family. `compute` asks for the COMPUTE-only family and
+  warns, saying why, when it has to fall back. `graphics` always takes the
+  universal family, the one the compositor renders its frames on. The point of
+  the default is a desktop that stays responsive while a long forward runs: on
+  an RX 580 under RADV with zeta-2.1 Q4_K_M, glxgears held 130 fps through a
+  prefill that used to drop it to 7 (153 → 166 tok/s prefill, 31.2 → 30.7 tok/s
+  decode; the contributor's figures, PR 106). `auto` is the default on every
+  discrete GPU, and on an integrated GPU under the AMD Windows driver, where it
+  was measured; an integrated GPU under any other driver defaults to `graphics`,
+  because the `comp` ring's hang budget measured tighter on one under RADV. What
+  the compute-only family costs on the devices measured here, Qwen3-1.7B Q4_K_M
+  under the AMD Windows driver with a desktop running: on the RX 7900 XTX tg128
+  474.86 → 454.79 t/s (-4.2%) and pp512 11611.42 → 11482.28 t/s (-1.1%); on a
+  Ryzen integrated GPU nothing measurable (tg128 27.12 → 27.12, pp512 230.94 →
+  230.84). Desktop responsiveness itself was not measured here. Set it in the
+  config file (`"queue.family" = "graphics"` under `[kernels.vulkan.tune]`), in
+  the environment (`INFR_TUNE=queue.family=graphics`) or on the command line
+  (`--set kernels.vulkan.tune.queue.family=graphics`, on `infr run`, `bench`,
+  `serve` and `tune show`); any other word is an error that lists the three.
+  `kernels.vulkan.gfx_queue = true` (`INFR_GFX_QUEUE`) is an alias of
+  `graphics`. `infr tune show` prints the value, where it came from and the
+  family picked, and the startup log says the same. A COMPUTE-only family that
+  writes no timestamps is never used, with a warning, since the submit splitter,
+  the work bound, the dropped-work check and `INFR_PROF_OPS` read timestamps
+  from the submit queue. The generation golden and the tolerance tests run on
+  both devices pass unchanged on the compute-only family.
+
+- **Tuning parameter `gemv.kq_fma`: fp32 decode GEMVs for GPUs without an
+  accelerated int8 dot.** Three decode (one-row) kernels, on by default where
+  the driver does not report the packed int8 dot as accelerated (AMD GCN under
+  RADV), where it is emulated in ALU and they were measured:
+  `native_gemv_kq_fma` reads Q4_K/Q6_K blocks against the f32 activations
+  directly, in place of the activation quantize plus the int8 GEMV, with a
+  multi-row twin (`native_gemv_kq_fma_mrow`) for MTP verify batches;
+  `linear_f32_mo` is a multi-output f32 GEMV; and one-row bf16 weights take the
+  bf16 reduction GEMV. On an RX 580 the K-quant kernel took tg128 of
+  Qwen2.5-Coder-3B from 55.4 to 62.9 t/s and of Gemma 4 E4B at depth 4096 from
+  30.9 to 36.8 t/s (the contributor's figures, PR 107). Devices with an
+  accelerated dot keep the kernels they were tuned with, so their output is
+  unchanged; `INFR_TUNE=gemv.kq_fma=true|false` sets it either way,
+  `kernels.vulkan.kq_fma_gemv` (`INFR_KQ_FMA_GEMV=0|1`) is an alias, and
+  `infr tune show` says which a device runs. A verify batch takes the multi-row
+  twin wherever the decode row takes the fp32 kernel, at any output width, so a
+  verify row is bit-identical to its decode row; the Q4_K and Q6_K kernels' dot
+  sums are `precise` so that this holds on drivers that contract the two shaders
+  differently (the AMD Windows driver on RDNA3 did, by one ulp).
+  `linear_f32_mo`'s grid splits past 65535 workgroups, which a 262144-wide f32
+  output reaches.
+
+- **Tuning parameter `attn_split.decode_min_chunk`: the chunk floor of decode
+  split-K attention.** Decode attention cuts each head's keys into chunks of
+  `max(keys / 32, floor)`, one workgroup per chunk. The floor is 16 on a
+  discrete device in the slow class (no matrix units and no accelerated int8
+  dot, or wave64-only): on an RX 580 under RADV that took
+  gemma-4-E4B-it-qat-UD-Q4_K_XL decode from 39.24 to 45.74 tok/s at depth 16 and
+  from 40.73 to 41.45 at depth 2048 (`docs/perf/vulkan-decode-attn-chunk.md`).
+  Every other device keeps 64, the floor before this, so its decode output is
+  unchanged. The floor sets the chunk of every span under 32 times its value, so
+  16 changes the last bits of decode attention up to 2047 keys of context, not
+  only under 512. MTP verify batches take the same floor as decode. The combine
+  pass (`attn_combine.comp`) now issues the partial loads of 8 chunks before
+  testing their weights, on every device, with the same sums in the same order.
+
+- **GPU logits held to the CPU reference within a tolerance.** New public module
+  `infr_llama::tolerance`: `score_row` and `RunScore` (KL divergence, top-set
+  probability cosine, centred logit deviation, top-1 agreement above a near-tie
+  margin, the reference's top-1 rank) and the per-model tolerance `TABLE` with
+  its `PathClass`es. New `SeamModel::forced_logits` with
+  `seam::{ForcedOn, ForcedLogits, PrefillHead}`: drive a prompt and forced
+  tokens through the CPU reference, CPU or Vulkan backend and read the logits at
+  every position. The ignored `gpu_seam_tolerance_*` tests use them; see
+  `docs/gpu-tolerance.md`. Nothing on the inference path changes.
 
 - **`kernels.cpu.max_tier` (`INFR_CPU_MAX_TIER`): a ceiling on the CPU's SIMD
-  tier**, `scalar`, `avx2`, `avx512` or `avx512vnni`. Every run-time dispatch in
-  the CPU backend (each quantized dot kernel, the packed VNNI GEMMs, the MoE
-  expert tiles, the int8 path's routes) and `infr_core::math`'s slice functions
-  ask one process-wide tier, `infr_core::simd::active`: the widest the CPU has,
-  or the ceiling when it is lower; a ceiling above what the CPU has runs the
-  CPU's widest. The ceiling selects which hand-written kernel of a family runs
-  (the scalar, AVX2, AVX-512 or VNNI one); it does not change the instruction
-  set the compiler may use, so on a `target-cpu=native` build the scalar kernels
-  are still compiled for, and auto-vectorized with, the machine's features. A
-  debug and testing switch: every tier gives the same bits, so it changes only
-  speed. With no ceiling set it has no measurable cost: the CPU backend's graph
-  interpreter is compiled twice and picks once per graph, and the uncapped copy
-  dispatches exactly as before (a compile-time constant on a native build). It
-  is process-wide: each CPU backend applies its value when built, unset meaning
-  no ceiling, so the last backend built decides. A misspelt tier is a config
-  error at load in the file, `--set` and the environment alike. It replaces the
-  unreleased `kernels.cpu.math_tier` / `INFR_CPU_MATH_TIER` (and
-  `math::set_tier`), which forced only the math slices: one ceiling covers both,
-  and the old key is no longer read. New: `infr_core::simd` (`SimdTier`,
-  `active`, `allows`, `capped`, `set_max`); `infr_cpu::turbo::QK` is public.
+  tier**, `scalar`, `avx2`, `avx512` or `avx512vnni`, and on aarch64 `dotprod`
+  (`infr_core::simd::SimdTier::Dotprod`; `SimdTier::ALL` lists the running
+  architecture's tiers and `SimdTier::NAMED` every name, which loads on every
+  architecture; another architecture's tier runs the CPU's widest, with a
+  warning). Every run-time dispatch in the CPU backend (each quantized dot
+  kernel, the packed VNNI GEMMs, the MoE expert tiles, the int8 path's routes)
+  and `infr_core::math`'s slice functions ask one process-wide tier,
+  `infr_core::simd::active`: the widest the CPU has, or the ceiling when it is
+  lower; a ceiling above what the CPU has runs the CPU's widest. The ceiling
+  selects which hand-written kernel of a family runs (the scalar, AVX2, AVX-512
+  or VNNI one); it does not change the instruction set the compiler may use, so
+  on a `target-cpu=native` build the scalar kernels are still compiled for, and
+  auto-vectorized with, the machine's features. A debug and testing switch:
+  every tier gives the same bits, so it changes only speed. With no ceiling set
+  it has no measurable cost: the CPU backend's graph interpreter is compiled
+  twice and picks once per graph, and the uncapped copy dispatches exactly as
+  before (a compile-time constant on a native build). It is process-wide: each
+  CPU backend applies its value when built, unset meaning no ceiling, so the
+  last backend built decides. A misspelt tier is a config error at load in the
+  file, `--set` and the environment alike. It replaces the unreleased
+  `kernels.cpu.math_tier` / `INFR_CPU_MATH_TIER` (and `math::set_tier`), which
+  forced only the math slices: one ceiling covers both, and the old key is no
+  longer read. New: `infr_core::simd` (`SimdTier`, `active`, `allows`, `capped`,
+  `set_max`); `infr_cpu::turbo::QK` is public.
 
 - **`CpuBackend::pool_threads`**: the size of the backend's thread pool once a
   graph has built it. `crates/infr-cpu/tests/op_hashes.rs` uses it: every `Op`
@@ -363,6 +509,157 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   the slot alignment each needs.
 
 ### Changed
+
+- **`strftime_now` in chat templates is formatted by the C library, and accepts
+  fewer conversions.** The date a template stamps (Llama 3.x and SmolLM3 write
+  `Today Date:` with it) now comes from the C library's local-time conversion
+  and `strftime`, as llama.cpp's does; the `chrono` crate, flagged unmaintained
+  by RUSTSEC-2026-0543, is no longer a dependency. Accepted: literal text, `%%`,
+  the C99 conversions
+  `%a %A %b %B %c %C %d %D %e %F %g %G %h %H %I %j %m %M %n %p %r %R %S %t %T %u %U %V %w %W %x %X %y %Y %z %Z`,
+  and `%-` (no padding) before a numeric one. Those render as before, in English
+  whatever the system locale, except `%Z`, which is now the zone's name as the C
+  library gives it (`PST`, or `Pacific Standard Time` on Windows) where it used
+  to be the UTC offset (`-08:00`); on Windows a localized zone name that is not
+  UTF-8 in the system's ANSI code page makes `%Z` a template error. No longer
+  accepted, and a template error as any unknown conversion already was: `%q`,
+  `%v`, `%k`, `%l`, `%P`, `%s`, `%+`, the fractional seconds (`%f`, `%.f`,
+  `%.3f`, `%3f` and the like), `%:z` and its longer forms, `%#z`, and the
+  padding flags `%_` and `%0`. A format longer than 1024 bytes is also a
+  template error. The error message now names the conversion at fault.
+- **An over-long prompt is a real `400` on a stream.** `infr serve` counts the
+  prompt before it queues the request, so a streamed request whose prompt does
+  not fit gets `400 context_length_exceeded` where it used to get a `200`
+  followed by an error frame, and it no longer waits for a slot first. The
+  `request start` log line now carries `prompt_tokens`. A session with no fixed
+  context (CPU, MTP) is still refused by the runner.
+- **Request errors name the field at fault.** A tool with no `function.name`, a
+  tool schema the grammar engine rejects, a `tool_choice` naming a tool that was
+  not offered, and a forced `tool_choice` on a backend that cannot constrain are
+  `400`s naming `tools` or `tool_choice`; some were `500`s. Forced tool calls
+  now read `oneOf` as `anyOf` and bound the whitespace between JSON tokens, as
+  `response_format` replies do, and a tool whose `parameters` use `#/$defs/…`
+  references (the shape Pydantic generates) now compiles: its references are
+  rewritten to where the parameters sit in the call schema. They did not resolve
+  before.
+- **DiffusionGemma under `serve` trims its reply to the room left.** A session
+  is capped at the model's trained context; a reply that would not fit is cut to
+  the whole blocks that do and finishes `length`, and only a prompt that leaves
+  no room for one block is refused, with `400 context_length_exceeded`. An
+  over-long prompt used to open an arbitrarily large session.
+
+- **NEON int8 kernels on aarch64 (Apple Silicon, Arm Linux).** Q4_K, Q6_K and
+  Q8_0 weights, one-row and batch (the default `Q4_K_M` quantization is Q4_K and
+  Q6_K), run NEON kernels with the dot-product extension (`sdot`) instead of
+  their scalar kernels, where the CPU has it (every Apple M-series core). Same
+  bits as the scalar kernels, so outputs do not change. On a GitHub-hosted Apple
+  Silicon runner (2026-11-19, shared, so the ratios are the result and not the
+  absolute times), Qwen3-0.6B Q4_K_M decodes about 8.5x faster than with the
+  scalar kernels (roughly 7 to 11x: the scalar rounds varied) and prefills about
+  1.9x faster (pp512 54 to 102 t/s, medians of three rounds). Per kernel, over
+  two runs: Q4_K 5.5 to 7.6x one-row and 2.6 to 3.0x batch, Q6_K 18 to 23x and
+  about 5x, Q8_0 1.2 to 1.5x and 1.3 to 1.7x (`docs/math.md`, aarch64). Every
+  other quantized format still runs its scalar kernel there.
+
+- **One-row `Op::MoeFfn` takes int8 activations.** Quantized expert banks got
+  f32 activations at one row (every decode step) and int8 at two or more, so MoE
+  models were the one exception to the CPU's row-count identity. One row now
+  takes the int8 expert kernels too (reference mode keeps f32), and a prompt
+  prefilled in any chunk height gives the same bits. With the activation split
+  (Fixed, below) Qwen3-30B-A3B's first token, run as a one-row graph, is at KL
+  9e-4 and 9e-3 from the reference on two prompts; with the old quantizer it was
+  0.16 and 1.21. Decode is about 2% faster (tg64 medians +2.0% on Qwen3-30B-A3B,
+  +1.9% on ERNIE-4.5-21B-A3B, ten paired rounds on a quiet machine, measured
+  across this change and the activation split together). **Upgrade note:** MoE
+  models' CPU decode output changes once (`cpu_golden_qwen3moe` re-blessed, the
+  same on Windows and Linux under WSL; CI does not run the MoE goldens).
+
+- **The Vulkan backend cuts a forward by the estimated GPU time of its heavy
+  dispatches and of its submits (issue 94, plan 12 S2).** A driver's watchdog
+  resets the GPU when one submit runs for about 2 s (Windows' `TdrDelay`,
+  amdgpu's `lockup_timeout`) and drops its work; the dispatch cap could not see
+  a dispatch that is heavy on its own, so a large `-u` on a slow device ended in
+  an error. Now the heavy prefill kernels (the prefill GEMMs and the per-row
+  GEMV over more than one row, and the non-coopmat flash prefill attention)
+  estimate their GPU time before they are recorded: FLOPs over a throughput,
+  which is a pessimistic prior from the compute-unit count until the GPU has
+  measured the kernel. A dispatch estimated past the budget is recorded as
+  ranges of its workgroup grid, each in a submit of its own and bit-identical to
+  the whole dispatch, and a submit is closed at the next op boundary once its
+  estimated work reaches the budget. The budget is where cutting starts, not a
+  ceiling: a submit that was just under it takes one more op and can hold about
+  twice the budget, a dispatch has at most one range per workgroup along the cut
+  dimension, and some prefill GEMMs carry no estimate yet (the batched MoE
+  expert GEMM among them; backlog B226 has the list). The prior is replaced only
+  by measurement: the slowest of a kernel's last four timed heavy dispatches, or
+  the GPU time of a completed submit set against the estimate of its untimed
+  kernels. Neither raises a kernel's throughput past a bound that follows from
+  the budget (3 times the prior at 250 ms, 2 times at 500), so that a submit
+  whose estimates one bad reading took to that floor still runs within the
+  limit. Two new tuning parameters: `submit.budget_ms` (250 on an integrated or
+  slow-class device, 500 elsewhere; `0` = off) and `submit.prior_gflops` (8
+  GFLOP/s per compute unit). On a Ryzen integrated GPU, `infr bench` of
+  SmolLM3-3B Q4_K_M with `-u 512` and `INFR_NO_I8DOT=1`, which was reset in
+  every run before, completed five runs of five (5.1 t/s: the per-row GEMV's own
+  speed), `-u 2048 -p 2048` five of five, and `-u 2048` with the int8 kernels
+  off, whose heaviest dispatch is about 6 s whole, completed its one run; no
+  engine reset was logged. Those runs were of the first build; the final one ran
+  `-u 2048 -p 2048` three more times and `-u 512` with `INFR_NO_I8DOT=1` once,
+  all completing. **Upgrade notes:** the tuning hash in the device banner
+  changes on every device (two new parameters). On an integrated GPU a prefill
+  forward is now cut by work where the dispatch cap cut it, as many times
+  (Qwen3-1.7B, `pp512`: four a forward). Throughput against `main`, interleaved,
+  two file copies of each binary, the first copy rotating every round, on
+  2026-11-22. With the final build: on an RX 7900 XTX, Qwen3-1.7B Q4_K_M at
+  default settings takes no cut and reads pp512 11669.40 against 11662.84 t/s
+  (+0.06%, eight rounds, the copies of one binary 0.3% apart); SmolLM3-3B at
+  `-u 4096`, a forward of about 850 ms of GPU time, takes two cuts a forward and
+  reads pp4096 4557.78 against 4556.24 (+0.03%, six rounds); on the integrated
+  GPU Qwen3-1.7B pp512 reads 230.98 against 231.09 (-0.05%, six rounds). With
+  the build before the default budget went from 1000 to 500 ms, for runs that
+  change did not touch (decode is never cut, and the MoE forward is estimated
+  far under either budget): tg128 469.33 against 469.24 on the RX 7900 XTX
+  (twelve rounds) and 27.04 against 27.06 on the integrated GPU (six), and
+  Qwen3-30B-A3B pp1024 3565.74 against 3563.74 (six).
+  `device.submit_dispatches = 0` still means one submit per forward and turns
+  this off as well. `RUST_LOG=infr_vulkan=debug` prints one line per forward
+  with its dispatches, GPU time and estimated work, the splitter's cut counts
+  and the throughput learned per kernel. `docs/config.md` has the rules.
+
+- **A slow discrete GPU splits its first forward (issue 94).** A device that is
+  wave64-only, or has neither 16x16x16 f16 cooperative matrices nor an
+  accelerated int8 dot (GCN such as the RX 580), now starts the submit splitter
+  at 64 dispatches per submit instead of sending its first prefill forward as
+  one command buffer; single-token forwards stay whole until a measured forward
+  tightens the cap (from the KessokuNet fork's `a35dac2f`). The initial cap is
+  the tuning parameter `submit.initial_dispatches` (`infr tune show`), derived
+  from the new device facts `matrix_units` and `dot_accelerated` (also in
+  `infr tune show --json`). Default devices are unchanged: 0 on the RX 7900 XTX,
+  128 on the integrated GPU. A discrete device reporting neither fact starts at
+  64 as well. Because the parameter is new, the tuning hash in the device banner
+  changes on every device. A cap set by a tuning row, a tuning file or the user
+  (`INFR_TUNE=submit.initial_dispatches=N`) applies to decode too, like
+  `device.submit_dispatches`. This does not bound the work per submit, only the
+  dispatch count (plan 12, S2).
+
+- **Baseline x86-64 builds (the released binaries) run the f32 dots on FMA.**
+  `mul_add` compiled to a call to the C runtime's `fmaf` per element on a build
+  without the `fma` target feature, so attention's scores and value sums, MLA's
+  value sum, f16/bf16/f32 weights and reference mode ran several times slower
+  than on a native build. The dots now run an AVX2+FMA+F16C compilation of the
+  same source where the CPU has those, chosen once per graph, with the same
+  bits. The f16 KV cache write and the f16 dot convert eight values at a time on
+  every build (the same bits as `half`'s conversion, checked on all 2^32
+  inputs), and the bf16 dot reads its weights in chunks. Measured on a Ryzen 9
+  9950X3D, 16 threads, twelve interleaved rounds on a quiet machine (every run
+  is in `docs/math.md`), baseline build before against after: Qwen3-1.7B Q4_K_M
+  pp512 331.7-335.2 to 1021.7-1044.8 tok/s (a native build: 1114.2-1158.2),
+  gemma-3-1b-it pp512 369.3-383.9 to 578.8-592.7 (native 588.7-601.7),
+  Qwen3-0.6B tg64 in reference mode 14.7-15.0 to 27.8-28.4 (native 25.7-26.2);
+  `WriteKv` into an f16 cache 744-794 to 128-142 µs per call (a profile taken
+  with another agent's test running). Production decode is level, and so is a
+  native build, whose f16 dot is about four times faster and whose f16 KV write
+  is faster.
 
 - **CPU outputs are identical on every operating system, and change once.**
   Every transcendental function the CPU backend uses (`exp`, `ln`, `ln_1p`,
@@ -848,6 +1145,90 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **The production CPU's int8 activations keep the rest of a block that holds an
+  outlier.** The int8 activation quantizer for K-quant, IQ, TQ and 256-wide Q8_0
+  weights (`quantize_q8`) took one scale per 256 activations from the block's
+  largest magnitude, so a few very large activations rounded the rest of their
+  block to 0 or ±1. The first token's massive-activation dimensions do that in
+  every projection: against the CPU reference (`kernels.cpu.reference`),
+  position 0's KL was 5.58 and 1.92 on SmolLM3-3B (top-1 changed on a chat
+  prompt), 0.60 on ERNIE-4.5-0.3B and 0.086 on Qwen3-0.6B; llama.cpp's CPU,
+  whose `Q8_K` activations are the same scheme, measures 1.85 on SmolLM3-3B's. A
+  block whose one or two largest magnitudes stand sixteen times above the rest
+  now carries them in a sparse part on their own scale, and its dense codes take
+  the scale of what is left. Position 0 is at 4e-5 to 1.3e-2 on the same models;
+  away from position 0 the distance is level to slightly lower (geometric-mean
+  KL ratio 0.70 to 0.98 per model), with single positions moving both ways. The
+  split is not only a first-token event: on the inputs of the FFN down
+  projections it fires all through a sequence (1.6 to 38% of rows, by model and
+  weight format). As first landed it dotted each split block with a whole
+  one-block kernel call per weight row, which cost 3.5% of Qwen3-1.7B's prefill
+  on a native build, 1.9% of gemma-3-1b's, 1.65% and 1.5% on baseline builds and
+  2.9% of ERNIE-4.5-21B-A3B's MoE prefill (quiet machine, twelve and ten paired
+  rounds). The sparse part is now dotted from the weight elements at its codes
+  alone, the one-row kernel's own expression, so no output bit changed: per
+  weight row about 6 ns against 115 for a K-quant part, and in a prefill the
+  elements are decoded once per weight row for every row's parts, inside the
+  packed GEMM's group tasks. Against the build before the split, prefill medians
+  are now -0.69% / +1.43% (Qwen3-1.7B native / baseline), -0.03% / -0.06%
+  (gemma-3-1b), +1.30% / +0.64% (ERNIE-4.5-21B-A3B) and -0.30% / +0.57%
+  (Qwen3-30B-A3B), inside the protocol's noise of about 1.2%; against the split
+  as first landed, +1.90% / +3.12%, +1.46% / +1.13%, +1.61% / +1.87% and +0.18%
+  / +1.28%. Decode is level. The quantizer also clears an ordinary block from
+  its max pass (a bound on the sum of magnitudes) instead of a second pass. The
+  grid formats (IQ1/IQ2/IQ3) gain less (backlog B223). Blocks without such
+  outliers quantize to the same bits as before. Measurements and the options
+  weighed are in `docs/cpu-activations.md`. **Upgrade note:** the production
+  CPU's output changes once for every model whose activations carry such
+  outliers (the CPU goldens were re-blessed, Windows and Linux under WSL
+  agreeing); one-token llama.cpp parity dumps now differ at position 0 by design
+  (B212).
+
+- **A lost GPU reported one submit late now names the forward before it (issue
+  94).** After a watchdog cuts a forward short, some drivers let that submit
+  finish and report the lost device only on the next one (RADV after amdgpu's
+  soft recovery; AMD's Windows driver just past its limit), so the error named a
+  copy or the following forward. Every fatal GPU error now also lists the last
+  forward segments submitted, newest first, each with its dispatch count, first
+  and last kernel, how long before the failure it was submitted and how long it
+  ran on the GPU.
+
+- **`device.submit_dispatches` is documented as what it does.** A value above 0
+  sets the dispatch cap a device STARTS with; the measured loop only lowers it
+  from there, so a larger value does not raise where it ends (on issue 94's RX
+  580, 128 and 256 both ended on 62). The docs called it the cap. The "submit
+  splitter ARMED" warning also lost the runs of spaces it carried.
+
+- **A GPU submit that never completes is an error, not a hang.** Every Vulkan
+  host wait (segment fences, replays, one-shot copies, `Backend::sync`,
+  teardown) now waits at most `device.gpu_wait_timeout_ms`
+  (`INFR_GPU_WAIT_TIMEOUT_MS`, default 120 s, at least 5 s; `0` waits forever).
+  Before, a submit whose work the GPU dropped left the process spinning one core
+  forever. A wait past the bound, or a lost device, now returns an error naming
+  the submit (dispatch count, first and last kernel), the time waited, the fence
+  state and, where the device offers `VK_EXT_device_fault` (now enabled when
+  offered), the driver's fault report; the backend then fails every later call
+  with that error without touching the device, and leaks rather than frees what
+  the GPU may still be using, so teardown cannot hang either. Waiting no longer
+  needs a submit of its own: the fence rides on the submit that carries the
+  work. **Known cost:** on AMD's Windows driver this costs decode about 0.4%
+  (Qwen3-1.7B tg128: 476.87 against 478.59 t/s on an RX 7900 XTX, 27.20 against
+  27.31 on a Ryzen integrated GPU) and prefill up to 0.5%, because the driver
+  reports a fence signalled later than the old unbounded `vkQueueWaitIdle` sees
+  the work complete: waiting with `vkQueueWaitIdle` recovers it on both GPUs.
+  Accepted for now, since an error beats a hang; backlog B222 has the
+  measurements and the alternatives. **Dropped work is detected on forward
+  segments only:** after a watchdog reset AMD's Windows driver signals the fence
+  of work it threw away, and a forward segment (prefill chunks, the static
+  decode path) whose fence signals without its closing GPU timestamp is the same
+  error, where before a timestamp read waited on it forever. On the Ryzen
+  integrated GPU `infr bench` of SmolLM3-3B with `-u 2048`, or `-u 512` with
+  `INFR_NO_I8DOT=1`, now fails with it instead of hanging. Replayed and chained
+  decode tokens, one-shot copies, staging copies and queues without timestamps
+  have no such check: a reset there is reported by the next submit, and the step
+  it hit may return wrong output first (backlog B222). Avoiding the reset is not
+  done yet (plan 12, S2).
+
 - **Equal logits sample the same token on every toolchain.** The CPU backend's
   `Op::Sample` and the host sampler's top-k path ordered equal logits by
   unstable sorts with no tie-break, so which of two equal tokens a draw picked
@@ -1092,6 +1473,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   on none, a list or a dict is refused as Python refuses it. `| format` with
   more or fewer positional arguments than conversions is refused, and `%.3s`
   cuts Python's `str()` of a bool or a container.
+
+### Security
+
+- Update `url` 2.5.8 → 2.5.9 for RUSTSEC-2026-0592 (a stack overflow, which
+  aborts the process, in `Url::origin()` on a deeply nested `blob:` URL).
+  Reached through `reqwest` and `tower-http`, the HTTP stack model downloads and
+  `infr serve` use.
 
 ## [0.3.0] - 2026-11-13
 

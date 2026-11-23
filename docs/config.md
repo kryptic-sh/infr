@@ -100,10 +100,11 @@ Error: config `device.ctx`: expected a size/count like 8192, 256k or 50% (got "b
 
 Note the asymmetry with the environment, which is frozen at today's behaviour:
 `ctx = "banana"` in a file fails to load, while `INFR_CTX=banana` is silently
-ignored and falls back. Six environment keys do reject a bad value loudly, at
+ignored and falls back. Seven environment keys do reject a bad value loudly, at
 startup, on every subcommand: `INFR_SG`, `INFR_SUBMIT_DISPATCHES`,
-`INFR_PIPELINE`, `INFR_TENSOR_PARALLEL`, `INFR_EXPERT_PARALLEL`, and `INFR_TUNE`
-(see [Vulkan kernel tuning](#vulkan-kernel-tuning)).
+`INFR_GPU_WAIT_TIMEOUT_MS`, `INFR_PIPELINE`, `INFR_TENSOR_PARALLEL`,
+`INFR_EXPERT_PARALLEL`, and `INFR_TUNE` (see
+[Vulkan kernel tuning](#vulkan-kernel-tuning)).
 
 ### Diagnostics announce themselves
 
@@ -178,9 +179,43 @@ table that the tests check against the tree. `Config::all_paths()` is the full
 path list. What follows is the shape plus the knobs people actually reach for.
 
 **`[device]`** — which GPU (`dev`), how much context (`ctx`), the prefill
-micro-batch (`ubatch`, `ubatch_parallel`), CPU `threads`, and two low-level
-device knobs (`submit_dispatches` for the iGPU submit splitter, `subgroup_pref`
-to force subgroup 16 or 32).
+micro-batch (`ubatch`, `ubatch_parallel`), CPU `threads`, and three low-level
+device knobs (`submit_dispatches`, the submit splitter's starting cap and kill
+switch, see [Vulkan kernel tuning](#vulkan-kernel-tuning); `subgroup_pref` to
+force subgroup 16 or 32, and `gpu_wait_timeout_ms`, below).
+
+**`device.gpu_wait_timeout_ms`** (`INFR_GPU_WAIT_TIMEOUT_MS`, default 120000) is
+the longest the Vulkan backend waits for one piece of submitted GPU work. A wait
+that runs past it, or meets a lost device, is an error naming the submit it
+waited on (its dispatch count and first and last kernel), how long it waited,
+the fence's state and, on a lost device that offers `VK_EXT_device_fault`, the
+driver's fault report. The backend is then unusable: every later call returns
+the same error without touching the device, and teardown leaks rather than frees
+what the GPU may still be using. `infr run` prints it and exits non-zero;
+`infr serve` fails that request and every later one on that model with the same
+error, so restart the server. `0` waits forever (for debugging). Any other value
+below 5000 is refused when the backend is created: that floor is a guard against
+a typo (a value meant in seconds), NOT a safe setting, since legitimate waits
+far longer than 5 s have been measured. One wait can cover several pipelined
+forward segments, so heavy chunks on a slow device make long waits. Measured
+with a temporary log (not in the tree) of every successful wait:
+
+| Device               | Workload                                                               | Longest wait         |
+| -------------------- | ---------------------------------------------------------------------- | -------------------- |
+| Ryzen integrated GPU | `infr bench` SmolLM3-3B Q4_K_M `-p 2048 -u 2048`, 2 runs               | 12.6 s (next 10.5 s) |
+| Ryzen integrated GPU | the full GPU gate (light workloads), 1 run                             | 2.75 s               |
+| RX 7900 XTX          | `infr bench` SmolLM3-3B Q4_K_M `-p 2048 -u 2048`, 2 runs               | 0.35 s               |
+| RX 7900 XTX          | the gate's paged tests (`test(paged)`, 44 tests, paged MoE among them) | under 0.2 s          |
+| RX 7900 XTX          | the full GPU gate, 1 run                                               | under 0.1 s          |
+
+The integrated GPU's 12.6 s (2026-11-19) leaves the 120 s default about 9.5
+times headroom; a larger model or chunk on that GPU waits longer in proportion,
+so raise the bound for such runs rather than lower it (a bound too low fails
+work that would complete; one too high only delays the error of a rare hang).
+The gate figures are from 2026-11-18. Before this bound a submit whose work the
+GPU dropped hung the process forever with one core spinning
+(`docs/plan/12-low-capability-vulkan.md`). What the backend can and cannot
+detect about dropped work is in `docs/backlog.md` B222.
 
 **`[sampling]`** — `temp` (0 = greedy), `top_k`, `top_p`, `seed`, `max_new`,
 `ignore_eos`, `no_think`. **Provenance matters here**: `infr run` / `infr serve`
@@ -235,12 +270,12 @@ and these exist to force one off when bisecting a correctness or perf problem.
   `[kernels.vulkan.gemv]` sub-table), attention (`flash_warp`, `flash_splits`,
   `flash_min_rows`, `pv_splits`), DeltaNet (`dn_chunk_scan`, `dn_chunk`,
   `dn_split`), and the plumbing switches (`push_desc`, `pipeline_cache_disk`,
-  `no_replay`, `no_vram_guard`, `gfx_queue` — stay on the compositor's graphics
-  ring instead of a compute-only one — the BDA chunk caps). Note `f16 = false` also
-  disables coopmat regardless of `coopmat`, matching `INFR_NO_F16`'s effect
-  today. The hardware-shaped numbers (split counts, thresholds, rows per
-  workgroup, subgroup pins) are per-device tuning parameters, set under
-  `[kernels.vulkan.tune]`; see the next section.
+  `no_replay`, `no_vram_guard`, `gfx_queue` — an alias that turns the
+  `queue.family` tuning parameter to `graphics` — the BDA chunk caps). Note
+  `f16 = false` also disables coopmat regardless of `coopmat`, matching
+  `INFR_NO_F16`'s effect today. The hardware-shaped numbers (split counts,
+  thresholds, rows per workgroup, subgroup pins) are per-device tuning
+  parameters, set under `[kernels.vulkan.tune]`; see the next section.
   Some defaults were measured on one GPU and may be wrong for yours; A/B them
   with `infr bench` before trusting one.
 - **`[kernels.metal]`** — the Apple backend's native/CMM/RT kernel families per
@@ -256,12 +291,17 @@ and these exist to force one off when bisecting a correctness or perf problem.
   two share a core's SMT siblings; only when the threads fit one per allowed
   core; Windows only, no `INFR_*` twin), and `max_tier` (`INFR_CPU_MAX_TIER`:
   the widest SIMD tier the CPU backend's kernels and `infr_core::math`'s slice
-  functions may run, `scalar`, `avx2`, `avx512` or `avx512vnni`, instead of the
-  widest the CPU has; every tier gives the same bits, so it changes only speed.
-  A ceiling, not a demand: one above what the CPU has runs the CPU's widest. It
-  is a process-wide debug switch: every CPU backend applies it when built, unset
-  meaning no ceiling, so the last backend built decides for the whole process. A
-  misspelt name is a config error at load; see [`math.md`](math.md)).
+  functions may run, `scalar`; `avx2`, `avx512` or `avx512vnni` on x86-64;
+  `dotprod` on aarch64, instead of the widest the CPU has; every tier gives the
+  same bits, so it changes only speed. On a build without FMA (the released
+  binaries), `avx2` and up also let the f32 dots run their FMA code where the
+  CPU has FMA and F16C; `scalar` runs them through the C runtime's `fmaf`. A
+  ceiling, not a demand: one above what the CPU has runs the CPU's widest, and
+  so does another architecture's tier (every name loads on every architecture,
+  so one file serves both; the backend logs a warning). It is a process-wide
+  debug switch: every CPU backend applies it when built, unset meaning no
+  ceiling, so the last backend built decides for the whole process. A misspelt
+  name is a config error at load; see [`math.md`](math.md)).
 
 ### Vulkan kernel tuning
 
@@ -277,7 +317,7 @@ each value with the level it came from:
 $ infr tune show --dev Vulkan0
 device:  AMD Radeon RX 7900 XTX (AmdRdna3, AMD_PROPRIETARY)
 match:   vendor=amd arch=AmdRdna3 driver=AMD_PROPRIETARY integrated=false device_id=0x744c cu=96 subgroup=32-64 driver_version=0x800161
-hash:    5715f12d
+hash:    7751091e
 rows:
   amd-proprietary-split-k [class row, maintainer] sets split_k.scale_by_cu
   amd-proprietary-i8cm-kq [class row, maintainer] sets gemm_i8cm_kq.enabled
@@ -288,7 +328,198 @@ gemv_sg.rows                2      default
 ```
 
 `--json` prints the same as a document. The `hash` is also in the device banner
-(`tune:5715f12d`), so a log says whether two runs tuned alike.
+(`tune:7751091e`), so a log says whether two runs tuned alike.
+
+`infr tune check <model>` says whether the device, with the values in effect, is
+still within tolerance of the CPU reference on that model: run it after forcing
+a parameter (`INFR_TUNE=…` or `--set kernels.vulkan.tune.…` on the same command
+line), after a driver update, or on hardware no table row was written for. It
+needs a model that has rows in the tolerance table, exits 0 within tolerance and
+3 outside it, and takes `--dev` and `--json` like `show`
+([`gpu-tolerance.md`](gpu-tolerance.md), "The command").
+
+Three parameters carry kernels and choices contributed from an RX 580 under RADV
+(PRs 105 to 107). The first two default to what was measured there on that class
+of device only, so every other device runs what it ran before them; the third is
+on wherever it applies:
+
+- `gemv.kq_fma` turns on the fp32 decode GEMVs (`native_gemv_kq_fma` for
+  Q4_K/Q6_K with its MTP verify twin, `linear_f32_mo`, one-row bf16). Default:
+  on where the driver does not report an accelerated packed int8 dot
+  (`dot_accelerated` in `infr tune show --json`). `kernels.vulkan.kq_fma_gemv`
+  (`INFR_KQ_FMA_GEMV=0|1`) is its alias.
+- `attn_split.decode_min_chunk` is the fewest keys per chunk of decode split-K
+  attention. Default: 16 on a discrete device in the slow class (wave64-only, or
+  neither matrix units nor an accelerated int8 dot), 64 elsewhere. It changes
+  the last bits of decode attention for every context under 32 times its value.
+- `queue.family` chooses the queue family inference submits on (`auto`,
+  `compute` or `graphics`). Default: `auto` on every discrete device (PR 106's
+  rule, kept by the project owner's decision so that the desktop stays
+  responsive), and on an integrated GPU under the AMD Windows driver by a table
+  row; described under "Which queue inference runs on" below.
+
+Three parameters are not kernel choices; they decide how a forward is cut into
+submits, so that no submit runs long enough for a driver's watchdog to reset the
+GPU and drop the work. That limit is a time, about 2 s by default on both
+systems measured: Windows' `TdrDelay`, and amdgpu's `lockup_timeout` on Linux
+(2000 ms, issue 94). Vulkan does not report either, so the defaults assume it.
+
+`submit.initial_dispatches` is the submit splitter's dispatch cap before any
+forward has been measured (`0` = no cap). Its default is 128 on an integrated
+GPU, 64 on a discrete device that is wave64-only or has neither 16x16x16 f16
+cooperative matrices nor an accelerated int8 dot (the device facts
+`matrix_units` and `dot_accelerated` in `infr tune show --json`), and 0
+otherwise. A device that reports neither fact, an unknown card included, starts
+at 64: splitting a fast card's first forward costs a few submits, while not
+splitting a slow one's lost the device (issue 94). The default spares
+single-token forwards on a discrete card; a value set at any other level, or
+`device.submit_dispatches`, applies to every forward. Whatever the starting
+value, after each forward the splitter lowers the cap to what would have kept
+that forward's submits at 250 ms each (never below 16), and never raises it
+again in that process. So `device.submit_dispatches = N`
+(`INFR_SUBMIT_DISPATCHES=N`) sets where the cap STARTS, not where it ends: on
+issue 94's RX 580, 128 and 256 both ended on the 62 the measured forwards asked
+for. `device.submit_dispatches = 0` is the kill switch: one submit per forward,
+nothing measured, and no cut from the work bound below either.
+
+`submit.budget_ms` bounds work rather than dispatches, on every device and from
+the first forward. Its default is 250 on an integrated GPU or a slow-class
+device (the ones above that start with a dispatch cap) and 500 elsewhere. The
+heavy prefill kernels estimate their GPU time before they are recorded: the
+prefill GEMMs and the per-row GEMV over more than one row, and the non-coopmat
+flash prefill attention (backlog B226 names the GEMMs that carry no estimate
+yet). A dispatch estimated past the budget is cut into ranges of its workgroup
+grid, each in a submit of its own, with output bit-identical to the whole
+dispatch; and a submit is closed at the next op boundary once the work recorded
+into it reaches the budget. So the budget is where cutting starts, not a
+ceiling: a submit that was just under it takes one more op and can hold about
+twice the budget, and a dispatch has at most one range per workgroup along the
+dimension that is cut, so a range of a very coarse grid can still pass it. The
+watchdog counts a submit's time, not a dispatch's (on the integrated GPU
+measured, eight dispatches of 0.39 s in one submit were reset like one dispatch
+of 3.1 s, and the same eight in eight submits completed), so the ranges need
+their own submits. 250 is an eighth of the 2 s limit: the estimate before a
+kernel has been measured is a guess, a second program using the GPU stretches a
+submit (by about a second in one measurement), and 250 ms is what the
+dispatch-count splitter already aims at. 500 is a quarter of it: Windows'
+`TdrDelay` is not per adapter, so a fast discrete card is under the same limit,
+and once its estimates have been corrected to what its submits measure, a submit
+of twice the budget is twice the budget of real work, 1 s, the forward time from
+which the dispatch-count splitter treats any device as in danger. `0` turns the
+work bound off; the dispatch-count splitter still applies.
+
+The estimate is the op's FLOPs over a throughput: the one learned for that
+kernel earlier in the process when there is one, else `submit.prior_gflops`, 8
+GFLOP/s per compute unit (16 on a device that reports none), scaled up for the
+faster kernel families (8 times for an accelerated int8 dot, 16 for matrix
+units). The prior is meant to be pessimistic, so a device's first forward is cut
+more than it needs, not less, and only what the GPU measured replaces it, in two
+ways. A dispatch estimated at a thirty-second of the budget or more is timed,
+and the kernel's rate is the slowest of its last four such samples, with the
+prior counted for the ones it does not have yet: one slow reading is forgotten
+after four more, and the rate only comes down when four in a row read faster,
+from the first sample on. And the GPU time of every submit of a forward is set
+against the estimate of the kernels in it that have no timed dispatch, as if
+they had taken all of that time: when even so they ran faster than estimated,
+they are scaled to it by one shared factor. Taken together, in the mix that
+submit ran, those kernels are then never estimated under what was measured; one
+of them that is slower against its prior than the others can still come out too
+fast, within the bound below. A submit that ran slower changes nothing, and one
+made mostly of timed kernels corrects nothing.
+
+No measurement raises a kernel's throughput past a bound over its prior, so one
+bad reading cannot take a kernel out of the work bound. The bound follows from
+the budget: a submit holding twice the budget of work estimated at that floor
+must still run within 1.5 s on an integrated or slow-class device if the prior
+was exact, and within the 2 s limit itself, with no margin, on any other. That
+is 3 times the prior at a budget of 250 and 2 times at 500; from a budget of 750
+on the first kind, or 1000 on the others, no measurement lowers an estimate
+below the prior (a slow timed sample still raises it). The bound covers what the
+estimate covers: a submit holds more than twice the budget when work without an
+estimate, a tagged dispatch that stays whole, or a range held to one workgroup
+goes into it. A sample is bounded on the slow side too, at 64 times slower than
+the prior. A kernel that cannot be cut the way it is tagged, and any dispatch
+recorded where no submit can be opened (a decode replay, or under
+`device.submit_dispatches = 0`), stays whole. Dispatches without an estimate
+(everything but the kernels above, and every single-row forward) count as free:
+the dispatch cap is what bounds those.
+
+What that costs is in [plan 12](plan/12-low-capability-vulkan.md), with the
+runs: the bound holds a kernel's estimate above its real time wherever the
+kernel is more than that much faster than its prior, which is extra cuts, not
+lost work. On the integrated GPU measured the int8 GEMMs and the flash attention
+are, so its estimates read about twice the GPU time and a `pp512` forward of
+Qwen3-1.7B is cut by work where the dispatch cap cut it before, at the same
+number of submits and the same throughput. On the RX 7900 XTX a small or
+mid-sized model's forward at the default batch takes no cut. SmolLM3-3B at
+`-u 4096`, which really runs longer than the budget, takes two cuts on every
+pass: one is owed, the other comes from its estimate standing above the real
+time.
+
+**Which queue inference runs on.** A GPU takes work on queues, and most devices
+have at least two kinds: a universal one that does graphics and compute, which
+is the one your desktop's compositor draws its frames on, and often a
+compute-only one. `queue.family` says which of them infr submits its work to:
+
+- **`auto`** (the default on a discrete GPU): the compute-only queue when the
+  device has one that infr can use, otherwise the universal one. On the
+  compute-only queue a long forward does not sit in front of the compositor's
+  frames, so the desktop stays responsive while a model runs: an RX 580 under
+  RADV held 130 fps in glxgears through a prefill that used to drop it to 7.
+- **`compute`**: the same choice, asked for by name. If the device has no
+  compute-only queue, or has one infr cannot use, infr falls back to the
+  universal queue and logs a warning that says which of the two it was.
+- **`graphics`**: always the universal queue. Choose it when throughput matters
+  more than the desktop, for example on a headless machine or a dedicated
+  inference box.
+
+This is a trade-off, and the default sides with the desktop. On the compute-only
+queue the model can run a few percent slower and the desktop stays usable. On
+`graphics` the model gets that speed back, and on a machine whose GPU also draws
+the desktop, windows and video may stutter or freeze for as long as a forward
+runs. infr does not try to detect whether a GPU drives a display: if you want
+the speed and can live with a laggy desktop, set `graphics`.
+
+The difference in speed is measured, not assumed: on an RX 7900 XTX under the
+AMD Windows driver the compute-only queue cost 4.2% of decode speed and 1.1% of
+prefill speed, on a Ryzen integrated GPU under the same driver nothing
+measurable, and the contributor measured about 6% of decode on an RX 580 under
+RADV (the figures are in the changelog and in backlog B227 and B228; Linux
+headless is not measured yet). An integrated GPU defaults to `graphics` unless a
+table row for its driver says otherwise (the AMD Windows driver's sets `auto`):
+under RADV the compute ring's hang budget measured tighter on one.
+
+Set it in any of the three places every tuning parameter is set from:
+
+```toml
+# infr.toml
+[kernels.vulkan.tune]
+"queue.family" = "graphics"   # auto | compute | graphics
+```
+
+```sh
+INFR_TUNE=queue.family=graphics infr run model.gguf
+infr bench model.gguf --set kernels.vulkan.tune.queue.family=graphics
+```
+
+`--set` is accepted by `infr run`, `infr bench`, `infr serve` and
+`infr tune show`. Any other word is an error that lists the three. The older
+`kernels.vulkan.gfx_queue = true` (`INFR_GFX_QUEUE`) is an alias of `graphics`.
+`infr tune show` prints the value, where it came from and the family that was
+picked, and the startup log has the same line:
+
+```
+queue.family                 auto   default; picked queue family 1 (compute-only, timestampValidBits 64): a compute-only family that writes timestamps
+```
+
+"A queue infr cannot use" is one that writes no timestamps (`timestampValidBits`
+0): the submit splitter, the work bound, the dropped-work check and
+`INFR_PROF_OPS` all read timestamps from the submit queue, so such a family is
+never picked, under any setting, with a warning. The choice also decides which
+of the driver's watchdogs applies. amdgpu documents a longer job timeout for its
+compute rings than for the graphics ring, but the work budget does not count on
+it: the 2 s figure is the tighter one, and it is the one that was measured, on
+the graphics ring.
 
 Each value is resolved once, when the backend is created, from these levels —
 the last one that sets a parameter wins, per parameter:
@@ -343,10 +574,11 @@ on a device that cannot pin a 16-wide subgroup runs at 32, as it always has;
 
 **The older knobs are aliases.** `device.subgroup_pref` (`INFR_SG`),
 `kernels.vulkan.flash_splits`, `pv_splits`, `flash_min_rows`, `flash_bm32`,
-`mmv_mw_warps`, `moe_small_m`, `canvas_chunk_n`, `i8cm_kq` (`INFR_NO_I8CM_KQ`)
-and the whole `[kernels.vulkan.gemv]` group keep their names, grammars and
-meanings — including their old clamps and fallbacks — and write the matching
-parameter at the level that set them (`infr tune show` labels it, e.g.
+`mmv_mw_warps`, `moe_small_m`, `canvas_chunk_n`, `i8cm_kq` (`INFR_NO_I8CM_KQ`),
+`kq_fma_gemv` (`INFR_KQ_FMA_GEMV`), `gfx_queue` (`INFR_GFX_QUEUE`) and the whole
+`[kernels.vulkan.gemv]` group keep their names, grammars and meanings —
+including their old clamps and fallbacks — and write the matching parameter at
+the level that set them (`infr tune show` labels it, e.g.
 `env alias INFR_FLASH_SPLITS`). At the same level the new `tune` key wins over
 the alias; across levels the higher level wins whichever spelling it uses. An
 alias set to a value that has no effect — its unset spelling
@@ -402,7 +634,36 @@ a legitimate slow reply, so it is opt-in), `idle_timeout_secs`
 unfinished work; default `0` disables idle exit), and `stats_interval_secs`
 (`INFR_SERVE_STATS_SECS` — how often the server logs its throughput line,
 default `5`; `0` switches the line off). Per-request sampling is not here — it
-stays on the request.
+stays on the request. Three more keys shape the HTTP surface:
+
+| key                  | env                             | what it does                                                                                                                     |
+| -------------------- | ------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| `allowed_hosts`      | `INFR_SERVE_ALLOWED_HOSTS`      | host names a request's `Host` header may carry (comma-separated in the environment, a list in the file); `*` turns the check off |
+| `sse_keepalive_secs` | `INFR_SERVE_SSE_KEEPALIVE_SECS` | how long a streamed reply may stay silent before the server sends an SSE comment line; `0` sends none                            |
+| `max_body_bytes`     | `INFR_SERVE_MAX_BODY_BYTES`     | the largest request body accepted; a larger one is a `413`                                                                       |
+
+**The `Host` check is DNS-rebinding protection.** A web page whose hostname
+re-resolves to `127.0.0.1` is same-origin with a local server and could drive
+it, but its requests still carry the page's own hostname. With `allowed_hosts`
+unset, the check guards only a server with no API key bound to a loopback
+address: it accepts `localhost`, any `*.localhost` name, `127.0.0.1`, `[::1]`
+and the bind host, on any port (so an SSH or container port forward works), and
+a request with no `Host` at all, which no browser sends. Anything else is a
+`403` whose body names this key. A server with an API key, or one bound to a
+non-loopback address, is not checked unless the key is set; once set, the listed
+names are allowed in addition to the loopback ones and the check always applies,
+which is the reverse-proxy and custom-hostname case. An entry that could never
+match (a URL, a path, a `*.x` pattern) stops the server at startup. `/health` is
+never checked.
+
+**`response_format`** is enforced, not ignored: `json_object` constrains the
+reply to a JSON object and `json_schema` to the given schema, streamed or not,
+on every path that can force a tool call (Vulkan at any `--parallel`, CPU, a
+Metal session). A path that cannot constrain (DiffusionGemma, a Metal
+speculative draft) answers `400`, as does a schema the grammar engine rejects.
+Thinking is switched off for such a request. Numbers the schema leaves unbounded
+are limited in length so a reply cannot run digits to `max_tokens`, and exponent
+form is not produced; strings and nesting are not bounded.
 
 Idle exit waits for queued requests, image validation, generation, and response
 streams to finish. Every HTTP request resets the timer, including health and

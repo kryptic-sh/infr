@@ -15,13 +15,14 @@ use infr_core::backend::{Backend, Buffer, BufferUsage};
 use infr_core::tensor::DType;
 use infr_core::WeightSource;
 use infr_cpu::CpuBackend;
-use infr_gguf::TensorBytes;
+use infr_gguf::{Gguf, TensorBytes};
 
 mod dsv4_emit;
 mod dsv4_plan;
 mod kv_store;
 pub mod model;
 mod pool;
+mod routing;
 mod runner;
 mod sc;
 mod weights;
@@ -29,6 +30,7 @@ mod wshape;
 
 pub(crate) use kv_store::KvPrefixStore;
 pub(crate) use pool::{paged_layer, KvPool, PagedSlot, POOL_BLOCKS};
+pub use routing::Routing;
 pub(crate) use runner::generate_dense_backend;
 pub(crate) use sc::DenoiseReq;
 pub use sc::{DenoiseOutcome, EbReduced};
@@ -821,6 +823,8 @@ pub(crate) fn generate_dense_cpu_mode(
             None, // h_out
             None, // denoise_req
             req,
+            None, // prefill_logits
+            None, // route
         )
     };
     // A cold init that got as far as building `state` left the bound weights in it, whole, even
@@ -918,6 +922,12 @@ pub(crate) fn generate_dense_vulkan(
     )
 }
 
+/// The binder of a WARM call: every weight is already bound, so asking it for one is a broken
+/// invariant, reported by name.
+fn warm_binder<'a>() -> Box<BindWeight<'a>> {
+    Box::new(|name: &str, _tb, _dt, _n| Err(anyhow!("warm session must not re-bind {name}")))
+}
+
 /// [`generate_dense_vulkan`] with a caller-held [`SeamKv`]: hold `state` (+ a `want_ctx` capacity)
 /// across calls and each turn prefills only the suffix that differs from the cached tokens —
 /// ChatSession-style KV reuse on the agnostic seam.
@@ -948,10 +958,8 @@ pub(crate) fn generate_dense_vulkan_session(
     // building the full `vulkan_moe_binder` — which re-resolves the placement tiers and allocs a
     // Box — is pure per-turn waste. Skip it: a no-op binder that errors loudly if the invariant
     // ever breaks.
-    let warm_binder: Box<BindWeight<'_>> =
-        Box::new(|name: &str, _tb, _dt, _n| Err(anyhow!("warm session must not re-bind {name}")));
     let bind = if state.is_some() {
-        warm_binder
+        warm_binder()
     } else {
         let _gp = req.and_then(|r| r.gate_pass());
         vulkan_moe_binder(vk, g, cfg, ec, true, want_ctx)?
@@ -4504,6 +4512,390 @@ pub(crate) fn window_logits_rows(
         None,
     )?;
     Ok(logits)
+}
+
+/// The backend a teacher-forced run drives ([`crate::SeamModel::forced_logits`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ForcedOn {
+    /// The CPU backend in reference mode (`kernels.cpu.reference`: quantized weights decoded to
+    /// f32 and dotted in f32, no int8 activations).
+    CpuReference,
+    /// The production CPU backend.
+    Cpu,
+    /// The Vulkan backend on the engine configuration's device.
+    Vulkan,
+}
+
+/// Which prefill rows a teacher-forced run scores ([`crate::SeamModel::forced_logits`]). Each
+/// scored row costs a vocabulary-wide head the production prefill never runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrefillHead {
+    /// Every prompt row before the frontier.
+    All,
+    /// The last row of each prefill chunk.
+    LastOfChunk,
+    /// No prefill row: the batched prefill runs exactly as in production, and only the decode
+    /// rows are scored.
+    Off,
+}
+
+/// What a teacher-forced run produced: the logits at every position it scored, in position
+/// order. See [`crate::SeamModel::forced_logits`].
+#[derive(Clone, Debug)]
+pub struct ForcedLogits {
+    /// The scored positions; row `r` of `logits` is the next-token distribution after
+    /// `seq[..=positions[r]]`.
+    pub positions: Vec<usize>,
+    /// `[positions.len() * vocab]` raw logits (post-softcap, pre-softmax).
+    pub logits: Vec<f32>,
+    pub vocab: usize,
+    /// How many of the leading rows came from the batched prefill; the rest came from one decode
+    /// step each.
+    pub prefill_rows: usize,
+    /// The whole sequence the run fed: the prompt, then each forced token.
+    pub seq: Vec<u32>,
+    /// The compute kernels the backend built for the run (Vulkan; empty on the CPU), so a test
+    /// can assert which kernel families a configuration actually reached.
+    pub kernels: Vec<&'static str>,
+    /// What the backend's own routers selected at every position the run fed, whether or not
+    /// the run was forced along another run's selection; `None` for a model with no
+    /// router-selected expert layer.
+    pub routing: Option<Routing>,
+}
+
+/// Drive `prompt` and then `n_steps` forced tokens through `be`, capturing the logits at every
+/// position, on the production paths: one ORDINARY batched prefill of `prompt[..len-1]` (chunked
+/// at the engine's `device.ubatch`; the LM head is added over its rows through
+/// `generate_dense_backend_bound`'s `prefill_logits`, nothing else changes), then one per-token
+/// decode step per position from `len-1` on, each a warm call on the same session that feeds
+/// exactly the one new token, so it reads KV written by the prefill and by every earlier decode
+/// step. `next(step, row)` picks the token fed after each decode row: the reference's greedy
+/// argmax, or the reference's recorded token when the backend under test is forced along it.
+///
+/// The decode step is the per-token path: where the backend replays, each step is a warm call that
+/// builds, records and executes a fresh replay plan once, so the record-once-replay-many mechanism
+/// (parameters advancing across replays of one recording) and the chained decode (several steps
+/// per submit, the production greedy path) are NOT exercised; the static per-token path runs when
+/// the configuration sets `kernels.vulkan.no_replay`. Forcing needs every step's logits, which the
+/// chain does not read back; [`greedy_tail_vulkan`] is how those two are compared with this path.
+///
+/// A model whose prompt takes no batched prefill (MoE without the batched kernels, gemma-4 E2B)
+/// returns no prefill rows; its prompt positions are not scored.
+///
+/// On a model with router-selected expert layers, every graph also reads back what each such
+/// router selected ([`ForcedLogits::routing`], with the selection scores when `route_scores`),
+/// and with `route` every such layer runs on that selection instead of its own, at every position
+/// (`Op::MoeFfn::expert_ids`): the run is then forced along a reference's routing as well as its
+/// tokens. The selection it reads back is its own either way.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn forced_run(
+    be: &dyn Backend,
+    bind_weight: &BindWeight,
+    g: &Gguf,
+    cfg: &Config,
+    ec: &EngineConfig,
+    token_embd: TokenEmbd<'_>,
+    ple: Option<&PerLayerEmbd>,
+    prompt: &[u32],
+    n_steps: usize,
+    head: PrefillHead,
+    route: Option<&Routing>,
+    route_scores: bool,
+    mut next: impl FnMut(usize, &[f32]) -> u32,
+) -> AResult<ForcedLogits> {
+    let routed = !routing::router_selected_layers(cfg).is_empty();
+    if route.is_some() && !routed {
+        return Err(anyhow!(
+            "a routing was supplied for a model with no router-selected expert layer"
+        ));
+    }
+    let mut route_tap = routed.then_some(routing::RouteTap {
+        forced: route,
+        scores: route_scores,
+        taken: Vec::new(),
+    });
+    if prompt.len() < 4 {
+        return Err(anyhow!(
+            "a forced run needs a prompt of at least 4 tokens for a batched prefill, got {}",
+            prompt.len()
+        ));
+    }
+    let want_ctx = prompt.len() + n_steps + 2;
+    let mut state = None;
+    let mut tap = runner::PrefillTap {
+        last_only: head == PrefillHead::LastOfChunk,
+        ..Default::default()
+    };
+    runner::generate_dense_backend_bound(
+        None,
+        be,
+        bind_weight,
+        g,
+        cfg,
+        ec,
+        token_embd,
+        ple,
+        prompt,
+        0,
+        |_| {},
+        &mut state,
+        want_ctx,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        (head != PrefillHead::Off).then_some(&mut tap),
+        route_tap.as_mut(),
+    )?;
+    let vocab = cfg.vocab;
+    let prefill_rows = tap.positions.len();
+    if tap.logits.len() != prefill_rows * vocab {
+        return Err(anyhow!(
+            "prefill logits are not one row of {vocab} per position"
+        ));
+    }
+    // Every row the head ran must be a prompt position before the frontier, in order, and an
+    // every-row head must have covered all of them.
+    let in_order = tap.positions.windows(2).all(|w| w[0] < w[1])
+        && tap.positions.last().is_none_or(|&p| p + 2 == prompt.len());
+    if !in_order
+        || (head == PrefillHead::All && prefill_rows != 0 && prefill_rows != prompt.len() - 1)
+    {
+        return Err(anyhow!(
+            "the batched prefill returned rows at {:?} for a {}-token prompt",
+            tap.positions,
+            prompt.len()
+        ));
+    }
+    let mut positions = tap.positions;
+    let mut logits = tap.logits;
+    let mut seq = prompt.to_vec();
+    for step in 0..n_steps {
+        let mut row = Vec::new();
+        let (_, stats) = runner::generate_dense_backend_bound(
+            None,
+            be,
+            bind_weight,
+            g,
+            cfg,
+            ec,
+            token_embd,
+            ple,
+            &seq,
+            1,
+            |_| {},
+            &mut state,
+            want_ctx,
+            None,
+            None,
+            None,
+            Some(&mut row),
+            None,
+            None,
+            None,
+            None,
+            route_tap.as_mut(),
+        )?;
+        if row.len() != vocab {
+            return Err(anyhow!(
+                "decode step {step} returned {} logits, not {vocab}",
+                row.len()
+            ));
+        }
+        // A step that re-prefilled the sequence would score the prefill again, not the decode
+        // path reading the session's KV.
+        if (stats.n_cached, stats.n_prompt) != (seq.len() - 1, 1) {
+            return Err(anyhow!(
+                "decode step {step} reused {} of {} tokens and fed {}, not exactly the new one",
+                stats.n_cached,
+                seq.len(),
+                stats.n_prompt
+            ));
+        }
+        positions.push(seq.len() - 1);
+        seq.push(next(step, &row));
+        logits.extend_from_slice(&row);
+    }
+    // Every token but the last was fed: the last forced token is only a row's choice.
+    let routing = match &route_tap {
+        Some(t) => Some(routing::assemble_routing(
+            routing::router_selected_layers(cfg),
+            cfg.moe.as_ref().expect("a routed model has a MoeConfig"),
+            &t.taken,
+            seq.len() - 1,
+            route_scores,
+        )?),
+        None => None,
+    };
+    Ok(ForcedLogits {
+        positions,
+        logits,
+        vocab,
+        prefill_rows,
+        seq,
+        kernels: Vec::new(),
+        routing,
+    })
+}
+
+/// [`forced_run`] on a fresh CPU backend (`reference` picks `kernels.cpu.reference`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn forced_run_cpu(
+    reference: bool,
+    g: &Gguf,
+    cfg: &Config,
+    ec: &std::sync::Arc<EngineConfig>,
+    token_embd: TokenEmbd<'_>,
+    ple: Option<&PerLayerEmbd>,
+    prompt: &[u32],
+    n_steps: usize,
+    head: PrefillHead,
+    route: Option<&Routing>,
+    next: impl FnMut(usize, &[f32]) -> u32,
+) -> AResult<ForcedLogits> {
+    let be = if reference {
+        CpuBackend::reference_with(ec.clone())
+    } else {
+        CpuBackend::new_with(ec.clone())
+    };
+    let bind = cpu_upload_bind(&be);
+    forced_run(
+        &be, &bind, g, cfg, ec, token_embd, ple, prompt, n_steps, head, route, true, next,
+    )
+}
+
+/// [`forced_run`] on a fresh Vulkan backend for `ec`'s device.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn forced_run_vulkan(
+    g: &Gguf,
+    cfg: &Config,
+    ec: &std::sync::Arc<EngineConfig>,
+    token_embd: TokenEmbd<'_>,
+    ple: Option<&PerLayerEmbd>,
+    prompt: &[u32],
+    n_steps: usize,
+    head: PrefillHead,
+    route: Option<&Routing>,
+    next: impl FnMut(usize, &[f32]) -> u32,
+) -> AResult<ForcedLogits> {
+    let vk = infr_vulkan::VulkanBackend::new_with(ec.clone())
+        .map_err(|e| anyhow!("vulkan init: {e}"))?;
+    let bind = vulkan_upload_bind(&vk);
+    // `moe_topk` writes a selection, not the scores it ranked by (`Op::MoeRoute::dst_scores`).
+    let mut out = forced_run(
+        &vk, &bind, g, cfg, ec, token_embd, ple, prompt, n_steps, head, route, false, next,
+    )?;
+    out.kernels = vk.built_kernel_names();
+    Ok(out)
+}
+
+/// What a production greedy generation on Vulkan produced, and what it left in its session
+/// ([`crate::SeamModel::greedy_tail_vulkan`]).
+#[derive(Clone, Debug)]
+pub struct GreedyTail {
+    /// The tokens the generation sampled, in order.
+    pub ids: Vec<u32>,
+    /// How many of them came back from chained submits ([`GenStats::n_chained`]).
+    pub chained: usize,
+    /// The record-once decode recordings the generation made: one where the whole decode replayed
+    /// a single recording, none where the backend does not replay the model.
+    pub recordings: u64,
+    /// The generation ended itself on an end token ([`GenStats::natural_stop`]), which is then
+    /// the last of `ids`; otherwise it ran the length it was asked for.
+    pub natural_stop: bool,
+    /// The logits after `prompt ++ ids`: one more per-token step on the same session, which feeds
+    /// the last sampled token and attends over every KV row the generation wrote.
+    pub row: Vec<f32>,
+}
+
+/// Generate `n` greedy tokens after `prompt` on a fresh Vulkan backend for `ec`'s device through
+/// [`generate_dense_vulkan_session`], the function [`generate_dense_vulkan`] is (the production
+/// placement, prefill and decode: chained where `spec.decode_chain` and the device allow, else
+/// one replay of a single recording per token, else the static per-token path), then run one more
+/// per-token step on the same session and return its logits. That row is how a caller sees what
+/// the generation left in the KV cache, which the chain itself never reads back.
+///
+/// One thing differs from [`generate_dense_vulkan`]: the session is opened with room for that
+/// extra step, a context one row longer than the one-shot call asks for.
+pub(crate) fn greedy_tail_vulkan(
+    g: &Gguf,
+    cfg: &Config,
+    ec: &std::sync::Arc<EngineConfig>,
+    token_embd: TokenEmbd<'_>,
+    ple: Option<&PerLayerEmbd>,
+    prompt: &[u32],
+    n: usize,
+) -> AResult<GreedyTail> {
+    let vk = infr_vulkan::VulkanBackend::new_with(ec.clone())
+        .map_err(|e| anyhow!("vulkan init: {e}"))?;
+    let want_ctx = prompt.len() + n + 2;
+    let mut state = None;
+    let (ids, stats) = generate_dense_vulkan_session(
+        &vk,
+        g,
+        cfg,
+        ec,
+        token_embd,
+        ple,
+        prompt,
+        n,
+        |_| {},
+        &mut state,
+        want_ctx,
+        None,
+        None,
+    )?;
+    let recordings = vk.decode_recordings();
+    let seq: Vec<u32> = prompt.iter().chain(&ids).copied().collect();
+    let mut row = Vec::new();
+    let (_, tail) = runner::generate_dense_backend(
+        &vk,
+        &*warm_binder(),
+        g,
+        cfg,
+        ec,
+        token_embd,
+        ple,
+        &seq,
+        1,
+        |_| {},
+        &mut state,
+        want_ctx,
+        None,
+        None,
+        None,
+        Some(&mut row),
+        None,
+        None,
+        None,
+    )?;
+    // A step that re-prefilled would score a prefill, not the KV the generation wrote.
+    if (tail.n_cached, tail.n_prompt) != (seq.len() - 1, 1) {
+        return Err(anyhow!(
+            "the step after the generation reused {} of {} tokens and fed {}, not exactly the last \
+             sampled one",
+            tail.n_cached,
+            seq.len(),
+            tail.n_prompt
+        ));
+    }
+    if row.len() != cfg.vocab {
+        return Err(anyhow!(
+            "the step after the generation returned {} logits, not {}",
+            row.len(),
+            cfg.vocab
+        ));
+    }
+    Ok(GreedyTail {
+        ids,
+        chained: stats.n_chained,
+        recordings,
+        natural_stop: stats.natural_stop,
+        row,
+    })
 }
 
 /// Backend-generic dense decode runner. Builds the agnostic decode [`Graph`] per token and runs it

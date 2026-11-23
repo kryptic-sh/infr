@@ -34,9 +34,14 @@ layout(binding = 3) readonly buffer WB { uint nw[]; };
 
 shared float red[NR * 64]; // per-subgroup partials when a workgroup spans several subgroups
 
+// `precise` here and on each item's result: the decode kernel and its multi-row twin must give
+// the same bits for a row (the MTP verify contract), and they only do if neither compiler
+// contracts a multiply-add the other leaves alone. Without it the AMD Windows driver on RDNA3
+// differed by one ulp between the two files.
 float dot4b(uint q, vec4 xv) {
-    return float(q & 0xFFu) * xv.x + float((q >> 8u) & 0xFFu) * xv.y
-         + float((q >> 16u) & 0xFFu) * xv.z + float(q >> 24u) * xv.w;
+    precise float r = float(q & 0xFFu) * xv.x + float((q >> 8u) & 0xFFu) * xv.y
+                    + float((q >> 16u) & 0xFFu) * xv.z + float(q >> 24u) * xv.w;
+    return r;
 }
 float hsum(vec4 v) { return (v.x + v.y) + (v.z + v.w); }
 
@@ -79,7 +84,7 @@ vec4 item(uvec4 rb, uint sb, uint sbb, uint l8) {
     }
     bool hi = g >= 2u;
     uint s = ((2u * g) & 3u) * 8u;
-    vec4 out4;
+    precise vec4 out4;
     [[unroll]] for (uint r = 0u; r < 4u; r++) {
         uvec4 hdr = hdrs[r];
         uvec4 q = qs[r];
@@ -124,7 +129,7 @@ vec4 item(uvec4 rb, uint sb, uint sbb, uint l8) {
         ws[r] = uvec3(NW2(sc), NW(sc + 2u));
         wd[r] = NW((bd + 208u) >> 2u);
     }
-    vec4 out4;
+    precise vec4 out4;
     [[unroll]] for (uint r = 0u; r < 4u; r++) {
         bool odd = ((rb[r] + sbb) & 2u) != 0u;
         uvec2 la = odd ? (wa[r].xy >> 16u) | (wa[r].yz << 16u) : wa[r].xy;

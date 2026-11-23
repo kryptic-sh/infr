@@ -59,9 +59,29 @@ pub struct DeviceFacts {
     pub wave64: bool,
     /// `maxComputeSharedMemorySize`, bytes.
     pub max_shared_memory: u32,
+    /// The 16x16x16 f16 cooperative-matrix kernels are live (`Capabilities::f16_coopmat`, after
+    /// any forced mask such as `INFR_NO_COOPMAT` and the wave64 path's coopmat-off rule).
+    pub matrix_units: bool,
+    /// The driver reports packed signed 4x8-bit dot products as accelerated
+    /// (`integerDotProduct4x8BitPackedSignedAccelerated`): `false` where the int8 dot the
+    /// kernels use is emulated in ALU, as on GCN under RADV.
+    pub dot_accelerated: bool,
 }
 
 impl DeviceFacts {
+    /// A device whose work per dispatch is slow enough that a whole first forward in one submit
+    /// can outlast a driver's job timeout (issue 94's RX 580): a wave64-only part, or one with
+    /// neither matrix units nor an accelerated int8 dot.
+    pub fn slow_class(&self) -> bool {
+        self.wave64 || (!self.matrix_units && !self.dot_accelerated)
+    }
+
+    /// A device a driver's watchdog is known to reset under long work: an integrated GPU, or one
+    /// in the slow class. It gets the tight default of `submit.budget_ms` (`crate::work`).
+    pub fn reset_prone(&self) -> bool {
+        self.integrated || self.slow_class()
+    }
+
     /// The vendor's short name, as a row's `match.vendor` spells it.
     pub fn vendor(&self) -> &'static str {
         vendor_name(self.vendor_id)
@@ -186,6 +206,43 @@ impl AttnSplit {
     }
 }
 
+/// `queue.family`: which of a device's queue families inference submits on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum QueueFamily {
+    /// A COMPUTE-only family when the device has one that writes timestamps, else the universal
+    /// family, without comment.
+    #[default]
+    Auto,
+    /// Ask for a COMPUTE-only family; fall back to the universal one with a warning that says
+    /// why when there is none, or none that writes timestamps.
+    Compute,
+    /// The universal (GRAPHICS and COMPUTE) family, the one a compositor renders on.
+    Graphics,
+}
+
+impl QueueFamily {
+    /// Every value with its spelling, in the order `infr tune list` prints them.
+    pub(crate) const ALL: [(&'static str, QueueFamily); 3] = [
+        ("auto", QueueFamily::Auto),
+        ("compute", QueueFamily::Compute),
+        ("graphics", QueueFamily::Graphics),
+    ];
+    /// The spellings alone, for the parameter's declared range.
+    pub(crate) const NAMES: &'static [&'static str] = &["auto", "compute", "graphics"];
+
+    pub(crate) fn name(self) -> &'static str {
+        Self::ALL
+            .iter()
+            .find(|(_, v)| *v == self)
+            .map(|(n, _)| *n)
+            .expect("every value is listed")
+    }
+
+    pub(crate) fn from_name(s: &str) -> Option<Self> {
+        Self::ALL.iter().find(|(n, _)| *n == s).map(|(_, v)| *v)
+    }
+}
+
 /// The resolved parameter set, typed, one field per parameter. Built once per backend by
 /// [`resolve::resolve`]; every kernel choice reads its field here.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -194,6 +251,9 @@ pub(crate) struct Tuning {
     pub sg_pref: u32,
     /// `gemv.variant`: the multi-row decode GEMV build (`None` = the plain RM path).
     pub gemv_variant: Option<String>,
+    /// `gemv.kq_fma`: the fp32 decode GEMVs for devices without an accelerated int8 dot
+    /// (`native_gemv_kq_fma` and its verify twin, `linear_f32_mo`, one-row `linear_bf16`).
+    pub gemv_kq_fma: bool,
     /// `gemv_rm.*`: the multi-output-row decode GEMV.
     pub gemv_rm_enabled: bool,
     pub gemv_rm_rows: u32,
@@ -216,6 +276,9 @@ pub(crate) struct Tuning {
     pub flash_force_bm32: bool,
     /// `attn_pv.*`: the non-flash coopmat attention's P·V split.
     pub pv: AttnSplit,
+    /// `attn_split.decode_min_chunk`: the chunk floor of decode split-K attention
+    /// (`crate::attn_chunk`).
+    pub attn_decode_min_chunk: usize,
     /// `attn_canvas.chunks`: the canvas-mask split-K chunk divisor.
     pub canvas_chunks: usize,
     /// `moe.small_m`: the small-batch MoE path's row ceiling.
@@ -230,6 +293,18 @@ pub(crate) struct Tuning {
     /// `rmsnorm.*`: the 1024-wide decode RMSNorm build.
     pub rmsnorm_wide: bool,
     pub rmsnorm_wide_min_dim: usize,
+    /// `queue.family`: which queue family inference submits on
+    /// (`VulkanBackend::pick_queue_family`).
+    pub queue_family: QueueFamily,
+    /// `submit.initial_dispatches`: the submit splitter's cap before any forward has been
+    /// measured (`0` = never split).
+    pub submit_initial_dispatches: usize,
+    /// `submit.budget_ms`: the estimated GPU time past which a dispatch is cut into ranges and
+    /// a submit is closed at the next op boundary (`0` = no work bound; see `crate::work`).
+    pub submit_budget_ms: u32,
+    /// `submit.prior_gflops`: the throughput the work estimate assumes for a kernel this process
+    /// has not measured yet, in GFLOP/s for the whole device.
+    pub submit_prior_gflops: u32,
 }
 
 impl Tuning {

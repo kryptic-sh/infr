@@ -78,8 +78,13 @@ cfg_struct! {
         /// `INFR_UBATCH_PARALLEL`: prefill chunk for a sequence sharing the GPU (`serve -np N`).
         ubatch_parallel: usize = 256,
         /// `INFR_SUBMIT_DISPATCHES`: submit-splitter cap (`0` = never split). `None` = the
-        /// measured `initial_submit_dispatch_cap(integrated)` default.
+        /// measured `initial_submit_dispatch_cap(integrated, slow)` default.
         submit_dispatches: Option<usize> = None,
+        /// `INFR_GPU_WAIT_TIMEOUT_MS`: how long one host wait on GPU work may take before the
+        /// backend gives up, reports the submit it was waiting on and refuses further work
+        /// (`0` = wait forever, for debugging). `None` = the backend's default; the Vulkan backend
+        /// refuses any other value under its minimum at creation.
+        gpu_wait_timeout_ms: Option<u64> = None,
         /// `INFR_SG`: subgroup-size preference, exactly 16 or 32. `None` = vendor-derived.
         subgroup_pref: Option<u32> = None,
         /// Worker threads. Sourced from the CLI's `-t`; still PUBLISHED as `RAYON_NUM_THREADS`
@@ -301,7 +306,8 @@ cfg_struct! {
     ///
     /// The fields listed in [`tune::TUNE_ALIASES`] (`flash_splits`, `pv_splits`,
     /// `flash_min_rows`, `flash_bm32`, `mmv_mw_warps`, `moe_small_m`, `canvas_chunk_n`,
-    /// `i8cm_kq`, the `gemv` group) are aliases of Vulkan tuning parameters: they keep their
+    /// `i8cm_kq`, `kq_fma_gemv`, `gfx_queue`, the `gemv` group) are aliases of Vulkan tuning
+    /// parameters: they keep their
     /// spelling and meaning, and the backend's tuning resolver turns them into the parameter.
     VulkanCfg / PartialVulkanCfg {
         subs {
@@ -475,9 +481,9 @@ cfg_struct! {
         delta_strided: bool = false,
         /// `INFR_NO_PUSH_DESC` (inverted).
         push_desc: bool = true,
-        /// `INFR_GFX_QUEUE` — submit on the universal (graphics) family instead of a COMPUTE-only
-        /// one. The compositor renders on that same ring, so inference then competes with the
-        /// desktop's frames; kept for devices whose compute ring is unusable.
+        /// `INFR_GFX_QUEUE` — submit on the universal (graphics) family even where the device
+        /// rule would pick a COMPUTE-only one. An alias of the Vulkan tuning parameter
+        /// `queue.family`, which it sets to `graphics`.
         gfx_queue: bool = false,
         /// `INFR_NO_PIPELINE_CACHE` (inverted).
         pipeline_cache_disk: bool = true,
@@ -578,12 +584,13 @@ cfg_struct! {
         /// `INFR_CPU_REPACK_MB`: repack-cache byte budget, in MiB.
         repack_mb: usize = 4096,
         /// `INFR_CPU_MAX_TIER`: the widest SIMD tier the CPU backend's kernels and
-        /// `infr_core::math`'s slice functions may run (`scalar`, `avx2`, `avx512` or
-        /// `avx512vnni`, a [`crate::simd::SimdTier`] name; any other value is a config error)
-        /// instead of the widest the CPU supports. A ceiling, not a demand: one above what the
-        /// CPU has runs the CPU's widest. A debug switch: every tier gives the same bits, so this
-        /// changes only speed; it exists to run and test the narrow paths (an aarch64 machine
-        /// runs `scalar`) on a machine that has wider ones. PROCESS-WIDE: every CPU backend
+        /// `infr_core::math`'s slice functions may run (`scalar`; `avx2`, `avx512` or
+        /// `avx512vnni` on x86-64; `dotprod` on aarch64: a [`crate::simd::SimdTier`] name; any
+        /// other value is a config error) instead of the widest the CPU supports. A ceiling, not
+        /// a demand: one above what the CPU has runs the CPU's widest, and so does another
+        /// architecture's tier. A debug switch: every tier gives the same bits, so this changes
+        /// only speed; it exists to run and test the narrow paths on a machine that has wider
+        /// ones. PROCESS-WIDE: every CPU backend
         /// applies its value when it is built (unset = no ceiling), so the last backend built
         /// decides the tier for all of them.
         max_tier: Option<crate::simd::SimdTier> = None,
@@ -891,6 +898,34 @@ cfg_struct! {
         /// More tokens = more detail, but the CPU vision encoder's attention grows with the square
         /// of the image's patch count. 280 is Gemma 4's default budget.
         image_max_tokens: usize = 280,
+        /// `INFR_SERVE_ALLOWED_HOSTS`: the host names a request's `Host` may carry, comma-separated
+        /// in the environment, a list in a file. `*` turns the check off; an empty list is unset.
+        /// An entry that is not a bare host name or address (a URL, a path, a `*.x` pattern) stops
+        /// the server at startup.
+        ///
+        /// Unset, the check guards only a KEYLESS LOOPBACK server, and allows the loopback names
+        /// (`localhost`, `*.localhost`, `127.0.0.1`, `[::1]`) and the bind host, on any port, and a
+        /// request with no `Host`. That is DNS-rebinding protection: a web page whose hostname
+        /// re-resolves to `127.0.0.1` is same-origin with the server and could otherwise drive
+        /// it, but its requests carry its own hostname. A server with an API key, or one bound to
+        /// a non-loopback address, has chosen its exposure and is not checked. Set, the listed
+        /// names are allowed IN ADDITION to the loopback ones, and the check applies whatever the
+        /// bind address or key — the reverse-proxy and custom-hostname case. `/health` is never
+        /// checked.
+        allowed_hosts: Option<Vec<String>> = None,
+        /// `INFR_SERVE_SSE_KEEPALIVE_SECS`: how long a streamed reply may go quiet before the
+        /// server sends an SSE comment line, in seconds. `0` sends none; an interval past the
+        /// server's ceiling (`MAX_SSE_KEEPALIVE` in infr-server) is held to that ceiling.
+        ///
+        /// A long prefill or a grammar-forced tool call sends nothing until the first token, and a
+        /// proxy with an idle timeout cuts a stream that has been silent too long. A comment line
+        /// is ignored by every conforming SSE parser, so it keeps the connection alive without
+        /// changing what the client reads. The default is axum's own keep-alive interval.
+        sse_keepalive_secs: u64 = 15,
+        /// `INFR_SERVE_MAX_BODY_BYTES`: the largest request body accepted, in bytes; a larger one
+        /// is a `413`. Must be positive, else the default — which is axum's own default body
+        /// limit, the limit this server applied before the knob existed.
+        max_body_bytes: u64 = 2_097_152,
     }
 }
 

@@ -988,8 +988,8 @@ fn prefill_chunk_never_outgrows_the_window_ring() {
 }
 
 /// The canonical layout with its routed expert banks stored as Q8_0, the shipped expert bank's
-/// sibling that `Op::MoeFfn` feeds int8-quantized activations once a graph has two rows or more
-/// (its `int8_ok`; `infr_cpu`'s `expert_acts_kind`), where one row keeps f32 activations.
+/// sibling that `Op::MoeFfn` feeds int8-quantized activations at every row count (`infr_cpu`'s
+/// `expert_acts_kind`), each row quantized on its own.
 fn quantized_banks() -> SyntheticModel {
     let mut m = session_model(&dsv4_dims());
     let mut n = 0;
@@ -1014,84 +1014,37 @@ fn open_quantized(m: &SyntheticModel, ubatch: usize, reference: bool) -> Model {
     Model::open_with(&format!("dsv4-pf-q8-{ubatch}-{reference}"), m, ec)
 }
 
-/// The largest |logit| difference chunked prefill may make against one position per graph on
-/// [`quantized_banks`] in the production kernels, at the last prompt position and at the first
-/// decoded one: the int8 rounding of the expert activations, which a one-row graph does not
-/// apply. Measured at 300 tokens: 1.71e-4 and 2.37e-4.
-const QUANTIZED_BANKS_MAX_DIFF: f32 = 1e-3;
-
-/// **With quantized expert banks, chunked prefill is close to one position per graph, not equal,
-/// and the CPU's reference mode makes it equal again.** A chunk sends the Q8_0 banks int8
-/// activations and one position per graph f32 ones, so the two differ by that rounding,
-/// everywhere downstream of the first MoE layer: the logits stay within
-/// [`QUANTIZED_BANKS_MAX_DIFF`] (and DO differ, or the int8 path would not be running), while the
-/// indexer's selections may flip at near-ties (the canonical indexer's four heads make many) and
-/// the compressed buffers differ. Every chunk height gives the same bits as every other: each
-/// row's activations are quantized on their own. Reference mode keeps every row count on f32
-/// activations, so there chunked and one-position prefill agree bit for bit on everything
-/// [`observe`] records, and its one-position run equals the production one-position run (no
-/// int8 activation reaches a one-row graph).
+/// **With quantized expert banks, chunked prefill equals one position per graph**, bit for bit,
+/// in the production kernels and in reference mode. The Q8_0 banks take int8 activations at
+/// every row count, each row quantized on its own, and the expert kernels give a row the same
+/// bits in a bucket of any size, so every chunk height gives the same logits, indexer
+/// selections, compressed state and decode as one position per graph (until 2026-11 one row took
+/// f32 activations, and chunked prefill sat 1.71e-4 from it in the logits). Reference mode keeps
+/// every row count on f32 activations, and there too chunked and one-position prefill agree; the
+/// production one-position run DIFFERS from the reference one, which shows one row really takes
+/// the int8 path.
 #[test]
-fn quantized_banks_chunked_prefill_is_close_and_reference_is_exact() {
+fn quantized_banks_chunked_prefill_is_exact_in_both_modes() {
     let m = quantized_banks();
     let prompt = ids(300, 11);
     let one = observe(&open_quantized(&m, 1, false), &prompt, 1, false);
-    let max = |a: &[f32], b: &[f32]| {
-        a.iter()
-            .zip(b)
-            .map(|(x, y)| (x - y).abs())
-            .fold(0f32, f32::max)
-    };
-    let chunked: Vec<Observed> = CHUNKS
-        .iter()
-        .map(|&k| observe(&open_quantized(&m, k, false), &prompt, k, false))
-        .collect();
-    let (logits, decode) = (
-        max(&chunked[0].logits, &one.logits),
-        max(&chunked[0].decode_logits, &one.decode_logits),
-    );
-    let flipped = (chunked[0].selections.iter())
-        .zip(&one.selections)
-        .filter(|(a, b)| a != b)
-        .count();
-    let measured = format!(
-        "max |logit diff| {logits:e} at the prompt's end, {decode:e} at the first decoded \
-         position; {flipped} of {} selections differ",
-        one.selections.len()
-    );
-    assert!(
-        logits > 0.0,
-        "the chunks took the one-row f32 path, no int8 activation ran: {measured}"
-    );
-    assert!(
-        logits <= QUANTIZED_BANKS_MAX_DIFF && decode <= QUANTIZED_BANKS_MAX_DIFF,
-        "chunked prefill moved the logits too far: {measured}"
-    );
-    for (k, c) in CHUNKS.iter().zip(&chunked).skip(1) {
+    for k in CHUNKS {
+        let c = observe(&open_quantized(&m, k, false), &prompt, k, false);
         let d = report(
-            &format!("chunk {k} against chunk {}", CHUNKS[0]),
-            c,
-            &chunked[0],
+            &format!("chunk {k} against one position per graph"),
+            &c,
+            &one,
         );
-        assert!(
-            d.is_empty(),
-            "{}",
-            d.join(
-                "
-"
-            )
-        );
+        assert!(d.is_empty(), "{}", d.join("\n"));
     }
     let ref_one = observe(&open_quantized(&m, 1, true), &prompt, 1, false);
     let ref_chunked = observe(&open_quantized(&m, 37, true), &prompt, 37, false);
     let d = report("reference mode, chunk 37", &ref_chunked, &ref_one);
     assert!(d.is_empty(), "{}", d.join("\n"));
-    let d = report(
-        "one position per graph, production against reference",
-        &one,
-        &ref_one,
+    assert!(
+        one.logits != ref_one.logits,
+        "one position per graph gave the reference logits: no int8 activation ran at one row"
     );
-    assert!(d.is_empty(), "{}", d.join("\n"));
 }
 
 /// The canonical layout stored in the shipped V4-Flash file's dtypes (`docs/deepseek.md`, "The
@@ -1178,7 +1131,7 @@ fn shipped_dtypes() -> SyntheticModel {
 /// Every Q8_0 matmul runs `Op::Linear` at the chunk's row count on the batched int8 kernels and at
 /// one row on the one-row kernels, which give the same bits (`infr-cpu`'s
 /// `linear_batch_identity`); the Q2_K expert banks keep f32 activations at every row count; the
-/// BF16 routers take an f32 dot. So unlike [`quantized_banks`], nothing here may differ: the
+/// BF16 routers take an f32 dot. So, as with [`quantized_banks`], nothing here may differ: the
 /// logits, every row's kept blocks, every compressed cache and ring, and the decode after, at a
 /// chunk height under a CSA block, an unaligned one, and the whole prompt, in the production
 /// kernels.
@@ -1219,9 +1172,8 @@ fn shipped_dtypes_chunked_prefill_equals_one_position_per_graph() {
 
 /// **With quantized expert banks, a layer-major prefill equals the chunk-major one at the same
 /// chunk height bit for bit**, int8 activations included: the reorder hands every op the same
-/// rows, and each row's activations are quantized on their own. So the layer-major path sits
-/// within [`QUANTIZED_BANKS_MAX_DIFF`] of one position per graph exactly where chunk-major does
-/// (the test above). In reference mode it equals one position per graph.
+/// rows, and each row's activations are quantized on their own. So the layer-major path equals
+/// one position per graph as chunk-major does (the test above), in both modes.
 #[test]
 fn quantized_banks_layer_major_equals_chunk_major() {
     let m = quantized_banks();

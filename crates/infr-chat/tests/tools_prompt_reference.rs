@@ -108,6 +108,23 @@ fn qwen35_tools_prompt_matches_the_reference() {
     );
 }
 
+/// Today's date line as a bare `strftime_now` call with the Llama 3.x template's own format
+/// writes it. What the function answers in a known time zone is `localtime`'s unit tests'
+/// business; this is only the date to expect from the same call made by the template.
+fn today_line() -> String {
+    let today = render_template(
+        "{{ strftime_now('%d %b %Y') }}",
+        vec![],
+        Value::Null,
+        "",
+        "",
+        false,
+        false,
+    )
+    .expect("a bare strftime_now renders");
+    format!("Today Date: {today}\n")
+}
+
 /// The Llama 3.x template stamps today's date through `strftime_now` (`render_template` passes no
 /// `date_string` to override it); the reference render was taken on the date written in it, so
 /// that line is moved to the render's date before comparing. The date is read on both sides of the
@@ -117,13 +134,11 @@ fn llama3_tools_prompt_matches_the_reference() {
     const CAPTURED: &str = "Today Date: 13 Nov 2026\n";
     let want = include_str!("fixtures/llama3_tools_reference.txt");
     assert!(want.contains(CAPTURED), "the fixture's date line moved");
-    let want_on = |date: chrono::DateTime<chrono::Local>| {
-        want.replace(CAPTURED, &date.format("Today Date: %d %b %Y\n").to_string())
-    };
-    let before = chrono::Local::now();
+    let want_on = |date_line: &str| want.replace(CAPTURED, date_line);
+    let before = today_line();
     let got = render(include_str!("fixtures/llama3_chat_template.jinja"));
-    let after = chrono::Local::now();
-    if got != want_on(after) {
-        assert_eq!(got, want_on(before));
+    let after = today_line();
+    if got != want_on(&after) {
+        assert_eq!(got, want_on(&before));
     }
 }

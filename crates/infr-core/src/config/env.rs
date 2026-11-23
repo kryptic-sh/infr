@@ -147,6 +147,14 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
         })?;
         p.device.submit_dispatches = Some(Some(n));
     }
+    // A safety bound: a typo meant to change it must not silently leave the default in place.
+    if let Some(v) = get("INFR_GPU_WAIT_TIMEOUT_MS") {
+        let ms = v.parse::<u64>().map_err(|e| ConfigError::Env {
+            key: "INFR_GPU_WAIT_TIMEOUT_MS",
+            message: format!("expected milliseconds (0 = wait forever): {e}"),
+        })?;
+        p.device.gpu_wait_timeout_ms = Some(Some(ms));
+    }
     // Exactly "16" or "32"; anything else is an error, not a silent fallback.
     if let Some(v) = get("INFR_SG") {
         let sg = match v.as_str() {
@@ -441,6 +449,18 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     p.serve.stats_interval_secs = num::<u64>(get, "INFR_SERVE_STATS_SECS");
     p.serve.mmproj = opt_path(get, "INFR_MMPROJ");
     p.serve.image_max_tokens = num::<usize>(get, "INFR_IMAGE_MAX_TOKENS").filter(|&v| v > 0);
+    // The `--set` list grammar; a value with no names in it (``, ` `, `,`, `none`) is "unset",
+    // the default policy, as the server reads an empty list from any layer.
+    p.serve.allowed_hosts = get("INFR_SERVE_ALLOWED_HOSTS").map(|v| {
+        <Option<Vec<String>> as super::partial::ConfigValue>::parse_set(&v)
+            .ok()
+            .flatten()
+            .filter(|list| !list.is_empty())
+    });
+    // `0` is a VALUE here too: it turns the keep-alive off.
+    p.serve.sse_keepalive_secs = num::<u64>(get, "INFR_SERVE_SSE_KEEPALIVE_SECS");
+    // A zero body limit would refuse every request, so it is junk, like a zero token cap.
+    p.serve.max_body_bytes = num::<u64>(get, "INFR_SERVE_MAX_BODY_BYTES").filter(|&v| v > 0);
 
     // ── hub ──────────────────────────────────────────────────────────────────
     // NO `> 0` filter: `0` is a MEANINGFUL value ("fetch strictly one file at a time"), so it must

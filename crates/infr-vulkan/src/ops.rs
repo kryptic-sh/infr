@@ -29,6 +29,12 @@ pub(crate) struct ComputeKernel {
     /// the request's shader/layout matches the built one — a name reused with a different
     /// `spv`/`n_buf`/`push_size` would otherwise silently return a mismatched pipeline.
     pub spv_hash: u64,
+    /// The subgroup pin the pipeline was created with, so a `DISPATCH_BASE` twin
+    /// ([`VulkanBackend::dispatch_base_pipeline`]) is created the same way.
+    pub pin: Option<SubgroupPin>,
+    /// The shader declares `gl_NumWorkGroups` (`spirv::reads_num_workgroups`): its grid may then
+    /// be cut into ranges only under a convention the op states (`work::Split::WideGrid`).
+    pub reads_num_workgroups: bool,
 }
 
 /// Cheap non-cryptographic hash of a kernel's SPIR-V words — only used to catch a `name` reused
@@ -170,31 +176,7 @@ pub(crate) fn try_make_compute_kernel(
         }
     };
 
-    let entry = c"main";
-    let mut req_sz =
-        vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default().required_subgroup_size(0);
-    let mut stage = vk::PipelineShaderStageCreateInfo::default()
-        .stage(vk::ShaderStageFlags::COMPUTE)
-        .module(shader)
-        .name(entry);
-    let w64_entry = vk::SpecializationMapEntry::default()
-        .constant_id(WAVE64_SPEC_ID)
-        .offset(0)
-        .size(std::mem::size_of::<vk::Bool32>());
-    let w64_data = vk::TRUE.to_ne_bytes();
-    let w64_spec = vk::SpecializationInfo::default()
-        .map_entries(std::slice::from_ref(&w64_entry))
-        .data(&w64_data);
-    if wave64 {
-        stage = stage.specialization_info(&w64_spec);
-    }
-    if let Some(pin) = subgroup_pin(required_sg, wave64, crate::spirv::local_size(spv)) {
-        req_sz = req_sz.required_subgroup_size(pin.size);
-        if pin.full {
-            stage = stage.flags(vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS);
-        }
-        stage = stage.push_next(&mut req_sz);
-    }
+    let pin = subgroup_pin(required_sg, wave64, crate::spirv::local_size(spv));
     // Everything built so far, for the error paths below (nothing else may return early past here
     // without releasing them).
     let undo = |device: &ash::Device| unsafe {
@@ -202,17 +184,17 @@ pub(crate) fn try_make_compute_kernel(
         device.destroy_descriptor_set_layout(ds_layout, None);
         device.destroy_shader_module(shader, None);
     };
-    let pipeline = match unsafe {
-        device.create_compute_pipelines(
-            pcache, // disk-persisted device cache (see pcache.rs); null = caching off
-            &[vk::ComputePipelineCreateInfo::default()
-                .stage(stage)
-                .layout(pipeline_layout)],
-            None,
-        )
-    } {
-        Ok(p) => p[0],
-        Err((_, e)) => {
+    let pipeline = match create_pipeline(
+        device,
+        pcache,
+        shader,
+        pipeline_layout,
+        pin,
+        wave64,
+        vk::PipelineCreateFlags::empty(),
+    ) {
+        Ok(p) => p,
+        Err(e) => {
             undo(device);
             return Err(be(format!(
                 "create_compute_pipelines failed for kernel {name:?}: {e} — a device whose \
@@ -267,7 +249,60 @@ pub(crate) fn try_make_compute_kernel(
         n_buf,
         push_size,
         spv_hash: hash_spv(spv),
+        pin,
+        reads_num_workgroups: crate::spirv::reads_num_workgroups(spv),
     })
+}
+
+/// Create one compute pipeline of `shader` under `layout`: the wave64 specialization when
+/// `wave64`, the subgroup `pin`, and `flags`. Shared by a kernel's own pipeline and its
+/// `DISPATCH_BASE` twin, so the two can only differ by `flags`.
+fn create_pipeline(
+    device: &ash::Device,
+    pcache: vk::PipelineCache,
+    shader: vk::ShaderModule,
+    layout: vk::PipelineLayout,
+    pin: Option<SubgroupPin>,
+    wave64: bool,
+    flags: vk::PipelineCreateFlags,
+) -> std::result::Result<vk::Pipeline, vk::Result> {
+    let entry = c"main";
+    let mut req_sz =
+        vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default().required_subgroup_size(0);
+    let mut stage = vk::PipelineShaderStageCreateInfo::default()
+        .stage(vk::ShaderStageFlags::COMPUTE)
+        .module(shader)
+        .name(entry);
+    let w64_entry = vk::SpecializationMapEntry::default()
+        .constant_id(WAVE64_SPEC_ID)
+        .offset(0)
+        .size(std::mem::size_of::<vk::Bool32>());
+    let w64_data = vk::TRUE.to_ne_bytes();
+    let w64_spec = vk::SpecializationInfo::default()
+        .map_entries(std::slice::from_ref(&w64_entry))
+        .data(&w64_data);
+    if wave64 {
+        stage = stage.specialization_info(&w64_spec);
+    }
+    if let Some(pin) = pin {
+        req_sz = req_sz.required_subgroup_size(pin.size);
+        if pin.full {
+            stage = stage.flags(vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS);
+        }
+        stage = stage.push_next(&mut req_sz);
+    }
+    unsafe {
+        device.create_compute_pipelines(
+            pcache, // disk-persisted device cache (see pcache.rs); null = caching off
+            &[vk::ComputePipelineCreateInfo::default()
+                .flags(flags)
+                .stage(stage)
+                .layout(layout)],
+            None,
+        )
+    }
+    .map(|p| p[0])
+    .map_err(|(_, e)| e)
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -476,6 +511,42 @@ impl VulkanBackend {
             );
         }
         k
+    }
+
+    /// The twin of `k`'s pipeline created with `VK_PIPELINE_CREATE_DISPATCH_BASE_BIT`, which
+    /// `vkCmdDispatchBase` with a non-zero base requires: the same shader module, layout,
+    /// specialization and subgroup pin, so it runs the same code. Built on first use and cached
+    /// by kernel name; only a dispatch the work bound cuts into ranges ever asks for one, so a
+    /// device that never cuts creates none and its kernels' own pipelines are untouched.
+    pub(crate) fn dispatch_base_pipeline(&self, k: &ComputeKernel) -> vk::Pipeline {
+        let mut map = self.shared.base_pipelines.lock().unwrap();
+        if let Some(&p) = map.get(k.name) {
+            return p;
+        }
+        let built = create_pipeline(
+            &self.shared.device,
+            self.shared.pipeline_cache,
+            k.shader,
+            k.pipeline_layout,
+            k.pin,
+            self.shared.wave64,
+            vk::PipelineCreateFlags::DISPATCH_BASE,
+        );
+        match built {
+            Ok(p) if p != vk::Pipeline::null() => {
+                map.insert(k.name, p);
+                drop(map);
+                self.shared.persist_pipeline_cache();
+                p
+            }
+            other => {
+                drop(map);
+                panic!(
+                    "creating the DISPATCH_BASE twin of kernel {:?} failed ({other:?}) although its own pipeline was created from the same module",
+                    k.name
+                )
+            }
+        }
     }
 
     /// Build the [`EagerBind`] for one one-shot dispatch of `k`: with push descriptors the

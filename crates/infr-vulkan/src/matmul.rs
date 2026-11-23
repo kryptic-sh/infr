@@ -77,6 +77,7 @@ fn checked_matmul_shape(
 /// destroyed. Destruction order is the reverse of creation, and the pool frees its descriptor sets
 /// implicitly.
 struct Transients<'a> {
+    shared: &'a crate::VulkanShared,
     device: &'a ash::Device,
     shader_module: vk::ShaderModule,
     ds_layout: vk::DescriptorSetLayout,
@@ -86,9 +87,10 @@ struct Transients<'a> {
 }
 
 impl<'a> Transients<'a> {
-    fn new(device: &'a ash::Device) -> Self {
+    fn new(shared: &'a crate::VulkanShared) -> Self {
         Self {
-            device,
+            shared,
+            device: &shared.device,
             shader_module: vk::ShaderModule::null(),
             ds_layout: vk::DescriptorSetLayout::null(),
             pipeline_layout: vk::PipelineLayout::null(),
@@ -102,7 +104,11 @@ impl Drop for Transients<'_> {
     fn drop(&mut self) {
         // SAFETY: every handle was created on `self.device` and, by the time this runs, the queue
         // has been idled by the caller's fence wait (success) or nothing was ever submitted with
-        // them (early return). A null handle is one that was never created.
+        // them (early return). A null handle is one that was never created. A failed wait poisons
+        // the backend and leaves them to the GPU that may still be running them (`gpu_wait`).
+        if self.shared.poisoned() {
+            return;
+        }
         unsafe {
             if self.desc_pool != vk::DescriptorPool::null() {
                 self.device.destroy_descriptor_pool(self.desc_pool, None);
@@ -165,7 +171,7 @@ impl VulkanBackend {
         // Every transient handle below is registered here as it is created, so all of them are
         // destroyed however this function leaves — including the dozen `?` early returns and the
         // null-pipeline bail-out, which used to abandon whatever had been built so far.
-        let mut tr = Transients::new(device);
+        let mut tr = Transients::new(&self.shared);
 
         // ── shader module ──────────────────────────────────────────────────────
         let shader_module = unsafe {

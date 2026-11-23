@@ -794,6 +794,7 @@ pub(crate) fn generate_spec(
             ctx_full: false,
             n_cached: 0,
             natural_stop: false,
+            n_chained: 0,
         },
         stats,
     ))

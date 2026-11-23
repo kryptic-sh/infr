@@ -40,9 +40,14 @@ shared float red[NR * 64];
 // Unaligned-safe word funnel: sh in {0,8,16,24}; (hi<<1)<<(31-sh) is 0 when sh==0.
 uint fun(uint lo, uint hi, uint sh) { return (lo >> sh) | ((hi << 1u) << (31u - sh)); }
 
+// `precise` here and on each item's result: the decode kernel and its multi-row twin must give
+// the same bits for a row (the MTP verify contract), and they only do if neither compiler
+// contracts a multiply-add the other leaves alone. Without it the AMD Windows driver on RDNA3
+// differed by one ulp between the two files.
 float dot4b(uint q, vec4 xv) {
-    return float(q & 0xFFu) * xv.x + float((q >> 8u) & 0xFFu) * xv.y
-         + float((q >> 16u) & 0xFFu) * xv.z + float(q >> 24u) * xv.w;
+    precise float r = float(q & 0xFFu) * xv.x + float((q >> 8u) & 0xFFu) * xv.y
+                    + float((q >> 16u) & 0xFFu) * xv.z + float(q >> 24u) * xv.w;
+    return r;
 }
 float hsum(vec4 v) { return (v.x + v.y) + (v.z + v.w); }
 
@@ -70,7 +75,7 @@ vec4 vdot(uint sb, uint g, uint h, uint xo, uvec4 hdr[4], uvec4 qq[4]) {
     }
     float sxa = hsum(xa[0] + xa[1] + xa[2] + xa[3]);
     float sxc = hsum(xc[0] + xc[1] + xc[2] + xc[3]);
-    vec4 out4;
+    precise vec4 out4;
     [[unroll]] for (uint r = 0u; r < 4u; r++) {
         float slo = 0.0, shi = 0.0;
         [[unroll]] for (uint w = 0u; w < 4u; w++) {
@@ -116,7 +121,7 @@ vec4 vdot(uint hf, uint j, uint xo,
         xv[og * 2u + 1u] = x4[xb + og * 8u + 1u];
         sx[og] = hsum(xv[og * 2u] + xv[og * 2u + 1u]);
     }
-    vec4 out4;
+    precise vec4 out4;
     [[unroll]] for (uint r = 0u; r < 4u; r++) {
         // NOTE: the m=1 kernel folds the superblock index into xb (`sb * 256`); here the caller
         // passes xo already including it — same addresses, same order.

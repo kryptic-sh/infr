@@ -905,6 +905,74 @@ fn kq_fma_gemv_ok(
         && !crate::recorder::bda_weight_breaches(dt, in_f, out_f, vk)
 }
 
+/// Which fp32 K-quant GEMV a resident `Linear` takes ([`kq_fma_choice`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KqFma {
+    /// One row: `Recorder::linear_kq_fma`.
+    Decode,
+    /// An MTP verify batch: `Recorder::linear_kq_fma_mrow`, bit-identical to [`KqFma::Decode`]
+    /// row for row.
+    Verify,
+}
+
+/// Whether a resident `Linear` of `m` rows takes an fp32 K-quant GEMV instead of the int8 path,
+/// and which one. `on` is the tuning parameter `gemv.kq_fma`; `breaches` says the weight is past
+/// the u32 addressing cap (`recorder::bda_weight_breaches`).
+///
+/// Decode and MTP verify are decided HERE, together, because a verify row must score its position
+/// as the decode step would (`Graph::mtp_verify`): every shape whose decode row takes the fp32
+/// kernel takes its multi-row twin for a verify batch of up to the multi-row bands' row count,
+/// at any output width and whatever the int8 kernels' own gates say. A larger verify batch (a
+/// whole-prompt verify) has no decode partner at its rows and keeps the prefill tiers, as does
+/// every batch that is not a verify.
+fn kq_fma_choice(
+    on: bool,
+    dt: infr_core::DType,
+    m: usize,
+    in_f: usize,
+    w_off: usize,
+    mtp_verify: bool,
+    breaches: bool,
+) -> Option<KqFma> {
+    let shape_ok = on
+        && crate::gemm::native_gemv_kq_fma_spv(dt, false, 8, false).is_some()
+        && crate::gemm::native_gemv_kq_fma_mrow_spv(dt, 8).is_some()
+        && in_f.is_multiple_of(256)
+        && w_off.is_multiple_of(256)
+        && !breaches;
+    if !shape_ok {
+        None
+    } else if m == 1 {
+        Some(KqFma::Decode)
+    } else if mtp_verify && m <= MROW_BANDS[MROW16_BAND].max_m {
+        Some(KqFma::Verify)
+    } else {
+        None
+    }
+}
+
+/// [`kq_fma_choice`] for a `Linear` on `be_`.
+fn kq_fma_gemv(
+    be_: &VulkanBackend,
+    graph: &Graph,
+    dt: infr_core::DType,
+    m: usize,
+    in_f: usize,
+    out_f: usize,
+    w_off: usize,
+) -> Option<KqFma> {
+    let breaches = crate::recorder::bda_weight_breaches(dt, in_f, out_f, &be_.cfg().kernels.vulkan);
+    kq_fma_choice(
+        be_.tuning().gemv_kq_fma,
+        dt,
+        m,
+        in_f,
+        w_off,
+        graph.mtp_verify,
+        breaches,
+    )
+}
+
 fn mmv_mw_choice(
     caps: &infr_core::backend::Capabilities,
     vk: &infr_core::config::VulkanCfg,
@@ -1071,7 +1139,7 @@ enum RopeMode<'a> {
 /// dispatch with a larger chunk COUNT is an OOB shared-memory write. This is the device fact the
 /// shared [`infr_core::tier::cap_chunk_count`] / [`infr_core::tier::baked_chunk`] policy is
 /// parameterized by.
-const ATTN_MAX_CHUNKS: usize = 1024;
+pub(crate) const ATTN_MAX_CHUNKS: usize = 1024;
 
 /// `attn_partial.comp` stages one chunk's scores in `shared float sc[ATTN_PARTIAL_MAX_CHUNK]`, so a
 /// chunk of more keys is an OOB shared-memory write. Every chunk size the adapter hands that kernel
@@ -1100,7 +1168,9 @@ const ATTN_SPLIT_DECODE: infr_core::tier::AttnSplitCfg = infr_core::tier::AttnSp
 
 /// Flash-decoding split-K chunk policy: ~32 chunks/head, each 64..512 keys, floor-rounded (the
 /// measured Vulkan `attn_partial` shape — see [`infr_core::tier::ChunkRounding`] for why the
-/// rounding is config and not a shared constant).
+/// rounding is config and not a shared constant). Decode rows, and the MTP verify rows that must
+/// match them, take the same shape with the floor of the tuning parameter
+/// `attn_split.decode_min_chunk` (`crate::attn_chunk`).
 pub(crate) const ATTN_SPLIT: infr_core::tier::AttnSplitCfg = infr_core::tier::AttnSplitCfg {
     target_chunks: 32,
     min_chunk: 64,
@@ -1659,7 +1729,7 @@ fn lower_op(
                 }
                 let (rr, yf) = (r(*residual)?, r(*final_dst)?);
                 if native_dense_supported(dt) {
-                    if kq_fma_gemv_ok(be_, dt, in_f, out_f, 0) {
+                    if kq_fma_gemv(be_, graph, dt, 1, in_f, out_f, 0) == Some(KqFma::Decode) {
                         rec.linear_kq_fma(dt, w, 0, xb, Some(rr), yf, in_f, out_f);
                         return Ok(());
                     }
@@ -2738,8 +2808,10 @@ fn lower_op(
                 // Baked MIN chunk, rising only when the capacity would exceed the
                 // ATTN_MAX_CHUNKS scratch/combine cap; the kernel derives the effective adaptive
                 // chunk from the live kv_len each token, so one recorded plan serves every depth.
-                let chunk =
-                    infr_core::tier::baked_chunk(cap_rows, ATTN_MAX_CHUNKS, ATTN_DECODE_MIN_CHUNK);
+                let chunk = crate::attn_chunk::baked_min_chunk(
+                    cap_rows,
+                    be_.tuning().attn_decode_min_chunk,
+                );
                 let n_chunks = infr_core::tier::n_chunks(cap_rows, chunk);
                 // A cache past `ATTN_PARTIAL_MAX_CHUNK * ATTN_MAX_CHUNKS` rows bakes a chunk the
                 // partial kernel cannot stage; it takes the scalar decode instead. A paged cache
@@ -2889,8 +2961,10 @@ fn lower_op(
                 // reads the compact block format INLINE in `attn_partial` (no dequant→f16 prepass,
                 // no f16 scratch — the ¼-traffic win at long context). Gate it to the case the
                 // split-K decode path definitely handles inline: rows==1, K==V one inline-decode
-                // format, hd%4≤512, and the split-K tier is the one that fires (this predicate is
-                // EXACTLY `split_ok` at rows==1 for a full-context causal/SWA cache — see below).
+                // format, hd%4≤512, and the split-K tier is the one that fires. `dec_chunk` below
+                // is the chunk the static decode arm computes for the same span, from the same
+                // function and floor (`attn_chunk::static_chunk`), so `dec_span > dec_chunk` is
+                // that arm's `span > chunk` before its chunk-count cap.
                 // Conservatively keep the prepass for ring / capacity-limited caches (`ring_past` /
                 // `cap_short`) and for `hd` the split path rejects — those still run correctly (if
                 // slower) through the f16 scratch. PREFILL (rows>1) always keeps the prepass (coopmat
@@ -2905,7 +2979,8 @@ fn lower_op(
                     0
                 };
                 let dec_span = kv_len - dec_swa_base;
-                let dec_chunk = infr_core::tier::adaptive_chunk(dec_span, &ATTN_SPLIT);
+                let dec_chunk =
+                    crate::attn_chunk::static_chunk(dec_span, be_.tuning().attn_decode_min_chunk);
                 // Only exclude a RING cache (SWA past its wrap) — its RROW-wrapped inline read is
                 // correct but out of the kv_addr_parity coverage, so keep the prepass there for now.
                 // (`cap_short` — the nonfa 256-row PREFILL tile-pad guard — is irrelevant to the
@@ -3247,10 +3322,12 @@ fn lower_op(
                     // rows for a ring, kv_len itself here), so a few big chunks keep the scratch
                     // ~100s of MB with plenty of workgroups (nh * n_chunks * rows).
                     512
-                } else if rows == 1 {
-                    // Decode: the shuffle-free scalar kernel is the only fallback below the split
-                    // floor, and at kv < 64 it costs more than the whole split pass.
-                    infr_core::tier::adaptive_chunk(span, &ATTN_SPLIT_DECODE)
+                } else if crate::attn_chunk::uses_decode_floor(rows, graph.mtp_verify) {
+                    // Decode, and an MTP verify batch: the floor is the tuning parameter
+                    // `attn_split.decode_min_chunk`. The verify rows share it because a chunk
+                    // boundary moves the result's last bits, and a verify row has to score its
+                    // position as the decode step would.
+                    crate::attn_chunk::static_chunk(span, be_.tuning().attn_decode_min_chunk)
                 } else {
                     infr_core::tier::adaptive_chunk(span, &ATTN_SPLIT)
                 };
@@ -4043,6 +4120,71 @@ fn lower_op(
                 r(*dst_prob)?,
                 *n as usize,
             );
+        }
+        // The router's own selection and nothing run on it (the teacher-forced tolerance
+        // comparison): the router dispatch and the `moe_topk` call of the `Op::MoeFfn` arm below,
+        // with no hash selection, so the ids are the ones that arm picks from the same operands.
+        // Keep the two in step; `gpu_seam_tolerance_own_routing_is_the_selection_it_runs` fails
+        // when they select differently.
+        Op::MoeRoute {
+            router_x,
+            router,
+            exp_probs_b,
+            dst_ids,
+            dst_scores,
+            ne,
+            n_expert,
+            n_used,
+            gating,
+            n_expert_groups,
+            n_expert_groups_used,
+        } => {
+            if dst_scores.is_some() {
+                return Err(be(
+                    "vulkan adapter: Op::MoeRoute dst_scores is not implemented (moe_topk writes \
+                     the selection, not the scores it ranked by)",
+                ));
+            }
+            let (ne, n_expert, n_used) = (*ne as usize, *n_expert as usize, *n_used as usize);
+            let rows = graph.desc(*router_x).numel() / ne;
+            let gating_u32 = match gating {
+                infr_core::graph::MoeGating::Softmax => 0u32,
+                infr_core::graph::MoeGating::Sigmoid => 1u32,
+                infr_core::graph::MoeGating::SqrtSoftplus => 2u32,
+            };
+            let bias_buf: &dyn Buffer = match exp_probs_b {
+                Some(epb) => r(*epb)?,
+                None => be_.unused_binding()?,
+            };
+            let logits = pooled(pool, be_, "moe_route_logits", rows * n_expert * 4)?;
+            // `moe_topk` writes a weight per slot as well; nothing reads these.
+            let wts = pooled(pool, be_, "moe_route_wts", rows * n_used * 4)?;
+            let (rxb, rw) = (r(*router_x)?, r(*router)?);
+            let rdt = graph.desc(*router).dtype;
+            if native_dense_supported(rdt) {
+                rec.linear_native(rdt, rw, 0, rxb, pool[&logits].as_ref(), rows, ne, n_expert);
+            } else if matches!(rdt, infr_core::DType::F32) {
+                rec.linear_f32(rw, rxb, pool[&logits].as_ref(), rows, ne, n_expert);
+            } else {
+                rec.linear(rw, rxb, pool[&logits].as_ref(), rows, ne, n_expert);
+            }
+            rec.moe_topk(
+                pool[&logits].as_ref(),
+                r(*dst_ids)?,
+                pool[&wts].as_ref(),
+                bias_buf,
+                rows,
+                n_expert,
+                n_used,
+                1.0,
+                gating_u32,
+                false,
+                exp_probs_b.is_some(),
+                *n_expert_groups,
+                *n_expert_groups_used,
+                be_.unused_binding()?,
+                false,
+            )?;
         }
         // MoE FFN (single token): router GEMV → GPU-resident top-k (gating-dependent weighting,
         // ×scale) → fused multi-slot expert SwiGLU (gate/up share the row, down reads each slot's
@@ -5205,7 +5347,7 @@ pub(crate) fn execute(be_: &VulkanBackend, plan: &dyn Plan, bindings: &Bindings)
         write_page_table(&mut pbytes, replay.page_table);
         be_.upload(replay.params.as_ref(), &pbytes)?;
     }
-    replay.recorded.replay().map_err(|e| be(e.to_string()))?;
+    replay.recorded.replay()?;
     Ok(())
 }
 
@@ -5267,7 +5409,7 @@ pub(crate) fn execute_chain(
     }
     // The chunk decodes positions p0+1 ..= p0+n (params[0] = the last decoded position).
     let p0 = read_pos0(be_, replay.params.as_ref())?;
-    replay.recorded.replay_n(n).map_err(|e| be(e.to_string()))?;
+    replay.recorded.replay_n(n)?;
     let mut rbytes = vec![0u8; 64 * 4];
     be_.download(ring.as_ref(), &mut rbytes)?;
     let ring_u32: &[u32] = bytemuck::cast_slice(&rbytes);
@@ -5519,7 +5661,7 @@ fn record_decode_replay(
     // instead of one long one. This preserves the `_dyn`/params/ring decode semantics exactly — the
     // identical dispatch stream is just distributed across command buffers, with a seeded global
     // barrier at each continuation segment's head carrying the cross-segment ordering.
-    let cap = be_.submit_dispatch_cap();
+    let cap = be_.decode_submit_cap();
     let mut segments: Vec<crate::recorder::RecordedSegment> = Vec::new();
     let mut rec = be_.recorder_persistent()?;
     // Device-side position stream: seed params to [pos0-1, pos0] and record a one-thread
@@ -5830,7 +5972,19 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
     // default) bounds the dispatches per command buffer; segments are submitted WITHOUT waiting
     // and run back-to-back on the queue, so the GPU sees the same uninterrupted stream of work —
     // only the watchdog's view changes, from one long job to several short ones.
-    let cap = be_.submit_dispatch_cap();
+    let single_token = graph
+        .ops
+        .iter()
+        .all(|op| !matches!(op, Op::Linear { m, .. } if *m > 1));
+    let cap = if single_token {
+        be_.decode_submit_cap()
+    } else {
+        be_.submit_dispatch_cap()
+    };
+    // The splitter's second bound: the estimated GPU time recorded into the segment
+    // (`crate::work`). Only multi-row GEMMs and GEMVs carry an estimate, so a single-token
+    // forward never reaches it.
+    let work_budget = be_.work_cut_budget_ns();
     // Paged forwards only: see `EarlySubmit`. It reuses the splitter's submit-and-continue
     // below, so its segments are pipelined, windowed and timed exactly like the watchdog's, and
     // `crate::segment_cut` checks the watchdog cap first, so it only ever adds cuts.
@@ -5881,7 +6035,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
             let partial = rec.take().expect("segment always Some between ops");
             discard_segment(be_, partial).map_err(|e| be(e.to_string()))?;
             for seg in segments {
-                seg.wait().map_err(|e| be(e.to_string()))?;
+                seg.wait()?;
             }
             pstream.drain()?;
             // `transient`, `pool`, `dyn_args` and the scratch arena drop AFTER these waits (they
@@ -5892,9 +6046,15 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
         // share transient scratch, and the hazard tracking that orders them is per-recorder.
         // Crossing the cap, or the paged early-submit cadence, therefore closes the segment at the
         // next op boundary.
-        let cut = rec
-            .as_ref()
-            .and_then(|r| crate::segment_cut(r.dispatches(), cap, early.threshold(r.serial())));
+        let cut = rec.as_ref().and_then(|r| {
+            crate::segment_cut(
+                r.dispatches(),
+                cap,
+                r.work_ns(),
+                work_budget,
+                early.threshold(r.serial()),
+            )
+        });
         if let Some(cut) = cut {
             be_.note_segment_cut(cut);
             let seg = submit_nowait(be_, rec.take().expect("segment always Some between ops"))?;
@@ -5905,7 +6065,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
             // finished N — in steady state this fence is already signaled and the wait is free.
             while segments.len() > MAX_INFLIGHT {
                 let old = segments.pop_front().expect("len > MAX_INFLIGHT >= 0");
-                old.wait().map_err(|e| be(e.to_string()))?;
+                old.wait()?;
             }
             let fresh = be_.recorder()?;
             // Hazard tracking is per-recorder and starts empty, so cross-segment RAW/WAR ordering
@@ -6018,20 +6178,20 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
     }
     transient.extend(pool.into_values());
     let last = rec.take().expect("segment always Some at loop end");
-    submitted_dispatches += last.dispatches();
+    submitted_dispatches += last.total_dispatches();
     let last_serial = last.serial();
     submit_wait(be_, last)?;
-    // The blocking finish above already waited the queue idle — draining just releases the
-    // pipelined segments' command buffers/fences (every buffer they referenced outlives this
-    // call: pooled scratch in `transient`, ring/tape/arenas on the session).
+    // The blocking finish above waited for the last segment's own fence; waiting each pipelined
+    // segment's fence here completes the forward and releases their command buffers (every buffer
+    // they referenced outlives this call: pooled scratch in `transient`, ring/tape/arenas on the session).
     for seg in segments {
-        seg.wait().map_err(|e| be(e.to_string()))?;
+        seg.wait()?;
     }
     pstream.drain()?;
     if be_.moe_paged() {
         // The session's lock is released at the end of this statement.
         let stopped = be_.moe_pager().lock().unwrap().as_mut().map(|sess| {
-            // The queue is idle, so every recording up to `last` has completed.
+            // Every segment up to `last` has been waited above, so every recording has completed.
             sess.fills_copied(last_serial);
             sess.end_forward()
         });
@@ -6039,7 +6199,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
         // forward waits too.
         drop(stopped);
     }
-    // Feed this forward back into the splitter: `finish` waited the queue idle and every segment
+    // Feed this forward back into the splitter: `finish` waited the last segment and every segment
     // has been waited, so each one's GPU interval is in the clock's sum. See `ForwardClock` for
     // why that, and not this forward's wall time, is what the watchdog bound is judged by.
     clock.observe(be_, submitted_dispatches);
@@ -6141,7 +6301,7 @@ impl PagedStream {
     fn drain(&mut self) -> Result<()> {
         for p in &mut self.pending {
             if let Some(s) = p.take() {
-                s.wait().map_err(|e| be(e.to_string()))?;
+                s.wait()?;
             }
         }
         Ok(())
@@ -6163,7 +6323,7 @@ fn rotate_stream<'a>(
     ps.half ^= 1;
     ps.cursor = 0;
     if let Some(prev) = ps.pending[ps.half].take() {
-        prev.wait().map_err(|e| be(e.to_string()))?;
+        prev.wait()?;
     }
     let fresh = be_.recorder()?;
     fresh.seed_barrier();
@@ -6171,7 +6331,7 @@ fn rotate_stream<'a>(
     Ok(())
 }
 
-/// Blocking submit of the ambient segment (queue idle on return) + full stream drain — the ONE
+/// Blocking submit of the ambient segment + full stream drain — the ONE
 /// remaining host sync on the paged path, paid only by a small-m layer whose expert set is not
 /// fully resident (its router ids must be read back before its GEMVs can be staged). Both ring
 /// halves and the whole tape are reusable afterwards, and so are the background fills' staging
@@ -6185,11 +6345,14 @@ fn sync_stream<'a>(
     let serial = last.serial();
     submit_wait(be_, last)?;
     be_.note_segment_cut(crate::SegmentCut::Drain);
-    ps.drain()?; // fences already signaled (queue idle) — releases their transient objects
+    ps.drain()?; // fences already signaled (see below) — releases their transient objects
     ps.cursor = 0;
     ps.tape_cursor = 0;
     if let Some(sess) = be_.moe_pager().lock().unwrap().as_mut() {
-        sess.fills_copied(serial); // the queue is idle: every recording up to `last` completed
+        // The waited segment opens with a global barrier over everything submitted before it
+        // (a continuation segment) or is the forward's first (everything earlier was waited), so
+        // its completion means every recording up to `last` completed.
+        sess.fills_copied(serial);
     }
     *rec = Some(be_.recorder()?);
     Ok(())
@@ -6361,6 +6524,26 @@ fn quant_linear(
         && mmv_gate
         && crate::gemm::native_mmv_mrow_m16_kernel_name(dt).is_some()
         && be_.cfg().kernels.vulkan.mrow16;
+    // The fp32 K-quant GEMVs (`gemv.kq_fma`): the decode row and the MTP verify batch are
+    // dispatched HERE, from one predicate and ahead of every int8 route, so the two cannot land
+    // on different numerics. The verify twin is bit-identical to the decode kernel row for row;
+    // an int8 decode tier taken first for the same weight (as `mmv_mw_choice` below would, for
+    // every weight of 2M elements up on a device with an int8 dot) would leave verify fp32 and
+    // decode int8-quantized. The int8 bands' own gates (an accelerated dot, a weight size
+    // floor, an output width cutoff) likewise say nothing about what decode took.
+    if let Some(wb) = w.buffer {
+        match kq_fma_gemv(be_, graph, dt, m, in_f, out_f, w_off) {
+            Some(KqFma::Decode) => {
+                rec.linear_kq_fma(dt, wb, w_off, xb, None, y, in_f, out_f);
+                return Ok(());
+            }
+            Some(KqFma::Verify) => {
+                rec.linear_kq_fma_mrow(dt, wb, w_off, xb, y, m, in_f, out_f);
+                return Ok(());
+            }
+            None => {}
+        }
+    }
     // The multi-row GEMVs index the weight in u32 and are not chunked, so a weight past the
     // addressing cap leaves this tier for the chunked per-row GEMV (see `tiled_gemm_fits` below).
     if (in_band(MROW_BAND) || mrow16)
@@ -8071,7 +8254,10 @@ mod tests {
         assert_eq!(off.threshold(1), 0);
         off.cut(2);
         assert_eq!(off.threshold(2), 0);
-        assert_eq!(crate::segment_cut(1_000_000, 0, off.threshold(2)), None);
+        assert_eq!(
+            crate::segment_cut(1_000_000, 0, 0, 0, off.threshold(2)),
+            None
+        );
 
         let mut big = EarlySubmit::new(usize::MAX / 2 + 1);
         big.cut(3);
@@ -8516,6 +8702,58 @@ mod tests {
             include_str!("../build.rs").contains(&format!("\"-DSC_MAX={ATTN_MROWS_CHUNK}u\"")),
             "attn_partial_mrows_c256's SC_MAX drifted from ATTN_MROWS_CHUNK"
         );
+    }
+
+    /// The fp32 K-quant GEMV is chosen for decode and for an MTP verify batch by ONE predicate,
+    /// so a verify row and the decode row at its position cannot land on different numerics:
+    /// wherever the decode row takes the fp32 kernel, a verify batch of every row count up to the
+    /// multi-row bands' takes the twin, at every output width; and where decode does not, neither
+    /// does verify. An ordinary prefill batch, a verify batch past the bands and a device with
+    /// the parameter off take neither.
+    #[test]
+    fn kq_fma_decode_and_verify_share_one_choice() {
+        use infr_core::DType::{Q4K, Q5K, Q6K, Q8_0};
+        let max_verify = MROW_BANDS[MROW16_BAND].max_m;
+        for dt in [Q4K, Q6K, Q5K, Q8_0] {
+            for in_f in [256usize, 768, 2560, 100, 288] {
+                for w_off in [0usize, 256, 96] {
+                    for breaches in [false, true] {
+                        let decode = kq_fma_choice(true, dt, 1, in_f, w_off, false, breaches);
+                        let takes = matches!(dt, Q4K | Q6K)
+                            && in_f.is_multiple_of(256)
+                            && w_off.is_multiple_of(256)
+                            && !breaches;
+                        let what = format!("{dt:?} in_f {in_f} w_off {w_off} breach {breaches}");
+                        assert_eq!(decode, takes.then_some(KqFma::Decode), "{what}");
+                        // The flag does not change what a decode row takes.
+                        assert_eq!(
+                            kq_fma_choice(true, dt, 1, in_f, w_off, true, breaches),
+                            decode,
+                            "{what}"
+                        );
+                        for m in 2..=max_verify + 2 {
+                            let verify = kq_fma_choice(true, dt, m, in_f, w_off, true, breaches);
+                            let want = (takes && m <= max_verify).then_some(KqFma::Verify);
+                            assert_eq!(verify, want, "{what} m {m}");
+                            assert_eq!(
+                                kq_fma_choice(true, dt, m, in_f, w_off, false, breaches),
+                                None,
+                                "{what} m {m}: an ordinary batch took the verify kernel"
+                            );
+                        }
+                        for m in 1..=max_verify {
+                            for verify in [false, true] {
+                                assert_eq!(
+                                    kq_fma_choice(false, dt, m, in_f, w_off, verify, breaches),
+                                    None,
+                                    "{what} m {m}: taken with the parameter off"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// The rows-batched tier covers at most `ATTN_MROWS_CHUNK * ATTN_MAX_CHUNKS` keys; one key

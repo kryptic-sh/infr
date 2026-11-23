@@ -14,6 +14,7 @@ mod indexer;
 #[doc(hidden)]
 pub mod indexer_tap;
 pub mod kvquant;
+pub mod linear_tap;
 mod op_hash;
 pub mod op_tap;
 pub mod paged;
@@ -37,7 +38,7 @@ use infr_core::backend::{Backend, Bindings, Buffer, BufferUsage, Capabilities, G
 use infr_core::config::Config;
 use infr_core::error::Result;
 use infr_core::exec::Provision;
-use infr_core::graph::{Activation, AttnMask, Graph, MoeGating, Op};
+use infr_core::graph::{Activation, AttnMask, Graph, Op};
 use infr_core::math;
 use infr_core::tensor::{DType, TensorId};
 use infr_gguf::dequant::dequant_block;
@@ -47,16 +48,14 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use kernels::{
-    dot, dot_bf16, dot_f16, dot_n, gated_act_row, vec_dot_iq1m, vec_dot_iq1m_batch, vec_dot_iq1s,
-    vec_dot_iq1s_batch, vec_dot_iq2s, vec_dot_iq2s_batch, vec_dot_iq2xs, vec_dot_iq2xs_batch,
-    vec_dot_iq2xxs, vec_dot_iq2xxs_batch, vec_dot_iq3s, vec_dot_iq3s_batch, vec_dot_iq3xxs,
-    vec_dot_iq3xxs_batch, vec_dot_iq4nl_32_batch, vec_dot_iq4xs, vec_dot_iq4xs_batch,
-    vec_dot_mxfp4_32_batch, vec_dot_nvfp4_batch, vec_dot_q2_0_batch, vec_dot_q2k,
-    vec_dot_q2k_batch, vec_dot_q3k, vec_dot_q3k_batch, vec_dot_q4_0_32_batch,
-    vec_dot_q4_1_32_batch, vec_dot_q4k, vec_dot_q4k_batch, vec_dot_q4k_batch2, vec_dot_q4k_batch8,
-    vec_dot_q5_0_32_batch, vec_dot_q5_1_32_batch, vec_dot_q5k, vec_dot_q5k_batch, vec_dot_q6k,
-    vec_dot_q6k_batch, vec_dot_q8_0, vec_dot_q8_0_32_batch, vec_dot_q8_0_batch, vec_dot_tq1_0,
-    vec_dot_tq1_0_batch, vec_dot_tq2_0, vec_dot_tq2_0_batch,
+    gated_act_row, vec_dot_hi, vec_dot_iq1m_batch, vec_dot_iq1s_batch, vec_dot_iq2s_batch,
+    vec_dot_iq2xs_batch, vec_dot_iq2xxs_batch, vec_dot_iq3s_batch, vec_dot_iq3xxs_batch,
+    vec_dot_iq4nl_32_batch, vec_dot_iq4xs_batch, vec_dot_mxfp4_32_batch, vec_dot_nvfp4_batch,
+    vec_dot_q2_0_batch, vec_dot_q2k_batch, vec_dot_q3k_batch, vec_dot_q4_0_32_batch,
+    vec_dot_q4_1_32_batch, vec_dot_q4k_batch, vec_dot_q4k_batch2, vec_dot_q4k_batch8,
+    vec_dot_q5_0_32_batch, vec_dot_q5_1_32_batch, vec_dot_q5k_batch, vec_dot_q6k_batch,
+    vec_dot_q8_0_32_batch, vec_dot_q8_0_batch, vec_dot_q8_any, vec_dot_tq1_0_batch,
+    vec_dot_tq2_0_batch, Dots, HiBatch,
 };
 use moe::{expert_acts_kind, expert_gemm_range, ActsKind, ExpertActs};
 use quant::{quantize_q8, quantize_q8_32, Q8x32, Q8};
@@ -367,10 +366,17 @@ impl CpuBackend {
     /// for: no environment, and two backends with different configurations can coexist in one
     /// test, with ONE exception: `kernels.cpu.max_tier` is a process-wide debug switch. Every
     /// construction applies it ([`infr_core::simd::set_max`]; unset = no ceiling, the widest
-    /// tier the CPU has; a ceiling above the CPU's widest runs the widest), so the backend built
-    /// last decides the SIMD tier of every kernel and math slice for every backend in the
-    /// process. Only speed is at stake: every tier gives the same bits.
+    /// tier the CPU has; a ceiling above the CPU's widest runs the widest, and so does another
+    /// architecture's tier, with a warning), so the backend built last decides the SIMD tier of
+    /// every kernel and math slice for every backend in the process. Only speed is at stake:
+    /// every tier gives the same bits.
     pub fn new_with(cfg: Arc<Config>) -> Self {
+        if let Some(t) = cfg.kernels.cpu.max_tier.filter(|t| !t.native()) {
+            tracing::warn!(
+                "kernels.cpu.max_tier = {:?} is not a tier of this CPU's architecture: no ceiling",
+                t.name()
+            );
+        }
         infr_core::simd::set_max(cfg.kernels.cpu.max_tier);
         Self {
             weight_cache: Mutex::default(),
@@ -438,6 +444,101 @@ impl CpuBackend {
             .get_or_init(|| pool::SpinPool::new(&self.cfg.kernels.cpu))
     }
 
+    /// Add each activation row's sparse part ([`Q8::hi`], [`vec_dot_hi`]) into a prefill
+    /// `Op::Linear`'s o-major output `out` (`out[o * m + r]`) over the weight rows `wbytes`
+    /// (`bpr` bytes each). Each value becomes `dense + vec_dot_hi(..)`, the one-row route's
+    /// expression ([`HiBatch`] computes the same bits for many weight rows at once); rows with
+    /// no sparse part are not touched, and when no row has one nothing runs. (The packed GEMM's
+    /// row-major output takes its parts in [`Self::linear_packed`].)
+    fn add_hi(
+        &self,
+        dt: DType,
+        wbytes: &[u8],
+        bpr: usize,
+        in_f: usize,
+        q8s: &[Q8],
+        out: &mut [f32],
+    ) {
+        let Some(hb) = HiBatch::new(dt, in_f, q8s) else {
+            return;
+        };
+        // Each task owns a run of whole weight rows' columns.
+        let m = q8s.len();
+        self.pool()
+            .for_chunks_mut(out, HI_ROWS * m, 1, &|c, block| {
+                hb.add_o_major(wbytes, bpr, c * HI_ROWS, block.len() / m, block, m);
+            });
+    }
+
+    /// Record one `Op::Linear` for the test tap (`linear_tap`): the `rows` of its activation
+    /// `xs` (`m × in_f`), its output `out` (`m × out_f`), and each row recomputed exactly from the
+    /// weight rows `wbytes` (`bpr` bytes each, stored as `dt`).
+    #[allow(clippy::too_many_arguments)]
+    fn tap_linear(
+        &self,
+        op_idx: usize,
+        dt: DType,
+        wbytes: &[u8],
+        bpr: usize,
+        xs: &[f32],
+        out: &[f32],
+        m: usize,
+        in_f: usize,
+        out_f: usize,
+        rows: &[usize],
+    ) {
+        // Each row three ways: as it is, and after a round trip through each production
+        // activation quantizer.
+        let sim = |block| linear_tap::ActSim {
+            block,
+            keep: 0,
+            ratio: 0,
+            qmax: 127,
+            split: false,
+            sub: 0,
+            emax: 0,
+        };
+        let variants: Vec<[Vec<f32>; 3]> = rows
+            .iter()
+            .map(|&r| {
+                let x = &xs[r * in_f..r * in_f + in_f];
+                [
+                    x.to_vec(),
+                    quant::dequantize_q8(&quantize_q8(x)),
+                    sim(32).round_trip(x),
+                ]
+            })
+            .collect();
+        let exact: Vec<Vec<[f64; 3]>> = self.pool().collect(out_f, &|o| {
+            let w = bytes_to_f32(&wbytes[o * bpr..o * bpr + bpr], dt);
+            let dot = |x: &[f32]| w.iter().zip(x).map(|(&a, &b)| a as f64 * b as f64).sum();
+            variants
+                .iter()
+                .map(|v| [dot(&v[0]), dot(&v[1]), dot(&v[2])])
+                .collect()
+        });
+        let rows = rows
+            .iter()
+            .enumerate()
+            .map(|(k, &r)| linear_tap::TappedRow {
+                row: r,
+                x: xs[r * in_f..r * in_f + in_f].to_vec(),
+                out: out[r * out_f..r * out_f + out_f].to_vec(),
+                exact: exact.iter().map(|e| e[k][0]).collect(),
+                exact_q256: exact.iter().map(|e| e[k][1]).collect(),
+                exact_q32: exact.iter().map(|e| e[k][2]).collect(),
+            })
+            .collect();
+        linear_tap::record(linear_tap::TappedLinear {
+            op_idx,
+            dtype: dt,
+            m,
+            in_f,
+            out_f,
+            rows,
+        });
+    }
+
     /// The repack cache's byte budget (`kernels.cpu.repack_mb`, MiB → bytes), read by
     /// [`Self::q4k_pack_for`].
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
@@ -472,7 +573,9 @@ impl CpuBackend {
     /// thread's scratch group and runs the GEMM over every token: the pack costs one pass over
     /// the group's weights, which the `m` tokens share, and nothing is held past the call. The
     /// `out_f % 8` tail rows take the per-row batch kernels. Every kernel here is bit-identical
-    /// to the single-token one, so the result does not depend on the route.
+    /// to the single-token one, so the result does not depend on the route. Rows with a sparse
+    /// activation part ([`Q8::hi`]) get it added as every route adds it (`dense +
+    /// vec_dot_hi(..)`, through [`HiBatch`]).
     #[cfg(target_arch = "x86_64")]
     fn linear_packed<const CAP: bool>(
         &self,
@@ -487,20 +590,33 @@ impl CpuBackend {
         assert_eq!(out.len(), m * out_f);
         let (nb, bpr, groups) = (in_f / 256, wbytes.len() / out_f, out_f / 8);
         let gout = repack::GemmOut::row_major(out, out_f);
-        // SAFETY (both arms): `linear_packed_ok` checked AVX-512BW + VNNI; each task writes only
-        // its own group's rows `8g..8g + 8` of `out`, which outlives the `run`.
-        match dt {
-            DType::Q4K | DType::Q5K => self.pool().run(groups, &|g| unsafe {
-                let rows =
-                    std::array::from_fn(|i| &wbytes[(8 * g + i) * bpr..(8 * g + i + 1) * bpr]);
-                repack::q4k_pack_and_gemm_group(dt, rows, nb, q8s, gout, 8 * g);
+        // SAFETY: `linear_packed_ok` checked AVX-512BW + VNNI; each task writes only its own
+        // group's rows `8g..8g + 8` of `out`, which outlives the `run`.
+        let gemm = |g: usize| unsafe {
+            let rows = std::array::from_fn(|i| &wbytes[(8 * g + i) * bpr..(8 * g + i + 1) * bpr]);
+            match dt {
+                DType::Q4K | DType::Q5K => {
+                    repack::q4k_pack_and_gemm_group(dt, rows, nb, q8s, gout, 8 * g)
+                }
+                DType::Q6K => repack::q6k_pack_and_gemm_group(rows, nb, q8s, gout, 8 * g),
+                _ => unreachable!("linear_packed_ok admits Q4_K, Q5_K and Q6_K only"),
+            }
+        };
+        // The sparse activation parts ([`HiBatch`]): each GEMM task adds them to its own group's
+        // results while it holds those weight rows, so they read no weight memory again.
+        let hb = HiBatch::new(dt, in_f, q8s);
+        match &hb {
+            Some(hb) => self.pool().run(groups, &|g| {
+                gemm(g);
+                // One allocation per group task (`chunk_len` i32s: 16 per distinct element and block);
+                // the thread-local scratch (`moe::with_block_scratch`) holds f32s, so is not reused.
+                let mut tab = vec![0i32; hb.chunk_len()];
+                hb.for_group(wbytes, bpr, 8 * g, 8, &mut tab, |r, acc| {
+                    // SAFETY: as the GEMM's stores: this task's group, rows `8g..8g + 8`.
+                    unsafe { gout.add8(8 * g, r, acc) }
+                });
             }),
-            DType::Q6K => self.pool().run(groups, &|g| unsafe {
-                let rows =
-                    std::array::from_fn(|i| &wbytes[(8 * g + i) * bpr..(8 * g + i + 1) * bpr]);
-                repack::q6k_pack_and_gemm_group(rows, nb, q8s, gout, 8 * g);
-            }),
-            _ => unreachable!("linear_packed_ok admits Q4_K, Q5_K and Q6_K only"),
+            None => self.pool().run(groups, &|g| gemm(g)),
         }
         let tail = out_f - 8 * groups;
         if tail > 0 {
@@ -514,6 +630,9 @@ impl CpuBackend {
                     _ => vec_dot_q6k_batch::<CAP>(row, q8s, in_f, col),
                 }
             });
+            if let Some(hb) = &hb {
+                hb.add_o_major(wbytes, bpr, 8 * groups, tail, &mut cols, m);
+            }
             for (i, col) in cols.chunks(m).enumerate() {
                 for (r, &v) in col.iter().enumerate() {
                     out[r * out_f + 8 * groups + i] = v;
@@ -760,6 +879,9 @@ pub(crate) fn bytes_to_f32(bytes: &[u8], dtype: DType) -> Vec<f32> {
         other => dequant_block(other, bytes).expect("cpu backend: host dequant"),
     }
 }
+
+/// Weight rows one task of [`CpuBackend::add_hi`] takes on an o-major output.
+const HI_ROWS: usize = 64;
 
 /// Fewest weight rows a single-token `Op::Linear` task claims: a row's dot is well under a
 /// microsecond, so fewer would make the shared task cursor the bottleneck.
@@ -1182,6 +1304,9 @@ impl CpuBackend {
                     .into(),
             ));
         }
+        // The f32 dots' compilation, chosen once for the whole graph and copied into every op's
+        // loops (`kernels::Dots`).
+        let dots = Dots::resolve::<CAP>();
 
         // The op loop runs on this thread, which takes a share of every pool job: give it the
         // pool's placement for the walk. A graph with a Linear is about to use the pool, so it is
@@ -1529,18 +1654,29 @@ impl CpuBackend {
                     let row0 = w_off as usize / in_f;
                     let wbytes: &[u8] = &bytes[row0 * bpr..(row0 + out_f) * bpr];
                     let mut out = rc.for_overwrite(m * out_f);
+                    // The test tap (`linear_tap`): the rows it wants, `None` when it is off.
+                    let tap_rows = linear_tap::wanted(m);
+                    let tap = |out: &[f32]| {
+                        if let Some(rows) = &tap_rows {
+                            self.tap_linear(op_idx, dt, wbytes, bpr, xs, out, m, in_f, out_f, rows);
+                        }
+                    };
                     // REFERENCE mode (see `CpuBackend::reference`): decode the weight row to f32 and
                     // take a plain f32 dot, so the ONLY error is the weight's own quantization —
                     // the int8-activation kernels below carry ~4e-3 relative error, which flips
                     // greedy tokens at Q2_K. The float dtypes already take an exact dot, so they
                     // stay on their (identical, faster) production arms.
                     if reference && !matches!(dt, DType::F32 | DType::F16 | DType::Bf16) {
+                        // A test's simulated activation quantizer (`linear_tap::simulate`).
+                        let sim_xs: Option<Vec<f32>> = linear_tap::simulated(dt, in_f)
+                            .map(|sim| xs.chunks(in_f).flat_map(|r| sim.round_trip(r)).collect());
+                        let xd: &[f32] = sim_xs.as_deref().unwrap_or(xs);
                         let mut out_t = rc.zeroed(out_f * m);
                         self.pool().for_chunks_mut(&mut out_t, m, 8, &|o, chunk| {
                             let row = &wbytes[o * bpr..o * bpr + bpr];
                             let wf = bytes_to_f32(row, dt);
                             for r in 0..m {
-                                chunk[r] = dot(&wf, &xs[r * in_f..r * in_f + in_f]);
+                                chunk[r] = dots.dot(&wf, &xd[r * in_f..r * in_f + in_f]);
                             }
                         });
                         self.pool().for_chunks_mut(&mut out, out_f, 1, &|r, orow| {
@@ -1549,6 +1685,7 @@ impl CpuBackend {
                             }
                         });
                         rc.give(out_t);
+                        tap(&out);
                         rc.set(&mut vals, dst.0 as usize, out);
                         continue;
                     }
@@ -1607,36 +1744,27 @@ impl CpuBackend {
                             .clamp(DECODE_ROWS_MIN, DECODE_ROWS_MAX);
                         self.pool().for_chunks_mut(&mut out, 1, grain, &|o, dst_o| {
                             let row = &wbytes[o * bpr..o * bpr + bpr];
+                            // The int8 kernels on the 256-element activation: the dense dot,
+                            // plus the sparse part's for a row that has one (`vec_dot_hi`).
+                            if let Some(q) = q8.as_ref() {
+                                let dense = vec_dot_q8_any::<CAP>(dt, row, q, in_f);
+                                dst_o[0] = if q.hi.is_empty() {
+                                    dense
+                                } else {
+                                    dense + vec_dot_hi(dt, row, q, in_f)
+                                };
+                                return;
+                            }
                             dst_o[0] = match dt {
-                                DType::Q4K => vec_dot_q4k::<CAP>(row, q8.as_ref().unwrap(), in_f),
-                                DType::Q6K => vec_dot_q6k::<CAP>(row, q8.as_ref().unwrap(), in_f),
                                 DType::Q8_0 => {
-                                    if q8_0_blk32 {
-                                        vec_dot_q8_0_32_batch::<CAP>(
-                                            row,
-                                            q8_32.as_ref().unwrap(),
-                                            in_f,
-                                            dst_o,
-                                        );
-                                        return;
-                                    }
-                                    vec_dot_q8_0::<CAP>(row, q8.as_ref().unwrap(), in_f)
+                                    vec_dot_q8_0_32_batch::<CAP>(
+                                        row,
+                                        q8_32.as_ref().unwrap(),
+                                        in_f,
+                                        dst_o,
+                                    );
+                                    return;
                                 }
-                                DType::Q5K => vec_dot_q5k::<CAP>(row, q8.as_ref().unwrap(), in_f),
-                                DType::Q2K => vec_dot_q2k::<CAP>(row, q8.as_ref().unwrap(), in_f),
-                                DType::Q3K => vec_dot_q3k::<CAP>(row, q8.as_ref().unwrap(), in_f),
-                                DType::Iq4Xs => {
-                                    vec_dot_iq4xs::<CAP>(row, q8.as_ref().unwrap(), in_f)
-                                }
-                                DType::Iq2S => vec_dot_iq2s(row, q8.as_ref().unwrap(), in_f),
-                                DType::Iq2Xs => vec_dot_iq2xs(row, q8.as_ref().unwrap(), in_f),
-                                DType::Iq2Xxs => vec_dot_iq2xxs(row, q8.as_ref().unwrap(), in_f),
-                                DType::Iq1S => vec_dot_iq1s(row, q8.as_ref().unwrap(), in_f),
-                                DType::Iq1M => vec_dot_iq1m(row, q8.as_ref().unwrap(), in_f),
-                                DType::Iq3S => vec_dot_iq3s(row, q8.as_ref().unwrap(), in_f),
-                                DType::Iq3Xxs => vec_dot_iq3xxs(row, q8.as_ref().unwrap(), in_f),
-                                DType::Tq2_0 => vec_dot_tq2_0(row, q8.as_ref().unwrap(), in_f),
-                                DType::Tq1_0 => vec_dot_tq1_0(row, q8.as_ref().unwrap(), in_f),
                                 DType::Q4_0 => {
                                     vec_dot_q4_0_32_batch::<CAP>(
                                         row,
@@ -1709,10 +1837,10 @@ impl CpuBackend {
                                     );
                                     return;
                                 }
-                                DType::F32 => dot(&f32_row(row), xrow),
-                                DType::F16 => dot_f16(row, xrow),
-                                DType::Bf16 => dot_bf16(row, xrow),
-                                _ => dot(&bytes_to_f32(row, dt), xrow),
+                                DType::F32 => dots.dot(&f32_row(row), xrow),
+                                DType::F16 => dots.dot_f16(row, xrow),
+                                DType::Bf16 => dots.dot_bf16(row, xrow),
+                                _ => dots.dot(&bytes_to_f32(row, dt), xrow),
                             };
                         });
                     } else {
@@ -1994,31 +2122,35 @@ impl CpuBackend {
                                             let w32 = f32_row(row);
                                             for r in 0..m {
                                                 chunk[r] =
-                                                    dot(&w32, &xs[r * in_f..r * in_f + in_f]);
+                                                    dots.dot(&w32, &xs[r * in_f..r * in_f + in_f]);
                                             }
                                         }
                                         DType::F16 => {
                                             for r in 0..m {
-                                                chunk[r] =
-                                                    dot_f16(row, &xs[r * in_f..r * in_f + in_f]);
+                                                chunk[r] = dots
+                                                    .dot_f16(row, &xs[r * in_f..r * in_f + in_f]);
                                             }
                                         }
                                         DType::Bf16 => {
                                             for r in 0..m {
-                                                chunk[r] =
-                                                    dot_bf16(row, &xs[r * in_f..r * in_f + in_f]);
+                                                chunk[r] = dots
+                                                    .dot_bf16(row, &xs[r * in_f..r * in_f + in_f]);
                                             }
                                         }
                                         _ => {
                                             // Dequant the weight row ONCE, reuse across all m tokens.
                                             let wf = bytes_to_f32(row, dt);
                                             for r in 0..m {
-                                                chunk[r] = dot(&wf, &xs[r * in_f..r * in_f + in_f]);
+                                                chunk[r] =
+                                                    dots.dot(&wf, &xs[r * in_f..r * in_f + in_f]);
                                             }
                                         }
                                     }
                                 });
                             }
+                            // The sparse activation parts (empty `q8s` on the 32-block and float
+                            // routes, so nothing runs there).
+                            self.add_hi(dt, wbytes, bpr, in_f, &q8s, &mut out_t);
                             // Transpose out_t[o * m + r] → out[r * out_f + o], parallel over the m output
                             // rows (each gathers its out_f values from the o-major temp). The serial
                             // version was ~20% of the matvec at large out_f × m.
@@ -2030,6 +2162,7 @@ impl CpuBackend {
                             rc.give(out_t);
                         }
                     }
+                    tap(&out);
                     rc.set(&mut vals, dst.0 as usize, out);
                 }
                 Op::Rope {
@@ -2224,9 +2357,7 @@ impl CpuBackend {
                         match g.desc(cache).dtype {
                             DType::F16 => {
                                 let df: &mut [u16] = bytemuck::cast_slice_mut(&mut d);
-                                for i in 0..n {
-                                    df[base + i] = half::f16::from_f32(s[i]).to_bits();
-                                }
+                                dots.f16_from_f32(&mut df[base..base + n], &s[..n]);
                             }
                             DType::Q8_0 => {
                                 // Q8_0 blocks (34 B / 32 elems): d = amax/127 (stored f16), q =
@@ -2461,10 +2592,10 @@ impl CpuBackend {
                         for quad in quads {
                             let jr: [usize; KEYS] =
                                 std::array::from_fn(|_| key_rows.next().unwrap());
-                            *quad = dot_n(qrow, jr.map(krow));
+                            *quad = dots.dot_n(qrow, jr.map(krow));
                         }
                         for (scj, jr) in tail.iter_mut().zip(key_rows) {
-                            *scj = dot(qrow, krow(jr));
+                            *scj = dots.dot(qrow, krow(jr));
                         }
                         for (jj, scj) in sc_raw.iter_mut().enumerate() {
                             let j = lo + jj;
@@ -2486,10 +2617,10 @@ impl CpuBackend {
                         let (cquads, ctail) = sc_comp.as_chunks_mut::<KEYS>();
                         let (kquads, ktail) = kept_j.as_chunks::<KEYS>();
                         for (quad, js) in cquads.iter_mut().zip(kquads) {
-                            *quad = dot_n(qrow, js.map(crow));
+                            *quad = dots.dot_n(qrow, js.map(crow));
                         }
                         for (scj, &j) in ctail.iter_mut().zip(ktail) {
-                            *scj = dot(qrow, crow(j));
+                            *scj = dots.dot(qrow, crow(j));
                         }
                         let cbias = cs.as_ref().and_then(|(_, b, c)| b.map(|b| (b, c.len)));
                         for (scj, &j) in sc_comp.iter_mut().zip(kept_j) {
@@ -2522,16 +2653,12 @@ impl CpuBackend {
                             let p = e / l;
                             let vb = (jr * nkv + kvh) * hd;
                             // Independent lanes — vectorizes to FMA.
-                            for (o, &v) in ob_slice.iter_mut().zip(&vs[vb..vb + hd]) {
-                                *o = v.mul_add(p, *o);
-                            }
+                            dots.axpy(ob_slice, &vs[vb..vb + hd], p);
                         }
                         // A compressed key's value row is its key row.
                         for (&e, &j) in e_comp.iter().zip(kept_j) {
                             let p = e / l;
-                            for (o, &v) in ob_slice.iter_mut().zip(crow(j)) {
-                                *o = v.mul_add(p, *o);
-                            }
+                            dots.axpy(ob_slice, crow(j), p);
                         }
                     };
                     // One task is one head over a block of consecutive query rows, so the block
@@ -3146,48 +3273,17 @@ impl CpuBackend {
                     // — so this alone replaces what used to be `rows` separate re-dequants of it),
                     // then a per-row softmax + top-`n_used` selection (independent per row, so
                     // parallel over rows is safe).
-                    // Whole-call gate — see expert_matvec_batch's param doc. REFERENCE mode
-                    // (`CpuBackend::reference`) forces every bank onto `ActsKind::Raw`, i.e. the
-                    // f32-activation path decode (rows == 1) already takes, so an oracle run has
-                    // no int8-activation error anywhere.
-                    let int8_ok = rows >= 2 && !reference;
+                    // Quantized banks take int8 activations at EVERY row count, one row (decode)
+                    // included: each row is quantized on its own and the expert kernels give a
+                    // row the same bits in a bucket of any size, so a row's result does not
+                    // depend on how many rows the op has (`tests/moe_batch_identity.rs`).
+                    // REFERENCE mode (`CpuBackend::reference`) forces every bank onto
+                    // `ActsKind::Raw`, so an oracle run has no int8-activation error anywhere.
+                    let int8_ok = !reference;
                     let pool = self.pool();
-                    // Router GEMM on the pool: serial it was 12-20ms/layer at 512 rows (134M MAC)
-                    // — long enough that spinning pool workers SMT-throttled it, which is where
-                    // qwen3moe's phase-3 prefill regression hid (per-op MoeFfn time had IMPROVED).
-                    let logits_all: Vec<f32> = {
-                        let r_kind = expert_acts_kind(rdt, ne, int8_ok);
-                        let rq8: Vec<Q8> = if r_kind == ActsKind::Super {
-                            pool.collect(rows, &|r| quantize_q8(&rxs[r * ne..r * ne + ne]))
-                        } else {
-                            Vec::new()
-                        };
-                        let rq832: Vec<Q8x32> = if r_kind == ActsKind::Blk32 {
-                            pool.collect(rows, &|r| quantize_q8_32(&rxs[r * ne..r * ne + ne]))
-                        } else {
-                            Vec::new()
-                        };
-                        let racts = match r_kind {
-                            ActsKind::Super => ExpertActs::Super(&rq8),
-                            ActsKind::Blk32 => ExpertActs::Blk32(&rq832),
-                            ActsKind::Raw => ExpertActs::Raw(&rxs),
-                        };
-                        let mut lt = vec![0f32; n_expert * rows]; // o-major
-                        pool.for_chunks_mut(&mut lt, 8 * rows, 1, &|c, dst| {
-                            let o0 = c * 8;
-                            let o1 = (o0 + 8).min(n_expert);
-                            expert_gemm_range::<CAP>(
-                                &rbytes, rdt, ne, n_expert, &racts, None, o0, o1, dst,
-                            );
-                        });
-                        let mut logits = vec![0f32; rows * n_expert];
-                        pool.for_chunks_mut(&mut logits, n_expert, 4, &|r, lrow| {
-                            for (o, dst) in lrow.iter_mut().enumerate() {
-                                *dst = lt[o * rows + r];
-                            }
-                        });
-                        logits
-                    };
+                    let logits_all: Vec<f32> = moe::router_logits::<CAP>(
+                        pool, &rbytes, rdt, ne, n_expert, &rxs, rows, int8_ok,
+                    );
                     struct RouteRow {
                         /// Selected experts, sorted by DESCENDING router prob — the same order the
                         /// original per-row loop accumulated in. On a HASH-routed layer these are
@@ -3214,41 +3310,7 @@ impl CpuBackend {
                     });
                     let routes: Vec<RouteRow> = pool.collect(rows, &|r| {
                         let logits = &logits_all[r * n_expert..r * n_expert + n_expert];
-                        // Router probabilities: softmax over all experts (qwen3moe/…) or a per-expert
-                        // sigmoid (llama4). Both are monotone in the logit, so the top-`n_used`
-                        // selection is identical either way (llama4 selects by raw logits — same set).
-                        let probs: Vec<f32> = match gating {
-                            MoeGating::Softmax => {
-                                let maxl = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                                let mut p = logits.to_vec();
-                                math::exp_sub_slice(&mut p, maxl);
-                                let psum: f32 = p.iter().sum();
-                                for v in p.iter_mut() {
-                                    *v /= psum;
-                                }
-                                p
-                            }
-                            MoeGating::Sigmoid => {
-                                let mut p = logits.to_vec();
-                                math::sigmoid_slice(&mut p);
-                                p
-                            }
-                            MoeGating::SqrtSoftplus => {
-                                // sqrt(softplus(x)) = sqrt(ln(1 + exp(x))). Monotone like sigmoid;
-                                // top-k-by-logit picks the same set.
-                                logits
-                                    .iter()
-                                    .map(|&v| {
-                                        let sp = if v > 20.0 {
-                                            v
-                                        } else {
-                                            math::ln(1.0_f32 + math::exp(v))
-                                        };
-                                        sp.sqrt()
-                                    })
-                                    .collect()
-                            }
-                        };
+                        let probs = moe::router_probs(logits, gating);
                         let idx: Vec<usize> = if let Some(hids) = &hash_ids {
                             // Hash-routed (V4): the token's table row IS the selection. Everything
                             // the `else` branch computes — the biased copy, the group scores, the
@@ -3267,66 +3329,14 @@ impl CpuBackend {
                                 })
                                 .collect()
                         } else {
-                            // DeepSeek V2+: router bias for SELECTION only — add to a copy used for
-                            // top-k selection; original probs still used for per-expert weights.
-                            let mut sel_probs: Vec<f32> = if let Some(epb) = exp_probs_b {
-                                let epb_w = weight(epb);
-                                probs
-                                    .iter()
-                                    .enumerate()
-                                    .map(|(e, &p)| p + epb_w[e])
-                                    .collect()
-                            } else {
-                                probs.clone()
-                            };
-                            // DeepSeek V3+: group-limited routing — per-group top-2, top groups,
-                            // mask the rest to -inf (matching llama.cpp `build_moe_ffn`).
-                            if n_expert_groups > 1 && n_expert_groups_used > 0 {
-                                let n_exp_per_group = n_expert / n_expert_groups as usize;
-                                let ng = n_expert_groups as usize;
-                                let ng_used = n_expert_groups_used as usize;
-                                // Compute per-group score: sum of top-2 within each group.
-                                let mut gscores = vec![f32::NEG_INFINITY; ng];
-                                for g in 0..ng {
-                                    let base = g * n_exp_per_group;
-                                    let mut best = [f32::NEG_INFINITY; 2];
-                                    for &s in &sel_probs[base..base + n_exp_per_group] {
-                                        if s > best[0] {
-                                            best[1] = best[0];
-                                            best[0] = s;
-                                        } else if s > best[1] {
-                                            best[1] = s;
-                                        }
-                                    }
-                                    gscores[g] = best[0] + best[1];
-                                }
-                                // Top ng_used groups by score.
-                                let mut gidx: Vec<usize> = (0..ng).collect();
-                                // `total_cmp`: a NaN score must not panic the backend. Without
-                                // a NaN it orders as `partial_cmp` did except -0.0 / +0.0; a NaN
-                                // score ranks first and the routing output is garbage.
-                                gidx.sort_by(|&a, &b| gscores[b].total_cmp(&gscores[a]));
-                                gidx.truncate(ng_used);
-                                // Mask non-chosen groups to -inf.
-                                let mut chosen = vec![false; ng];
-                                for &g in &gidx {
-                                    chosen[g] = true;
-                                }
-                                for g in 0..ng {
-                                    if !chosen[g] {
-                                        for s in sel_probs
-                                            [g * n_exp_per_group..(g + 1) * n_exp_per_group]
-                                            .iter_mut()
-                                        {
-                                            *s = f32::NEG_INFINITY;
-                                        }
-                                    }
-                                }
-                            }
-                            let mut idx: Vec<usize> = (0..n_expert).collect();
-                            idx.sort_by(|&a, &b| sel_probs[b].total_cmp(&sel_probs[a]));
-                            idx.truncate(n_used);
-                            idx
+                            let bias = exp_probs_b.map(weight);
+                            let scores = moe::selection_scores(
+                                &probs,
+                                bias.as_ref().map(|b| &b[..]),
+                                n_expert_groups,
+                                n_expert_groups_used,
+                            );
+                            moe::top_experts(&scores, n_used)
                         };
                         // `norm_w`: renormalize the selected weights to sum to 1 before scaling
                         // (softmax MoE); llama4 uses the raw sigmoid prob × scale (no renorm).
@@ -3799,6 +3809,72 @@ impl CpuBackend {
                         rc.give(stage);
                     }
                 }
+                Op::MoeRoute {
+                    router_x,
+                    router,
+                    exp_probs_b,
+                    dst_ids,
+                    dst_scores,
+                    ne,
+                    n_expert,
+                    n_used,
+                    gating,
+                    n_expert_groups,
+                    n_expert_groups_used,
+                } => {
+                    // `Op::MoeFfn`'s selection and nothing after it, through the helpers that op
+                    // routes with, so the two select the same experts from the same operands.
+                    let (ne, n_expert, n_used) = (ne as usize, n_expert as usize, n_used as usize);
+                    let rxs = rc.copy_of(&vals[router_x.0 as usize]);
+                    let rows = rxs.len() / ne;
+                    let rbuf = bindings.get(router).expect("cpu backend: unbound router");
+                    refuse_relock(
+                        "Op::MoeRoute",
+                        ("router", rbuf),
+                        &[("exp_probs_b", exp_probs_b.and_then(|id| bindings.get(id)))],
+                    );
+                    let logits_all = {
+                        let rbytes = cpu_buf(rbuf).read();
+                        moe::router_logits::<CAP>(
+                            self.pool(),
+                            &rbytes,
+                            g.desc(router).dtype,
+                            ne,
+                            n_expert,
+                            &rxs,
+                            rows,
+                            !reference,
+                        )
+                    };
+                    let bias = exp_probs_b.map(weight);
+                    let mut ids = rc.zeroed(rows * n_used);
+                    let mut scores_all = dst_scores.map(|_| Vec::with_capacity(rows * n_expert));
+                    for r in 0..rows {
+                        let probs = moe::router_probs(
+                            &logits_all[r * n_expert..(r + 1) * n_expert],
+                            gating,
+                        );
+                        let scores = moe::selection_scores(
+                            &probs,
+                            bias.as_ref().map(|b| &b[..]),
+                            n_expert_groups,
+                            n_expert_groups_used,
+                        );
+                        for (slot, e) in ids[r * n_used..(r + 1) * n_used]
+                            .iter_mut()
+                            .zip(moe::top_experts(&scores, n_used))
+                        {
+                            *slot = f32::from_bits(e as u32);
+                        }
+                        if let Some(all) = &mut scores_all {
+                            all.extend_from_slice(&scores);
+                        }
+                    }
+                    rc.set(&mut vals, dst_ids.0 as usize, ids);
+                    if let (Some(id), Some(all)) = (dst_scores, scores_all) {
+                        rc.set(&mut vals, id.0 as usize, all);
+                    }
+                }
                 Op::Conv1dSilu {
                     x,
                     weight: w,
@@ -4054,8 +4130,7 @@ impl CpuBackend {
                                 let jr = if cap_rows > 0 { j % cap_rows } else { j };
                                 let krow = jr * key_len;
                                 // dot(q_full, K row j), plus the optional top-k mask at key j
-                                *scj =
-                                    crate::kernels::dot(&q_full, &ks[krow..krow + key_len]) * scale;
+                                *scj = dots.dot(&q_full, &ks[krow..krow + key_len]) * scale;
                                 if let Some(kb) = &kb {
                                     *scj += kb[ti * kv_len + j];
                                 }
@@ -4068,7 +4143,10 @@ impl CpuBackend {
                             for &e in &sc {
                                 l += e;
                             }
-                            // Accumulate: V is first kv_lora columns of K.
+                            // Accumulate: V is first kv_lora columns of K. Each key's projected
+                            // value row is gathered first, then added in by one `axpy`
+                            // (`p.mul_add(v, o)` and `v.mul_add(p, o)` are the same fused value).
+                            let mut vrow = vec![0f32; vhd];
                             for (jj, &e) in sc.iter().enumerate() {
                                 let j = lo + jj;
                                 let jr = if cap_rows > 0 { j % cap_rows } else { j };
@@ -4078,7 +4156,7 @@ impl CpuBackend {
                                 // Apply wv_b[h] to the accumulated output directly:
                                 // ob_slice += p * wv_b[h] @ V[jj]
                                 let wv_off = h * kv_lora * vhd;
-                                for o_idx in 0..vhd {
+                                for (o_idx, v) in vrow.iter_mut().enumerate() {
                                     let mut vs = 0f32;
                                     for a_idx in 0..kv_lora {
                                         // wv_b[h][a_idx][o_idx]: element [a][o] with a the FAST
@@ -4086,8 +4164,9 @@ impl CpuBackend {
                                         vs +=
                                             wv[wv_off + a_idx + o_idx * kv_lora] * ks[krow + a_idx];
                                     }
-                                    ob_slice[o_idx] = p.mul_add(vs, ob_slice[o_idx]);
+                                    *v = vs;
                                 }
+                                dots.axpy(&mut ob_slice[..vhd], &vrow, p);
                             }
                         });
                     rc.set(&mut vals, dst.0 as usize, out);
@@ -4170,7 +4249,8 @@ impl CpuBackend {
                     // `rows × keys` f32, in a buffer an earlier op of this execute freed when one
                     // fits (the previous CSA layer's scores, given back below).
                     let buf = rc.for_overwrite(his.iter().copied().max().unwrap_or(0) * rows);
-                    let sc = indexer::score(self.pool(), buf, qs, ws, keys, nh, hd, scale, &his);
+                    let sc =
+                        indexer::score::<CAP>(self.pool(), buf, qs, ws, keys, nh, hd, scale, &his);
                     let mut out = vec![0f32; rows * top_k];
                     let tap = indexer_tap::active().then(|| std::sync::Mutex::new(Vec::new()));
                     self.pool()
@@ -4330,9 +4410,7 @@ impl CpuBackend {
                         for h in 0..hc {
                             let w = ws[t * hc + h];
                             let xr = &xs[(t * hc + h) * ne..][..ne];
-                            for (o, &xv) in o.iter_mut().zip(xr) {
-                                *o = xv.mul_add(w, *o);
-                            }
+                            dots.axpy(o, xr, w);
                         }
                     });
                     rc.set(&mut vals, dst.0 as usize, out);
@@ -4367,9 +4445,7 @@ impl CpuBackend {
                             // failure `Op::HyperConnectMix`'s doc warns about.
                             let w = cs[t * hc * hc + d + hc * src];
                             let rr = &rs[(t * hc + src) * ne..][..ne];
-                            for (o, &rv) in o.iter_mut().zip(rr) {
-                                *o = rv.mul_add(w, *o);
-                            }
+                            dots.axpy(o, rr, w);
                         }
                     });
                     rc.set(&mut vals, dst.0 as usize, out);
@@ -4419,12 +4495,10 @@ impl CpuBackend {
                                 *e = s - m;
                             }
                             math::exp_slice(&mut es);
-                            for (((o, d), &e), &v) in
-                                o.iter_mut().zip(den.iter_mut()).zip(es.iter()).zip(vr)
-                            {
+                            for (d, &e) in den.iter_mut().zip(es.iter()) {
                                 *d += e;
-                                *o = v.mul_add(e, *o);
                             }
+                            dots.mul_add_into(o, vr, &es);
                         }
                         for ((o, &d), &m) in o.iter_mut().zip(den.iter()).zip(m.iter()) {
                             // An all-`-inf` window is `0/0` (`s - m` is `NaN` for every lane): the
@@ -4798,6 +4872,94 @@ fn deltanet_scan(
 /// Fixtures shared by the crate's unit tests.
 #[cfg(test)]
 pub(crate) mod test_util {
+    use infr_core::tensor::DType;
+
+    /// Every weight format whose activations take the 256-element quantizer (`quantize_q8`), and
+    /// so can meet a sparse part (`Q8::hi`).
+    pub(crate) const Q8_DTYPES: [DType; 16] = [
+        DType::Q4K,
+        DType::Q6K,
+        DType::Q8_0,
+        DType::Q5K,
+        DType::Q2K,
+        DType::Q3K,
+        DType::Iq4Xs,
+        DType::Iq2S,
+        DType::Iq2Xs,
+        DType::Iq2Xxs,
+        DType::Iq1S,
+        DType::Iq1M,
+        DType::Iq3S,
+        DType::Iq3Xxs,
+        DType::Tq2_0,
+        DType::Tq1_0,
+    ];
+
+    /// `rows` weight rows of `in_f` in format `dt`: LCG payloads (every code pattern), each
+    /// block's scales the format's own magnitudes times `scales[k]`, `k` cycling through the
+    /// list block by block (`(b * 5 + b / 7) % len`) so neighbouring blocks differ.
+    pub(crate) fn synth_weights(
+        dt: DType,
+        rows: usize,
+        in_f: usize,
+        seed: u32,
+        scales: &[(f32, f32)],
+    ) -> Vec<u8> {
+        let spec = infr_core::decode_spec::block_spec(dt);
+        let (d, min) = infr_testkit::synth_scales(dt);
+        let nblk = rows * in_f / spec.block_elems;
+        let mut w = Vec::with_capacity(nblk * spec.block_bytes);
+        for b in 0..nblk {
+            let mut blk =
+                infr_testkit::lcg_bytes(seed ^ (b as u32).wrapping_mul(0x9e37), spec.block_bytes);
+            let (fd, fm) = scales[(b * 5 + b / 7) % scales.len()];
+            spec.write_scales(&mut blk, d * fd, min * fm);
+            w.extend_from_slice(&blk);
+        }
+        w
+    }
+
+    /// The spike patterns the sparse part's tests feed (`(index, value)` over a rest of
+    /// magnitude under 1.6, so a spike of 30 or more splits its block): one spike; two in a
+    /// block; spikes in several blocks; at the first and last index of a block; at the first and
+    /// last index of 8-, 16- and 32-element sub-blocks; in the last block; two equal; two equal
+    /// and opposite in one 8-element group; two far apart, whose second needs a second part; one
+    /// so large that its scale times an f16 maximum overflows. `in_f` is a multiple of 256 of
+    /// at least 512.
+    pub(crate) fn spike_patterns(in_f: usize) -> Vec<Vec<(usize, f32)>> {
+        let last = in_f - 256;
+        vec![
+            vec![(5, 400.0)],
+            vec![(3, 412.5), (7, -129.3)],
+            vec![(10, 300.0), (300, -250.0), (last + 77, 500.0)],
+            vec![(0, 350.0), (255, -280.0)],
+            vec![(256, 200.0), (511, -330.0)],
+            vec![(8, 300.0), (15, -200.0)],
+            vec![(16, 310.0), (31, -90.0)],
+            vec![(32, 250.0), (63, 260.0)],
+            vec![(127, -300.0), (128, 300.0)],
+            vec![(in_f - 1, -3.0e4)],
+            vec![(last, 500.0), (last + 129, 400.0)],
+            vec![(40, 300.0), (41, 300.0)],
+            vec![(70, 300.0), (71, -300.0)],
+            vec![(40, 300.0), (200, -300.0)],
+            vec![(3, 3000.0), (20, 941.0625)],
+            vec![(9, 1.0e37)],
+        ]
+    }
+
+    /// Activation row `r` of `in_f`: ordinary values of magnitude under 1.6 with
+    /// [`spike_patterns`]' pattern `r % len` placed over them.
+    pub(crate) fn spiky_row(r: usize, in_f: usize) -> Vec<f32> {
+        let pats = spike_patterns(in_f);
+        let mut x: Vec<f32> = (0..in_f)
+            .map(|i| (((i * 29 + r * 13) % 97) as f32 - 48.0) / 31.0)
+            .collect();
+        for &(i, v) in &pats[r % pats.len()] {
+            x[i] = v;
+        }
+        x
+    }
     /// Deterministic quant weight bytes with every block's f16 scale(s) at `d_offs` set to small
     /// finite values (random bits there would be NaN/inf half the time).
     pub(crate) fn det_quant_rows(
@@ -4870,6 +5032,8 @@ mod tests {
     }
     use super::test_util::det_quant_rows;
     use super::*;
+    use crate::kernels::{vec_dot_q4k, vec_dot_q5k, vec_dot_q6k};
+    use infr_core::graph::MoeGating;
     use infr_core::tensor::TensorDesc;
 
     /// One owned buffer bound to `Op::Mla`'s `k_cache` and to a weight it reads is refused by
@@ -5831,6 +5995,62 @@ mod tests {
             .chunks(4)
             .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
             .collect()
+    }
+
+    /// Every `Op::Linear` route that adds a sparse activation part (one row; the batch kernels,
+    /// tiles and packed GEMM with their row-major and o-major adds) gives, on every element, the
+    /// one-row dense kernel plus the sparse part dotted the way it was before the fast sparse dot
+    /// (`vec_dot_hi_reference`), for every format that takes `Q8` activations, at 1, 2, 5 and 19
+    /// rows, on rows of every spike pattern (`test_util::spike_patterns`) and some with none.
+    #[test]
+    fn linear_routes_add_the_reference_sparse_dot_bitwise() {
+        use crate::kernels::{vec_dot_hi_reference, vec_dot_q8_any};
+        use crate::test_util::{spiky_row, synth_weights, Q8_DTYPES};
+        let (in_f, out_f) = (768usize, 19usize);
+        let row = |r: usize| -> Vec<f32> {
+            if r % 4 == 3 {
+                (0..in_f)
+                    .map(|i| ((i * 7 + r) % 23) as f32 / 9.0 - 1.2)
+                    .collect()
+            } else {
+                spiky_row(r, in_f)
+            }
+        };
+        let mut split = 0usize;
+        for dt in Q8_DTYPES {
+            let w = synth_weights(
+                dt,
+                out_f,
+                in_f,
+                0x7a,
+                &[(1.0, 1.0), (-0.5, 2.0), (3.0, 0.0)],
+            );
+            let bpr = w.len() / out_f;
+            for m in [1usize, 2, 5, 19] {
+                let xs: Vec<Vec<f32>> = (0..m).map(row).collect();
+                let got = run_linear(dt, &w, &xs.concat(), m, in_f, out_f);
+                for (r, x) in xs.iter().enumerate() {
+                    let q8 = quantize_q8(x);
+                    for o in 0..out_f {
+                        let wr = &w[o * bpr..(o + 1) * bpr];
+                        let dense = vec_dot_q8_any::<false>(dt, wr, &q8, in_f);
+                        let want = if q8.hi.is_empty() {
+                            dense
+                        } else {
+                            split += 1;
+                            dense + vec_dot_hi_reference::<false>(dt, wr, &q8, in_f)
+                        };
+                        let g = got[r * out_f + o];
+                        assert_eq!(
+                            g.to_bits(),
+                            want.to_bits(),
+                            "{dt:?} m={m} row {r} o={o}: got {g}, want {want}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(split > 0, "no row split");
     }
 
     /// Prefill `Op::Linear` on K-quant weights gives the single-token kernel's bits on every

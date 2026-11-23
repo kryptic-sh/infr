@@ -21,18 +21,18 @@ it that way.
 
 ## What it owns
 
-| module   | capability                                     |
-| -------- | ---------------------------------------------- |
-| `cpu`    | physical core count, compute-thread placement  |
-| `fileio` | positioned reads and writes                    |
-| `link`   | the content-addressed store's link step        |
-| `lock`   | an exclusive, crash-safe file lock             |
-| `mem`    | committable host memory, mapped-page residency |
-| `paths`  | config / cache / home directory resolution     |
-| `proc`   | process liveness                               |
-| `signal` | `SIGINT` / `SIGTERM`, or the local equivalent  |
-| `socket` | Linux systemd TCP listener inheritance         |
-| `stdin`  | an interruptible byte read from fd 0           |
+| module      | capability                                     |
+| ----------- | ---------------------------------------------- |
+| `cpu`       | physical core count, compute-thread placement  |
+| `fileio`    | positioned reads and writes                    |
+| `link`      | the content-addressed store's link step        |
+| `localtime` | `strftime` over the machine's local time       |
+| `lock`      | an exclusive, crash-safe file lock             |
+| `mem`       | committable host memory, mapped-page residency |
+| `paths`     | config / cache / home directory resolution     |
+| `proc`      | process liveness                               |
+| `signal`    | `SIGINT` / `SIGTERM`, or the local equivalent  |
+| `stdin`     | an interruptible byte read from fd 0           |
 
 ## What must not be sanded off
 
@@ -55,6 +55,16 @@ case is documented at its definition rather than smoothed over:
   `unsafe`: on Linux `MADV_DONTNEED` zero-fills private or anonymous memory, so
   it is sound only on a shared read-only file mapping, which
   `infr_gguf::TensorBytes::release_resident` is the safe way to name.
+- **`localtime::strftime_local`** writes `%Z` as the C library names the zone:
+  an abbreviation on Unix, the system's localized long name on Windows, where a
+  name that is not UTF-8 in the ANSI code page makes the call an error (B233).
+  Every other conversion it accepts writes the same text everywhere, and it
+  accepts only those every supported C library implements, because the UCRT
+  terminates the process on one it does not know. The C library reads `TZ`
+  unsynchronised with `std::env::set_var`, and when it reads it differs by
+  library; the doc comment says what was checked for each and why the race
+  cannot happen today, and B232 what would close it. Targets other than Unix and
+  Windows with the UCRT fail to compile.
 - **`proc::pid_alive`** answers `true` where there is no probe — losing a
   tripwire rather than reporting a live process as dead. A new platform should
   get a real probe, not inherit that arm.

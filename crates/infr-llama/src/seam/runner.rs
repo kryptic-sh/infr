@@ -6046,6 +6046,9 @@ pub(crate) fn generate_dense_backend_bound(
     // INFR_PROF_STAGES=1: report prompt-ingest + decode tok/s to stderr (CPU perf iteration).
     let prof = ec.prof.stages;
     let mut prompt_t = std::time::Duration::ZERO;
+    // A long prefill reports every 5% of the suffix, so a server log shows it moving.
+    let prefill_report_step = ((prompt.len().saturating_sub(start)) / 20).max(1);
+    let mut prefill_next_report = prefill_report_step;
     let mut decode_t = std::time::Duration::ZERO;
     let mut decode_n = 0usize;
     // Of `decode_n`, the tokens that came back from chained submits (`GenStats::n_chained`).
@@ -6492,6 +6495,22 @@ pub(crate) fn generate_dense_backend_bound(
                     // Last span for this chunk: its uploads and its residual stream are dead.
                     if si + 1 == spans.len() {
                         live[ci] = None;
+                        if cend >= prefill_next_report && prompt.len().saturating_sub(start) >= 4096
+                        {
+                            prefill_next_report = cend + prefill_report_step;
+                            let done = cend.saturating_sub(start);
+                            let total = prompt.len().saturating_sub(start);
+                            tracing::info!(
+                                prefilled = done,
+                                total,
+                                pct = done * 100 / total.max(1),
+                                prefill_tps = format_args!(
+                                    "{:.0}",
+                                    done as f64 / prompt_t.as_secs_f64().max(1e-9)
+                                ),
+                                "prefill progress"
+                            );
+                        }
                     }
                 }
             }

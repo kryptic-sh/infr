@@ -2954,6 +2954,8 @@ impl DiffusionGemmaMetalSession {
             None,
             None,
             None,
+            None, // paged_blocks
+            1,    // slot_copies
         )?;
         Ok(())
     }
@@ -2997,6 +2999,8 @@ impl DiffusionGemmaMetalSession {
                 reduced: &mut reduced,
             }),
             None,
+            None, // paged_blocks
+            1,    // slot_copies
         )?;
         Ok(out_logits)
     }

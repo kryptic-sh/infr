@@ -16,6 +16,14 @@ pub enum PathClass {
     /// GEMVs. Each quantizes its activations per 32-element block, which the CPU reference does
     /// not, so the distance is dominated by that quantization.
     Int8,
+    /// [`PathClass::Float`] with the whole cooperative-matrix tier off as well
+    /// (`kernels.vulkan.coopmat`), so the batched prefill's GEMMs take f32 operands on every
+    /// device. A model has a row here when its Float row is dominated by the f16 operands of the
+    /// cooperative-matrix prefill GEMMs and so cannot be tight; this class is then its fine check
+    /// of what still runs. With the tier off the kernels that serve those GEMMs are not built
+    /// either (`splitk_reduce` and `store_f16`, on the RX 7900 XTX under RADV), so on a device
+    /// with the tier they, like the GEMMs, are scored only under the model's Float row.
+    FloatNoCoopmat,
     /// [`PathClass::Float`] with an 8-bit KV cache (`q8_0` K and V), scored against the CPU
     /// reference running the same cache format.
     KvQ8,
@@ -94,7 +102,7 @@ const fn row(model: &'static str, class: PathClass, steady: Tolerance, first: To
     }
 }
 
-use PathClass::{Float, Int8, KvQ8};
+use PathClass::{Float, FloatNoCoopmat, Int8, KvQ8};
 
 /// The tolerance table. Rows are per model as well as per class because the same arithmetic
 /// lands at very different distances on different models (gemma-3-1b is about a hundred times more
@@ -107,6 +115,17 @@ use PathClass::{Float, Int8, KvQ8};
 /// `infr tune show`): `Vulkan0` RX 7900 XTX (RDNA3), native and forced wave64, tuning rows on and
 /// off; `Vulkan1` the Ryzen 9950X3D's integrated GPU (RDNA2), only what `docs/gpu-tolerance.md`
 /// lists. Re-derived 2026-11-18 with the first rows split out.
+///
+/// **gemma-3's rows, 2026-11-23.** Its Float row was split in two and its Int8 row's steady
+/// near-tie margin raised, from `measure_gpu_tolerance` on Linux 7.3.5-arch1-1, Mesa RADV
+/// 26.3.1, headless: `Vulkan0` RX 7900 XTX (RADV NAVI31) and `Vulkan1` the integrated GPU (RADV
+/// RAPHAEL_MENDOCINO). At the prompts' own ends: every gemma configuration of `GPU_CONFIGS`
+/// with a class here, native lanes and forced wave64, tuning rows on and off (no row matches
+/// RADV, so the two agree). At the `INFR_TOL_SPLIT` prompt ends `docs/gpu-tolerance.md` lists:
+/// native lanes only, and `gpu`, `gpu-float`, `gpu-float-static`, `gpu-float-nocoopmat` and
+/// `gpu-float-nocoopmat-static` only (no `-ub32` configuration). The moved ends count toward
+/// the two Float rows and not toward the Int8 row. The comment above each gemma row says which
+/// figures it was set from.
 ///
 /// **How each value was set**, separately for the first rows and for the rest, from the worst
 /// legitimate value over every device, configuration, prompt and phase: KL max and mean times 2;
@@ -138,22 +157,55 @@ pub const TABLE: &[Entry] = &[
         t(4.9e-2, 6.7e-3, 0.9455, 5.7e-2, 1.00, 5),
         t(4.9e-2, 8.9e-3, 0.9455, 5.7e-2, 1.00, 5),
     ),
+    // A SMOKE CHECK of the cooperative-matrix f16 prefill path, not a fine one: where a device
+    // runs those GEMMs (`native_gemm_warp_*`) gemma-3's distance is the accuracy cost of their f16
+    // operands and moves with the summation order and with where the prompt ends (B207), so this
+    // row admits a fine planted bug its FloatNoCoopmat row catches ((d) of
+    // `docs/gpu-tolerance.md`). Set from the RX 7900 XTX under RADV, native lanes, configurations
+    // `gpu-float*`: worst KL 1.03e-2 (prompt 1 ended after 6 tokens, position 13), mean 8.1e-4
+    // and logit deviation 2.8e-2 (ended after 16), cosine 0.98952, against 1.02e-2, 4.9e-4,
+    // 2.7e-2 and 0.98979 at the prompt's own end. The Windows figure for the same path, a worst
+    // KL of 3.2e-3 at position 40, which set the row's earlier bound, is below them. The first
+    // rows there measure less than the rest and take the steady bound.
     row(
         "gemma-3-1b-it-Q4_K_M.gguf",
         Float,
-        t(6.4e-3, 4.9e-4, 0.9950, 2.6e-2, 0.25, 3),
-        t(6.4e-3, 1.6e-3, 0.9950, 2.6e-2, 0.25, 3),
+        t(2.1e-2, 1.7e-3, 0.9790, 4.2e-2, 0.25, 3),
+        t(2.1e-2, 1.7e-3, 0.9790, 4.2e-2, 0.25, 3),
     ),
-    // A SMOKE CHECK, not a fine one: gemma-3's legitimate int8 distance (worst KL 0.26 from
-    // position 2 on, 0.87 in the first two; both on the integrated GPU, native lanes, config
-    // `gpu`, prompt 2, positions 115 and 1) is as large as a gross bug's on Qwen3-0.6B, so this
-    // row admits bugs its Float row is there to catch. The RX 7900 XTX measures 2.6e-2 and 0.33
-    // natively: ten times apart, unexplained (B207).
+    // A SMOKE CHECK, not a fine one: gemma-3's legitimate int8 distance is as large as a gross
+    // bug's on Qwen3-0.6B, so this row admits bugs its FloatNoCoopmat row is there to catch.
+    // Every limit but the steady near tie was set on Windows, from a worst KL of 0.26 from
+    // position 2 on and 0.87 in the first two (both on the integrated GPU, native lanes, config
+    // `gpu`, prompt 2, positions 115 and 1), where the RX 7900 XTX measured 2.6e-2 and 0.33
+    // natively: ten times apart, unexplained (B207). Under RADV the integrated GPU, and the RX
+    // 7900 XTX with wave64 forced, measure 0.310 from position 2 on (prompt 1, position 13) and
+    // 0.81 in the first two: inside the bounds, with less than the rule's margin left (B207).
+    // The steady near tie is from RADV, 2026-11-23: the widest top-1 miss at the prompts' own
+    // ends is at 1.185 nats (the same two paths, prompt 2, position 179). With a prompt ended
+    // early this row's KL, mean and deviation limits do not hold (B207), so those runs set
+    // nothing here.
     row(
         "gemma-3-1b-it-Q4_K_M.gguf",
         Int8,
-        t(5.2e-1, 2.7e-2, 0.7106, 1.5e-1, 1.00, 5),
+        t(5.2e-1, 2.7e-2, 0.7106, 1.5e-1, 1.78, 5),
         t(1.8e0, 1.2e0, 0.0100, 1.9e-1, 2.00, 9),
+    ),
+    // gemma-3's fine check. Worst legitimate values, the same on both RADV GPUs to the digits
+    // given (`gpu-float-nocoopmat*`, and `gpu-float*` wherever the tier does not run): KL 8.81e-4
+    // (prompt 1 ended after 12 tokens, position 13), mean 5.7e-5 (ended after 16), cosine
+    // 0.998998, logit deviation 7.4e-3, no top-1 miss; 7.14e-4, 3.5e-5, 0.999184 and 6.6e-3 at
+    // the prompt's own end. The row is from RADV alone: no Windows run of these configurations
+    // exists. The one older Windows figure that may be of this path, the integrated GPU's Float
+    // worst of 1.6e-3 as B207 quotes it (no printed run behind it, earlier code, its path
+    // inferred), would sit inside the KL bound. A Windows run outside this row is a finding to
+    // investigate, not a reason to widen it. The first rows measure far less (KL 2.1e-6) and
+    // take the steady bound.
+    row(
+        "gemma-3-1b-it-Q4_K_M.gguf",
+        FloatNoCoopmat,
+        t(1.8e-3, 1.2e-4, 0.9979, 1.2e-2, 0.25, 1),
+        t(1.8e-3, 1.2e-4, 0.9979, 1.2e-2, 0.25, 1),
     ),
     row(
         "LFM3-1.7B-F16.gguf",

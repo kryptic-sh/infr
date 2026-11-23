@@ -441,6 +441,13 @@ pub fn vulkan_float(c: &mut EngineConfig) {
     v.i8_dot = false;
 }
 
+/// [`vulkan_float`] with the whole cooperative-matrix tier off as well (`kernels.vulkan.coopmat`,
+/// what `INFR_NO_COOPMAT` sets): the prefill GEMMs then take f32 operands, on every device.
+pub fn vulkan_float_nocoopmat(c: &mut EngineConfig) {
+    vulkan_float(c);
+    c.kernels.vulkan.coopmat = false;
+}
+
 /// A KV-format pair as a config edit — the `INFR_KV_TYPE_K`/`_V` pair, typed.
 pub fn kv_types(c: &mut EngineConfig, k: &str, v: &str) {
     c.kv.type_k = infr_core::budget::parse_kv_dtype(k);
@@ -478,6 +485,23 @@ pub const GPU_CONFIGS: &[GpuConfig] = &[
         },
         None,
     ),
+    ("gpu-float-nocoopmat", vulkan_float_nocoopmat, None),
+    (
+        "gpu-float-nocoopmat-ub32",
+        |c| {
+            vulkan_float_nocoopmat(c);
+            c.device.ubatch = Some(SMALL_UBATCH);
+        },
+        None,
+    ),
+    (
+        "gpu-float-nocoopmat-static",
+        |c| {
+            vulkan_float_nocoopmat(c);
+            c.kernels.vulkan.no_replay = true;
+        },
+        None,
+    ),
     (
         "gpu-kv-q8",
         |c| kv_types(c, "q8_0", "q8_0"),
@@ -509,16 +533,6 @@ pub const DIAGNOSIS_CONFIGS: &[GpuConfig] = &[
     // The shipped configuration without the dp4a K-quant prefill GEMM (`kernels.vulkan.dp4a_kq`):
     // its weights then take the `mmq` GEMM, still on int8 activations.
     ("gpu-no-dp4a-kq", |c| c.kernels.vulkan.dp4a_kq = false, None),
-    // The Float class with the whole cooperative-matrix tier off (`kernels.vulkan.coopmat`, what
-    // `INFR_NO_COOPMAT` sets): the prefill GEMMs then take f32 operands.
-    (
-        "gpu-float-nocoopmat",
-        |c| {
-            vulkan_float(c);
-            c.kernels.vulkan.coopmat = false;
-        },
-        None,
-    ),
 ];
 
 /// The three-way measurement on one model: CPU production against the CPU reference, then each

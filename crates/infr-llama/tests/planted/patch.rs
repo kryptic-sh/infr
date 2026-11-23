@@ -71,7 +71,8 @@ impl Patch {
     /// Every value of tensor `name`, or only those of its block `block`, times `factor`. A K-quant
     /// block is scaled through its super-block scales (`Q4_K`: `d` and `dmin`, so the block's
     /// every value scales; `Q6_K`: `d`), each rounded to f16, so the factor lands within an f16
-    /// rounding of `factor`; a float tensor's values are scaled one by one.
+    /// rounding of `factor`; a float tensor's values are scaled one by one, all of them when no
+    /// block is named, whatever the tensor's length.
     pub fn scale(&mut self, name: &str, block: Option<usize>, factor: f32) {
         let (dt, shape, range) = self.tensor(name);
         let numel: usize = shape.iter().product();
@@ -80,40 +81,47 @@ impl Patch {
             None => 0..numel / BLOCK,
         };
         assert!(blocks.end * BLOCK <= numel, "{name} has no block {block:?}");
+        // The values a float tensor's scaling covers.
+        let values = match block {
+            Some(b) => b * BLOCK..(b + 1) * BLOCK,
+            None => 0..numel,
+        };
         let data = &mut self.bytes[range];
         let scale_f16 = |b: &mut [u8]| {
             let v = half::f16::from_le_bytes([b[0], b[1]]).to_f32() * factor;
             b.copy_from_slice(&half::f16::from_f32(v).to_le_bytes());
         };
-        for bi in blocks {
-            match dt {
-                DType::Q4K => {
+        match dt {
+            DType::Q4K => {
+                for bi in blocks {
                     let blk = &mut data[bi * Q4K_BYTES..(bi + 1) * Q4K_BYTES];
                     scale_f16(&mut blk[0..2]);
                     scale_f16(&mut blk[2..4]);
                 }
-                DType::Q6K => {
+            }
+            DType::Q6K => {
+                for bi in blocks {
                     let blk = &mut data[bi * Q6K_BYTES..(bi + 1) * Q6K_BYTES];
                     scale_f16(&mut blk[Q6K_BYTES - 2..]);
                 }
-                DType::F16 => {
-                    for e in data[bi * BLOCK * 2..(bi + 1) * BLOCK * 2]
-                        .as_chunks_mut::<2>()
-                        .0
-                    {
-                        scale_f16(e);
-                    }
-                }
-                DType::F32 => {
-                    for e in data[bi * BLOCK * 4..(bi + 1) * BLOCK * 4]
-                        .as_chunks_mut::<4>()
-                        .0
-                    {
-                        *e = (f32::from_le_bytes(*e) * factor).to_le_bytes();
-                    }
-                }
-                _ => panic!("{name}: no block scaling for {dt:?}"),
             }
+            DType::F16 => {
+                for e in data[values.start * 2..values.end * 2]
+                    .as_chunks_mut::<2>()
+                    .0
+                {
+                    scale_f16(e);
+                }
+            }
+            DType::F32 => {
+                for e in data[values.start * 4..values.end * 4]
+                    .as_chunks_mut::<4>()
+                    .0
+                {
+                    *e = (f32::from_le_bytes(*e) * factor).to_le_bytes();
+                }
+            }
+            _ => panic!("{name}: no block scaling for {dt:?}"),
         }
     }
 

@@ -18,7 +18,7 @@ use infr_llama::seam::{ForcedLogits, ForcedOn};
 use infr_llama::tolerance::{tolerance, PathClass};
 use infr_testkit::gguf::{Fill, Meta, SyntheticModel, TempGguf, TensorSpec};
 use patch::Patch;
-use PathClass::{Float, Int8};
+use PathClass::{Float, FloatNoCoopmat, Int8};
 
 /// The planted bugs.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -47,7 +47,7 @@ impl Bug {
             Bug::RopeQueryAhead => "(a) rope query at position + 1",
             Bug::MaskDropsLastKey => "(b) mask drops the last visible key",
             Bug::RmsEpsScaled => "(c) RMSNorm epsilon x10",
-            Bug::FfnDownScaled => "(d) every block of one ffn_down x1.01",
+            Bug::FfnDownScaled => "(d) one layer's FFN output x1.01, through its last weight",
             Bug::FfnDownBlockScaled => "(d1) one block of one ffn_down x1.01",
             Bug::GateUpSwapped => "(e) gate and up swapped",
             Bug::AttnResidualDropped => "(f) one layer's attention residual dropped",
@@ -70,16 +70,19 @@ impl Bug {
         }
     }
 
-    /// Whether the gate may miss this bug in `class`, on every model and device: the misses
+    /// Whether the gate may miss this bug on `t` in `class`, on every device: the misses
     /// `docs/gpu-tolerance.md` records. Such a run is measured and printed, never required to
-    /// pass or to fail.
-    fn may_miss(self, class: PathClass) -> bool {
-        match class {
-            Int8 => matches!(
+    /// pass or to fail. A row that only catches gross bugs (every Int8 row, and the rows a
+    /// target lists in [`Target::smoke`]) may miss the fine ones; a fine row only the single
+    /// mis-scaled block.
+    fn may_miss(self, t: &Target, class: PathClass) -> bool {
+        if class == Int8 || t.smoke.contains(&class) {
+            matches!(
                 self,
                 Bug::RmsEpsScaled | Bug::FfnDownScaled | Bug::FfnDownBlockScaled
-            ),
-            _ => self == Bug::FfnDownBlockScaled,
+            )
+        } else {
+            self == Bug::FfnDownBlockScaled
         }
     }
 }
@@ -92,39 +95,70 @@ struct Target {
     table: &'static str,
     /// The layer whose `ffn_down` is scaled or misread.
     ffn_layer: usize,
+    /// The weight of that layer [`Bug::FfnDownScaled`] scales, by its name in the block: the last
+    /// one the FFN sublayer's output passes through before the residual add, so that the scale
+    /// reaches the residual stream. `ffn_down`, unless a norm follows it.
+    ffn_last: &'static str,
     /// The layer whose attention residual is dropped.
     resid_layer: usize,
     /// The model's rope pairs `(p, p + head_dim/2)` (NEOX), not `(2p, 2p + 1)`.
     neox: bool,
     /// The model's vocabulary spells nothing; it is prompted with ids.
     synthetic: bool,
+    /// The classes, besides Int8, whose row for this model the table labels a smoke check.
+    smoke: &'static [PathClass],
 }
 
 const QWEN3: Target = Target {
     key: "qwen3-0.6b",
     table: "Qwen3-0.6B-Q4_K_M.gguf",
     ffn_layer: 10,
+    ffn_last: "ffn_down",
     resid_layer: 14,
     neox: true,
     synthetic: false,
+    smoke: &[],
+};
+
+/// gemma-3-1b: the fused per-head norm and rope of Qwen3 (so the same pairing), and a Q4_K_M file
+/// whose `ffn_down` tensors alternate between `Q4_K` and `Q6_K`; the layer named here holds a
+/// `Q4_K` one, which [`Bug::NibbleMap`] needs. Its sandwich norms renormalize each sublayer's
+/// output before the residual add, so a scale of the whole `ffn_down` never reaches the residual
+/// stream (planted there it moved the run's worst KL only 1.3 times off the clean run's,
+/// `docs/gpu-tolerance.md`, "Mutations"); the post-FFN norm's gain is the weight whose scale
+/// does. Its Float row is a smoke check of the
+/// cooperative-matrix f16 prefill path (`TABLE`), FloatNoCoopmat the fine one.
+const GEMMA3: Target = Target {
+    key: "gemma3-1b",
+    table: "gemma-3-1b-it-Q4_K_M.gguf",
+    ffn_layer: 10,
+    ffn_last: "post_ffw_norm",
+    resid_layer: 13,
+    neox: true,
+    synthetic: false,
+    smoke: &[Float],
 };
 
 const ERNIE_F16: Target = Target {
     key: "ernie-0.3b-f16",
     table: "ERNIE-4.5-0.3B-PT-F16.gguf",
     ffn_layer: 6,
+    ffn_last: "ffn_down",
     resid_layer: 9,
     neox: false,
     synthetic: false,
+    smoke: &[],
 };
 
 const SYNTHETIC: Target = Target {
     key: "synthetic-f32",
     table: "synthetic-f32",
     ffn_layer: 1,
+    ffn_last: "ffn_down",
     resid_layer: 1,
     neox: false,
     synthetic: true,
+    smoke: &[],
 };
 
 /// The synthetic MoE's key. It has no table row of its own: it is held to the synthetic f32
@@ -137,9 +171,11 @@ const MOE: Target = Target {
     key: SYNTHETIC_MOE,
     table: "synthetic-f32",
     ffn_layer: 1,
+    ffn_last: "ffn_down",
     resid_layer: 1,
     neox: false,
     synthetic: true,
+    smoke: &[],
 };
 
 /// Experts of the synthetic MoE, how many each token uses, and their width.
@@ -256,7 +292,11 @@ fn open_planted(t: &Target, bug: Bug) -> Case {
     let n_layer = p.arch_u64("block_count") as usize;
     let down = format!("blk.{}.ffn_down.weight", t.ffn_layer);
     match bug {
-        Bug::FfnDownScaled => p.scale(&down, None, BLOCK_SCALE),
+        Bug::FfnDownScaled => p.scale(
+            &format!("blk.{}.{}.weight", t.ffn_layer, t.ffn_last),
+            None,
+            BLOCK_SCALE,
+        ),
         Bug::FfnDownBlockScaled => {
             // One block in the middle of the tensor.
             let mid = p.blocks(&down) / 2;
@@ -488,7 +528,7 @@ fn demonstrate(
                     bug.label()
                 ));
             }
-            if verdicts == Verdicts::Gated && caught.is_empty() && !bug.may_miss(class) {
+            if verdicts == Verdicts::Gated && caught.is_empty() && !bug.may_miss(t, class) {
                 wrong.push(format!(
                     "{} on {run} ({class:?}) passed the gate: KL {kl:.3}x and mean KL {mean:.3}x \
                      its bound",
@@ -549,6 +589,43 @@ fn gpu_planted_qwen3() {
         &QWEN3,
         ForcedOn::Vulkan,
         &[("gpu", Int8), ("gpu-float", Float)],
+        &bugs,
+        Verdicts::Gated,
+    );
+}
+
+/// The planted bugs' own size on gemma-3-1b: each planted copy on the CPU reference against the
+/// clean copy's CPU reference, where the clean distance is exactly 0, held to the model's fine
+/// row. No GPU's noise is in these distances, so they are the bug side of that row's gap.
+#[test]
+#[ignore = "needs gemma-3-1b-it Q4_K_M"]
+fn planted_gemma3_bugs_fail_the_fine_row_on_the_cpu() {
+    let mut bugs = DENSE_BUGS.to_vec();
+    bugs.push(Bug::NibbleMap);
+    demonstrate(
+        &GEMMA3,
+        ForcedOn::CpuReference,
+        &[("gpu", FloatNoCoopmat)],
+        &bugs,
+        Verdicts::Gated,
+    );
+}
+
+/// gemma-3-1b Q4_K_M in each class its rows are scored in: the shipped int8 kernels, the
+/// int8-free ones, and the int8-free ones with the cooperative-matrix tier off.
+#[test]
+#[ignore = "needs gemma-3-1b-it Q4_K_M and a Vulkan GPU"]
+fn gpu_planted_gemma3() {
+    let mut bugs = DENSE_BUGS.to_vec();
+    bugs.push(Bug::NibbleMap);
+    demonstrate(
+        &GEMMA3,
+        ForcedOn::Vulkan,
+        &[
+            ("gpu", Int8),
+            ("gpu-float", Float),
+            ("gpu-float-nocoopmat", FloatNoCoopmat),
+        ],
         &bugs,
         Verdicts::Gated,
     );

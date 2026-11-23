@@ -6860,20 +6860,83 @@ values. What it leaves:
   on the integrated GPU** (both RADV, Qwen3-0.6B, both classes; KL 620x and
   3.3e5x its bound on the integrated GPU). The gate fails either way; why the
   two devices handle the same overflow differently is not looked into.
-- **gemma-3-1b is outside its rows on both RADV GPUs. Neither is a driver
-  defect: each is an accuracy cost of a prefill GEMM family, and the rows are
-  their owner's call** (2026-11-23, Linux 7.3.5-arch1-1, Mesa `mesa` and
-  `vulkan-radeon` 26.3.1-2, headless, no compositor running). With every model
-  the tests name cached, nine of the ten `gpu_seam_tolerance_*` tests pass on
-  each GPU (LFM3 and both ERNIE files included) and `gpu_seam_tolerance_gemma3`
-  fails on each, with the same values in three runs on `Vulkan0` and two on
-  `Vulkan1`. The table was not changed (no ratchet).
-  - **`Vulkan0` (RX 7900 XTX, `RADV NAVI31`), Float row.** The three Float
-    configurations on prompt 1 (33 tokens): prefill worst KL 1.02e-2 at position
-    13 (bound 6.4e-3), mean 4.93e-4 (bound 4.9e-4), top-k cosine 0.98979 (bound
-    0.995); decode worst KL 7.87e-3 at position 40 (7.67e-3 static), logit
-    deviation 2.72e-2 (bound 2.6e-2). Prompts 0 and 2 are at most 1.2e-4 from
-    position 2 on.
+- **gemma-3-1b's rows were re-set on RADV; what that leaves** (2026-11-23, Linux
+  7.3.5-arch1-1, Mesa `mesa` and `vulkan-radeon` 26.3.1-2, headless, no
+  compositor running). Its Float check is split in two
+  (`PathClass::FloatNoCoopmat`, the fine row, scored with the cooperative-matrix
+  tier off, and Float, now a smoke row for the f16 cooperative-matrix prefill
+  path), its Int8 smoke row's near tie is raised, gemma-3 is a planted-bug
+  target (`gpu_planted_gemma3`), and `gpu_seam_tolerance_gemma3` passes on both
+  RADV GPUs with no environment knob (`docs/gpu-tolerance.md`, "The table" and
+  "Mutations", has the values and both sides of each gap). Open:
+  - **Windows has not run the new rows.** FloatNoCoopmat is set from RADV alone
+    (worst KL 8.81e-4 on both GPUs): no Windows run of the
+    `gpu-float-nocoopmat*` configurations exists. The one older Windows figure
+    that may be of this path, the integrated GPU's Float worst of 1.6e-3 quoted
+    under "Against Windows" below, has no printed run behind it, is from the
+    code of 2026-11-18, and is of this path only by inference (that device took
+    the non-coopmat GEMMs on Qwen3); it set nothing, and would sit inside the KL
+    bound. Owed on the Windows box: `gpu_seam_tolerance_gemma3` on both GPUs,
+    and `measure_gpu_tolerance` for gemma with the three `gpu-float-nocoopmat*`
+    configurations, natively and with wave64 forced. A run outside the row there
+    is a finding to investigate, not a reason to widen it.
+  - **The fine row's gap to (d) is thin.** A 1% scale of one layer's FFN output
+    (on gemma the post-FFN norm's gain, `blk.10.post_ffw_norm`: the norm absorbs
+    a scale of the whole `ffn_down`) measures a steady worst KL of 2.6e-3 on the
+    CPU reference against the clean reference and 2.3e-3 on both GPUs: 1.26
+    times the row's KL bound. It also fails the first rows' mean KL (2.5 times
+    its bound on both GPUs, where the legitimate value is 1.6e-6 against a bound
+    of 1.2e-4) and the steady cosine (1.5 times its bound's distance from 1).
+    (c), the epsilon, is 14 times over the KL bound.
+  - **gemma's Int8 smoke row does not hold at moved prompt ends, so those runs
+    set none of it.** With prompt 1 ended early (`INFR_TOL_SPLIT`), so that
+    position 13 and its neighbours are int8 decode rows, the RX 7900 XTX (native
+    lanes, `gpu`) measures a decode worst KL of 0.618 (ended after 10 tokens,
+    position 13; mean 9.0e-2, logit deviation 0.165) and 0.70 (after 12,
+    position 40; mean 8.8e-2, deviation 0.192, cosine 0.546): over the row's
+    steady KL, mean and deviation bounds, with a top-1 miss at a 1.349-nat
+    reference margin (after 10, position 22, where the GPU's choice is 1.96 nats
+    under the reference's), wider than the near tie. On the integrated GPU the
+    prefill mean goes over its bound with prompt 2 ended after 16 tokens
+    (3.46e-2 over 13 rows) and after 4 (4.0e-2, one row), and with prompt 1
+    ended after 16 (3.2e-2); its worst KL there is 0.478 (prompt 1 after 12,
+    position 13), inside. No gate configuration ends a prompt there, but a
+    different prompt set could. Position 13 of prompt 1 is the row the
+    production CPU misses by 1.35 (the table at the top of this entry; B209).
+    Not looked into: whether the int8 decode GEMVs' distance on that row is all
+    activation quantization. Needs a decision: re-derive the whole row with the
+    moved ends in (it then admits more than it does now), or find why those rows
+    are that far first.
+  - **The Int8 row's margins at the gated prompt ends are thin on the integrated
+    GPU.** Configuration `gpu` (the RX 7900 XTX with wave64 forced gives the
+    same digits): worst KL 0.310 at prompt 1, position 13, against the 0.26 the
+    row was set from on Windows, 1.7 times under the bound; mean KL 1.65e-2,
+    1.63 times under; logit deviation 0.115, 1.30 times under. The rule asks for
+    2, 2 and 1.5. Only the steady near tie was re-set (1.5 times the 1.185-nat
+    miss at prompt 2, position 179).
+  - **The coopmat-free runs repeat the Float runs on a device without the
+    tier.** Where the Float run builds no cooperative-matrix GEMM (the
+    integrated GPU; any device with wave64 forced) the three
+    `gpu-float-nocoopmat*` runs build the kernels the three `gpu-float*` runs
+    built and measure the same values, and gemma's test went from 116 s to 202 s
+    on the integrated GPU. The obvious option: skip them when the two kernel
+    lists are equal, which
+    `gpu_seam_tolerance_nocoopmat_runs_build_no_coopmat_gemm` already computes,
+    and hold the Float runs to the fine row there instead. Not done in this
+    slice.
+  - **The f16 cooperative-matrix prefill path's accuracy cost is unfixed.** On
+    the RX 7900 XTX under RADV gemma-3's Float configurations measure a worst KL
+    of 1.02e-2 (prompt 1, position 13) where the f32-operand path measures
+    7.14e-4, and no tuning row matches RADV (B231), so the card's Int8
+    configurations prefill on the same f16 GEMMs. The product option: run the
+    first positions of a prefill through f32-operand kernels. It would help
+    every cooperative-matrix device, Windows included; but the simulation below
+    says a handful of rows is not reliably enough (three held, four to eight did
+    not, of this prompt's 32), so it is a kernel-selection change with a
+    prefill-speed cost on short prompts, unmeasured on any GPU, in code another
+    session owns. Its size is not known until the first-rows curve is taken on a
+    GPU and on more than one prompt. The evidence, all from before the rows were
+    re-set ("the bound" below is the Float row's of the time, 6.4e-3 worst KL):
     - _Which kernels **[ran]**: the cooperative-matrix f16 prefill GEMM path._
       With `kernels.vulkan.coopmat` off (`gpu-float-nocoopmat`, the whole
       cooperative-matrix tier) position 13 measures 7.14e-4 and position 40
@@ -6960,11 +7023,11 @@ values. What it leaves:
       of 3.2e-3 there (position 40), against 3.0e-4 with wave64 forced and
       1.6e-3 on the integrated GPU, and it set the bound. Why that run is lower
       than this one was not established.
-  - **`Vulkan1` (Ryzen 9950X3D integrated, `RADV RAPHAEL_MENDOCINO`), Int8 smoke
-    row.** Configuration `gpu`, prompt 2 (180 tokens), position 179, the first
-    decode row, flips its top-1 at a 1.185-nat reference margin against the
-    row's 1-nat near tie; KL there 0.18, inside the bound. Every Float
-    configuration passes (3.1e-6 at that position).
+  - **The dp4a K-quant prefill GEMM is the far int8 kernel on the integrated
+    GPU.** Configuration `gpu`, prompt 2 (180 tokens), position 179, the first
+    decode row, flips its top-1 at a 1.185-nat reference margin (KL there 0.18);
+    the near tie now admits it. Every Float configuration measures 3.1e-6 at
+    that position.
     - _It does not follow the end of the prompt **[ran]**._ Ended at 150 tokens
       (position 179 a decode row 30 past the boundary) it measures 0.200 and
       flips; at 170, 0.170 and does not; at 183 and 190 (position 179 a
@@ -6982,42 +7045,19 @@ values. What it leaves:
     - Position 179 is the last token of the prompt, where the reference's top
       two candidates are 1.185 nats apart; a KL of 0.17 to 0.20 is enough to
       swap them in some runs.
-  - **The decisions, with what each costs.**
-    - _gemma's Float row._ (a) Loosen it to this measurement by the table's
-      rule. Cheapest, but it is gemma's only real check and the looser value's
-      gap to a bug is unmeasured: no bug has been planted in gemma-3 in any
-      class, which the no-ratchet rule asks for, so it first needs a gemma
-      target in `gpu_planted_*`. (b) Split the check: a tight row scored with
-      the cooperative-matrix tier off (worst KL 7.2e-4 on both GPUs here, a
-      ninth of today's bound, though 8.1e-5 to 8.8e-4 across prompt ends) and a
-      loose one on the f16 GEMMs. Keeps a sharp check on everything but those
-      GEMMs at the cost of one more configuration per run, and leaves the f16
-      GEMMs on gemma to a smoke row plus their op-level tests, which bound
-      nothing as tight. (c) Remove the cost in the product: run the first
-      positions of a prefill through f32-operand kernels. It would help every
-      cooperative-matrix device, Windows included, not only the gate; but the
-      simulation says a handful of rows is not reliably enough (three held, four
-      to eight did not, of this prompt's 32), so it is a kernel-selection change
-      with a prefill-speed cost on short prompts, unmeasured on any GPU, in code
-      another session owns. **Recommended: (b) now, (c) as a measured slice of
-      its own.** (b) is the only option that tightens what the gate sees instead
-      of loosening it, needs no planted-bug evidence to be safe, and does not
-      wait on a kernel change; (c) is the real fix but its size is not known
-      until the first-rows curve is taken on a GPU and on more than one prompt.
-    - _gemma's Int8 smoke row._ (a) Raise its near tie by the table's rule (1.5
-      times the widest legitimate miss, 1.78 nats): one number, but fewer
-      positions then count toward the top-1 check, and the row is already
-      labelled a smoke check. (b) Leave it and accept a known failure on this
-      device until the dp4a K-quant GEMM's distance on gemma is understood:
-      honest, but a red test in every RADV gate run hides the next one. (c)
-      Score gemma's Int8 row with `dp4a_kq` off: it passes here, and stops
-      testing the kernel that ships. **Recommended: (a)**, with the dp4a lead
-      above kept open: the Float rows are what hold gemma, and a smoke row
-      should not fail on a draw.
-    - _A rule for MoE rows_: see the entry above on the router near tie.
-  - **Not done:** `gpu-float-nocoopmat` over the whole tolerance set; the
-    first-rows curve on a GPU; any of this on Windows; the split-K builds
-    against a host model.
+  - **Should every model have a FloatNoCoopmat row?** Only gemma-3 has one,
+    because only its Float row was outside its bound on a cooperative-matrix
+    device. The other models' Float rows carry the same f16-operand cost inside
+    their bounds (Qwen3-0.6B's clean Float run is at 0.31 of its KL bound on the
+    RX 7900 XTX and 0.13 on the integrated GPU, the planted-bug table), so a
+    coopmat-free row per model would be a tighter fine check for each. Not
+    measured for any other model: it needs `measure_gpu_tolerance` with the
+    `gpu-float-nocoopmat*` configurations per model on every device, and three
+    more runs per model in the gate.
+  - **Not done:** the first-rows curve on a GPU; the split-K builds against a
+    host model; any planted bug that lives only inside a cooperative-matrix
+    GEMM, which is what the Float smoke row and the op-level tests are left to
+    catch.
 
 - **`gpu_seam_golden_qwen3` fails on the integrated GPU under RADV; the blessed
   hash is one device's path.** In the full GPU gate of 2026-11-23 (Linux, Mesa
@@ -7211,11 +7251,12 @@ machine as well as on the Windows box.
 
 - **G3 is done** (2026-11-23): the planted-bug demonstrations are committed
   behind `infr-llama`'s `mutations` feature and ran on both GPUs of the Linux
-  machine (`docs/gpu-tolerance.md`, Mutations). What they leave is in B207. On
-  RADV `gpu_seam_tolerance_gemma3` fails on both GPUs, neither a driver defect,
-  each an accuracy cost of a prefill GEMM family (B207); what to do with gemma's
-  rows, and the rule an MoE row needs, are the table owner's decisions before G4
-  leans on it.
+  machine (`docs/gpu-tolerance.md`, Mutations). What they leave is in B207.
+  gemma-3's rows were re-set the same day (a fine row scored without the
+  cooperative-matrix tier, its Float and Int8 rows as smoke rows), with gemma-3
+  a planted-bug target, and `gpu_seam_tolerance_gemma3` passes on both RADV
+  GPUs; Windows has not run the new rows (B207). The rule an MoE row needs is
+  still the table owner's decision before G4 leans on an MoE model.
 - **G4, what it converts:** the whole-vocabulary cosine tests and the exact-hash
   GPU goldens in `crates/infr-llama/tests/cpu_backend.rs` (`gpu_seam_golden_*`)
   move to the tolerance test, and `infr tune check --against cpu-reference` is
@@ -7229,9 +7270,9 @@ machine as well as on the Windows box.
   about 4% faster decode at shallow depth (B227). After G4 that default can
   change on a tolerance pass alone, with no hash to bless.
 - **What the Linux machine adds:** the tolerance table is set from two GPUs on
-  one Windows box; a run there is a third driver. It is in B207: every model
-  cached, nine of ten tests pass on each GPU and gemma-3 is outside its rows on
-  both.
+  one Windows box; a run there is a third driver. Every model is cached, and
+  every `gpu_seam_tolerance_*` test passes on each GPU since gemma-3's rows were
+  re-set from that run (B207 has what the re-set leaves open).
 
 Then:
 

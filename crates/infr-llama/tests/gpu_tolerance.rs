@@ -39,7 +39,7 @@ fn measure_gpu_tolerance() {
     }
 }
 
-use infr_llama::tolerance::PathClass::{self, Float, Int8, KvQ8};
+use infr_llama::tolerance::PathClass::{self, Float, FloatNoCoopmat, Int8, KvQ8};
 
 /// A quantized model: the production kernels at both prefill chunk heights, and the same with
 /// every int8-activation kernel off, once more on the static per-token decode path.
@@ -49,6 +49,16 @@ const QUANT_RUNS: &[(&str, PathClass)] = &[
     ("gpu-float", Float),
     ("gpu-float-ub32", Float),
     ("gpu-float-static", Float),
+];
+
+/// The int8-free runs once more with the cooperative-matrix tier off, for a model whose Float row
+/// cannot be tight on the f16 operands of the cooperative-matrix prefill GEMMs (gemma-3): the
+/// prefill GEMMs then take f32 operands on every device, at both chunk heights and on the static
+/// per-token decode path.
+const NOCOOPMAT_RUNS: &[(&str, PathClass)] = &[
+    ("gpu-float-nocoopmat", FloatNoCoopmat),
+    ("gpu-float-nocoopmat-ub32", FloatNoCoopmat),
+    ("gpu-float-nocoopmat-static", FloatNoCoopmat),
 ];
 
 /// A float-weight model: the production kernels at both prefill chunk heights, and the static
@@ -217,6 +227,55 @@ fn gpu_seam_tolerance_float_runs_build_no_int8_kernel() {
     assert!(bad.is_empty(), "the Float run built int8 kernels: {bad:?}");
 }
 
+/// What makes a kernel a cooperative-matrix prefill GEMM, by its name. Typed by hand, like
+/// [`INT8_KERNEL_MARKERS`] and with the same gap: one named otherwise would pass unseen (B207).
+const COOPMAT_GEMM_MARKER: &str = "gemm_warp";
+
+/// The FloatNoCoopmat class runs no cooperative-matrix prefill GEMM: such a run of gemma-3 builds
+/// none, while the Float run on the same model does wherever the device has the tier (so the
+/// check can fail there; on a device without it the two runs build the same kernels, which is
+/// printed and is all that can be said).
+#[test]
+#[ignore = "needs gemma-3-1b-it Q4_K_M and a Vulkan GPU"]
+fn gpu_seam_tolerance_nocoopmat_runs_build_no_coopmat_gemm() {
+    use infr_llama::seam::ForcedOn;
+    let _guard = forced::watchdog("the coopmat-free check", forced::GATE_TIMEOUT);
+    let Some(case) = forced::open_or_skip("gemma3-1b") else {
+        return;
+    };
+    if forced::device_for("gemma3-1b", case.bytes).is_none() {
+        return;
+    }
+    let r = forced::forced_reference(&case.model, &case.prompts[1], 4);
+    let coopmat = |k: &str| k.contains(COOPMAT_GEMM_MARKER);
+    let float = forced::forced(&case.model, ForcedOn::Vulkan, forced::vulkan_float, &r).kernels;
+    let without = forced::forced(
+        &case.model,
+        ForcedOn::Vulkan,
+        forced::vulkan_float_nocoopmat,
+        &r,
+    )
+    .kernels;
+    eprintln!("float: {float:?}\nwithout the tier: {without:?}");
+    let bad: Vec<_> = without.iter().filter(|k| coopmat(k)).collect();
+    assert!(
+        bad.is_empty(),
+        "the run with the cooperative-matrix tier off built its GEMMs: {bad:?}"
+    );
+    if float.iter().any(|k| coopmat(k)) {
+        assert_ne!(float, without, "the tier's switch changed no kernel");
+    } else {
+        eprintln!(
+            "this device's Float run builds no cooperative-matrix GEMM: the two classes run the \
+             same kernels here, and the check above could not have failed"
+        );
+        assert_eq!(
+            float, without,
+            "the tier's switch changed kernels it does not name"
+        );
+    }
+}
+
 #[test]
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_tolerance_synthetic_f32() {
@@ -240,7 +299,9 @@ fn gpu_seam_tolerance_qwen3() {
 #[test]
 #[ignore = "needs gemma-3-1b-it Q4_K_M and a Vulkan GPU"]
 fn gpu_seam_tolerance_gemma3() {
-    forced::gate("gemma3-1b", QUANT_RUNS);
+    let mut runs = QUANT_RUNS.to_vec();
+    runs.extend_from_slice(NOCOOPMAT_RUNS);
+    forced::gate("gemma3-1b", &runs);
 }
 
 #[test]

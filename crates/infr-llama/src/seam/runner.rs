@@ -1954,6 +1954,8 @@ pub(crate) fn generate_dense_backend_bound(
         // no autoregressive decode loop — its per-prefill decode is exactly one token — so this
         // costs nothing while making both modes bit-identical.
         g.no_decode_replay = c.diffusion_gemma;
+        #[cfg(feature = "mutations")]
+        crate::mutation::opt_out_of_replay(c, &mut g);
         let f32d = |n: usize| TensorDesc::new(vec![n], DType::F32);
         // KV cache dtype: f16 by default (halves memory vs f32, tightens CPU↔GPU parity); Q8_0
         // per-side when the runner enabled it (see `k_fmt`/`v_fmt` at the cache alloc). ONLY the
@@ -2062,6 +2064,12 @@ pub(crate) fn generate_dense_backend_bound(
         // The compressor plan of this graph's positions, per tier, with the per-step inputs it
         // declares (`super::dsv4_emit::Dsv4Tiers`).
         let mut step_i32: Vec<(TensorId, Vec<i32>)> = Vec::new();
+        // The positions the query rope reads: `positions`, unless a test planted a bug there.
+        #[cfg(feature = "mutations")]
+        let q_positions =
+            crate::mutation::query_positions(c, &mut g, positions, start_pos, batch, &mut step_i32);
+        #[cfg(not(feature = "mutations"))]
+        let q_positions = positions;
         let dsv4_tiers = c.deepseek4.then(|| {
             super::dsv4_emit::Dsv4Tiers::new(
                 &mut g,
@@ -4087,7 +4095,7 @@ pub(crate) fn generate_dense_backend_bound(
                         g.push(Op::QkNormRope {
                             x: q_src,
                             weight: qn,
-                            positions,
+                            positions: q_positions,
                             dst: q16,
                             rows: batch as u32,
                             n_head: nh as u32,
@@ -4120,7 +4128,7 @@ pub(crate) fn generate_dense_backend_bound(
                         // llama: Q roped to the f16 scratch (the attention kernels read f16 q).
                         g.push(Op::Rope {
                             x: q,
-                            positions,
+                            positions: q_positions,
                             dst: q16,
                             rows: batch as u32,
                             n_head: nh as u32,
@@ -4148,19 +4156,23 @@ pub(crate) fn generate_dense_backend_bound(
                         q16
                     }
                 };
+                #[cfg(feature = "mutations")]
+                let (attn_pos, kv_len) = crate::mutation::attention_span(c, start_pos, batch);
+                #[cfg(not(feature = "mutations"))]
+                let (attn_pos, kv_len) = (start_pos as u32, (start_pos + batch) as u32);
                 g.push(Op::Attention {
                     q: q_attn,
                     k_cache: k_cache[kv_src],
                     v_cache: v_cache[kv_src],
                     dst: attn,
                     rows: batch as u32,
-                    kv_len: (start_pos + batch) as u32,
+                    kv_len,
                     n_head: nh as u32,
                     n_kv: nkv as u32,
                     head_dim: hd as u32,
                     scale,
                     mask,
-                    pos: start_pos as u32,
+                    pos: attn_pos,
                     sinks: None,
                     key_bias: None,
                     comp: None,
@@ -4266,12 +4278,18 @@ pub(crate) fn generate_dense_backend_bound(
                     eps,
                 });
             } else {
-                g.push(Op::Add {
-                    a: hidden,
-                    b: sub,
-                    dst: hidden,
-                    n: (batch * ne) as u32,
-                });
+                #[cfg(feature = "mutations")]
+                let keep_residual = crate::mutation::keeps_attn_residual(c, l);
+                #[cfg(not(feature = "mutations"))]
+                let keep_residual = true;
+                if keep_residual {
+                    g.push(Op::Add {
+                        a: hidden,
+                        b: sub,
+                        dst: hidden,
+                        n: (batch * ne) as u32,
+                    });
+                }
                 // ffn
                 g.push(Op::RmsNorm {
                     x: hidden,

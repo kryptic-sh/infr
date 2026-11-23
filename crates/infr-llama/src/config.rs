@@ -415,6 +415,10 @@ pub struct Config {
     /// DeepSeek V2+ "lite" variant: `wq` present ⇒ lite (no wq_a/q_a_norm/wq_b). Detected by
     /// tensor presence, not GGUF key.
     pub is_lite: bool,
+    /// A bug a test planted in the graph this model builds ([`crate::SeamModel::plant`]); `None`
+    /// from every parse. Exists only with the `mutations` feature.
+    #[cfg(feature = "mutations")]
+    pub(crate) planted: Option<crate::mutation::Planted>,
 }
 
 fn positive_model_dimension(key: &str, value: u64) -> Result<usize> {
@@ -1933,6 +1937,8 @@ impl Config {
             rope_yarn_beta_fast,
             rope_yarn_beta_slow,
             is_lite,
+            #[cfg(feature = "mutations")]
+            planted: None,
         };
         if ernie4_5_moe {
             ernie4_5_moe_tensors(g, &cfg)?;

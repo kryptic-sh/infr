@@ -70,6 +70,15 @@ jobs:
       - run: rustup update --no-self-update stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # `infr-llama`'s `mutations` feature (the planted-bug hooks of
+      # `docs/gpu-tolerance.md`) is compiled out of every other build, so a
+      # change near its hooks would break only the feature build. Linux only:
+      # the hooks are the same code on every platform.
+      - name: cargo clippy with the mutations feature
+        if: runner.os == 'Linux'
+        run:
+          cargo clippy --workspace --all-targets --locked --features
+          infr-llama/mutations -- -D warnings
 
   # Intra-doc links are not checked by `cargo build` or `clippy`, so they rot
   # silently: this job was added after a single pass fixed 140 broken links across
@@ -117,6 +126,15 @@ jobs:
           tool: nextest
       - run: cargo nextest run --workspace --locked
       - run: cargo test --doc --workspace --locked
+      # The planted-bug demonstration that needs no GPU or model: every bug of
+      # `docs/gpu-tolerance.md`'s Mutations section planted in the synthetic
+      # models and scored on the CPU reference, so the gate is shown to fail
+      # on every push. Linux only, like the feature's clippy step.
+      - name: The planted-bug CPU demonstration
+        if: runner.os == 'Linux'
+        run:
+          cargo nextest run -p infr-llama --locked --features mutations --test
+          gpu_tolerance -E 'test(planted_bugs_fail_the_gate_on_the_cpu)'
       # Two CPU goldens on Windows and macOS: the checked-in hashes are the
       # Linux ones, and one CPU output on every system is plan 11's point. They
       # reuse the debug build above (`infr-cpu` is built at opt-level 3 in dev)

@@ -155,32 +155,127 @@ first-row split).
 
 ## Mutations
 
-Six bugs planted by hand in a scratch build (never committed) on Qwen3-0.6B, RX
-7900 XTX native lanes, with the per-token decode on the static path
-(`kernels.vulkan.no_replay`, so a graph-level edit reaches decode), scored
-against the Qwen3-0.6B rows from position 2 on (ratios are the measured value
-over the tolerance; cosine as distance from 1):
+The gate is shown to fail by planting bugs and scoring them, in committed tests
+built only with the `mutations` feature of `infr-llama` (a default build has no
+trace of them: the hooks are `#[cfg(feature = "mutations")]`, and the default
+release rlib carries no `infr_llama::mutation` symbol).
 
-| Bug                                                                             | Int8 run                                                                                              | Float run                                                                |
-| ------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
-| (a) RoPE: the query rotated at position + 1 (keys correct)                      | caught: KL 19 (420x), every metric                                                                    | caught: every metric                                                     |
-| (b) attention mask: the last visible key dropped (decode and every later chunk) | caught in decode: KL 17 (380x); the first chunk starts at 0 and is untouched                          | caught in decode                                                         |
-| (c) RMSNorm epsilon ten times too large (1e-5 for 1e-6)                         | **missed**: KL 1.35e-2 (0.30x), mean 0.44x — the clean run measured 1.47e-2 and 0.47x                 | caught: KL 3.1x, mean KL 4.5x, cosine 1.2x, deviation 1.4x               |
-| (d1) one Q4_K block of `blk.10.ffn_down` with its scale times 1.01              | **missed** (0.33x)                                                                                    | **missed**: KL 0.35x, mean 0.52x                                         |
-| (d) every block of `blk.10.ffn_down` with its scale times 1.01                  | **missed**: KL 0.32x, mean 0.54x                                                                      | caught: KL 5.7x, mean 11x, cosine 2.8x, deviation 4.3x, rank 2 against 1 |
-| (e) gate and up swapped in the FFN (split gate/up path)                         | caught at once: NaN logits, the position named                                                        | (the run stopped at the NaN)                                             |
-| (f) layer 14's attention residual dropped                                       | caught: KL 0.89 (20x), mean 32x, cosine 20x, deviation 4x, rank 16 against 5, top-1 flips at 1.5 nats | caught: KL 1.1e4x, every metric                                          |
+**How a bug is planted.** Each test loads the model twice: the clean copy runs
+the CPU reference, the other carries the bug and runs on the backend under test,
+in the same process, with nothing global (`crates/infr-llama/tests/planted/`).
 
-Splitting the first rows out tightened Qwen3's steady Int8 bound by a third, and
-it does not change the Int8 conclusion: (c) and (d) leave the int8 run's
-distance where the clean run's is, so no bound on that run can see them. The
-Int8 rows catch gross bugs only; the fine check is the Float runs, which
-exercise every non-int8 kernel (attention, norms, RoPE, the float GEMMs and
-GEMVs, the recurrent scans) at the precision where small bugs show. A bug living
-only inside an int8 kernel is the Float run's blind spot, covered by the
-op-level bounds (B207). A sub-percent error confined to one weight block (d1) is
-invisible to both. Not tried: a router that ignores its bias (B174's case, MoE),
-a wrong quant nibble map, a RoPE pairing error.
+- **Graph bugs** live in the loaded model's `Config`
+  (`SeamModel::plant(infr_llama::mutation::Planted)`), so every graph that model
+  builds carries them and no other model does: (a) the query rope reads a
+  positions input of its own holding position + 1 (a per-step input, so the
+  graph cannot replay); (b) `Op::Attention`'s `pos` and `kv_len` are one short
+  in every graph that does not start at position 0, so each row loses its own
+  key (decode and every prefill chunk after the first; the first chunk starts at
+  0 and is untouched); (c) the model's `rms_eps` is multiplied by 10 (Qwen3:
+  1e-5 for 1e-6); (f) one layer's attention residual add is not emitted. (a) and
+  (b) depend on the position a graph was built at, so their graphs opt out of
+  the replayed decode (`Graph::no_decode_replay`) and every decode step runs the
+  static path at its own position; the others reach the replayed decode too.
+- **Weight bugs** are written into a copy of the model file (the tensor's bytes
+  edited at its own offset, everything else as it was), so the backend runs its
+  production code on wrong weights: (d) every block of one `ffn_down` times 1.01
+  (Q4_K: `d` and `dmin` scaled, so the whole block scales, within an f16
+  rounding of 1.01; F16: each value) and (d1) one block of it; (e) every layer's
+  `ffn_gate` and `ffn_up` swapped; (g) a RoPE pairing error: within each head of
+  `attn_q` and `attn_k` (and the per-head q/k norm weights) the rows reordered
+  so the rope rotates `(2p, 2p+1)` where `(p, p+d/2)` is meant, or the reverse
+  on a NORM-rope model, which is exactly a rope kernel pairing the wrong
+  elements; (h) a wrong quant nibble map: the two nibbles of every packed byte
+  of one Q4_K `ffn_down` swapped; (i) a router that ignores its bias: every
+  `exp_probs_b.bias` zeroed (B174's case).
+
+**What each test asserts.** A clean control runs first, twice: it must pass the
+gate, and its two runs must agree bit for bit. Every planted run must then
+differ from the clean run in the decode rows of every prompt and configuration
+(the bug reached decode). Where the gate must catch the bug, the run must fail
+it with a failure that names a metric or a non-finite logit at a prompt. Where a
+miss is on record ((c), (d) and (d1) in Int8, (d1) in Float), the ratio is
+printed and nothing more is asserted, so a tighter table later cannot break the
+test. Each bug and run prints a `PLANTED` line with its verdict and its worst
+ratio over the steady phases (from position 2 on).
+
+CI runs the CPU demonstration and clippy with the feature on its Linux legs
+(`.github/workflows/ci.yml`, the `test` and `clippy` jobs); the GPU ones need a
+GPU and run by hand.
+
+```text
+# no GPU or model: every bug on the synthetic llama and the synthetic MoE, CPU reference
+cargo nextest run -p infr-llama --release --features mutations --test gpu_tolerance \
+  --no-capture -E 'test(planted_bugs_fail_the_gate_on_the_cpu)'
+# the GPU demonstrations, one GPU process at a time
+INFR_DEV=Vulkan0 cargo nextest run -p infr-llama --release --features mutations \
+  --test gpu_tolerance --run-ignored all --test-threads 1 --no-capture -E 'test(gpu_planted)'
+```
+
+`gpu_planted_qwen3` runs Qwen3-0.6B Q4_K_M in the Int8 (`gpu`) and Float
+(`gpu-float`) classes, every bug but (i); `gpu_planted_ernie_f16` runs
+ERNIE-4.5-0.3B F16 (a float-weight model: no nibbles, so no (h)) in Float;
+`gpu_planted_router_bias` runs (i) on a synthetic ERNIE-4.5 MoE (eight f32
+experts, two used, a softmax router with a selection bias), since ERNIE-4.5-21B
+was not cached on the machine when these ran (it is now; (i) has not been
+planted in it yet).
+
+**Measured 2026-11-23**, Linux 7.3.5-arch1-1, Mesa RADV 26.3.1, headless (no
+compositor running), on the final test code: `Vulkan0` RX 7900 XTX (RADV
+NAVI31), `Vulkan1` the Ryzen 9 9950X3D's integrated GPU (RADV
+RAPHAEL_MENDOCINO), native lanes, tuning rows on. Each cell is the worst KL from
+position 2 on over the row's steady KL bound, `Vulkan0` / `Vulkan1`; misses also
+give the mean-KL ratio.
+
+| Bug                                                | Qwen3-0.6B Int8                                  | Qwen3-0.6B Float                                | ERNIE-4.5-0.3B F16 Float                                       |
+| -------------------------------------------------- | ------------------------------------------------ | ----------------------------------------------- | -------------------------------------------------------------- |
+| clean control (passes)                             | 0.10 / 0.29                                      | 0.31 / 0.13                                     | 0.19 / 0.17                                                    |
+| (a) query rope at position + 1                     | caught: 421 / 424                                | caught: 2.2e5 / 2.2e5                           | caught: 1.4e5 / 1.4e5                                          |
+| (b) mask drops the last visible key                | caught in decode: 391 / 389                      | caught in decode: 2.1e5 / 2.1e5                 | caught in decode: 3.6e4 / 3.6e4                                |
+| (c) RMSNorm epsilon x10                            | **missed**: 0.34 (mean 0.36) / 0.17 (mean 0.39)  | caught: 3.8 (mean 5.2) / 3.0 (mean 4.3)         | caught: 2.4e3 / 2.4e3                                          |
+| (d) every block of `blk.10.ffn_down` x1.01         | **missed**: 0.087 (mean 0.24) / 0.34 (mean 0.42) | caught: 10.5 (mean 5.3) / 9.2 (mean 4.7)        | caught on mean KL (`blk.6`): 0.83 (mean 3.0) / 0.96 (mean 3.0) |
+| (d1) one block of it x1.01                         | **missed**: 0.18 (mean 0.23) / 0.32 (mean 0.40)  | **missed**: 0.35 (mean 0.52) / 0.12 (mean 0.19) | **missed**: 0.094 (mean 0.40) / 0.18 (mean 0.28)               |
+| (e) gate and up swapped                            | caught: NaN logit at position 0 / 620            | caught: NaN logit at position 0 / 3.3e5         | caught: 2.1e5 / 2.1e5                                          |
+| (f) one layer's attention residual dropped (14; 9) | caught: 20.5 / 21.7                              | caught: 1.1e4 / 1.1e4                           | caught: 1.2e4 / 1.2e4                                          |
+| (g) rope pairs the wrong elements                  | caught: 200 / 203                                | caught: 1.1e5 / 1.1e5                           | caught: 8.1e4 / 8.1e4                                          |
+| (h) Q4_K nibbles swapped in `blk.10.ffn_down`      | caught: 91 / 92                                  | caught: 4.8e4 / 4.8e4                           | not applicable (F16 weights)                                   |
+
+(i), the router that ignores its bias, on the synthetic MoE: the CPU
+demonstration catches it at 5274x (clean control 0); on both GPUs the planted
+run measures 5239x, but the clean control measures 4.29x (mean 1.78x) itself,
+outside the `synthetic-f32` Float row the MoE borrows (the table has no MoE
+row), at the first decode row of the long prompt. So on the GPU this is a
+measurement, not a gate verdict: `gpu_planted_router_bias` asserts only that the
+bug reaches decode. The synthetic MoE also takes no batched prefill, so only its
+decode rows are scored. The clean control's distance is one row: at most 1.03e-4
+KL on prompts 0 and 1, and on prompt 2 2.87e-3 at position 179, the first decode
+row after the 180-token prompt, the rest of that prompt averaging about 1.6e-5
+(from its mean). Both GPUs give the same values to seven digits. It is
+unexplained and may be a Vulkan MoE defect (B207); no MoE row should be set from
+these runs until it is explained.
+
+The CPU demonstration (synthetic llama, CPU reference, against the clean model's
+CPU reference, where the clean distance is exactly 0) catches every dense bug
+but (d1): (a) 2.7e4, (b) 6.3e3, (c) on the logit deviation (KL 1.19x), (d) on
+mean KL (1.43x), (e) 2.4e4, (f) 1.7e4, (g) 3.2e4; (d1) 0.003.
+
+What it says, adding to the first measurement (Qwen3 alone, RX 7900 XTX on
+Windows, scratch build) and agreeing with it everywhere it overlaps:
+
+- **The Int8 rows catch gross bugs only.** (c), (d) and (d1) leave the int8
+  run's distance where the clean run's is, on both GPUs; the Float runs catch
+  (c) and (d). The new bugs, (g) and (h), are gross and caught in both classes.
+  A bug living only inside an int8 kernel is the Float run's blind spot, covered
+  by the op-level bounds (B207).
+- **A sub-percent error in one weight block (d1) is invisible** to every row and
+  on every path, the CPU reference's own included (0.003x on the synthetic
+  model). Only a weight-level check (the dequant parity tests) covers it.
+- **(d) on ERNIE F16 is caught on mean KL only** (worst KL 0.83x and 0.96x): the
+  margin on that model is thin.
+- **(e) gives NaN logits on the RX 7900 XTX and finite ones on the integrated
+  GPU**, both classes (the first measurement also saw NaN): either way the gate
+  fails, but the two devices handle the same overflow differently; not looked
+  into.
 
 **Committed red-path tests.** `tolerance_gate_goes_red_on_a_scaled_weight_cpu`
 (normal test job, every system) runs the gate's evaluation on a synthetic llama
@@ -211,9 +306,9 @@ driver not measured here, kept small because the planted bugs sit only 3 to 4.5
 times above the Float tolerance (6.4x on KL and 9.2x on mean KL above the
 legitimate worst).
 
-**Both sides of each gap, on Qwen3-0.6B** (the only model the bugs were planted
-in), from position 2 on, worst legitimate value / tolerance / smallest planted
-bug that crossed it:
+**Both sides of each gap, on Qwen3-0.6B** (from the first measurement, on
+Windows; the committed demonstrations above agree with it), from position 2 on,
+worst legitimate value / tolerance / smallest planted bug that crossed it:
 
 | Class | KL max                       | mean KL                      | Verdict                                                                        |
 | ----- | ---------------------------- | ---------------------------- | ------------------------------------------------------------------------------ |
@@ -343,6 +438,21 @@ ten `gpu_seam_tolerance_*` tests passed, nine in the gate run (Qwen3 89 s,
 Qwen3.5 99 s, gemma-3 140 s, LFM3 239 s, the rest under 5 s each) and the ERNIE
 case, which the integrated GPU's gate filter leaves out, on its own in 69 s.
 
+**Results, 2026-11-23, Linux 7.3.5-arch1-1, Mesa 26.3.1 (`mesa` and
+`vulkan-radeon` 26.3.1-2), RADV, headless (no compositor running)**: the first
+run of the table on a third driver, one run per GPU. Of the ten tests, on both
+the RX 7900 XTX (`Vulkan0`, 189 s) and the integrated GPU (`Vulkan1`, 305 s),
+eight ran and passed (`gpu_seam_tolerance_ernie` on its F16 file alone, its
+Q4_K_M file not being cached at the time), `gpu_seam_tolerance_lfm3` skipped
+(neither file cached at the time; nextest counts it as passed; both are cached
+since and not yet re-run), and `gpu_seam_tolerance_gemma3` failed. On `Vulkan0`
+its three Float configurations on prompt 1 measure a worst KL of 1.02e-2 against
+the row's 6.4e-3, at position 13; its Int8 configurations measure the identical
+value on that prefill and pass their looser row. On `Vulkan1` its Int8 smoke row
+flips a top-1 at a 1.185-nat margin against a 1-nat near tie (prompt 2, position
+179). Neither cause was investigated, and the table was not changed; B207 has
+the values, and both are findings for the row's owner.
+
 The red-path tests scale `blk.1.ffn_down.weight` of the synthetic model by 1.02.
 On the CPU a 1.01 scale already trips the gate and 1.008 and below pass
 (measured in review), so 1.02 is about twice the threshold; the green control is
@@ -364,7 +474,8 @@ today's exact tests do not yet distinguish the configurations; they will once
 tuned kernels change bits per device. They are also what covers the chained and
 replayed decode the tolerance tests do not exercise. Not measured with the new
 metrics: B60's cases (Qwen3.5-MoE, DiffusionGemma: not cached here) and B174's
-router-bias case (needs a `moe_topk.comp` edit and ERNIE-4.5-21B).
+router-bias case on ERNIE-4.5-21B (the Mutations section has it on a synthetic
+MoE).
 
 ## Not measured
 

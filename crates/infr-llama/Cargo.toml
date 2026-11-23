@@ -6,6 +6,13 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Compiles `infr_llama::mutation`: bugs a test plants in one loaded model's graph
+# (`SeamModel::plant`), so the GPU tolerance gate can be shown to fail on them
+# (`docs/gpu-tolerance.md`, "Mutations"). Off by default: a normal build has no trace of them.
+# Run the demonstrations with `--features mutations` (the doc gives the command).
+mutations = []
+
 [dependencies]
 infr-prof.workspace = true
 infr-prof-rt.workspace = true

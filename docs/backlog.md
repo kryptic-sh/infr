@@ -6793,13 +6793,77 @@ values. What it leaves:
 - **A single mis-scaled block is invisible** (one Q4_K block's scale times 1.01:
   every metric at half its bound or less in both classes). Only a weight-level
   check (the dequant parity tests) covers it.
-- **Mutations measured on one model, one device**, with the per-token decode
-  replay off (`kernels.vulkan.no_replay`, so a graph-level edit reaches decode).
-  G3 should turn them into feature-gated tests and run them on the integrated
-  GPU and on a float-weight model; not tried at all: a router that ignores its
-  bias (B174's case; needs ERNIE-4.5-21B and a `moe_topk.comp` edit), a wrong
-  quant nibble map, a RoPE pairing error. The committed red-path tests scale a
-  synthetic model's weight instead (`*_goes_red_on_a_scaled_weight*`).
+- **What the mutation demonstrations (G3) do not cover.** They are committed
+  (`infr-llama`'s `mutations` feature, `tests/planted/`) and ran on both GPUs of
+  the Linux machine:
+  - **The router-bias bug is gated on the CPU only.** It runs on a synthetic
+    ERNIE-4.5 MoE (ERNIE-4.5-21B was not cached on the Linux machine when it
+    ran; it is now, and (i) has not been planted in it yet). The table has no
+    MoE row, and the clean synthetic MoE on the GPU lands outside the
+    `synthetic-f32` Float row it borrows, so on the GPU the test only measures.
+    The synthetic MoE also takes no batched prefill, so only its decode rows are
+    scored.
+  - **The GPU demonstrations are in no CI job**: they need a GPU. CI runs the
+    CPU one (`planted_bugs_fail_the_gate_on_the_cpu`) and clippy with the
+    feature, on the Linux legs of the `test` and `clippy` jobs.
+  - **Not planted:** a dropped bias (q/k/v bias, Qwen2.5), any bug with the q8
+    KV cache, any bug in an MoE expert kernel, and any model but Qwen3-0.6B,
+    ERNIE-4.5-0.3B F16 and the synthetic ones. Bugs (a) and (b) opt their graphs
+    out of the replayed decode, so the replayed decode never runs with either of
+    them planted; every other bug reaches it.
+  - **Two catches on the synthetic llama are thin.** In the CPU demonstration
+    (c) is caught at a worst KL of 1.19x its bound (and a logit deviation of
+    4.43e-3 against 3.9e-3), and (d) only on mean KL, at 1.43x (worst KL 0.73x).
+    They are the first to turn into misses if the synthetic model or its row
+    changes.
+- **The clean synthetic MoE has one outlying row on the GPU, unexplained.** On
+  `Vulkan0`, its clean run's worst KL is at most 1.03e-4 on prompts 0 and 1; on
+  prompt 2 it is 2.87e-3 at position 179, the first decode row after the
+  180-token prompt, with a logit deviation of 2.49e-2 there against that
+  prompt's mean of 1.66e-3. Prompt 2's mean KL (1.05e-4 over 32 rows) puts the
+  other 31 rows at about 1.6e-5 on average, so it is one row. `Vulkan1` gives
+  the same values to seven digits. A reviewer probed `Vulkan0` and found the
+  Vulkan logits differ from the production CPU's in every logit while the
+  production CPU equals the CPU reference bit for bit: the distance is the GPU's
+  own, possibly a Vulkan MoE defect. Not investigated; an MoE row should not be
+  set from these runs until it is explained. Unverified lead: gemma-3's top-1
+  flip on `Vulkan1` (below) is at the same row, prompt 2, position 179.
+- **Gate and up swapped (e) gives NaN logits on the RX 7900 XTX and finite ones
+  on the integrated GPU** (both RADV, Qwen3-0.6B, both classes; KL 620x and
+  3.3e5x its bound on the integrated GPU). The gate fails either way; why the
+  two devices handle the same overflow differently is not looked into.
+- **Two clean gate failures on RADV, the first run of the table on a third
+  driver** (2026-11-23, Linux 7.3.5-arch1-1, Mesa `mesa` and `vulkan-radeon`
+  26.3.1-2, headless, no compositor running). Each is a single run, and the
+  cause of neither was investigated. The table was not changed (no ratchet);
+  both are for the row's owner.
+  - `gpu_seam_tolerance_gemma3` on `Vulkan0` (RX 7900 XTX, `RADV NAVI31`): the
+    three Float configurations on prompt 1 land outside gemma-3's Float row:
+    prefill worst KL 1.02e-2 at position 13 (bound 6.4e-3), mean 4.93e-4 (bound
+    4.9e-4), top-k cosine 0.98979 (bound 0.995); decode worst KL 7.87e-3 at
+    position 40 (7.67e-3 static), logit deviation 2.72e-2 (bound 2.6e-2).
+    Prompts 0 and 2 are at most 1.2e-4 from position 2 on. The Int8
+    configurations pass, but their prefill on prompt 1 measures the identical
+    value (KL 1.022885e-2 at position 13, mean 4.927662e-4), so the failing
+    prefill rows are the same with the int8 kernels on and off. Position 13 of
+    prompt 1 is also the worst prefill row on `Vulkan1` (Float 7.1e-4, Int8
+    0.31) and the row where this entry's table above has the production CPU at a
+    KL of 1.35 from the reference. This entry already records gemma-3's Float
+    distance on the 7900 XTX at native lanes as ten to twenty times its wave64
+    and integrated-GPU distance (on Windows); here it crosses the bound.
+  - `gpu_seam_tolerance_gemma3` on `Vulkan1` (Ryzen 9950X3D integrated,
+    `RADV RAPHAEL_MENDOCINO`): configuration `gpu` (Int8, the smoke row), prompt
+    2, decode position 179 flips its top-1 at a 1.185-nat reference margin (the
+    row's near tie is 1 nat); worst KL there 0.18, inside the bound. Every Float
+    configuration passes.
+
+  The other `gpu_seam_tolerance_*` tests passed on both GPUs (ERNIE F16,
+  Qwen3-0.6B, Qwen3.5-0.8B, both synthetic models, the red path, the
+  prefill-head and int8-free checks); the LFM3 test and the ERNIE Q4_K_M half of
+  the ERNIE test skipped, their files not being cached at the time. Every model
+  the tolerance tests name is cached on the Linux machine since; the skipped
+  cases have not been re-run.
+
 - **The decode the forced runs exercise is the per-token path.** Each forced
   step records and executes a fresh replay plan once, so record-once-replay-many
   (one recording replayed with advancing parameters) and the chained decode
@@ -6938,21 +7002,22 @@ values. What it leaves:
 
 **Tag:** handoff · **Kind:** queue
 
-**Top priority, the first slice when work resumes: plan 11's G3 and G4**
+**Top priority, the first slice when work resumes: plan 11's G4**
 (`docs/plan/11-cpu-bit-identical.md`, section 6). It can be done on the Linux
 machine as well as on the Windows box.
 
-- **G3, what is left:** commit the planted-bug demonstrations as feature-gated
-  tests (six were measured by hand on Qwen3-0.6B, see the table in
-  `docs/gpu-tolerance.md`); run them on a second GPU and on a float model; add
-  the router-bias and quant-nibble-map bugs.
+- **G3 is done** (2026-11-23): the planted-bug demonstrations are committed
+  behind `infr-llama`'s `mutations` feature and ran on both GPUs of the Linux
+  machine (`docs/gpu-tolerance.md`, Mutations). What they leave is in B207. The
+  same session's first run of the table on RADV failed
+  `gpu_seam_tolerance_gemma3` on both GPUs (B207); that is for the table's owner
+  before G4 leans on it.
 - **G4, what it converts:** the whole-vocabulary cosine tests and the exact-hash
   GPU goldens in `crates/infr-llama/tests/cpu_backend.rs` (`gpu_seam_golden_*`)
   move to the tolerance test, and `infr tune check --against cpu-reference` is
   wired to `SeamModel::forced_logits` and `tolerance::table::TABLE`.
-- **Order:** the goldens stay in the gate until G3's demonstrations are
-  committed and run. Until then they are the only check that fails on any change
-  at all.
+- **Order:** G3's demonstrations are committed and run, so G4 may retire the
+  goldens from the gate once the conversion lands.
 - **Why it is first:** on 2026-11-22 the golden `gpu_seam_golden_qwen3` failed
   twice for changes the tolerance tests passed: PR 105's decode attention floor
   of 16, and `gemv.kq_fma` forced on (B227). It is what holds
@@ -6960,10 +7025,9 @@ machine as well as on the Windows box.
   about 4% faster decode at shallow depth (B227). After G4 that default can
   change on a tolerance pass alone, with no hash to bless.
 - **What the Linux machine adds:** the tolerance table is set from two GPUs on
-  one Windows box; a run there is a third driver. It needs the models the
-  `gpu_seam_tolerance_*` tests load in its Hugging Face cache first (the tests
-  name them; `docs/gpu-tolerance.md` lists the command). B228's compute-queue
-  measurement can be taken in the same sitting.
+  one Windows box; a run there is a third driver. The first run (2026-11-23) is
+  in B207: gemma-3 failed on both RADV GPUs; the LFM3 and ERNIE-4.5-0.3B Q4_K_M
+  cases skipped, their files not cached until afterwards, and are still to run.
 
 Then:
 

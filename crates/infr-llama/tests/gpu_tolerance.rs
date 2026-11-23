@@ -14,6 +14,11 @@
 #[path = "support/forced.rs"]
 mod forced;
 
+/// The planted-bug demonstrations, built only with the `mutations` feature.
+#[cfg(feature = "mutations")]
+#[path = "planted/mod.rs"]
+mod planted;
+
 #[test]
 fn forced_run_reproduces_the_cpu_reference_on_every_path() {
     forced::self_check_on_a_synthetic_llama();

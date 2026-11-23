@@ -135,40 +135,58 @@ pub fn open_case_scaled(key: &str, scaled: Option<(&str, f32)>) -> Option<Case> 
             };
             tag = format!("{tag}-{name}-x{factor}");
         }
-        let file = TempGguf::write(&tag, &m);
-        let bytes = std::fs::metadata(file.path()).map_or(0, |md| md.len());
-        let model = SeamModel::load_with(file.path(), None, std::sync::Arc::new(env_cfg()))
-            .expect("synthetic model load");
-        let prompts = [12usize, 34, 180]
-            .iter()
-            .enumerate()
-            .map(|(salt, &n)| {
-                (0..n)
-                    .map(|i| ((i * 7 + 3 + salt * 11) % 64) as u32)
-                    .collect()
-            })
-            .collect();
-        return Some(Case {
-            model,
-            prompts,
-            bytes,
-            _file: Some(file),
-        });
+        return Some(open_file(TempGguf::write(&tag, &m), true));
     }
     assert!(scaled.is_none(), "only a synthetic model can be scaled");
     let path = find_model(key)?;
     let bytes = std::fs::metadata(&path).map_or(0, |md| md.len());
     let model = load(&path);
-    let prompts = PROMPTS
-        .iter()
-        .map(|t| model.encode(t).expect("encode"))
-        .collect();
     Some(Case {
+        prompts: real_prompts(&model),
         model,
-        prompts,
         bytes,
         _file: None,
     })
+}
+
+/// [`PROMPTS`], tokenized by `model`.
+pub fn real_prompts(model: &SeamModel) -> Vec<Vec<u32>> {
+    PROMPTS
+        .iter()
+        .map(|t| model.encode(t).expect("encode"))
+        .collect()
+}
+
+/// The prompts of a synthetic model, one per role of [`PROMPTS`] (short, medium, long enough to
+/// span several [`SMALL_UBATCH`] chunks), as ids of its vocabulary.
+pub fn synthetic_prompts() -> Vec<Vec<u32>> {
+    [12usize, 34, 180]
+        .iter()
+        .enumerate()
+        .map(|(salt, &n)| {
+            (0..n)
+                .map(|i| ((i * 7 + 3 + salt * 11) % 64) as u32)
+                .collect()
+        })
+        .collect()
+}
+
+/// The [`Case`] of a model written to `file`, which it keeps for as long as the model maps it:
+/// prompted with the [`synthetic_prompts`] when `synthetic` (its vocabulary spells nothing), else
+/// with [`PROMPTS`].
+pub fn open_file(file: TempGguf, synthetic: bool) -> Case {
+    let bytes = std::fs::metadata(file.path()).map_or(0, |md| md.len());
+    let model = load(file.path());
+    Case {
+        prompts: if synthetic {
+            synthetic_prompts()
+        } else {
+            real_prompts(&model)
+        },
+        model,
+        bytes,
+        _file: Some(file),
+    }
 }
 
 /// The name the tolerance table knows a [`MODELS`] key (or a synthetic model) by: the GGUF file
@@ -304,6 +322,17 @@ pub fn score(
     near_steady: f64,
     near_first: f64,
 ) -> Scored {
+    try_score(reference, test, near_steady, near_first).unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// [`score`], returning a row that cannot be scored (a NaN or infinite logit, named with its
+/// position) as an error instead of panicking.
+pub fn try_score(
+    reference: &ForcedLogits,
+    test: &ForcedLogits,
+    near_steady: f64,
+    near_first: f64,
+) -> Result<Scored, String> {
     let v = reference.vocab;
     let ref_decode = &reference.positions[reference.prefill_rows..];
     assert_eq!(
@@ -329,16 +358,14 @@ pub fn score(
         } else {
             &mut s.decode
         };
-        phase
-            .add_rows(
-                &reference.logits[k * v..(k + 1) * v],
-                &test.logits[r * v..(r + 1) * v],
-                v,
-                &[pos],
-            )
-            .unwrap_or_else(|e| panic!("{e}"));
+        phase.add_rows(
+            &reference.logits[k * v..(k + 1) * v],
+            &test.logits[r * v..(r + 1) * v],
+            v,
+            &[pos],
+        )?;
     }
-    s
+    Ok(s)
 }
 
 /// One machine-readable line per phase, for the measurement log.
@@ -613,6 +640,47 @@ fn test_device() -> Option<(bool, String)> {
     ))
 }
 
+/// [`open_case`], or `None` with a printed `skip:` line when the model is not downloaded (a
+/// failure instead under `INFR_TEST_REQUIRE_MODELS`).
+pub fn open_or_skip(key: &str) -> Option<Case> {
+    let case = open_case(key);
+    if case.is_none() {
+        assert!(
+            std::env::var_os("INFR_TEST_REQUIRE_MODELS").is_none(),
+            "{key} is not in the HF cache, and INFR_TEST_REQUIRE_MODELS requires it"
+        );
+        eprintln!("skip: {key} not in the HF cache");
+    }
+    case
+}
+
+/// The device the `key` model's `bytes` of model files will run on, named; `None`, with a printed
+/// `skip:` line, without a Vulkan device or on an integrated device without the host memory for
+/// them.
+pub fn device_for(key: &str, bytes: u64) -> Option<String> {
+    let Some((integrated, device)) = test_device() else {
+        eprintln!("skip: no Vulkan device");
+        return None;
+    };
+    if integrated {
+        let need = bytes * UNIFIED_RESIDENT_FACTOR + UNIFIED_HOST_MARGIN;
+        match infr_core::hostmem::available_bytes() {
+            Some(avail) if avail >= need => {}
+            avail => {
+                eprintln!(
+                    "skip: {key} on {device}, a unified-memory device, needs {:.1} GB of free host \
+                     memory ({UNIFIED_RESIDENT_FACTOR} x the model + a {:.1} GB margin); {} free",
+                    need as f64 / 1e9,
+                    UNIFIED_HOST_MARGIN as f64 / 1e9,
+                    avail.map_or("unknown".to_string(), |a| format!("{:.1} GB", a as f64 / 1e9)),
+                );
+                return None;
+            }
+        }
+    }
+    Some(device)
+}
+
 /// The gate: on every prompt of the `key` model, each named [`GPU_CONFIGS`] entry must be within
 /// the tolerance table's entry for (`key`, its class) of the CPU reference: the first
 /// [`FIRST_ROWS`] positions within its `first` bound, the batched prefill's other rows and the
@@ -624,34 +692,12 @@ fn test_device() -> Option<(bool, String)> {
 /// log.
 pub fn gate(key: &str, runs: &[(&str, PathClass)]) {
     let _guard = watchdog(&format!("the {key} tolerance case"), GATE_TIMEOUT);
-    let Some(case) = open_case(key) else {
-        assert!(
-            std::env::var_os("INFR_TEST_REQUIRE_MODELS").is_none(),
-            "{key} is not in the HF cache, and INFR_TEST_REQUIRE_MODELS requires it"
-        );
-        eprintln!("skip: {key} not in the HF cache");
+    let Some(case) = open_or_skip(key) else {
         return;
     };
-    let Some((integrated, device)) = test_device() else {
-        eprintln!("skip: no Vulkan device");
+    let Some(device) = device_for(key, case.bytes) else {
         return;
     };
-    if integrated {
-        let need = case.bytes * UNIFIED_RESIDENT_FACTOR + UNIFIED_HOST_MARGIN;
-        match infr_core::hostmem::available_bytes() {
-            Some(avail) if avail >= need => {}
-            avail => {
-                eprintln!(
-                    "skip: {key} on {device}, a unified-memory device, needs {:.1} GB of free host \
-                     memory ({UNIFIED_RESIDENT_FACTOR} x the model + a {:.1} GB margin); {} free",
-                    need as f64 / 1e9,
-                    UNIFIED_HOST_MARGIN as f64 / 1e9,
-                    avail.map_or("unknown".to_string(), |a| format!("{:.1} GB", a as f64 / 1e9)),
-                );
-                return;
-            }
-        }
-    }
     let t_case = std::time::Instant::now();
     let failures = evaluate(key, &case, &case, ForcedOn::Vulkan, runs);
     eprintln!(
@@ -676,30 +722,85 @@ pub fn evaluate(
     on: ForcedOn,
     runs: &[(&str, PathClass)],
 ) -> Vec<String> {
+    let reference = Reference::new(reference);
+    evaluate_with(
+        key,
+        table_name(key),
+        &reference,
+        test,
+        on,
+        runs,
+        |_, _, _, _| {},
+    )
+}
+
+/// A case with its CPU reference's greedy run on each prompt, computed once for every
+/// [`evaluate_with`] that scores against it.
+pub struct Reference<'a> {
+    pub case: &'a Case,
+    pub runs: Vec<ForcedLogits>,
+}
+
+impl<'a> Reference<'a> {
+    pub fn new(case: &'a Case) -> Self {
+        let runs = case
+            .prompts
+            .iter()
+            .map(|ids| forced_reference(&case.model, ids, N_DECODE))
+            .collect();
+        Self { case, runs }
+    }
+}
+
+/// [`evaluate`] against a [`Reference`] computed once, scored against the table's entry for
+/// `table` (a model's [`table_name`]), with `seen(prompt, run name, run, score)` called after each
+/// run: the score is `None` when a row could not be scored, which is then a failure naming it.
+pub fn evaluate_with(
+    key: &str,
+    table: &str,
+    reference: &Reference,
+    test: &Case,
+    on: ForcedOn,
+    runs: &[(&str, PathClass)],
+    mut seen: impl FnMut(usize, &str, &ForcedLogits, Option<&Scored>),
+) -> Vec<String> {
     let mut failures = Vec::new();
     // Per run, the steady phases merged over every prompt, for the top-1 count.
     let mut merged: Vec<[Option<RunScore>; 2]> = vec![[None, None]; runs.len()];
-    for (pi, ids) in reference.prompts.iter().enumerate() {
-        let r = forced_reference(&reference.model, ids, N_DECODE);
+    for (pi, (ids, r)) in reference
+        .case
+        .prompts
+        .iter()
+        .zip(&reference.runs)
+        .enumerate()
+    {
         for (ri, &(name, class)) in runs.iter().enumerate() {
             let &(_, edit, kv) = gpu_config(name);
-            let entry = tolerance(table_name(key), class);
+            let entry = tolerance(table, class);
             let reference_run = match kv {
                 None => r.clone(),
                 Some((k, v)) => forced(
-                    &reference.model,
+                    &reference.case.model,
                     ForcedOn::CpuReference,
                     |c| kv_types(c, k, v),
-                    &r,
+                    r,
                 ),
             };
-            let g = forced_with(&test.model, on, edit, PrefillHead::All, &r);
-            let s = score(
+            let g = forced_with(&test.model, on, edit, PrefillHead::All, r);
+            let s = match try_score(
                 &reference_run,
                 &g,
                 entry.steady.near_tie,
                 entry.first.near_tie,
-            );
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    seen(pi, name, &g, None);
+                    failures.push(format!("{name} prompt {pi}: {e}"));
+                    continue;
+                }
+            };
+            seen(pi, name, &g, Some(&s));
             for (phase, ps) in s.phases() {
                 if ps.positions == 0 {
                     continue;
@@ -728,7 +829,8 @@ pub fn evaluate(
     }
     for (&(name, _), m) in runs.iter().zip(&merged) {
         for (phase, ps) in ["prefill", "decode"].iter().zip(m) {
-            let ps = ps.as_ref().expect("every run scored");
+            // No score: every prompt's row of this run failed to score, each a failure above.
+            let Some(ps) = ps else { continue };
             if ps.top1_scored < MIN_TOP1_SCORED {
                 failures.push(format!(
                     "{name} {phase}: only {} of {} positions clear the {}-nat near-tie margin \

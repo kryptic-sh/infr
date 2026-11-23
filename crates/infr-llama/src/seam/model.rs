@@ -1251,6 +1251,13 @@ impl SeamModel {
         }
     }
 
+    /// Plant `bug` in this model (`mutations` feature only): every graph it builds from now on, on
+    /// every backend, carries it; no other loaded model does. One bug per model.
+    #[cfg(feature = "mutations")]
+    pub fn plant(&mut self, bug: crate::mutation::Planted) {
+        crate::mutation::plant(&mut self.cfg, bug);
+    }
+
     /// Open a Phase-2 DiffusionGemma denoise session on the CPU reference backend (see
     /// `docs/diffusion-gemma.md`): [`prefill`](DiffusionGemmaCpuSession::prefill) causally
     /// prefills the prompt ONCE (encoder scalars, KV rows `0..P`), then repeated

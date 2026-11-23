@@ -24,6 +24,8 @@ pub(crate) use util::*;
 mod kv;
 pub use kv::MoeConfig;
 pub mod grammar;
+#[cfg(feature = "mutations")]
+pub mod mutation;
 /// N-slot concurrent generation (`infr serve --parallel N`) — see [`parallel::ParallelSeam`].
 pub mod parallel;
 pub mod sampling;

@@ -343,19 +343,31 @@ impl SyntheticModel {
     }
 }
 
-/// A synthetic GGUF on disk, removed when the test drops it. A `std::env::temp_dir()` file and an
-/// explicit unlink rather than a `tempfile` dependency; the counter keeps concurrently-running
-/// tests in one binary from colliding on a name.
+/// A GGUF a test wrote (a synthetic model, or an edited copy of a real one), removed when the test
+/// drops it. A plain file and an explicit unlink rather than a `tempfile` dependency.
 pub struct TempGguf(PathBuf);
 
 impl TempGguf {
     pub fn write(tag: &str, model: &SyntheticModel) -> Self {
-        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let path =
-            std::env::temp_dir().join(format!("infr-synth-{tag}-{}-{n}.gguf", std::process::id()));
+        let path = Self::unique_path(&std::env::temp_dir(), "infr-synth", tag);
         std::fs::write(&path, model.to_gguf_bytes()).expect("write synthetic GGUF");
         Self(path)
+    }
+
+    /// An edited copy of a model file, its whole `bytes`, written into `dir` — for a test that
+    /// plants a bug in a real model, too large for a memory-backed temporary directory.
+    pub fn write_copy(dir: &Path, tag: &str, bytes: &[u8]) -> Self {
+        let path = Self::unique_path(dir, "infr-copy", tag);
+        std::fs::write(&path, bytes).expect("write the edited GGUF copy");
+        Self(path)
+    }
+
+    /// A file name in `dir` no other test of this process uses: the counter keeps
+    /// concurrently-running tests in one binary from colliding on a name.
+    fn unique_path(dir: &Path, prefix: &str, tag: &str) -> PathBuf {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        dir.join(format!("{prefix}-{tag}-{}-{n}.gguf", std::process::id()))
     }
 
     pub fn path(&self) -> &Path {

@@ -1579,6 +1579,17 @@ pub(crate) fn kv_v_fmt(cfg: &Config, k_fmt: DType, v_fmt: DType) -> DType {
     }
 }
 
+/// KV formats for dense Vulkan placement, keeping explicit user choices in step with the runner.
+pub(crate) fn kv_placement_fmts(cfg: &Config, ec: &EngineConfig, auto_q8: bool) -> (DType, DType) {
+    let side = |want: Option<DType>| match want {
+        Some(dtype) => dtype,
+        None if ec.kv.force_q8 || auto_q8 => DType::Q8_0,
+        None => DType::F16,
+    };
+    let k = side(ec.kv.type_k);
+    (k, kv_v_fmt(cfg, k, side(ec.kv.type_v)))
+}
+
 /// Per-token (K, V) ELEMENT counts for layer `l` — the one answer to "how wide is a row of this
 /// layer's KV cache", shared by the runner's allocation, the graph declaration, the fork/seed
 /// copies and every footprint estimate. Multiply by a row count for a whole cache side.
@@ -2954,14 +2965,10 @@ pub(crate) fn vulkan_moe_binder<'a>(
             .sum();
         let fp = crate::weights::weight_footprint(g);
         let vram = vk.vram();
-        // The per-side KV formats a chunk/format candidate prices: `q8` = BOTH sides Q8_0 (34
-        // bytes / 32 elems), false = f16 (2 B/elem). Per-layer rows ring at window+ubatch rows
-        // (see `kv_rows_at`) — what lets a mostly-SWA model (gemma-4-31B: 50/60 layers SWA) price its
-        // KV small enough to take the try-resident tier at real contexts instead of streaming.
-        let kv_fmts = |q8: bool| {
-            let side = if q8 { DType::Q8_0 } else { DType::F16 };
-            (side, side)
-        };
+        // Per-layer rows ring at window+ubatch rows (see `kv_rows_at`) — what lets a mostly-SWA
+        // model (gemma-4-31B: 50/60 layers SWA) price its KV small enough to take the try-resident
+        // tier at real contexts instead of streaming. Explicit K/V formats must match the runner.
+        let kv_fmts = |q8: bool| kv_placement_fmts(cfg, ec, q8);
         // Does weights + KV + the honest activation reserve fit at this (chunk, fmt)? Through the
         // SHARED predicate, so this decision and `kv_fit_ctx_for`'s price the same session against
         // the same ceiling — the ALLOCATOR's (`VramInfo::alloc_room`), not the raw free figure.
@@ -5386,6 +5393,42 @@ mod seam_helper_tests {
             ..Default::default()
         };
         assert!(!super::kv_unset(&Config::default(), &q8));
+    }
+
+    #[test]
+    fn dense_placement_prices_explicit_kv_formats() {
+        let cfg = Config::default();
+        let explicit_q8 = EngineConfig {
+            kv: infr_core::config::KvCfg {
+                type_k: Some(DType::Q8_0),
+                type_k_specified: true,
+                type_v: Some(DType::Q8_0),
+                type_v_specified: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            super::kv_placement_fmts(&cfg, &explicit_q8, false),
+            (DType::Q8_0, DType::Q8_0)
+        );
+
+        let explicit_k_only = EngineConfig {
+            kv: infr_core::config::KvCfg {
+                type_k: Some(DType::Q8_0),
+                type_k_specified: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            super::kv_placement_fmts(&cfg, &explicit_k_only, false),
+            (DType::Q8_0, DType::F16)
+        );
+        assert_eq!(
+            super::kv_placement_fmts(&cfg, &EngineConfig::default(), true),
+            (DType::Q8_0, DType::Q8_0)
+        );
     }
 
     #[test]

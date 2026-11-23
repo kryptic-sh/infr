@@ -1212,6 +1212,13 @@ impl SeamModel {
     /// and each decode step's. `edit` adjusts a copy of this model's engine configuration for the
     /// run (a prefill chunk height, a tuning switch, a KV format), so one loaded model serves
     /// every configuration a comparison needs.
+    ///
+    /// `route` forces a routed-expert (MoE) model's routing as well: every router-selected layer
+    /// then runs, at every position, on the experts `route` holds for it (another run's
+    /// [`crate::seam::ForcedLogits::routing`], the reference's) instead of its own router's, so
+    /// two backends cannot part ways at a router near tie. The run's own selections come back in
+    /// its `routing` either way. `None` for a dense model, and for the run that sets the routing.
+    #[allow(clippy::too_many_arguments)]
     pub fn forced_logits(
         &self,
         on: crate::seam::ForcedOn,
@@ -1219,6 +1226,7 @@ impl SeamModel {
         prompt: &[u32],
         n_steps: usize,
         head: crate::seam::PrefillHead,
+        route: Option<&crate::seam::Routing>,
         next: impl FnMut(usize, &[f32]) -> u32,
     ) -> Result<crate::seam::ForcedLogits> {
         let mut ec = (*self.ecfg).clone();
@@ -1242,12 +1250,13 @@ impl SeamModel {
                     prompt,
                     n_steps,
                     head,
+                    route,
                     next,
                 )
             }
-            crate::seam::ForcedOn::Vulkan => {
-                crate::seam::forced_run_vulkan(g, c, &ec, embd, ple, prompt, n_steps, head, next)
-            }
+            crate::seam::ForcedOn::Vulkan => crate::seam::forced_run_vulkan(
+                g, c, &ec, embd, ple, prompt, n_steps, head, route, next,
+            ),
         }
     }
 

@@ -7,12 +7,16 @@ use crate::kernels::{
     vec_dot_q32_batch8, vec_dot_q4k_batch, vec_dot_q4k_batch8, vec_dot_q5_0_32_batch,
     vec_dot_q5k_batch, vec_dot_q6k_batch, vec_dot_q8_0_32_batch, vec_dot_q8_0_batch, Dots, HiBatch,
 };
+use crate::pool::SpinPool;
+use crate::quant::{quantize_q8, quantize_q8_32};
 use crate::quant::{Q8x32, Q8};
 use crate::repack::{packed_min_tokens, Q4kPack};
 #[cfg(target_arch = "x86_64")]
 use crate::repack::{
     q4k_gemm_group_out, q4k_pack_and_gemm_group, q6k_pack_and_gemm_group, GemmOut,
 };
+use infr_core::graph::MoeGating;
+use infr_core::math;
 use infr_core::tensor::DType;
 
 /// Activation batch for [`expert_gemm_range`] — the representation the weight dtype dictates
@@ -52,6 +56,164 @@ pub(crate) fn expert_acts_kind(dt: DType, in_f: usize, int8_ok: bool) -> ActsKin
     } else {
         ActsKind::Raw
     }
+}
+
+/// The router's logits for every row of `rxs` (`[rows, ne]`), row-major `[rows, n_expert]`: ONE
+/// batched matvec over every row (the router is tiny, `[n_expert, ne]`), on the pool. Serial it
+/// was 12-20ms/layer at 512 rows (134M MAC), long enough that spinning pool workers SMT-throttled
+/// it, which is where qwen3moe's phase-3 prefill regression hid (per-op MoeFfn time had IMPROVED).
+/// `Op::MoeFfn` and `Op::MoeRoute` both route on these, so the two cannot select differently.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn router_logits<const CAP: bool>(
+    pool: &SpinPool,
+    rbytes: &[u8],
+    rdt: DType,
+    ne: usize,
+    n_expert: usize,
+    rxs: &[f32],
+    rows: usize,
+    int8_ok: bool,
+) -> Vec<f32> {
+    let r_kind = expert_acts_kind(rdt, ne, int8_ok);
+    let rq8: Vec<Q8> = if r_kind == ActsKind::Super {
+        pool.collect(rows, &|r| quantize_q8(&rxs[r * ne..r * ne + ne]))
+    } else {
+        Vec::new()
+    };
+    let rq832: Vec<Q8x32> = if r_kind == ActsKind::Blk32 {
+        pool.collect(rows, &|r| quantize_q8_32(&rxs[r * ne..r * ne + ne]))
+    } else {
+        Vec::new()
+    };
+    let racts = match r_kind {
+        ActsKind::Super => ExpertActs::Super(&rq8),
+        ActsKind::Blk32 => ExpertActs::Blk32(&rq832),
+        ActsKind::Raw => ExpertActs::Raw(rxs),
+    };
+    let mut lt = vec![0f32; n_expert * rows]; // o-major
+    pool.for_chunks_mut(&mut lt, 8 * rows, 1, &|c, dst| {
+        let o0 = c * 8;
+        let o1 = (o0 + 8).min(n_expert);
+        expert_gemm_range::<CAP>(rbytes, rdt, ne, n_expert, &racts, None, o0, o1, dst);
+    });
+    let mut logits = vec![0f32; rows * n_expert];
+    pool.for_chunks_mut(&mut logits, n_expert, 4, &|r, lrow| {
+        for (o, dst) in lrow.iter_mut().enumerate() {
+            *dst = lt[o * rows + r];
+        }
+    });
+    logits
+}
+
+/// One row's router probabilities: softmax over all experts (qwen3moe/…) or a per-expert
+/// sigmoid (llama4). Both are monotone in the logit, so the top-`n_used` selection is identical
+/// either way (llama4 selects by raw logits — same set).
+pub(crate) fn router_probs(logits: &[f32], gating: MoeGating) -> Vec<f32> {
+    match gating {
+        MoeGating::Softmax => {
+            let maxl = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let mut p = logits.to_vec();
+            math::exp_sub_slice(&mut p, maxl);
+            let psum: f32 = p.iter().sum();
+            for v in p.iter_mut() {
+                *v /= psum;
+            }
+            p
+        }
+        MoeGating::Sigmoid => {
+            let mut p = logits.to_vec();
+            math::sigmoid_slice(&mut p);
+            p
+        }
+        MoeGating::SqrtSoftplus => {
+            // sqrt(softplus(x)) = sqrt(ln(1 + exp(x))). Monotone like sigmoid;
+            // top-k-by-logit picks the same set.
+            logits
+                .iter()
+                .map(|&v| {
+                    let sp = if v > 20.0 {
+                        v
+                    } else {
+                        math::ln(1.0_f32 + math::exp(v))
+                    };
+                    sp.sqrt()
+                })
+                .collect()
+        }
+    }
+}
+
+/// The score each expert of one row is ranked by: its probability, plus the router bias, with
+/// every expert of a group that lost set to negative infinity.
+pub(crate) fn selection_scores(
+    probs: &[f32],
+    bias: Option<&[f32]>,
+    n_expert_groups: u32,
+    n_expert_groups_used: u32,
+) -> Vec<f32> {
+    let n_expert = probs.len();
+    // DeepSeek V2+: router bias for SELECTION only — add to a copy used for
+    // top-k selection; original probs still used for per-expert weights.
+    let mut sel_probs: Vec<f32> = if let Some(epb_w) = bias {
+        probs
+            .iter()
+            .enumerate()
+            .map(|(e, &p)| p + epb_w[e])
+            .collect()
+    } else {
+        probs.to_vec()
+    };
+    // DeepSeek V3+: group-limited routing — per-group top-2, top groups,
+    // mask the rest to -inf (matching llama.cpp `build_moe_ffn`).
+    if n_expert_groups > 1 && n_expert_groups_used > 0 {
+        let n_exp_per_group = n_expert / n_expert_groups as usize;
+        let ng = n_expert_groups as usize;
+        let ng_used = n_expert_groups_used as usize;
+        // Compute per-group score: sum of top-2 within each group.
+        let mut gscores = vec![f32::NEG_INFINITY; ng];
+        for g in 0..ng {
+            let base = g * n_exp_per_group;
+            let mut best = [f32::NEG_INFINITY; 2];
+            for &s in &sel_probs[base..base + n_exp_per_group] {
+                if s > best[0] {
+                    best[1] = best[0];
+                    best[0] = s;
+                } else if s > best[1] {
+                    best[1] = s;
+                }
+            }
+            gscores[g] = best[0] + best[1];
+        }
+        // Top ng_used groups by score.
+        let mut gidx: Vec<usize> = (0..ng).collect();
+        // `total_cmp`: a NaN score must not panic the backend. Without
+        // a NaN it orders as `partial_cmp` did except -0.0 / +0.0; a NaN
+        // score ranks first and the routing output is garbage.
+        gidx.sort_by(|&a, &b| gscores[b].total_cmp(&gscores[a]));
+        gidx.truncate(ng_used);
+        // Mask non-chosen groups to -inf.
+        let mut chosen = vec![false; ng];
+        for &g in &gidx {
+            chosen[g] = true;
+        }
+        for g in 0..ng {
+            if !chosen[g] {
+                for s in sel_probs[g * n_exp_per_group..(g + 1) * n_exp_per_group].iter_mut() {
+                    *s = f32::NEG_INFINITY;
+                }
+            }
+        }
+    }
+    sel_probs
+}
+
+/// The `n_used` experts with the highest [`selection_scores`], best first; the lower id first on
+/// an equal score (the sort is stable).
+pub(crate) fn top_experts(scores: &[f32], n_used: usize) -> Vec<usize> {
+    let mut idx: Vec<usize> = (0..scores.len()).collect();
+    idx.sort_by(|&a, &b| scores[b].total_cmp(&scores[a]));
+    idx.truncate(n_used);
+    idx
 }
 
 thread_local! {

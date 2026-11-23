@@ -24,6 +24,11 @@ fn forced_run_reproduces_the_cpu_reference_on_every_path() {
     forced::self_check_on_a_synthetic_llama();
 }
 
+#[test]
+fn forced_run_reads_back_and_takes_a_routing_on_the_cpu() {
+    forced::self_check_on_a_synthetic_moe();
+}
+
 /// A measurement, not a gate: CPU production and every Vulkan configuration against the CPU
 /// reference on the models named in `INFR_TOL_MODELS` (keys of [`forced::MODELS`]), printed as one
 /// line per pair and phase (see [`forced::measure`]).
@@ -68,6 +73,10 @@ const FLOAT_RUNS: &[(&str, PathClass)] = &[
     ("gpu-ub32", Float),
     ("gpu-float-static", Float),
 ];
+
+/// A routed-expert model with float expert banks: the production kernels on the replayed
+/// per-token decode, and on the static one.
+const MOE_RUNS: &[(&str, PathClass)] = &[("gpu", Float), ("gpu-float-static", Float)];
 
 /// The red path, in the normal test job: a synthetic model with one projection's weights scaled
 /// by [`RED_SCALE`], driven on the CPU reference against the unmodified model's CPU reference, must
@@ -286,6 +295,74 @@ fn gpu_seam_tolerance_synthetic_f32() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_tolerance_synthetic_f16() {
     forced::gate("synthetic-f16", FLOAT_RUNS);
+}
+
+/// The synthetic routed-expert model, forced along the reference's expert selections, on the
+/// replayed and on the static per-token decode; its own selections are held to the row's routing
+/// near tie. It takes no batched prefill, so only its decode rows are scored.
+#[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+fn gpu_seam_tolerance_synthetic_moe() {
+    forced::gate(forced::SYNTHETIC_MOE, MOE_RUNS);
+}
+
+/// What a forced run reads back as a router's own selection is the selection its expert layer
+/// runs on when left to itself, and running on a supplied selection is the same arithmetic: a
+/// Vulkan run left on its own routers, and the same run forced along the selections that run
+/// read back, give the same logits bit for bit and read back the same selections, on the
+/// replayed and on the static decode. (`Op::MoeRoute` repeats the router dispatch of the
+/// `Op::MoeFfn` lowering; this fails when the two part.) The control: with one of those
+/// selections replaced by an expert the router did not pick, at the first decode position, the
+/// run's bits must change, or the supplied selection is not what ran.
+#[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+fn gpu_seam_tolerance_own_routing_is_the_selection_it_runs() {
+    use infr_llama::seam::{ForcedOn, PrefillHead};
+    let _guard = forced::watchdog("the own-routing check", forced::GATE_TIMEOUT);
+    let case = forced::open_case(forced::SYNTHETIC_MOE).expect("synthetic model");
+    if infr_testkit::gpu_or_skip(infr_vulkan::VulkanBackend::new_with(std::sync::Arc::new(
+        forced::env_cfg(),
+    )))
+    .is_none()
+    {
+        eprintln!("skip: no Vulkan device");
+        return;
+    }
+    let r = forced::forced_reference(&case.model, &case.prompts[2], forced::N_DECODE);
+    let bits = |g: &infr_llama::seam::ForcedLogits| {
+        g.logits.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
+    };
+    for &(name, _) in MOE_RUNS {
+        let edit = forced::gpu_config_edit(name);
+        let run = |route| {
+            forced::forced_along(
+                &case.model,
+                ForcedOn::Vulkan,
+                edit,
+                PrefillHead::All,
+                &r,
+                route,
+            )
+        };
+        let own = run(None);
+        let routing = own.routing.as_ref().expect("a routed model's routing");
+        let again = run(Some(routing));
+        assert!(
+            bits(&again) == bits(&own),
+            "{name}: forced along its own selections, the run's logits changed"
+        );
+        assert_eq!(again.routing, own.routing, "{name}: its selections moved");
+        let mut other = routing.clone();
+        let at = r.positions[r.prefill_rows] * other.layers.len() * other.n_used;
+        let picked = other.ids[at..at + other.n_used].to_vec();
+        other.ids[at] = (0..other.n_expert as u32)
+            .find(|e| !picked.contains(e))
+            .expect("more experts than a token uses");
+        assert!(
+            bits(&run(Some(&other))) != bits(&own),
+            "{name}: forced along another selection, the run's logits did not change"
+        );
+    }
 }
 
 #[test]

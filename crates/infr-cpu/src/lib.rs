@@ -35,7 +35,7 @@ use infr_core::backend::{Backend, Bindings, Buffer, BufferUsage, Capabilities, G
 use infr_core::config::Config;
 use infr_core::error::Result;
 use infr_core::exec::Provision;
-use infr_core::graph::{Activation, AttnMask, Graph, MoeGating, Op};
+use infr_core::graph::{Activation, AttnMask, Graph, Op};
 use infr_core::math;
 use infr_core::tensor::{DType, TensorId};
 use infr_gguf::dequant::dequant_block;
@@ -3242,42 +3242,9 @@ impl CpuBackend {
                     // `ActsKind::Raw`, so an oracle run has no int8-activation error anywhere.
                     let int8_ok = !reference;
                     let pool = self.pool();
-                    // Router GEMM on the pool: serial it was 12-20ms/layer at 512 rows (134M MAC)
-                    // — long enough that spinning pool workers SMT-throttled it, which is where
-                    // qwen3moe's phase-3 prefill regression hid (per-op MoeFfn time had IMPROVED).
-                    let logits_all: Vec<f32> = {
-                        let r_kind = expert_acts_kind(rdt, ne, int8_ok);
-                        let rq8: Vec<Q8> = if r_kind == ActsKind::Super {
-                            pool.collect(rows, &|r| quantize_q8(&rxs[r * ne..r * ne + ne]))
-                        } else {
-                            Vec::new()
-                        };
-                        let rq832: Vec<Q8x32> = if r_kind == ActsKind::Blk32 {
-                            pool.collect(rows, &|r| quantize_q8_32(&rxs[r * ne..r * ne + ne]))
-                        } else {
-                            Vec::new()
-                        };
-                        let racts = match r_kind {
-                            ActsKind::Super => ExpertActs::Super(&rq8),
-                            ActsKind::Blk32 => ExpertActs::Blk32(&rq832),
-                            ActsKind::Raw => ExpertActs::Raw(&rxs),
-                        };
-                        let mut lt = vec![0f32; n_expert * rows]; // o-major
-                        pool.for_chunks_mut(&mut lt, 8 * rows, 1, &|c, dst| {
-                            let o0 = c * 8;
-                            let o1 = (o0 + 8).min(n_expert);
-                            expert_gemm_range::<CAP>(
-                                &rbytes, rdt, ne, n_expert, &racts, None, o0, o1, dst,
-                            );
-                        });
-                        let mut logits = vec![0f32; rows * n_expert];
-                        pool.for_chunks_mut(&mut logits, n_expert, 4, &|r, lrow| {
-                            for (o, dst) in lrow.iter_mut().enumerate() {
-                                *dst = lt[o * rows + r];
-                            }
-                        });
-                        logits
-                    };
+                    let logits_all: Vec<f32> = moe::router_logits::<CAP>(
+                        pool, &rbytes, rdt, ne, n_expert, &rxs, rows, int8_ok,
+                    );
                     struct RouteRow {
                         /// Selected experts, sorted by DESCENDING router prob — the same order the
                         /// original per-row loop accumulated in. On a HASH-routed layer these are
@@ -3304,41 +3271,7 @@ impl CpuBackend {
                     });
                     let routes: Vec<RouteRow> = pool.collect(rows, &|r| {
                         let logits = &logits_all[r * n_expert..r * n_expert + n_expert];
-                        // Router probabilities: softmax over all experts (qwen3moe/…) or a per-expert
-                        // sigmoid (llama4). Both are monotone in the logit, so the top-`n_used`
-                        // selection is identical either way (llama4 selects by raw logits — same set).
-                        let probs: Vec<f32> = match gating {
-                            MoeGating::Softmax => {
-                                let maxl = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                                let mut p = logits.to_vec();
-                                math::exp_sub_slice(&mut p, maxl);
-                                let psum: f32 = p.iter().sum();
-                                for v in p.iter_mut() {
-                                    *v /= psum;
-                                }
-                                p
-                            }
-                            MoeGating::Sigmoid => {
-                                let mut p = logits.to_vec();
-                                math::sigmoid_slice(&mut p);
-                                p
-                            }
-                            MoeGating::SqrtSoftplus => {
-                                // sqrt(softplus(x)) = sqrt(ln(1 + exp(x))). Monotone like sigmoid;
-                                // top-k-by-logit picks the same set.
-                                logits
-                                    .iter()
-                                    .map(|&v| {
-                                        let sp = if v > 20.0 {
-                                            v
-                                        } else {
-                                            math::ln(1.0_f32 + math::exp(v))
-                                        };
-                                        sp.sqrt()
-                                    })
-                                    .collect()
-                            }
-                        };
+                        let probs = moe::router_probs(logits, gating);
                         let idx: Vec<usize> = if let Some(hids) = &hash_ids {
                             // Hash-routed (V4): the token's table row IS the selection. Everything
                             // the `else` branch computes — the biased copy, the group scores, the
@@ -3357,66 +3290,14 @@ impl CpuBackend {
                                 })
                                 .collect()
                         } else {
-                            // DeepSeek V2+: router bias for SELECTION only — add to a copy used for
-                            // top-k selection; original probs still used for per-expert weights.
-                            let mut sel_probs: Vec<f32> = if let Some(epb) = exp_probs_b {
-                                let epb_w = weight(epb);
-                                probs
-                                    .iter()
-                                    .enumerate()
-                                    .map(|(e, &p)| p + epb_w[e])
-                                    .collect()
-                            } else {
-                                probs.clone()
-                            };
-                            // DeepSeek V3+: group-limited routing — per-group top-2, top groups,
-                            // mask the rest to -inf (matching llama.cpp `build_moe_ffn`).
-                            if n_expert_groups > 1 && n_expert_groups_used > 0 {
-                                let n_exp_per_group = n_expert / n_expert_groups as usize;
-                                let ng = n_expert_groups as usize;
-                                let ng_used = n_expert_groups_used as usize;
-                                // Compute per-group score: sum of top-2 within each group.
-                                let mut gscores = vec![f32::NEG_INFINITY; ng];
-                                for g in 0..ng {
-                                    let base = g * n_exp_per_group;
-                                    let mut best = [f32::NEG_INFINITY; 2];
-                                    for &s in &sel_probs[base..base + n_exp_per_group] {
-                                        if s > best[0] {
-                                            best[1] = best[0];
-                                            best[0] = s;
-                                        } else if s > best[1] {
-                                            best[1] = s;
-                                        }
-                                    }
-                                    gscores[g] = best[0] + best[1];
-                                }
-                                // Top ng_used groups by score.
-                                let mut gidx: Vec<usize> = (0..ng).collect();
-                                // `total_cmp`: a NaN score must not panic the backend. Without
-                                // a NaN it orders as `partial_cmp` did except -0.0 / +0.0; a NaN
-                                // score ranks first and the routing output is garbage.
-                                gidx.sort_by(|&a, &b| gscores[b].total_cmp(&gscores[a]));
-                                gidx.truncate(ng_used);
-                                // Mask non-chosen groups to -inf.
-                                let mut chosen = vec![false; ng];
-                                for &g in &gidx {
-                                    chosen[g] = true;
-                                }
-                                for g in 0..ng {
-                                    if !chosen[g] {
-                                        for s in sel_probs
-                                            [g * n_exp_per_group..(g + 1) * n_exp_per_group]
-                                            .iter_mut()
-                                        {
-                                            *s = f32::NEG_INFINITY;
-                                        }
-                                    }
-                                }
-                            }
-                            let mut idx: Vec<usize> = (0..n_expert).collect();
-                            idx.sort_by(|&a, &b| sel_probs[b].total_cmp(&sel_probs[a]));
-                            idx.truncate(n_used);
-                            idx
+                            let bias = exp_probs_b.map(weight);
+                            let scores = moe::selection_scores(
+                                &probs,
+                                bias.as_ref().map(|b| &b[..]),
+                                n_expert_groups,
+                                n_expert_groups_used,
+                            );
+                            moe::top_experts(&scores, n_used)
                         };
                         // `norm_w`: renormalize the selected weights to sum to 1 before scaling
                         // (softmax MoE); llama4 uses the raw sigmoid prob × scale (no renorm).
@@ -3887,6 +3768,72 @@ impl CpuBackend {
                     rc.set(&mut vals, dst.0 as usize, out);
                     for stage in [gu_all, up_all, y_pairs, xs, rxs] {
                         rc.give(stage);
+                    }
+                }
+                Op::MoeRoute {
+                    router_x,
+                    router,
+                    exp_probs_b,
+                    dst_ids,
+                    dst_scores,
+                    ne,
+                    n_expert,
+                    n_used,
+                    gating,
+                    n_expert_groups,
+                    n_expert_groups_used,
+                } => {
+                    // `Op::MoeFfn`'s selection and nothing after it, through the helpers that op
+                    // routes with, so the two select the same experts from the same operands.
+                    let (ne, n_expert, n_used) = (ne as usize, n_expert as usize, n_used as usize);
+                    let rxs = rc.copy_of(&vals[router_x.0 as usize]);
+                    let rows = rxs.len() / ne;
+                    let rbuf = bindings.get(router).expect("cpu backend: unbound router");
+                    refuse_relock(
+                        "Op::MoeRoute",
+                        ("router", rbuf),
+                        &[("exp_probs_b", exp_probs_b.and_then(|id| bindings.get(id)))],
+                    );
+                    let logits_all = {
+                        let rbytes = cpu_buf(rbuf).read();
+                        moe::router_logits::<CAP>(
+                            self.pool(),
+                            &rbytes,
+                            g.desc(router).dtype,
+                            ne,
+                            n_expert,
+                            &rxs,
+                            rows,
+                            !reference,
+                        )
+                    };
+                    let bias = exp_probs_b.map(weight);
+                    let mut ids = rc.zeroed(rows * n_used);
+                    let mut scores_all = dst_scores.map(|_| Vec::with_capacity(rows * n_expert));
+                    for r in 0..rows {
+                        let probs = moe::router_probs(
+                            &logits_all[r * n_expert..(r + 1) * n_expert],
+                            gating,
+                        );
+                        let scores = moe::selection_scores(
+                            &probs,
+                            bias.as_ref().map(|b| &b[..]),
+                            n_expert_groups,
+                            n_expert_groups_used,
+                        );
+                        for (slot, e) in ids[r * n_used..(r + 1) * n_used]
+                            .iter_mut()
+                            .zip(moe::top_experts(&scores, n_used))
+                        {
+                            *slot = f32::from_bits(e as u32);
+                        }
+                        if let Some(all) = &mut scores_all {
+                            all.extend_from_slice(&scores);
+                        }
+                    }
+                    rc.set(&mut vals, dst_ids.0 as usize, ids);
+                    if let (Some(id), Some(all)) = (dst_scores, scores_all) {
+                        rc.set(&mut vals, id.0 as usize, all);
                     }
                 }
                 Op::Conv1dSilu {
@@ -5047,6 +4994,7 @@ mod tests {
     use super::test_util::det_quant_rows;
     use super::*;
     use crate::kernels::{vec_dot_q4k, vec_dot_q5k, vec_dot_q6k};
+    use infr_core::graph::MoeGating;
     use infr_core::tensor::TensorDesc;
 
     /// One owned buffer bound to `Op::Mla`'s `k_cache` and to a weight it reads is refused by

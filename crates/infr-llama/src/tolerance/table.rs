@@ -70,6 +70,11 @@ pub struct Entry {
     pub steady: Tolerance,
     /// The first [`FIRST_ROWS`] positions.
     pub first: Tolerance,
+    /// A routed-expert (MoE) model's row: the reference margin, in selection score
+    /// (`seam::Routing::scores`), above which the backend's own router must select the experts
+    /// the reference's did, at every position and layer (`metrics::RouteScore`). `None` for a
+    /// model with no router-selected layer.
+    pub route_near_tie: Option<f64>,
 }
 
 /// A [`Tolerance`], positionally: KL max, KL mean, top-k cosine min, logit deviation max, near-tie
@@ -99,6 +104,24 @@ const fn row(model: &'static str, class: PathClass, steady: Tolerance, first: To
         class,
         steady,
         first,
+        route_near_tie: None,
+    }
+}
+
+/// One [`TABLE`] row of a routed-expert model, with its routing near tie.
+const fn moe_row(
+    model: &'static str,
+    class: PathClass,
+    steady: Tolerance,
+    first: Tolerance,
+    route_near_tie: f64,
+) -> Entry {
+    Entry {
+        model,
+        class,
+        steady,
+        first,
+        route_near_tie: Some(route_near_tie),
     }
 }
 
@@ -133,6 +156,13 @@ use PathClass::{Float, FloatNoCoopmat, Int8, KvQ8};
 /// the logit deviation times 1.5; the rank at twice the worst plus one; the near-tie margin at 1.5
 /// times the widest legitimate top-1 miss, and at least 0.25 nats (float) or 1 nat (int8, q8 KV).
 /// `docs/gpu-tolerance.md` gives both sides of each gap, and the rows where there is none.
+///
+/// **Routed-expert (MoE) rows.** Such a model is forced along the reference's expert selections
+/// as well as its tokens, so its limits above are set from runs that route as the reference does
+/// and measure arithmetic alone. Its `route_near_tie` holds the routers themselves: 1.5 times the
+/// widest reference margin (`metrics::RouteFlip::margin`) at which a legitimate run's own router
+/// selected other experts. A model whose legitimate runs never select differently has no such
+/// margin to scale; how its near tie is set is not decided (B207).
 ///
 /// **No ratchet.** A row may be loosened only by its owner, with the measurement that needs it
 /// (device, driver, configuration, the run's printed values) and with the planted bugs of
@@ -266,6 +296,26 @@ pub const TABLE: &[Entry] = &[
         Float,
         t(6.7e-4, 5.9e-5, 0.9992, 3.9e-3, 0.25, 1),
         t(6.7e-4, 5.9e-5, 0.9992, 3.9e-3, 0.25, 1),
+    ),
+    // The synthetic routed-expert model (`synthetic_moe` in `tests/support/routed.rs`: f32
+    // experts, a softmax router with a selection bias), forced along the reference's expert
+    // selections. From RADV alone, both GPUs, 2026-11-23 (configurations `gpu` and
+    // `gpu-float-static`; native lanes, forced wave64 and tuning rows off at the prompts' own
+    // ends; native lanes and, on the RX 7900 XTX, forced wave64 with every prompt ended after 4
+    // tokens, which scores every later position: the model takes no batched prefill, so a gate
+    // run scores its decode rows only). Worst legitimate values: KL 2.31e-4 (prompt 2 ended after
+    // 4 tokens, position 90; 1.03e-4 at the prompts' own ends), mean 1.52e-5, cosine 0.999750,
+    // logit deviation 2.89e-3, no top-1 miss; and one selection that differs from the reference's,
+    // on every path, at a reference margin of 2.14e-4 in selection score (prompt 2, position 107,
+    // layer 0), which sets the routing near tie. No position under `FIRST_ROWS` is ever scored,
+    // so the first rows take the steady bound. The cosine bound is the rule applied to the value
+    // as the log prints it, to six places, and cut to four as gemma-3's rows are.
+    moe_row(
+        "synthetic-moe",
+        Float,
+        t(4.7e-4, 3.1e-5, 0.9995, 4.4e-3, 0.25, 1),
+        t(4.7e-4, 3.1e-5, 0.9995, 4.4e-3, 0.25, 1),
+        3.3e-4,
     ),
 ];
 
@@ -458,6 +508,7 @@ mod tests {
                 e.model,
                 e.class
             );
+            assert!(e.route_near_tie.is_none_or(|t| t > 0.0), "{}", e.model);
             assert!(
                 TABLE[..i]
                     .iter()

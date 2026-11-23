@@ -3912,6 +3912,71 @@ fn lower_op(
                 *n as usize,
             );
         }
+        // The router's own selection and nothing run on it (the teacher-forced tolerance
+        // comparison): the router dispatch and the `moe_topk` call of the `Op::MoeFfn` arm below,
+        // with no hash selection, so the ids are the ones that arm picks from the same operands.
+        // Keep the two in step; `gpu_seam_tolerance_own_routing_is_the_selection_it_runs` fails
+        // when they select differently.
+        Op::MoeRoute {
+            router_x,
+            router,
+            exp_probs_b,
+            dst_ids,
+            dst_scores,
+            ne,
+            n_expert,
+            n_used,
+            gating,
+            n_expert_groups,
+            n_expert_groups_used,
+        } => {
+            if dst_scores.is_some() {
+                return Err(be(
+                    "vulkan adapter: Op::MoeRoute dst_scores is not implemented (moe_topk writes \
+                     the selection, not the scores it ranked by)",
+                ));
+            }
+            let (ne, n_expert, n_used) = (*ne as usize, *n_expert as usize, *n_used as usize);
+            let rows = graph.desc(*router_x).numel() / ne;
+            let gating_u32 = match gating {
+                infr_core::graph::MoeGating::Softmax => 0u32,
+                infr_core::graph::MoeGating::Sigmoid => 1u32,
+                infr_core::graph::MoeGating::SqrtSoftplus => 2u32,
+            };
+            let bias_buf: &dyn Buffer = match exp_probs_b {
+                Some(epb) => r(*epb)?,
+                None => be_.unused_binding()?,
+            };
+            let logits = pooled(pool, be_, "moe_route_logits", rows * n_expert * 4)?;
+            // `moe_topk` writes a weight per slot as well; nothing reads these.
+            let wts = pooled(pool, be_, "moe_route_wts", rows * n_used * 4)?;
+            let (rxb, rw) = (r(*router_x)?, r(*router)?);
+            let rdt = graph.desc(*router).dtype;
+            if native_dense_supported(rdt) {
+                rec.linear_native(rdt, rw, 0, rxb, pool[&logits].as_ref(), rows, ne, n_expert);
+            } else if matches!(rdt, infr_core::DType::F32) {
+                rec.linear_f32(rw, rxb, pool[&logits].as_ref(), rows, ne, n_expert);
+            } else {
+                rec.linear(rw, rxb, pool[&logits].as_ref(), rows, ne, n_expert);
+            }
+            rec.moe_topk(
+                pool[&logits].as_ref(),
+                r(*dst_ids)?,
+                pool[&wts].as_ref(),
+                bias_buf,
+                rows,
+                n_expert,
+                n_used,
+                1.0,
+                gating_u32,
+                false,
+                exp_probs_b.is_some(),
+                *n_expert_groups,
+                *n_expert_groups_used,
+                be_.unused_binding()?,
+                false,
+            )?;
+        }
         // MoE FFN (single token): router GEMV → GPU-resident top-k (gating-dependent weighting,
         // ×scale) → fused multi-slot expert SwiGLU (gate/up share the row, down reads each slot's
         // act) → weighted accumulate. Mirrors the production GPU-resident decode path

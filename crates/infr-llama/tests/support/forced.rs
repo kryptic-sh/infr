@@ -1,10 +1,19 @@
 //! The teacher-forced comparison: the CPU reference's greedy run, the same tokens forced through
 //! another backend, and the two scored with `infr_llama::tolerance`.
 
-use infr_llama::seam::{ForcedLogits, ForcedOn, PrefillHead};
-use infr_llama::tolerance::{tolerance, PathClass, RunScore, FIRST_ROWS, MIN_TOP1_SCORED};
+use infr_llama::seam::{ForcedLogits, ForcedOn, PrefillHead, Routing};
+use infr_llama::tolerance::{
+    tolerance, PathClass, RouteScore, RunScore, FIRST_ROWS, MIN_TOP1_SCORED,
+};
+
+/// The routed-expert (MoE) half: the synthetic model, the routing comparison, its self-check.
+#[path = "routed.rs"]
+mod routed;
 use infr_llama::{EngineConfig, SeamModel};
 use infr_testkit::gguf::{Fill, Meta, SyntheticModel, TempGguf, TensorSpec};
+pub use routed::{
+    route_line, score_routing, self_check_on_a_synthetic_moe, synthetic_moe, SYNTHETIC_MOE,
+};
 
 /// Decode steps forced after each prompt.
 pub const N_DECODE: usize = 32;
@@ -99,13 +108,18 @@ pub struct Case {
     pub prompts: Vec<Vec<u32>>,
     /// The model file's size, for the host-memory check on unified-memory devices.
     pub bytes: u64,
+    /// Whether the model's prompt goes through the batched prefill. `false` only for a model
+    /// known to have none (the synthetic MoE: float expert banks have no batched kernel), whose
+    /// prompt positions are then not scored on logits ([`Reference::check_prefill`]).
+    pub batched_prefill: bool,
     /// The synthetic model's file, kept for as long as the model maps it.
     _file: Option<TempGguf>,
 }
 
 /// The [`Case`] for a [`MODELS`] key — [`PROMPTS`] tokenized — or for `synthetic-f32` /
-/// `synthetic-f16` ([`synthetic_llama`] with f32 or f16 projections; prompts of the same three
-/// lengths, as ids); `None` when a cached model is not downloaded.
+/// `synthetic-f16` ([`synthetic_llama`] with f32 or f16 projections) or [`SYNTHETIC_MOE`]
+/// ([`synthetic_moe`]), each prompted with ids at the same three lengths; `None` when a cached
+/// model is not downloaded.
 pub fn open_case(key: &str) -> Option<Case> {
     open_case_scaled(key, None)
 }
@@ -135,9 +149,13 @@ pub fn open_case_scaled(key: &str, scaled: Option<(&str, f32)>) -> Option<Case> 
             };
             tag = format!("{tag}-{name}-x{factor}");
         }
-        return Some(open_file(TempGguf::write(&tag, &m), true));
+        return Some(open_file(TempGguf::write(&tag, &m), true, true));
     }
-    assert!(scaled.is_none(), "only a synthetic model can be scaled");
+    assert!(scaled.is_none(), "only a synthetic llama can be scaled");
+    if key == SYNTHETIC_MOE {
+        let file = TempGguf::write(&format!("tolerance-{key}"), &synthetic_moe());
+        return Some(open_file(file, true, false));
+    }
     let path = find_model(key)?;
     let bytes = std::fs::metadata(&path).map_or(0, |md| md.len());
     let model = load(&path);
@@ -145,6 +163,7 @@ pub fn open_case_scaled(key: &str, scaled: Option<(&str, f32)>) -> Option<Case> 
         prompts: real_prompts(&model),
         model,
         bytes,
+        batched_prefill: true,
         _file: None,
     })
 }
@@ -173,8 +192,8 @@ pub fn synthetic_prompts() -> Vec<Vec<u32>> {
 
 /// The [`Case`] of a model written to `file`, which it keeps for as long as the model maps it:
 /// prompted with the [`synthetic_prompts`] when `synthetic` (its vocabulary spells nothing), else
-/// with [`PROMPTS`].
-pub fn open_file(file: TempGguf, synthetic: bool) -> Case {
+/// with [`PROMPTS`]. `batched_prefill` is [`Case::batched_prefill`].
+pub fn open_file(file: TempGguf, synthetic: bool, batched_prefill: bool) -> Case {
     let bytes = std::fs::metadata(file.path()).map_or(0, |md| md.len());
     let model = load(file.path());
     Case {
@@ -185,6 +204,7 @@ pub fn open_file(file: TempGguf, synthetic: bool) -> Case {
         },
         model,
         bytes,
+        batched_prefill,
         _file: Some(file),
     }
 }
@@ -195,6 +215,7 @@ pub fn table_name(key: &str) -> &'static str {
     match key {
         "synthetic-f32" => "synthetic-f32",
         "synthetic-f16" => "synthetic-f16",
+        SYNTHETIC_MOE => SYNTHETIC_MOE,
         _ => {
             MODELS
                 .iter()
@@ -242,12 +263,14 @@ pub fn forced_reference(model: &SeamModel, prompt: &[u32], n: usize) -> ForcedLo
             prompt,
             n,
             PrefillHead::All,
+            None,
             |_, row| argmax(row),
         )
         .expect("cpu reference run")
 }
 
-/// `reference`'s tokens forced through `on`, its engine configuration adjusted by `edit`.
+/// `reference`'s tokens, and on a routed-expert model its expert selections, forced through
+/// `on`, its engine configuration adjusted by `edit`.
 pub fn forced(
     model: &SeamModel,
     on: ForcedOn,
@@ -265,10 +288,23 @@ pub fn forced_with(
     head: PrefillHead,
     reference: &ForcedLogits,
 ) -> ForcedLogits {
+    forced_along(model, on, edit, head, reference, reference.routing.as_ref())
+}
+
+/// [`forced_with`] along `reference`'s tokens and the expert selections `route` holds (`None`:
+/// every router's own).
+pub fn forced_along(
+    model: &SeamModel,
+    on: ForcedOn,
+    edit: impl FnOnce(&mut EngineConfig),
+    head: PrefillHead,
+    reference: &ForcedLogits,
+    route: Option<&Routing>,
+) -> ForcedLogits {
     let steps = reference.positions.len() - reference.prefill_rows;
     let p = reference.seq.len() - steps;
     let got = model
-        .forced_logits(on, edit, &reference.seq[..p], steps, head, |s, _| {
+        .forced_logits(on, edit, &reference.seq[..p], steps, head, route, |s, _| {
             reference.seq[p + s]
         })
         .unwrap_or_else(|e| panic!("forced run on {on:?}: {e:#}"));
@@ -543,7 +579,11 @@ pub const DIAGNOSIS_CONFIGS: &[GpuConfig] = &[
 /// prompt and the rest forced, so the same positions are scored with the prefill-to-decode
 /// boundary elsewhere; the forced run refuses a prompt shorter than its batched prefill needs (the
 /// check at the top of `seam::forced_run`). `INFR_TOL_ROWS` adds a [`rows_line`] per comparison and
-/// the kernels the run built.
+/// the kernels the run built. On a routed-expert model every run is forced along the reference's
+/// expert selections and a [`route_line`] per comparison gives its own; `INFR_TOL_OWN_ROUTING`
+/// leaves the Vulkan runs on their own routers' selections instead, the comparison a router near
+/// tie throws off (`docs/gpu-tolerance.md`), for telling a routing difference from an arithmetic
+/// one.
 pub fn measure(key: &str) {
     let Some(case) = open_case(key) else {
         eprintln!("skip: {key} not in the HF cache");
@@ -570,6 +610,7 @@ pub fn measure(key: &str) {
     });
     let split = env_usize("INFR_TOL_SPLIT");
     let rows = std::env::var_os("INFR_TOL_ROWS").is_some();
+    let own_routing = std::env::var_os("INFR_TOL_OWN_ROUTING").is_some();
     let model = &case.model;
     for (pi, ids) in case.prompts.iter().enumerate() {
         if prompts.as_ref().is_some_and(|p| !p.contains(&pi)) {
@@ -590,6 +631,7 @@ pub fn measure(key: &str) {
                     &seq[..p],
                     seq.len() - p,
                     PrefillHead::All,
+                    None,
                     |s, _| seq[p + s],
                 )
                 .expect("cpu reference run at the moved prompt end");
@@ -603,6 +645,9 @@ pub fn measure(key: &str) {
             "{}",
             line(&tag("pair=cpuprod-ref"), &score(&r, &prod, 0.0, 0.0))
         );
+        if let Some(l) = route_line(&tag("pair=cpuprod-ref"), &r, &prod) {
+            println!("{l}");
+        }
         let named = |name: &str| only.as_ref().is_some_and(|o| o.iter().any(|n| n == name));
         let diagnosis = DIAGNOSIS_CONFIGS.iter().filter(|c| named(c.0));
         let gated = GPU_CONFIGS.iter().filter(|c| only.is_none() || named(c.0));
@@ -612,7 +657,7 @@ pub fn measure(key: &str) {
                 Some((k, v)) => forced(model, ForcedOn::CpuReference, |c| kv_types(c, k, v), &r),
             };
             let t0 = std::time::Instant::now();
-            let g = forced_with(
+            let g = forced_along(
                 model,
                 ForcedOn::Vulkan,
                 |c| {
@@ -627,6 +672,7 @@ pub fn measure(key: &str) {
                 },
                 head,
                 &r,
+                r.routing.as_ref().filter(|_| !own_routing),
             );
             let t_gpu = t0.elapsed();
             println!(
@@ -643,6 +689,9 @@ pub fn measure(key: &str) {
                     &score(&prod, &g, 0.0, 0.0)
                 )
             );
+            if let Some(l) = route_line(&tag(&format!("pair={name}-ref")), &r, &g) {
+                println!("{l}");
+            }
             if rows {
                 println!(
                     "{}",
@@ -700,6 +749,11 @@ pub fn watchdog(what: &str, limit: std::time::Duration) -> Watchdog {
         }
     });
     Watchdog(Some(tx))
+}
+
+/// The config edit of the [`GPU_CONFIGS`] entry named `name`.
+pub fn gpu_config_edit(name: &str) -> fn(&mut EngineConfig) {
+    gpu_config(name).1
 }
 
 /// The [`GPU_CONFIGS`] entry named `name`.
@@ -791,7 +845,17 @@ pub fn gate(key: &str, runs: &[(&str, PathClass)]) {
         return;
     };
     let t_case = std::time::Instant::now();
-    let failures = evaluate(key, &case, &case, ForcedOn::Vulkan, runs);
+    let reference = Reference::new(&case);
+    let mut failures = evaluate_with(
+        key,
+        table_name(key),
+        &reference,
+        &case,
+        ForcedOn::Vulkan,
+        runs,
+        |_, _, _, _| {},
+    );
+    reference.check_prefill(key, &mut failures);
     eprintln!(
         "time {key}: {:.1}s on {device}",
         t_case.elapsed().as_secs_f64()
@@ -842,11 +906,52 @@ impl<'a> Reference<'a> {
             .collect();
         Self { case, runs }
     }
+
+    /// Hold the reference's prefill rows to what the case says of its model, adding to
+    /// `failures`. A case marked as having no batched prefill ([`Case::batched_prefill`]) must
+    /// have produced no prefill row on any prompt; [`evaluate_with`]'s count of scored prefill
+    /// rows then reports zero of zero, which says nothing about the run, and that one failure is
+    /// dropped, with a printed line (the decode rows are scored, and a routed model's routing at
+    /// every position). Any other case must have prefill rows on every prompt: a model that
+    /// lost its batched prefill fails here by name.
+    pub fn check_prefill(&self, label: &str, failures: &mut Vec<String>) {
+        let without: Vec<usize> = (0..self.runs.len())
+            .filter(|&pi| self.runs[pi].prefill_rows == 0)
+            .collect();
+        if self.case.batched_prefill {
+            if !without.is_empty() {
+                failures.push(format!(
+                    "{label}: the reference took no batched prefill on prompts {without:?}, and \
+                     the case is not one marked as having none"
+                ));
+            }
+            return;
+        }
+        if without.len() != self.runs.len() {
+            failures.push(format!(
+                "{label}: the case is marked as having no batched prefill, and the reference \
+                 took one on {} of its {} prompts",
+                self.runs.len() - without.len(),
+                self.runs.len()
+            ));
+            return;
+        }
+        eprintln!(
+            "{label}: the model takes no batched prefill; its decode rows are scored, and a \
+             routed model's routing at every position"
+        );
+        failures.retain(|f| !f.contains(" prefill: only 0 of 0 positions"));
+    }
 }
 
 /// [`evaluate`] against a [`Reference`] computed once, scored against the table's entry for
 /// `table` (a model's [`table_name`]), with `seen(prompt, run name, run, score)` called after each
 /// run: the score is `None` when a row could not be scored, which is then a failure naming it.
+///
+/// A routed-expert model is forced along the reference's expert selections too, and its own
+/// selections are held to the entry's `route_near_tie` at every position and layer; over a case,
+/// at least [`MIN_TOP1_SCORED`] of the reference's selections must clear that margin. A row
+/// with a routing near tie and a run without a routing, or the reverse, is a failure.
 pub fn evaluate_with(
     key: &str,
     table: &str,
@@ -859,6 +964,8 @@ pub fn evaluate_with(
     let mut failures = Vec::new();
     // Per run, the steady phases merged over every prompt, for the top-1 count.
     let mut merged: Vec<[Option<RunScore>; 2]> = vec![[None, None]; runs.len()];
+    // Per run, the routing comparison merged over every prompt.
+    let mut routed: Vec<Option<RouteScore>> = vec![None; runs.len()];
     for (pi, (ids, r)) in reference
         .case
         .prompts
@@ -879,6 +986,30 @@ pub fn evaluate_with(
                 ),
             };
             let g = forced_with(&test.model, on, edit, PrefillHead::All, r);
+            match (entry.route_near_tie, g.routing.is_some()) {
+                (Some(near), true) => {
+                    let rs = score_routing(r, &g, near).expect("both runs carry a routing");
+                    println!(
+                        "{key} {name} ({class:?}) prompt {pi} ({} tokens):\n{}",
+                        ids.len(),
+                        rs.report()
+                    );
+                    for v in rs.violations() {
+                        failures.push(format!("{name} prompt {pi} routing: {v}"));
+                    }
+                    match &mut routed[ri] {
+                        Some(m) => m.merge(&rs),
+                        slot => *slot = Some(rs),
+                    }
+                }
+                (None, false) => {}
+                (near, _) => failures.push(format!(
+                    "{name} prompt {pi} routing: the {table} {class:?} row has {} routing near \
+                     tie and the run has {} routing",
+                    if near.is_some() { "a" } else { "no" },
+                    if near.is_some() { "no" } else { "a" },
+                )),
+            }
             let s = match try_score(
                 &reference_run,
                 &g,
@@ -917,6 +1048,15 @@ pub fn evaluate_with(
                     None => *slot = Some(ps.clone()),
                 }
             }
+        }
+    }
+    for (&(name, _), rs) in runs.iter().zip(&routed) {
+        if let Some(rs) = rs.as_ref().filter(|rs| rs.scored < MIN_TOP1_SCORED) {
+            failures.push(format!(
+                "{name} routing: only {} of {} selections clear the {:.3e} near tie (at least \
+                 {MIN_TOP1_SCORED} needed, or the routing check is vacuous)",
+                rs.scored, rs.calls, rs.near_tie
+            ));
         }
     }
     for (&(name, _), m) in runs.iter().zip(&merged) {
@@ -1068,6 +1208,7 @@ pub fn self_check_on_a_synthetic_llama() {
             &r.seq[..prompt.len() + 4],
             n - 4,
             PrefillHead::All,
+            None,
             |s, _| r.seq[prompt.len() + 4 + s],
         )
         .expect("longer prompt");

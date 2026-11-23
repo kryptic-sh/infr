@@ -5,7 +5,8 @@
 //! Graph bugs are planted with `SeamModel::plant`; weight bugs are written into a copy of the
 //! model file ([`patch`]). A clean control runs first, twice: it must pass the gate, and its two
 //! runs must agree bit for bit, so a planted run that differs from it differs because of the bug.
-//! Every planted run must differ from the clean one on every decode row set it scores (the bug
+//! Every planted run must differ from the clean one in the decode part of every prompt (its
+//! logit rows, and on a routed-expert model the experts its own routers selected there: the bug
 //! reached decode); where the gate must catch the bug, the run must fail it, naming a metric;
 //! where the doc records that it misses, the measured distance is printed and nothing more is
 //! asserted, so a tighter table later cannot break the test.
@@ -16,7 +17,7 @@ use super::forced::{self, Case, Reference, Scored};
 use infr_llama::mutation::Planted;
 use infr_llama::seam::{ForcedLogits, ForcedOn};
 use infr_llama::tolerance::{tolerance, PathClass};
-use infr_testkit::gguf::{Fill, Meta, SyntheticModel, TempGguf, TensorSpec};
+use infr_testkit::gguf::{Fill, TempGguf};
 use patch::Patch;
 use PathClass::{Float, FloatNoCoopmat, Int8};
 
@@ -82,14 +83,14 @@ impl Bug {
                 Bug::RmsEpsScaled | Bug::FfnDownScaled | Bug::FfnDownBlockScaled
             )
         } else {
-            self == Bug::FfnDownBlockScaled
+            self == Bug::FfnDownBlockScaled || t.fine_misses.contains(&self)
         }
     }
 }
 
 /// A model to plant bugs in and where they go.
 struct Target {
-    /// A `forced::MODELS` key, or `synthetic-f32` / [`SYNTHETIC_MOE`].
+    /// A `forced::MODELS` key, or `synthetic-f32` / [`forced::SYNTHETIC_MOE`].
     key: &'static str,
     /// The tolerance table's row the model is scored against.
     table: &'static str,
@@ -105,8 +106,16 @@ struct Target {
     neox: bool,
     /// The model's vocabulary spells nothing; it is prompted with ids.
     synthetic: bool,
+    /// `forced::Case::batched_prefill`: `false` for the one model here with no batched prefill.
+    batched_prefill: bool,
     /// The classes, besides Int8, whose row for this model the table labels a smoke check.
     smoke: &'static [PathClass],
+    /// The two FFN projections [`Bug::GateUpSwapped`] swaps in every layer, by their names in
+    /// the block.
+    gate_up: (&'static str, &'static str),
+    /// The bugs this model's fine rows are on record as missing, besides the single mis-scaled
+    /// block every row misses.
+    fine_misses: &'static [Bug],
 }
 
 const QWEN3: Target = Target {
@@ -117,7 +126,10 @@ const QWEN3: Target = Target {
     resid_layer: 14,
     neox: true,
     synthetic: false,
+    batched_prefill: true,
     smoke: &[],
+    gate_up: ("ffn_gate", "ffn_up"),
+    fine_misses: &[],
 };
 
 /// gemma-3-1b: the fused per-head norm and rope of Qwen3 (so the same pairing), and a Q4_K_M file
@@ -136,7 +148,10 @@ const GEMMA3: Target = Target {
     resid_layer: 13,
     neox: true,
     synthetic: false,
+    batched_prefill: true,
     smoke: &[Float],
+    gate_up: ("ffn_gate", "ffn_up"),
+    fine_misses: &[],
 };
 
 const ERNIE_F16: Target = Target {
@@ -147,7 +162,10 @@ const ERNIE_F16: Target = Target {
     resid_layer: 9,
     neox: false,
     synthetic: false,
+    batched_prefill: true,
     smoke: &[],
+    gate_up: ("ffn_gate", "ffn_up"),
+    fine_misses: &[],
 };
 
 const SYNTHETIC: Target = Target {
@@ -158,107 +176,30 @@ const SYNTHETIC: Target = Target {
     resid_layer: 1,
     neox: false,
     synthetic: true,
+    batched_prefill: true,
     smoke: &[],
+    gate_up: ("ffn_gate", "ffn_up"),
+    fine_misses: &[],
 };
 
-/// The synthetic MoE's key. It has no table row of its own: it is held to the synthetic f32
-/// llama's Float row, whose arithmetic (f32 weights, f16 KV) it shares. Its clean control passes
-/// that row on the CPU reference (a distance of 0) and not on the RX 7900 XTX, so only the CPU
-/// demonstration is gated ([`Verdicts`]).
-const SYNTHETIC_MOE: &str = "synthetic-ernie-moe";
-
+/// The synthetic routed-expert model, held to its own row: forced along the reference's expert
+/// selections, with its own selections held to the row's routing near tie. Its weight bugs go
+/// into the routed expert banks. A 1% scale of one layer's whole down bank is on record as
+/// missed: the shared expert beside it is not scaled, and the run stays inside the row
+/// (`docs/gpu-tolerance.md`, "Mutations").
 const MOE: Target = Target {
-    key: SYNTHETIC_MOE,
-    table: "synthetic-f32",
+    key: forced::SYNTHETIC_MOE,
+    table: forced::SYNTHETIC_MOE,
     ffn_layer: 1,
-    ffn_last: "ffn_down",
+    ffn_last: "ffn_down_exps",
     resid_layer: 1,
     neox: false,
     synthetic: true,
+    batched_prefill: false,
     smoke: &[],
+    gate_up: ("ffn_gate_exps", "ffn_up_exps"),
+    fine_misses: &[Bug::FfnDownScaled],
 };
-
-/// Experts of the synthetic MoE, how many each token uses, and their width.
-const MOE_EXPERTS: usize = 8;
-const MOE_USED: usize = 2;
-const MOE_FF: usize = 128;
-/// The router bias's amplitude: on the order of the gaps between the router's expert
-/// probabilities, so it changes which experts some tokens pick.
-const MOE_BIAS_AMP: f32 = 0.2;
-
-/// [`forced::synthetic_llama`] as an `ernie4_5-moe`: every layer's FFN replaced by a softmax
-/// router over [`MOE_EXPERTS`] f32 experts with a selection bias (`exp_probs_b.bias`) and an
-/// ungated shared expert, the layout of ERNIE-4.5-21B-A3B (B174's model) at toy size.
-fn synthetic_moe() -> SyntheticModel {
-    const ARCH: &str = "ernie4_5-moe";
-    let llama = forced::synthetic_llama(Fill::Rand(0.0));
-    let ne = llama
-        .tensors
-        .iter()
-        .find(|t| t.name == "token_embd.weight")
-        .expect("token_embd")
-        .shape[0];
-    let mut meta: Vec<(String, Meta)> = llama
-        .meta
-        .into_iter()
-        .map(|(k, v)| match k.strip_prefix("llama.") {
-            Some(rest) => (format!("{ARCH}.{rest}"), v),
-            None if k == "general.architecture" => (k, Meta::Str(ARCH.to_string())),
-            None => (k, v),
-        })
-        .collect();
-    let n_layer = meta
-        .iter()
-        .find_map(|(k, v)| match v {
-            Meta::U32(n) if k == &format!("{ARCH}.block_count") => Some(*n as usize),
-            _ => None,
-        })
-        .expect("block_count");
-    for (k, v) in [
-        ("expert_count", MOE_EXPERTS),
-        ("expert_used_count", MOE_USED),
-        ("expert_feed_forward_length", MOE_FF),
-        ("expert_shared_feed_forward_length", MOE_FF),
-        ("leading_dense_block_count", 0),
-        ("interleave_moe_layer_step", 1),
-    ] {
-        meta.push((format!("{ARCH}.{k}"), Meta::U32(v as u32)));
-    }
-    let mut tensors: Vec<TensorSpec> = llama
-        .tensors
-        .into_iter()
-        .filter(|t| {
-            !["ffn_gate.", "ffn_up.", "ffn_down."]
-                .iter()
-                .any(|f| t.name.contains(f))
-        })
-        .collect();
-    for l in 0..n_layer {
-        let p = |s: &str| format!("blk.{l}.{s}");
-        let r = |name: String, shape: Vec<usize>, amp: f32| {
-            TensorSpec::new(name, shape, Fill::Rand(amp))
-        };
-        tensors.extend([
-            r(p("ffn_gate_inp.weight"), vec![ne, MOE_EXPERTS], 0.3),
-            r(
-                p("ffn_gate_exps.weight"),
-                vec![ne, MOE_FF, MOE_EXPERTS],
-                0.2,
-            ),
-            r(p("ffn_up_exps.weight"), vec![ne, MOE_FF, MOE_EXPERTS], 0.2),
-            r(
-                p("ffn_down_exps.weight"),
-                vec![MOE_FF, ne, MOE_EXPERTS],
-                0.1,
-            ),
-            r(p("ffn_gate_shexp.weight"), vec![ne, MOE_FF], 0.2),
-            r(p("ffn_up_shexp.weight"), vec![ne, MOE_FF], 0.2),
-            r(p("ffn_down_shexp.weight"), vec![MOE_FF, ne], 0.1),
-            r(p("exp_probs_b.bias"), vec![MOE_EXPERTS], MOE_BIAS_AMP),
-        ]);
-    }
-    SyntheticModel { meta, tensors }
-}
 
 /// The synthetic models' files, written for the test that opens them.
 fn synthetic_file(key: &str) -> TempGguf {
@@ -266,7 +207,7 @@ fn synthetic_file(key: &str) -> TempGguf {
         "synthetic-f32" => {
             TempGguf::write("planted-src", &forced::synthetic_llama(Fill::Rand(0.0)))
         }
-        SYNTHETIC_MOE => TempGguf::write("planted-src-moe", &synthetic_moe()),
+        forced::SYNTHETIC_MOE => TempGguf::write("planted-src-moe", &forced::synthetic_moe()),
         _ => panic!("{key} is not synthetic"),
     }
 }
@@ -274,7 +215,11 @@ fn synthetic_file(key: &str) -> TempGguf {
 /// The clean model of `t`, or `None` (printed) when it is not downloaded.
 fn open_clean(t: &Target) -> Option<Case> {
     if t.synthetic {
-        Some(forced::open_file(synthetic_file(t.key), true))
+        Some(forced::open_file(
+            synthetic_file(t.key),
+            true,
+            t.batched_prefill,
+        ))
     } else {
         forced::open_or_skip(t.key)
     }
@@ -305,8 +250,8 @@ fn open_planted(t: &Target, bug: Bug) -> Case {
         Bug::GateUpSwapped => {
             for l in 0..n_layer {
                 p.swap(
-                    &format!("blk.{l}.ffn_gate.weight"),
-                    &format!("blk.{l}.ffn_up.weight"),
+                    &format!("blk.{l}.{}.weight", t.gate_up.0),
+                    &format!("blk.{l}.{}.weight", t.gate_up.1),
                 );
             }
         }
@@ -343,14 +288,15 @@ fn open_planted(t: &Target, bug: Bug) -> Case {
     let file = TempGguf::write_copy(dir, &format!("planted-{}-{bug:?}", t.key), &p.bytes);
     drop(p);
     drop(synth);
-    let mut case = forced::open_file(file, t.synthetic);
+    let mut case = forced::open_file(file, t.synthetic, t.batched_prefill);
     if let Some(planted) = bug.planted(t) {
         case.model.plant(planted);
     }
     case
 }
 
-/// One run of one prompt: the digests of its prefill rows and of its decode rows.
+/// One run of one prompt: the digests of what it computed before its first decode row and from
+/// it on ([`digests`]).
 type Digests = std::collections::BTreeMap<(usize, String), (u64, u64)>;
 
 /// What one evaluation measured: the gate's failures, each run's worst steady-phase KL and mean KL
@@ -361,9 +307,25 @@ struct Outcome {
     digests: Digests,
 }
 
-/// The digest of a run of logits, over their bit patterns.
-fn digest(xs: &[f32]) -> u64 {
-    infr_testkit::gguf::fnv1a64(bytemuck::cast_slice(xs))
+/// The digests of a run's prefill part and of its decode part: the logit rows' bit patterns, and
+/// on a routed-expert model the experts its own routers selected at those positions. The run is
+/// forced along the reference's selections, so a bug that only changes which experts a router
+/// picks changes no logit; it shows in the selections.
+fn digests(g: &ForcedLogits) -> (u64, u64) {
+    let split = g.prefill_rows * g.vocab;
+    let mut parts = [
+        bytemuck::cast_slice::<f32, u8>(&g.logits[..split]).to_vec(),
+        bytemuck::cast_slice::<f32, u8>(&g.logits[split..]).to_vec(),
+    ];
+    if let Some(r) = &g.routing {
+        // The first decode row's position: the selections before it belong to the prompt.
+        let per_pos = r.layers.len() * r.n_used;
+        let (prompt, decode) = r.ids.split_at(g.positions[g.prefill_rows] * per_pos);
+        parts[0].extend_from_slice(bytemuck::cast_slice(prompt));
+        parts[1].extend_from_slice(bytemuck::cast_slice(decode));
+    }
+    let [prefill, decode] = parts.map(|p| infr_testkit::gguf::fnv1a64(&p));
+    (prefill, decode)
 }
 
 /// Score `test`'s `runs` on `on` against `reference` with the gate, for the table row `table`.
@@ -379,11 +341,7 @@ fn run_case(
     let mut ratios = std::collections::BTreeMap::new();
     let mut digests = Digests::new();
     let mut seen = |pi: usize, name: &str, g: &ForcedLogits, s: Option<&Scored>| {
-        let split = g.prefill_rows * g.vocab;
-        digests.insert(
-            (pi, name.to_string()),
-            (digest(&g.logits[..split]), digest(&g.logits[split..])),
-        );
+        digests.insert((pi, name.to_string()), self::digests(g));
         let class = runs.iter().find(|r| r.0 == name).expect("a named run").1;
         let bound = tolerance(table, class).steady;
         let r: &mut (f64, f64) = ratios.entry(name.to_string()).or_default();
@@ -401,13 +359,7 @@ fn run_case(
         }
     };
     let mut failures = forced::evaluate_with(label, table, reference, test, on, runs, &mut seen);
-    // A model whose prompt takes no batched prefill (the synthetic MoE) has no prefill rows in
-    // the reference either; the gate's count of scored prefill rows then reports zero of zero,
-    // which says nothing about the run. Only its decode is scored.
-    if reference.runs.iter().all(|r| r.prefill_rows == 0) {
-        eprintln!("{label}: the model takes no batched prefill; its decode rows alone are scored");
-        failures.retain(|f| !f.contains(" prefill: only 0 of 0 positions"));
-    }
+    reference.check_prefill(label, &mut failures);
     Outcome {
         failures,
         ratios,
@@ -426,26 +378,9 @@ fn metric_failures<'a>(o: &'a Outcome, run: &str) -> Vec<&'a str> {
         .collect()
 }
 
-/// Whether a demonstration holds the gate's verdicts to what the doc records, or only measures.
-#[derive(Clone, Copy, PartialEq)]
-enum Verdicts {
-    /// The clean control must pass the gate, and every bug not recorded as missed must fail it.
-    Gated,
-    /// The table has no row that fits the model (the synthetic MoE on a GPU, held to a borrowed
-    /// row its clean run does not meet): every distance is printed, and only that the bug reached
-    /// decode is asserted.
-    Measured,
-}
-
 /// Plant each of `bugs` in `t`'s model in turn, drive it on `on` with `runs`, and check what the
 /// gate does (see the module doc). Prints one `PLANTED` line per bug and run, the doc's table.
-fn demonstrate(
-    t: &Target,
-    on: ForcedOn,
-    runs: &[(&str, PathClass)],
-    bugs: &[Bug],
-    verdicts: Verdicts,
-) {
+fn demonstrate(t: &Target, on: ForcedOn, runs: &[(&str, PathClass)], bugs: &[Bug]) {
     let Some(clean) = open_clean(t) else {
         return;
     };
@@ -467,17 +402,8 @@ fn demonstrate(
         on,
         runs,
     );
-    if verdicts == Verdicts::Measured && !control.failures.is_empty() {
-        println!(
-            "PLANTED model={} device={device} the clean control is outside the {} row, so the \
-             gate's verdicts are not asserted:\n  {}",
-            t.key,
-            t.table,
-            control.failures.join("\n  ")
-        );
-    }
     assert!(
-        verdicts == Verdicts::Measured || control.failures.is_empty(),
+        control.failures.is_empty(),
         "the clean {} fails the gate on {device}, so no planted bug can be measured against it:\n  {}",
         t.key,
         control.failures.join("\n  ")
@@ -528,7 +454,7 @@ fn demonstrate(
                     bug.label()
                 ));
             }
-            if verdicts == Verdicts::Gated && caught.is_empty() && !bug.may_miss(t, class) {
+            if caught.is_empty() && !bug.may_miss(t, class) {
                 wrong.push(format!(
                     "{} on {run} ({class:?}) passed the gate: KL {kl:.3}x and mean KL {mean:.3}x \
                      its bound",
@@ -544,6 +470,14 @@ fn demonstrate(
     );
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
+
+/// The bugs the synthetic routed-expert model takes: one in what its routers select, and a fine
+/// and a gross one in what its routed experts compute.
+const MOE_BUGS: &[Bug] = &[
+    Bug::RouterIgnoresBias,
+    Bug::FfnDownScaled,
+    Bug::GateUpSwapped,
+];
 
 /// The bugs every dense model takes.
 const DENSE_BUGS: &[Bug] = &[
@@ -563,20 +497,8 @@ const DENSE_BUGS: &[Bug] = &[
 #[test]
 fn planted_bugs_fail_the_gate_on_the_cpu() {
     let runs = &[("gpu", Float)];
-    demonstrate(
-        &SYNTHETIC,
-        ForcedOn::CpuReference,
-        runs,
-        DENSE_BUGS,
-        Verdicts::Gated,
-    );
-    demonstrate(
-        &MOE,
-        ForcedOn::CpuReference,
-        runs,
-        &[Bug::RouterIgnoresBias],
-        Verdicts::Gated,
-    );
+    demonstrate(&SYNTHETIC, ForcedOn::CpuReference, runs, DENSE_BUGS);
+    demonstrate(&MOE, ForcedOn::CpuReference, runs, MOE_BUGS);
 }
 
 /// Qwen3-0.6B Q4_K_M, the shipped int8 kernels and the int8-free ones.
@@ -590,7 +512,6 @@ fn gpu_planted_qwen3() {
         ForcedOn::Vulkan,
         &[("gpu", Int8), ("gpu-float", Float)],
         &bugs,
-        Verdicts::Gated,
     );
 }
 
@@ -607,7 +528,6 @@ fn planted_gemma3_bugs_fail_the_fine_row_on_the_cpu() {
         ForcedOn::CpuReference,
         &[("gpu", FloatNoCoopmat)],
         &bugs,
-        Verdicts::Gated,
     );
 }
 
@@ -627,7 +547,6 @@ fn gpu_planted_gemma3() {
             ("gpu-float-nocoopmat", FloatNoCoopmat),
         ],
         &bugs,
-        Verdicts::Gated,
     );
 }
 
@@ -635,27 +554,15 @@ fn gpu_planted_gemma3() {
 #[test]
 #[ignore = "needs ERNIE-4.5-0.3B F16 and a Vulkan GPU"]
 fn gpu_planted_ernie_f16() {
-    demonstrate(
-        &ERNIE_F16,
-        ForcedOn::Vulkan,
-        &[("gpu", Float)],
-        DENSE_BUGS,
-        Verdicts::Gated,
-    );
+    demonstrate(&ERNIE_F16, ForcedOn::Vulkan, &[("gpu", Float)], DENSE_BUGS);
 }
 
-/// The router bias B174 found ignored, on a synthetic ERNIE-4.5 MoE (the real 21B model is not
-/// cached here). A measurement: the table has no MoE row, and the clean run on the RX 7900 XTX
-/// (RADV) lands outside the synthetic f32 llama's row it borrows, so the gate's verdict means
-/// nothing here; that the bug reaches decode is asserted, and both distances are printed.
+/// The routed-expert bugs on the synthetic ERNIE-4.5 MoE, against its own row: the router bias
+/// B174 found ignored, which the routing comparison must catch (the run is forced along the
+/// reference's selections, so the bug moves no logit), and two bugs in the routed expert banks,
+/// which only the rows can.
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn gpu_planted_router_bias() {
-    demonstrate(
-        &MOE,
-        ForcedOn::Vulkan,
-        &[("gpu", Float)],
-        &[Bug::RouterIgnoresBias],
-        Verdicts::Measured,
-    );
+    demonstrate(&MOE, ForcedOn::Vulkan, &[("gpu", Float)], MOE_BUGS);
 }

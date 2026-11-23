@@ -1389,6 +1389,31 @@ fn moe(name: &str, dt: DType, rows: usize, gating: MoeGating, variant: u8) -> Ca
     })
 }
 
+/// The router's selection alone, for `rows` tokens over `n_expert` experts: the ids, and with
+/// `biased` the selection bias, group-limited routing and the scores the experts were ranked by.
+fn moe_route(name: &str, rows: usize, gating: MoeGating, biased: bool) -> Case {
+    let (ne, n_expert, n_used) = (256usize, 8usize, 3usize);
+    let mut c = Case::new(format!("MoeRoute {name} rows {rows}"));
+    let x = c.input_f32(vec![rows, ne], 120);
+    let router = c.weight_f32(vec![n_expert, ne], 121);
+    let exp_probs_b = biased.then(|| c.weight_f32(vec![n_expert], 125));
+    let dst_ids = c.output(vec![rows, n_used], DType::F32);
+    let dst_scores = biased.then(|| c.output(vec![rows, n_expert], DType::F32));
+    c.push(Op::MoeRoute {
+        router_x: x,
+        router,
+        exp_probs_b,
+        dst_ids,
+        dst_scores,
+        ne: ne as u32,
+        n_expert: n_expert as u32,
+        n_used: n_used as u32,
+        gating,
+        n_expert_groups: if biased { 4 } else { 0 },
+        n_expert_groups_used: if biased { 2 } else { 0 },
+    })
+}
+
 /// [`moe`] on [`spiky_row`] activations (one block a row, row `r` taking pattern `r + 1`, so the
 /// one-row case has a spike), through the expert banks' `Q8` route.
 fn moe_spiky(dt: DType, rows: usize) -> Case {
@@ -1415,6 +1440,8 @@ fn moe_cases() -> Vec<Case> {
         2,
     ));
     v.push(moe("weight before", DType::Q4K, 5, MoeGating::Sigmoid, 3));
+    v.push(moe_route("softmax", 9, MoeGating::Softmax, false));
+    v.push(moe_route("grouped biased", 5, MoeGating::Sigmoid, true));
     v.push(moe_spiky(DType::Q4K, 1));
     v.push(moe_spiky(DType::Q4K, 9));
     v.push(moe_spiky(DType::Q6K, 9));
@@ -1477,6 +1504,7 @@ fn op_name(op: &Op) -> &'static str {
         Op::Copy { .. } => "Copy",
         Op::CopyStrided { .. } => "CopyStrided",
         Op::MoeFfn { .. } => "MoeFfn",
+        Op::MoeRoute { .. } => "MoeRoute",
         Op::Conv1dSilu { .. } => "Conv1dSilu",
         Op::ShortConv { .. } => "ShortConv",
         Op::HeadGate { .. } => "HeadGate",
@@ -1487,7 +1515,7 @@ fn op_name(op: &Op) -> &'static str {
 
 /// The number of `Op` variants [`op_name`] names (keep in step with it: a variant named there
 /// but not counted here fails [`every_op_variant_has_a_case`]).
-const OP_VARIANTS: usize = 39;
+const OP_VARIANTS: usize = 40;
 
 #[test]
 fn every_op_variant_has_a_case() {
@@ -1668,6 +1696,8 @@ const EXPECTED: &[(&str, u64)] = &[
     ("MoeFfn grouped biased Q4K rows 5", 0x10423bc2d8e420c5),
     ("MoeFfn hash routed Q4K rows 5", 0x187b3a67fc5c9f74),
     ("MoeFfn weight before Q4K rows 5", 0x900aebc15c5f130a),
+    ("MoeRoute softmax rows 9", 0xf53a2f7458baa5a4),
+    ("MoeRoute grouped biased rows 5", 0x5cdbb9b7690ae42f),
     ("Linear spiky Q8_0 m1 2048x20", 0x40f8b4137666ffa0),
     ("Linear spiky Q8_0 m5 2048x20", 0x2cd687dc906069cd),
     ("Linear spiky Q8_0 m19 2048x20", 0x7bd1efa8a4761e11),

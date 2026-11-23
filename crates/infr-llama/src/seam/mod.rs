@@ -20,11 +20,13 @@ use infr_gguf::{Gguf, TensorBytes};
 mod dsv4_emit;
 mod dsv4_plan;
 pub mod model;
+mod routing;
 mod runner;
 mod sc;
 mod weights;
 mod wshape;
 
+pub use routing::Routing;
 pub(crate) use runner::generate_dense_backend;
 pub(crate) use sc::DenoiseReq;
 pub use sc::{DenoiseOutcome, EbReduced};
@@ -673,6 +675,7 @@ pub(crate) fn generate_dense_cpu_mode(
             None, // denoise_req
             req,
             None, // prefill_logits
+            None, // route
         )
     };
     // A cold init that got as far as building `state` left the bound weights in it, whole, even
@@ -4340,6 +4343,10 @@ pub struct ForcedLogits {
     /// The compute kernels the backend built for the run (Vulkan; empty on the CPU), so a test
     /// can assert which kernel families a configuration actually reached.
     pub kernels: Vec<&'static str>,
+    /// What the backend's own routers selected at every position the run fed, whether or not
+    /// the run was forced along another run's selection; `None` for a model with no
+    /// router-selected expert layer.
+    pub routing: Option<Routing>,
 }
 
 /// Drive `prompt` and then `n_steps` forced tokens through `be`, capturing the logits at every
@@ -4360,6 +4367,12 @@ pub struct ForcedLogits {
 ///
 /// A model whose prompt takes no batched prefill (MoE without the batched kernels, gemma-4 E2B)
 /// returns no prefill rows; its prompt positions are not scored.
+///
+/// On a model with router-selected expert layers, every graph also reads back what each such
+/// router selected ([`ForcedLogits::routing`], with the selection scores when `route_scores`),
+/// and with `route` every such layer runs on that selection instead of its own, at every position
+/// (`Op::MoeFfn::expert_ids`): the run is then forced along a reference's routing as well as its
+/// tokens. The selection it reads back is its own either way.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn forced_run(
     be: &dyn Backend,
@@ -4372,8 +4385,21 @@ pub(crate) fn forced_run(
     prompt: &[u32],
     n_steps: usize,
     head: PrefillHead,
+    route: Option<&Routing>,
+    route_scores: bool,
     mut next: impl FnMut(usize, &[f32]) -> u32,
 ) -> AResult<ForcedLogits> {
+    let routed = !routing::router_selected_layers(cfg).is_empty();
+    if route.is_some() && !routed {
+        return Err(anyhow!(
+            "a routing was supplied for a model with no router-selected expert layer"
+        ));
+    }
+    let mut route_tap = routed.then_some(routing::RouteTap {
+        forced: route,
+        scores: route_scores,
+        taken: Vec::new(),
+    });
     if prompt.len() < 4 {
         return Err(anyhow!(
             "a forced run needs a prompt of at least 4 tokens for a batched prefill, got {}",
@@ -4408,6 +4434,7 @@ pub(crate) fn forced_run(
         None,
         None,
         (head != PrefillHead::Off).then_some(&mut tap),
+        route_tap.as_mut(),
     )?;
     let vocab = cfg.vocab;
     let prefill_rows = tap.positions.len();
@@ -4434,7 +4461,8 @@ pub(crate) fn forced_run(
     let mut seq = prompt.to_vec();
     for step in 0..n_steps {
         let mut row = Vec::new();
-        let (_, stats) = runner::generate_dense_backend(
+        let (_, stats) = runner::generate_dense_backend_bound(
+            None,
             be,
             bind_weight,
             g,
@@ -4454,6 +4482,8 @@ pub(crate) fn forced_run(
             None,
             None,
             None,
+            None,
+            route_tap.as_mut(),
         )?;
         if row.len() != vocab {
             return Err(anyhow!(
@@ -4475,6 +4505,17 @@ pub(crate) fn forced_run(
         seq.push(next(step, &row));
         logits.extend_from_slice(&row);
     }
+    // Every token but the last was fed: the last forced token is only a row's choice.
+    let routing = match &route_tap {
+        Some(t) => Some(routing::assemble_routing(
+            routing::router_selected_layers(cfg),
+            cfg.moe.as_ref().expect("a routed model has a MoeConfig"),
+            &t.taken,
+            seq.len() - 1,
+            route_scores,
+        )?),
+        None => None,
+    };
     Ok(ForcedLogits {
         positions,
         logits,
@@ -4482,6 +4523,7 @@ pub(crate) fn forced_run(
         prefill_rows,
         seq,
         kernels: Vec::new(),
+        routing,
     })
 }
 
@@ -4497,6 +4539,7 @@ pub(crate) fn forced_run_cpu(
     prompt: &[u32],
     n_steps: usize,
     head: PrefillHead,
+    route: Option<&Routing>,
     next: impl FnMut(usize, &[f32]) -> u32,
 ) -> AResult<ForcedLogits> {
     let be = if reference {
@@ -4506,7 +4549,7 @@ pub(crate) fn forced_run_cpu(
     };
     let bind = cpu_upload_bind(&be);
     forced_run(
-        &be, &bind, g, cfg, ec, token_embd, ple, prompt, n_steps, head, next,
+        &be, &bind, g, cfg, ec, token_embd, ple, prompt, n_steps, head, route, true, next,
     )
 }
 
@@ -4521,13 +4564,15 @@ pub(crate) fn forced_run_vulkan(
     prompt: &[u32],
     n_steps: usize,
     head: PrefillHead,
+    route: Option<&Routing>,
     next: impl FnMut(usize, &[f32]) -> u32,
 ) -> AResult<ForcedLogits> {
     let vk = infr_vulkan::VulkanBackend::new_with(ec.clone())
         .map_err(|e| anyhow!("vulkan init: {e}"))?;
     let bind = vulkan_upload_bind(&vk);
+    // `moe_topk` writes a selection, not the scores it ranked by (`Op::MoeRoute::dst_scores`).
     let mut out = forced_run(
-        &vk, &bind, g, cfg, ec, token_embd, ple, prompt, n_steps, head, next,
+        &vk, &bind, g, cfg, ec, token_embd, ple, prompt, n_steps, head, route, false, next,
     )?;
     out.kernels = vk.built_kernel_names();
     Ok(out)

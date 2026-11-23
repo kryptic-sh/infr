@@ -1225,6 +1225,37 @@ pub enum Op {
         /// takes, byte-identical to before this field existed.
         expert_ids: Option<TensorId>,
     },
+    /// The selection half of [`Op::MoeFfn`] on its own: the router's top-`n_used` experts for each
+    /// row of `router_x`, written out and nothing run on them. `router_x`, `router`, `ne`,
+    /// `n_expert`, `n_used`, `gating`, `exp_probs_b`, `n_expert_groups` and `n_expert_groups_used`
+    /// mean what they mean there, and a backend must select exactly what its `Op::MoeFfn` would
+    /// with the same operands and no [`Op::MoeFfn::expert_ids`]: the same router kernel, the same
+    /// ranking, the same tie-break.
+    ///
+    /// Its one caller is the teacher-forced tolerance comparison
+    /// (`infr_llama::SeamModel::forced_logits`), which runs each `Op::MoeFfn` on the reference's
+    /// selection (through `expert_ids`) and needs the selection the backend under test would have
+    /// made itself, to compare the two. No generation path emits it.
+    MoeRoute {
+        router_x: TensorId,
+        router: TensorId,
+        /// The selection bias, as [`Op::MoeFfn`]'s `exp_probs_b`.
+        exp_probs_b: Option<TensorId>,
+        /// `[rows, n_used]` selected expert ids, best first, each a u32 bit pattern in an f32
+        /// slot ([`Op::Argmax`]'s carrier, so an `Output` handle reads back as the ids' bytes).
+        dst_ids: TensorId,
+        /// `[rows, n_expert]` f32: the score each expert was ranked by (the gated probability,
+        /// plus the bias, with an expert group that lost set to negative infinity), which gives a
+        /// selection its margin. A backend whose router kernel does not produce the scores
+        /// refuses the op when this is set.
+        dst_scores: Option<TensorId>,
+        ne: u32,
+        n_expert: u32,
+        n_used: u32,
+        gating: MoeGating,
+        n_expert_groups: u32,
+        n_expert_groups_used: u32,
+    },
     /// Depthwise causal 1-D conv over `channels` followed by SiLU (qwen35 gated DeltaNet).
     /// Processes `rows` tokens sequentially, carrying the rolling history in `state` across rows and
     /// leaving it updated after the last row. `x`/`dst` are `[rows, channels]`; `weight` is the
@@ -1356,6 +1387,7 @@ impl Op {
             Op::Copy { .. } => "Copy",
             Op::CopyStrided { .. } => "CopyStrided",
             Op::MoeFfn { .. } => "MoeFfn",
+            Op::MoeRoute { .. } => "MoeRoute",
             Op::Conv1dSilu { .. } => "Conv1dSilu",
             Op::ShortConv { .. } => "ShortConv",
             Op::HeadGate { .. } => "HeadGate",
@@ -1544,6 +1576,20 @@ impl Op {
                 r.extend(exp_probs_b);
                 r.extend(expert_ids);
                 (r, vec![dst])
+            }
+            Op::MoeRoute {
+                router_x,
+                router,
+                exp_probs_b,
+                dst_ids,
+                dst_scores,
+                ..
+            } => {
+                let mut r = vec![router_x, router];
+                r.extend(exp_probs_b);
+                let mut w = vec![dst_ids];
+                w.extend(dst_scores);
+                (r, w)
             }
             Op::Conv1dSilu {
                 x,
@@ -2396,6 +2442,24 @@ mod tests {
                 v.extend(expert_ids);
                 v
             }
+            Op::MoeRoute {
+                router_x,
+                router,
+                exp_probs_b,
+                dst_ids,
+                dst_scores,
+                ne: _,
+                n_expert: _,
+                n_used: _,
+                gating: _,
+                n_expert_groups: _,
+                n_expert_groups_used: _,
+            } => {
+                let mut v = vec![router_x, router, dst_ids];
+                v.extend(exp_probs_b);
+                v.extend(dst_scores);
+                v
+            }
             Op::Conv1dSilu {
                 x,
                 weight,
@@ -2806,6 +2870,19 @@ mod tests {
                 n_expert_groups: 0,
                 n_expert_groups_used: 0,
                 expert_ids: Some(t()),
+            },
+            Op::MoeRoute {
+                router_x: t(),
+                router: t(),
+                exp_probs_b: Some(t()),
+                dst_ids: t(),
+                dst_scores: Some(t()),
+                ne: 0,
+                n_expert: 0,
+                n_used: 0,
+                gating: MoeGating::Softmax,
+                n_expert_groups: 0,
+                n_expert_groups_used: 0,
             },
             Op::Conv1dSilu {
                 x: t(),

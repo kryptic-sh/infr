@@ -129,6 +129,7 @@ fn reference_run(model: &SeamModel, prompt: &[u32], n: usize) -> ForcedLogits {
             prompt,
             n,
             PrefillHead::All,
+            None,
             |_, row| argmax(row),
         )
         .expect("cpu reference run")
@@ -145,6 +146,7 @@ fn forced(model: &SeamModel, on: ForcedOn, reference: &ForcedLogits) -> ForcedLo
             &reference.seq[..p],
             steps,
             PrefillHead::All,
+            reference.routing.as_ref(),
             |s, _| reference.seq[p + s],
         )
         .expect("forced run");

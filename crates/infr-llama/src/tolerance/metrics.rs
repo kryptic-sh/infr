@@ -3,6 +3,7 @@
 //! Every function here is pure and computes in f64 from the two f32 rows, so a score depends on
 //! nothing but the logits it was given.
 
+use crate::seam::Routing;
 use infr_core::math;
 
 /// The share of a row's probability mass its top set holds, for [`RowScore::topk_cos`]: the
@@ -471,12 +472,313 @@ impl RunScore {
     }
 }
 
+/// One (position, layer) where a run's own router selected another set of experts than the
+/// reference's.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RouteFlip {
+    pub pos: usize,
+    pub layer: usize,
+    /// How far the reference's scores would have to move for its router to select the run's
+    /// set: over the experts in exactly one of the two sets, the reference's HIGHEST selection
+    /// score among those it selected and the run did not, less its LOWEST among those the run
+    /// selected and it did not. For one expert swapped for another that is the gap between the
+    /// two; for a difference of several experts it is the widest gap the run's set jumps, so a
+    /// run that drops the reference's clear first choice is not excused by a near tie further
+    /// down. Never negative, at least the reference's margin between its last selected and first
+    /// rejected expert, and infinite when the run selects an expert of a group the reference
+    /// masked out.
+    pub margin: f64,
+}
+
+/// How a run's own expert selections ([`Routing`]) compare with the reference's, over every
+/// position the two runs fed and every router-selected layer. The run is forced along the
+/// reference's selection (`SeamModel::forced_logits`), so each of its routers saw the hidden state
+/// the reference's did up to the backend's rounding, and a selection can differ legitimately only
+/// where the reference scored the experts in question nearly alike: a difference at a margin above
+/// `near_tie` is a router that selects wrongly.
+///
+/// A selection is compared as a set: the order of the selected experts decides only the order
+/// their outputs are summed in, and the forced run sums in the reference's.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RouteScore {
+    /// The reference margin (in selection score, see [`Routing::scores`]) at or below which a
+    /// different selection is a near tie and not counted.
+    pub near_tie: f64,
+    /// (position, layer) pairs compared.
+    pub calls: usize,
+    /// Of `calls`, those where the reference's margin between its last selected and its first
+    /// rejected expert is above `near_tie`: where any other selection would be counted.
+    pub scored: usize,
+    /// Every pair where the selections differ, in order.
+    pub flips: Vec<RouteFlip>,
+    /// Of `flips`, those at a margin above `near_tie`.
+    pub misses: Vec<RouteFlip>,
+    /// The reference's smallest margin between its last selected and first rejected expert.
+    pub narrowest: f64,
+}
+
+impl RouteScore {
+    pub fn new(near_tie: f64) -> Self {
+        RouteScore {
+            near_tie,
+            calls: 0,
+            scored: 0,
+            flips: Vec::new(),
+            misses: Vec::new(),
+            narrowest: f64::INFINITY,
+        }
+    }
+
+    /// Compare `test`'s own selections with `reference`'s, which must carry its selection scores
+    /// (the CPU's do). An error when the two are not selections of the same layers over the same
+    /// positions, a selection names an expert twice, or a score is NaN.
+    pub fn add(&mut self, reference: &Routing, test: &Routing) -> Result<(), String> {
+        if (&reference.layers, reference.n_used, reference.n_expert)
+            != (&test.layers, test.n_used, test.n_expert)
+            || reference.positions() != test.positions()
+        {
+            return Err(format!(
+                "the routings differ in shape: reference layers {:?} over {} positions, test \
+                 layers {:?} over {}",
+                reference.layers,
+                reference.positions(),
+                test.layers,
+                test.positions()
+            ));
+        }
+        for pos in 0..reference.positions() {
+            for &layer in &reference.layers {
+                let at = format!("position {pos}, layer {layer}");
+                let scores = reference
+                    .scores_at(pos, layer)
+                    .ok_or_else(|| format!("the reference has no selection scores at {at}"))?;
+                if scores.iter().any(|s| s.is_nan()) {
+                    return Err(format!("a NaN selection score in the reference at {at}"));
+                }
+                // Each selection as a sorted set. A selection naming an expert twice is not one:
+                // a top-k that failed to mask a pick, or a readback that was never written.
+                let set = |r: &Routing, whose: &str| {
+                    let mut ids = r.ids_at(pos, layer).expect("checked shape").to_vec();
+                    ids.sort_unstable();
+                    match ids.windows(2).find(|w| w[0] == w[1]) {
+                        Some(w) => Err(format!(
+                            "{whose} selection at {at} names expert {} twice",
+                            w[0]
+                        )),
+                        None => Ok(ids),
+                    }
+                };
+                let (want, got) = (set(reference, "the reference's")?, set(test, "the run's")?);
+                let score = |e: &u32| scores[*e as usize] as f64;
+                let last_selected = want.iter().map(score).fold(f64::INFINITY, f64::min);
+                let first_rejected = (0..reference.n_expert as u32)
+                    .filter(|e| !want.contains(e))
+                    .map(|e| score(&e))
+                    .fold(f64::NEG_INFINITY, f64::max);
+                let boundary = last_selected - first_rejected;
+                self.calls += 1;
+                self.narrowest = self.narrowest.min(boundary);
+                if boundary > self.near_tie {
+                    self.scored += 1;
+                }
+                // Whether the two differ is a question about the ids alone: a score (negative
+                // infinity in a masked group) decides only how far apart they are.
+                if want == got {
+                    continue;
+                }
+                let dropped = want.iter().filter(|e| !got.contains(e)).map(score);
+                let taken = got.iter().filter(|e| !want.contains(e)).map(score);
+                // `max(0.0)` also turns the NaN of two masked experts traded for each other
+                // (negative infinity less itself) into the tie it is.
+                let gap =
+                    dropped.fold(f64::NEG_INFINITY, f64::max) - taken.fold(f64::INFINITY, f64::min);
+                let flip = RouteFlip {
+                    pos,
+                    layer,
+                    margin: gap.max(0.0),
+                };
+                self.flips.push(flip);
+                if flip.margin > self.near_tie {
+                    self.misses.push(flip);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Fold another run's score (scored at the same near tie) into this one.
+    pub fn merge(&mut self, o: &RouteScore) {
+        assert_eq!(self.near_tie, o.near_tie, "merging runs scored differently");
+        self.calls += o.calls;
+        self.scored += o.scored;
+        self.flips.extend_from_slice(&o.flips);
+        self.misses.extend_from_slice(&o.misses);
+        self.narrowest = self.narrowest.min(o.narrowest);
+    }
+
+    /// The largest margin at which the run selected differently, counted or not (0 when it never
+    /// did): what a near-tie threshold has to clear.
+    pub fn widest_flip(&self) -> f64 {
+        self.flips.iter().map(|f| f.margin).fold(0.0, f64::max)
+    }
+
+    /// Every selection that differs at a margin above the near tie, described; empty when the
+    /// run's routing passes.
+    pub fn violations(&self) -> Vec<String> {
+        if self.misses.is_empty() {
+            return Vec::new();
+        }
+        let at: Vec<String> = self
+            .misses
+            .iter()
+            .map(|f| format!("{}/{} ({:.3e})", f.pos, f.layer, f.margin))
+            .collect();
+        vec![format!(
+            "the router selects other experts at position/layer (reference margin) {}, each over \
+             the {:.3e} near tie",
+            at.join(", "),
+            self.near_tie
+        )]
+    }
+
+    /// One line for a test log.
+    pub fn report(&self) -> String {
+        format!(
+            "  routing        {} of {} selections differ ({} over the {:.3e} near tie, the widest \
+             at {:.3e}); {} of the reference's clear it, its narrowest at {:.3e}\n",
+            self.flips.len(),
+            self.calls,
+            self.misses.len(),
+            self.near_tie,
+            self.widest_flip(),
+            self.scored,
+            self.narrowest,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn close(a: f64, b: f64, tol: f64) -> bool {
         (a - b).abs() <= tol
+    }
+
+    /// A one-layer routing of two of four experts over the given selections, every position
+    /// scoring the experts `[0.4, 0.3, 0.2, 0.1]`.
+    fn routing(selections: &[[u32; 2]]) -> Routing {
+        Routing {
+            layers: vec![3],
+            n_used: 2,
+            n_expert: 4,
+            ids: selections.iter().flatten().copied().collect(),
+            scores: selections
+                .iter()
+                .flat_map(|_| [0.4f32, 0.3, 0.2, 0.1])
+                .collect(),
+        }
+    }
+
+    /// The same set in another order is the same selection; another set is a flip at the margin
+    /// between the experts the two runs disagree on, counted only above the near tie.
+    #[test]
+    fn route_score_counts_flips_above_the_near_tie() {
+        let reference = routing(&[[0, 1], [0, 1], [0, 1], [0, 1]]);
+        // Position 1 swaps the order; 2 takes expert 2 for 1 (margin 0.1); 3 takes 3 for 0 (0.3).
+        let test = routing(&[[0, 1], [1, 0], [0, 2], [3, 1]]);
+        let mut s = RouteScore::new(0.2);
+        s.add(&reference, &test).unwrap();
+        assert_eq!((s.calls, s.scored), (4, 0), "the boundary margin is 0.1");
+        let flips: Vec<(usize, usize)> = s.flips.iter().map(|f| (f.pos, f.layer)).collect();
+        assert_eq!(flips, [(2, 3), (3, 3)]);
+        assert!(close(s.flips[0].margin, 0.1, 1e-6), "{:?}", s.flips);
+        assert!(close(s.flips[1].margin, 0.3, 1e-6), "{:?}", s.flips);
+        assert!(close(s.narrowest, 0.1, 1e-6) && close(s.widest_flip(), 0.3, 1e-6));
+        assert_eq!(s.misses, [s.flips[1]]);
+        let v = s.violations();
+        assert!(v.len() == 1 && v[0].contains("3/3"), "{v:?}");
+
+        let mut tight = RouteScore::new(0.05);
+        tight.add(&reference, &test).unwrap();
+        assert_eq!((tight.scored, tight.misses.len()), (4, 2));
+        let mut loose = RouteScore::new(0.5);
+        loose.add(&reference, &test).unwrap();
+        assert!(loose.violations().is_empty());
+        let mut same = RouteScore::new(0.0);
+        same.add(&reference, &reference).unwrap();
+        assert!(same.flips.is_empty() && same.violations().is_empty());
+    }
+
+    /// A selection that names an expert twice is refused, on either side: `[0, 0]` holds only
+    /// experts the reference selected, and an all-zero readback is that at every position.
+    #[test]
+    fn route_score_refuses_a_repeated_expert() {
+        let reference = routing(&[[0, 1], [0, 1]]);
+        for bad in [routing(&[[0, 1], [0, 0]]), routing(&[[0, 0], [0, 0]])] {
+            let e = RouteScore::new(0.0).add(&reference, &bad).unwrap_err();
+            assert!(e.contains("names expert 0 twice"), "{e}");
+            assert!(RouteScore::new(0.0).add(&bad, &reference).is_err());
+        }
+    }
+
+    /// Group-limited routing scores every expert of a losing group negative infinity. A run that
+    /// selects only such experts differs from the reference, at an infinite margin: whether two
+    /// selections differ does not depend on the scores.
+    #[test]
+    fn route_score_counts_a_selection_from_a_masked_group() {
+        let masked = |selections: &[[u32; 2]]| Routing {
+            scores: selections
+                .iter()
+                .flat_map(|_| [0.4f32, 0.3, f32::NEG_INFINITY, f32::NEG_INFINITY])
+                .collect(),
+            ..routing(selections)
+        };
+        let (reference, test) = (masked(&[[0, 1], [0, 1]]), masked(&[[0, 1], [2, 3]]));
+        let mut s = RouteScore::new(1e9);
+        s.add(&reference, &test).unwrap();
+        assert_eq!(s.flips.len(), 1, "{:?}", s.flips);
+        assert_eq!((s.flips[0].pos, s.flips[0].margin), (1, f64::INFINITY));
+        assert_eq!(s.misses.len(), 1, "no near tie admits a masked expert");
+    }
+
+    /// A difference of several experts is as wide as the widest gap it jumps: the reference's
+    /// clear first choice dropped for its last is not a near tie because its second and third
+    /// are one.
+    #[test]
+    fn route_flip_margin_is_the_widest_gap_of_a_multi_expert_difference() {
+        let scored = |selection: [u32; 2]| Routing {
+            scores: vec![0.9, 0.11, 0.10, 0.0001],
+            ..routing(&[selection])
+        };
+        let mut s = RouteScore::new(0.05);
+        s.add(&scored([0, 1]), &scored([2, 3])).unwrap();
+        // The pairwise minimum (0.11 against 0.10) would call this a near tie.
+        assert!(
+            close(s.flips[0].margin, 0.9 - 0.0001, 1e-6),
+            "{:?}",
+            s.flips
+        );
+        assert_eq!(s.misses.len(), 1);
+        // One expert swapped for another is the gap between the two, as before.
+        let mut one = RouteScore::new(0.05);
+        one.add(&scored([0, 1]), &scored([0, 2])).unwrap();
+        assert!(close(one.flips[0].margin, 0.01, 1e-6), "{:?}", one.flips);
+        assert!(one.misses.is_empty());
+    }
+
+    /// A reference without scores, or another shape, is an error and not a pass.
+    #[test]
+    fn route_score_refuses_what_it_cannot_compare() {
+        let reference = routing(&[[0, 1], [0, 1]]);
+        let mut unscored = reference.clone();
+        unscored.scores.clear();
+        assert!(RouteScore::new(0.0).add(&unscored, &reference).is_err());
+        assert!(RouteScore::new(0.0)
+            .add(&reference, &routing(&[[0, 1]]))
+            .is_err());
+        // The test side needs none.
+        assert!(RouteScore::new(0.0).add(&reference, &unscored).is_ok());
     }
 
     #[test]

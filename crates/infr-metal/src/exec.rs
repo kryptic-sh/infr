@@ -1546,6 +1546,7 @@ fn op_name(op: &Op) -> &'static str {
         Op::Copy { .. } => "Copy",
         Op::CopyStrided { .. } => "CopyStrided",
         Op::MoeFfn { .. } => "MoeFfn",
+        Op::MoeRoute { .. } => "MoeRoute",
         Op::Conv1dSilu { .. } => "Conv1dSilu",
         Op::ShortConv { .. } => "ShortConv",
         Op::HeadGate { .. } => "HeadGate",
@@ -6300,6 +6301,17 @@ impl MetalBackend {
                 return Err(Error::Unsupported(
                     "Metal Op::GatherI32 (DeepSeek V4 ffn_gate_tid2eid hash routing) not \
                      implemented — Metal's device MoE path refuses V4's sqrt-softplus gating too"
+                        .into(),
+                ));
+            }
+            Op::MoeRoute { .. } => {
+                // The router's selection on its own, which only the teacher-forced tolerance
+                // comparison emits (`SeamModel::forced_logits`); that harness drives the CPU and
+                // Vulkan seams and has no Metal arm. Refused by name, so a Metal arm added there
+                // fails here and not with a silently unwritten selection.
+                return Err(Error::Unsupported(
+                    "Metal Op::MoeRoute (the tolerance comparison's routing readback) not \
+                     implemented"
                         .into(),
                 ));
             }

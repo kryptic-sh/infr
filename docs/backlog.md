@@ -6796,66 +6796,91 @@ values. What it leaves:
 - **What the mutation demonstrations (G3) do not cover.** They are committed
   (`infr-llama`'s `mutations` feature, `tests/planted/`) and ran on both GPUs of
   the Linux machine:
-  - **The router-bias bug is gated on the CPU only.** It runs on a synthetic
-    ERNIE-4.5 MoE (ERNIE-4.5-21B was not cached on the Linux machine when it
-    ran; it is now, and (i) has not been planted in it yet). The table has no
-    MoE row, and the clean synthetic MoE on the GPU lands outside the
-    `synthetic-f32` Float row it borrows, so on the GPU the test only measures.
-    The synthetic MoE also takes no batched prefill, so only its decode rows are
-    scored.
   - **The GPU demonstrations are in no CI job**: they need a GPU. CI runs the
     CPU one (`planted_bugs_fail_the_gate_on_the_cpu`) and clippy with the
     feature, on the Linux legs of the `test` and `clippy` jobs.
   - **Not planted:** a dropped bias (q/k/v bias, Qwen2.5), any bug with the q8
-    KV cache, any bug in an MoE expert kernel, and any model but Qwen3-0.6B,
-    ERNIE-4.5-0.3B F16 and the synthetic ones. Bugs (a) and (b) opt their graphs
-    out of the replayed decode, so the replayed decode never runs with either of
-    them planted; every other bug reaches it.
+    KV cache, any bug in a real MoE model (the synthetic MoE takes the router
+    bias and two in its routed expert banks; its batched and int8 expert kernels
+    never run), and any model but Qwen3-0.6B, gemma-3-1b, ERNIE-4.5-0.3B F16 and
+    the synthetic ones. Bugs (a) and (b) opt their graphs out of the replayed
+    decode, so the replayed decode never runs with either of them planted; every
+    other bug reaches it.
   - **Two catches on the synthetic llama are thin.** In the CPU demonstration
     (c) is caught at a worst KL of 1.19x its bound (and a logit deviation of
     4.43e-3 against 3.9e-3), and (d) only on mean KL, at 1.43x (worst KL 0.73x).
     They are the first to turn into misses if the synthetic model or its row
     changes.
-- **An MoE run may pick another expert at a router near tie, and the table has
-  no rule for it** (2026-11-23; the clean synthetic MoE's outlying row,
-  explained). On both RADV GPUs the clean run's worst KL is at most 1.03e-4 on
-  prompts 0 and 1 and 2.87e-3 on prompt 2 at position 179, the first decode row
-  after the 180-token prompt, the other 31 rows averaging about 1.6e-5. It is
-  not a prefill-to-decode defect. **[ran, `Vulkan0`, headless]** With the same
-  sequence and the prompt ended at 100, 150, 170, 178 or 179 tokens, position
-  179 still measures 2.87e-3 (replayed and static decode alike) and the row at
-  each new boundary is at most 1.3e-5; position 179 was only the first row the
-  test scores, because this model takes no batched prefill. With the earlier
-  rows scored, position 107 measures 0.371 and positions 110, 137, 138, 143 and
-  173 are raised too. The CPU reference's layer-0 router at position 107
-  separates its second and third expert by 2.14e-4 of selection probability, the
-  smallest of the sequence's 422 router calls (median 6.3e-2). Flipping that one
-  pick in the CPU reference (router call 214 of the run, counting from 0 in
-  execution order: position 107, layer 0, expert 4 taken in place of expert 6
-  beside expert 2; a scratch hook in `infr-cpu`'s `Op::MoeFfn`, not committed)
-  gives the GPU's profile against the unflipped reference (107: 0.371, 110:
-  4.65e-3, 138: 2.31e-2, 143: 5.62e-2, 179: 2.79e-3), and against the flipped
-  reference no GPU row is above 2.4e-4. So the GPU's rows are those of a run
-  that took the other expert at that near tie (inferred from the match: the
-  GPU's own expert ids were not read back, which needs a readback in the Vulkan
-  MoE arm that does not exist), position 107's layer-1 keys and values differ
-  from then on, and later rows that attend to it inherit the difference. **Needs
-  a decision before any MoE row is set:** (a) teacher-force the routing as well
-  as the tokens (`Op::MoeFfn` already takes a selection through `expert_ids` for
-  hash routing): the two backends cannot fork at a router tie, so a row can be
-  as tight as a dense one and sees a wrong expert kernel; the cost is a harness
-  and runner change to feed the reference's ids, and the router itself then goes
-  unscored by these rows and needs its own check (the picks agree wherever the
-  reference's margin is clear). (b) Leave every row after a near tie out of the
-  score: no change to what runs, but it needs the reference's router margins out
-  of the CPU backend (a tap like `linear_tap`), a threshold to defend, and on a
-  long prompt one early tie discards the rest. (c) A loose MoE row: nothing to
-  build, and it cannot tell a wrong expert from a legitimate one, which is the
-  bug class an MoE row exists for. **Recommended: (a)**, with the router's picks
-  compared separately; it is the only one that leaves the row able to fail on an
-  expert bug. Not done: the same question on a real MoE model (ERNIE-4.5-21B-A3B
-  and Qwen3-30B-A3B are cached now), and on `Vulkan1`, where only the unshifted
-  run was made.
+- **Routed-expert (MoE) models are forced along the reference's routing; what
+  that leaves** (2026-11-23). A router near tie used to throw the comparison
+  off: on the synthetic MoE both RADV GPUs select another expert at position
+  107, layer 0, where the CPU reference's margin is 2.14e-4 of selection
+  probability, and every later row inherited it (worst KL 2.87e-3 scored, 0.371
+  at the position itself). A forced run now takes the reference's expert
+  selections as well as its tokens (`Op::MoeFfn::expert_ids`), reads back what
+  each of its own routers would have selected (`Op::MoeRoute`), and the gate
+  holds those selections to the row's `route_near_tie`
+  (`tolerance::metrics::RouteScore`); the synthetic MoE has a row and a gate
+  test (`gpu_seam_tolerance_synthetic_moe`), and `docs/gpu-tolerance.md` has the
+  mechanism, the measurements and the planted bugs. Open:
+  - **No real MoE model has a row or a gate test.** ERNIE-4.5-21B-A3B Q4_K_M was
+    measured on both RADV GPUs (`measure_gpu_tolerance`, key `ernie-21b-moe`;
+    the table in `docs/gpu-tolerance.md`, "Mutations"): forced along the
+    reference's routing its int8-free runs measure a worst KL of 6.1e-6 on the
+    RX 7900 XTX and 3.8e-6 on the integrated GPU (6.8e-3 unforced on the RX 7900
+    XTX), with at most 18 of 8802 selections differing, at margins up to 2.7e-5;
+    its shipped int8 runs measure 3.6e-3 and 1.3e-2, with up to 434 selections
+    differing at margins up to 3.2e-2, where a uniform share among its 64
+    experts is 1.6e-2. So an Int8 routing near tie set by the rule would hold
+    almost nothing there: either the Int8 class of a real MoE model gets no
+    routing check (its Float runs carry it), or the int8 activation error at the
+    router is looked into first. Needs a decision before its rows are set.
+    Qwen3-30B-A3B is cached and was not run. Adding a row is a measurement on
+    both GPUs plus a `gpu_seam_tolerance_*` test; whether the gate should carry
+    a 13 GB model is the owner's call (on the integrated GPU the test's memory
+    rule needs about 39 GB of free host memory for it).
+  - **The routing near tie has no rule for a model that never selects
+    differently.** The synthetic row's is 1.5 times the one legitimate
+    difference seen. A row whose legitimate runs show none would get 0 by that
+    rule, and then fail on the first device that does differ at a real near tie.
+    The top-1 near tie has a floor for this (0.25 nats, 1 nat); a floor in
+    selection score would have to be argued per model, since a router's margins
+    scale with its expert count. Not decided.
+  - **Windows has run none of it**: the row, the gate test, the own-routing
+    check and the planted bugs are RADV only.
+  - **A paged MoE model cannot be forced.** `execute_paged_moe` (Vulkan) refuses
+    `expert_ids`, so a forced run of a model whose experts are paged fails with
+    that error instead of running. Implementing the supplied selection there is
+    the change.
+  - **`Op::MoeRoute` on Vulkan repeats the router dispatch of the `Op::MoeFfn`
+    lowering** (the choice between `linear_native`, `linear_f32` and `linear` by
+    the router's dtype) so that no existing line of the adapter moved.
+    **[read]** That choice is now written out in
+    `crates/infr-vulkan/src/adapter.rs` at each of: the `Op::MoeRoute` arm of
+    `lower_op`, the batched branch and the small-m branch of its `Op::MoeFfn`
+    arm, and `execute_paged_moe`. They must stay in step. The one drift guard,
+    `gpu_seam_tolerance_own_routing_is_the_selection_it_runs`, runs the
+    synthetic model one token at a time: it covers the small-m branch with an
+    f32 router (`linear_f32`) against the `Op::MoeRoute` arm, and neither the
+    batched branch, nor the paged path, nor a quantized or f16 router. The fix
+    is one helper that every one of those sites calls. Not done in this slice:
+    it moves existing lines of a file a Windows session is working in.
+  - **Vulkan reads back the selection, not the scores** (`moe_topk` does not
+    write them; `Op::MoeRoute::dst_scores` is refused there), so only a CPU run
+    can be the reference of a routing comparison. Metal refuses `Op::MoeRoute`
+    by name: a `ForcedOn::Metal` arm needs it implemented first.
+  - **The dual dense-and-MoE layers** (gemma-4 MoE, DiffusionGemma) emit the
+    same readback and take a supplied selection through the same helper
+    (`emit_route`), and no such model is cached here: **not run**.
+  - **A forced run does not run the path from a router's own pick into its
+    experts.** Its expert kernels read the supplied ids. That the two paths
+    compute the same bits is shown on the synthetic model only (the own-routing
+    check above, replayed and static decode, both GPUs), not on a batched
+    prefill and not on quantized expert banks.
+  - **A 1% scale of one layer's routed down bank is missed** by the synthetic
+    row (0.35 of the KL bound and 0.77 of the mean bound on the CPU reference;
+    1.36 times the mean bound on both GPUs, where the device's own distance adds
+    to it). The shared expert beside the bank is not scaled.
 - **Gate and up swapped (e) gives NaN logits on the RX 7900 XTX and finite ones
   on the integrated GPU** (both RADV, Qwen3-0.6B, both classes; KL 620x and
   3.3e5x its bound on the integrated GPU). The gate fails either way; why the
@@ -7154,10 +7179,10 @@ values. What it leaves:
 - **Qwen2.5-0.5B's float prefill is twenty times further than the other Qwens'**
   (worst KL 8.1e-4, one top-1 flip; decode is normal). It carries q/k/v biases,
   which the others do not. Not looked into; Qwen2.5 has no gate row.
-- **Not covered by the gate:** MoE (ERNIE-4.5-21B-A3B, Qwen3-30B-A3B: not run,
-  for time), KV formats other than f16 and q8_0, models not cached here (B60's
-  Qwen3.5-MoE and DiffusionGemma), Metal (no Apple hardware: the doc says how a
-  Mac owner would add it), and every device but these two.
+- **Not covered by the gate:** every real MoE model (the synthetic one is; see
+  the routed-expert entry above), KV formats other than f16 and q8_0, models not
+  cached here (B60's Qwen3.5-MoE and DiffusionGemma), Metal (no Apple hardware:
+  the doc says how a Mac owner would add it), and every device but these two.
 
 ### B231 — RADV runs on the generic Vulkan tuning: no table row matches it (2026-11-23)
 
@@ -7255,8 +7280,9 @@ machine as well as on the Windows box.
   gemma-3's rows were re-set the same day (a fine row scored without the
   cooperative-matrix tier, its Float and Int8 rows as smoke rows), with gemma-3
   a planted-bug target, and `gpu_seam_tolerance_gemma3` passes on both RADV
-  GPUs; Windows has not run the new rows (B207). The rule an MoE row needs is
-  still the table owner's decision before G4 leans on an MoE model.
+  GPUs; Windows has not run the new rows (B207). MoE rows are scored forced
+  along the reference's routing since the same day; no real MoE model has a row
+  yet (B207).
 - **G4, what it converts:** the whole-vocabulary cosine tests and the exact-hash
   GPU goldens in `crates/infr-llama/tests/cpu_backend.rs` (`gpu_seam_golden_*`)
   move to the tolerance test, and `infr tune check --against cpu-reference` is

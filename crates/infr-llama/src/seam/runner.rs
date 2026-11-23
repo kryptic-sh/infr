@@ -2,6 +2,7 @@
 //! drives it through a [`Backend`]. This is the giant `generate_dense_backend` — the single
 //! forward every entry point in `super` (CPU/Vulkan/Metal, one-shot/session/verify/denoise) funnels
 //! through. Pure-move split of `seam.rs` — see `super` for the module overview.
+use super::routing::{emit_route, RouteAsk, RouteBufs, RouteHandles, RouteTap};
 use super::sc::{
     build_sc_embt, diffusion_self_cond, DenoiseCache, DenoiseReq, EbReduced, SelfCondWeights,
 };
@@ -386,6 +387,9 @@ pub(super) struct DecodeHandles {
     // compressor plan: APE row ids, gather indices, block rope positions), with those values. The
     // driver uploads each into a buffer of its own and binds it (`upload_step_i32`).
     step_i32: Vec<(TensorId, Vec<i32>)>,
+    // The teacher-forced harness's routing handles (`RouteTap`), one per router-selected layer
+    // the graph holds, in layer order. Empty on every other build.
+    route: Vec<RouteHandles>,
     weights: Vec<TensorId>, // flat, in declaration == upload order
 }
 
@@ -500,6 +504,7 @@ pub(crate) fn generate_dense_backend(
         denoise_req,
         req,
         None, // prefill_logits
+        None, // route
     )
 }
 
@@ -583,8 +588,23 @@ pub(crate) fn generate_dense_backend_bound(
     // empty when the prompt takes no batched prefill (a suffix of two tokens or fewer, or a model
     // without one). `None` everywhere but that harness: no head, no buffer, no download.
     mut prefill_logits: Option<&mut PrefillTap>,
+    // Teacher-forced scoring of a routed-expert model: when `Some`, every graph the ordinary
+    // prefill and the per-token decode build also reads back each router-selected layer's own
+    // selection (`Op::MoeRoute`), and with `RouteTap::forced` runs those layers on the supplied
+    // selection instead of their own. `None` everywhere but that harness: no op, no input, no
+    // buffer, no download.
+    mut route: Option<&mut RouteTap>,
 ) -> AResult<(Vec<u32>, GenStats)> {
     let c = cfg;
+    let route_ask = route.as_deref().map(|t| RouteAsk {
+        forced: t.forced.is_some(),
+        scores: t.scores,
+    });
+    if route_ask.is_some() && (verify.is_some() || denoise_req.is_some()) {
+        return Err(anyhow!(
+            "the routing tap covers the ordinary prefill and the per-token decode only"
+        ));
+    }
     // Backend capabilities are a per-backend invariant; query ONCE (each call clones an owned
     // struct with a heap `String name`) and read fields off the cached copy below.
     let caps = be.capabilities();
@@ -2064,6 +2084,7 @@ pub(crate) fn generate_dense_backend_bound(
         // The compressor plan of this graph's positions, per tier, with the per-step inputs it
         // declares (`super::dsv4_emit::Dsv4Tiers`).
         let mut step_i32: Vec<(TensorId, Vec<i32>)> = Vec::new();
+        let mut route_h: Vec<RouteHandles> = Vec::new();
         // The positions the query rope reads: `positions`, unless a test planted a bug there.
         #[cfg(feature = "mutations")]
         let q_positions =
@@ -4431,6 +4452,33 @@ pub(crate) fn generate_dense_backend_bound(
                         });
                         sel
                     });
+                    // The teacher-forced harness (`RouteTap`): read the router's own selection
+                    // back and, on a forced run, take the reference's in its place. A selection
+                    // that is supplied leaves the bias and the groups nothing to rank, which is
+                    // also what the op requires then.
+                    let forced = match (route_ask, expert_ids) {
+                        (Some(ask), None) => emit_route(
+                            &mut g,
+                            ask,
+                            &mut route_h,
+                            l,
+                            batch,
+                            ne,
+                            &mc,
+                            hn,
+                            router,
+                            exp_probs_b,
+                        ),
+                        _ => None,
+                    };
+                    let (expert_ids, exp_probs_b, groups) = match forced {
+                        Some(ids) => (Some(ids), None, (0, 0)),
+                        None => (
+                            expert_ids,
+                            exp_probs_b,
+                            (mc.n_expert_groups, mc.n_expert_groups_used),
+                        ),
+                    };
                     g.push(Op::MoeFfn {
                         x: hn,
                         router_x: hn, // qwen3moe/qwen35moe: router reads the SAME normed input as the experts
@@ -4452,11 +4500,12 @@ pub(crate) fn generate_dense_backend_bound(
                         weight_before: mc.weight_before,
                         ep_band: None, // set per-rank by ExpertParallelBackend's lowering
                         exp_probs_b,
-                        n_expert_groups: mc.n_expert_groups,
-                        n_expert_groups_used: mc.n_expert_groups_used,
+                        n_expert_groups: groups.0,
+                        n_expert_groups_used: groups.1,
                         swiglu_clamp: clamp_exp,
-                        // `Some` only on a DeepSeek V4 hash-routed layer (see the gather above);
-                        // `None` everywhere else, which is the router's own top-k.
+                        // `Some` on a DeepSeek V4 hash-routed layer (see the gather above) and on
+                        // a teacher-forced run's supplied selection; `None` everywhere else, which
+                        // is the router's own top-k.
                         expert_ids,
                     });
                     if let Some(MoeSharedW {
@@ -4672,6 +4721,22 @@ pub(crate) fn generate_dense_backend_bound(
                         dim: ne as u32,
                         eps,
                     });
+                    // The router's own top-k, unless a teacher-forced run supplies the selection
+                    // (`RouteTap`).
+                    let forced = route_ask.and_then(|ask| {
+                        emit_route(
+                            &mut g,
+                            ask,
+                            &mut route_h,
+                            l,
+                            batch,
+                            ne,
+                            &mc,
+                            router_tmp,
+                            router,
+                            None,
+                        )
+                    });
                     g.push(Op::MoeFfn {
                         x: moe_in,
                         router_x: router_tmp,
@@ -4696,7 +4761,7 @@ pub(crate) fn generate_dense_backend_bound(
                         n_expert_groups: 0,
                         n_expert_groups_used: 0,
                         swiglu_clamp: None,
-                        expert_ids: None,
+                        expert_ids: forced,
                     });
                     g.push(Op::RmsNorm {
                         x: moe_out,
@@ -4978,6 +5043,7 @@ pub(crate) fn generate_dense_backend_bound(
                 comp,
                 hc_resid: hc_carry.then_some(hcr[0]),
                 step_i32,
+                route: route_h,
                 weights,
             },
         )
@@ -6007,7 +6073,19 @@ pub(crate) fn generate_dense_backend_bound(
                     let pf_plan = be.compile(&pf_g).map_err(|e| anyhow!("{e}"))?;
                     let t_compile = pf_t0.elapsed();
                     let step_bufs = upload_step_i32(be, &pf_h)?;
+                    let pf_route = match (route.as_deref(), &c.moe) {
+                        (Some(tap), Some(mc)) if !pf_h.route.is_empty() => {
+                            let layers = pf_h.route.iter().map(|r| r.layer).collect();
+                            let bufs = RouteBufs::alloc(be, layers, ch.m, mc, tap)?;
+                            bufs.upload(be, tap, cstart)?;
+                            Some(bufs)
+                        }
+                        _ => None,
+                    };
                     let mut pf_b = Bindings::new();
+                    if let Some(bufs) = &pf_route {
+                        bufs.bind(&mut pf_b, &pf_h.route);
+                    }
                     if let Some(ids) = pf_h.tok_ids {
                         pf_b.bind(ids, ch.ids.as_deref().unwrap_or(ch.input.as_ref()));
                     }
@@ -6061,6 +6139,9 @@ pub(crate) fn generate_dense_backend_bound(
                     *written_end = (*written_end).max(cstart + ch.m);
                     be.execute(pf_plan.as_ref(), &pf_b)
                         .map_err(|e| anyhow!("{e}"))?;
+                    if let (Some(bufs), Some(tap)) = (&pf_route, route.as_deref_mut()) {
+                        bufs.download(be, tap, cstart)?;
+                    }
                     if let (Some(tap), Some((_, buf))) =
                         (prefill_logits.as_deref_mut(), &pf_logits_buf)
                     {
@@ -6164,6 +6245,22 @@ pub(crate) fn generate_dense_backend_bound(
         // express. Force the ordinary per-token rebuild path below when a caller wants the tap —
         // slower, but this is a validation-only hook (see `h_out`'s doc), never a hot path.
         && h_out.is_none();
+    // The routing tap's buffers for the per-token graphs (`RouteTap`), one row each: the
+    // record-once plan and every per-token rebuild bind these, and each step uploads the
+    // reference's selection into them and reads the router's own back.
+    let dec_route = match (route.as_deref(), &c.moe) {
+        (Some(tap), Some(mc)) => {
+            let _gp = req.and_then(|r| r.gate_pass());
+            Some(RouteBufs::alloc(
+                be,
+                super::routing::router_selected_layers(c),
+                1,
+                mc,
+                tap,
+            )?)
+        }
+        _ => None,
+    };
     let ro = if dyn_replay {
         // Held across the build and compile like any step's turn. No tape is recorded here:
         // Vulkan records on the plan's first execute, and Metal's `compile` drops any tape it
@@ -6189,6 +6286,9 @@ pub(crate) fn generate_dense_backend_bound(
         b.bind(h.positions, pos_buf.as_ref());
         if let (Some(pid), Some(ib)) = (h.pl_tok_in, &ipl_buf) {
             b.bind(pid, ib.as_ref());
+        }
+        if let Some(bufs) = &dec_route {
+            bufs.bind(&mut b, &h.route);
         }
         bind_layer_io(
             &mut b,
@@ -6242,6 +6342,9 @@ pub(crate) fn generate_dense_backend_bound(
     // per-token fallback's draws for the SAME tokens (argmax draws nothing, so it's harmless there).
     let can_chain = gpu_embed
         && (gpu_argmax || gpu_sample)
+        // A chain feeds each step's sampled id on the device, with no host step between them to
+        // upload a selection or read one back.
+        && route_ask.is_none()
         && ro.is_some()
         && chain_n >= 2
         && ipl_buf.is_none()
@@ -6475,6 +6578,9 @@ pub(crate) fn generate_dense_backend_bound(
         } else {
             None
         };
+        if let (Some(bufs), Some(tap)) = (&dec_route, route.as_deref()) {
+            bufs.upload(be, tap, pos)?;
+        }
         let t_setup = std::time::Instant::now();
         let (setup_el, exec_el);
         *written_end = (*written_end).max(pos + 1);
@@ -6503,6 +6609,9 @@ pub(crate) fn generate_dense_backend_bound(
             b.bind(h.positions, pos_buf.as_ref());
             if let (Some(pid), Some(ib)) = (h.pl_tok_in, &ipl_buf) {
                 b.bind(pid, ib.as_ref());
+            }
+            if let Some(bufs) = &dec_route {
+                bufs.bind(&mut b, &h.route);
             }
             bind_layer_io(
                 &mut b,
@@ -6540,6 +6649,9 @@ pub(crate) fn generate_dense_backend_bound(
         // excluded from `last_written` — the fix for the `max_new==0` frontier and the
         // constrained-break unfed-forced-token cache-corruption cases.
         last_written = Some(pos);
+        if let (Some(bufs), Some(tap)) = (&dec_route, route.as_deref_mut()) {
+            bufs.download(be, tap, pos)?;
+        }
         if prof_dec && pos + 1 >= prompt.len() {
             dec_setup += setup_el;
             dec_exec += exec_el;

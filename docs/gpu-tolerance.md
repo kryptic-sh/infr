@@ -33,6 +33,59 @@ backends' full-vocabulary logits are captured at every position
   token reused, one fed), so it reads KV written by the prefill and by every
   earlier decode step.
 
+**Routed-expert (MoE) models are forced along the reference's routing too.** A
+router picks each token's top experts, and at a near tie two backends
+legitimately pick different ones; from there they compute different functions,
+and every later row that attends to that position inherits the difference (the
+synthetic MoE's case under "Mutations"). So a forced run takes, at every
+position it feeds and in every router-selected layer, the experts the CPU
+reference selected there, through `Op::MoeFfn`'s `expert_ids` (the path DeepSeek
+V4's hash-routed layers take in production: the router still runs and its
+probabilities still weight the experts, only the selection is supplied). The
+logit rows then compare the two backends' arithmetic under one routing. The
+reference run is left to its own routers, and `ForcedLogits::routing` carries
+what they selected, with the score every expert was ranked by.
+
+**What the routers select is compared on its own.** Each forced graph also holds
+an `Op::MoeRoute` per such layer, which reads back the selection the backend's
+own router makes on the hidden state it has: the same router dispatch and the
+same `moe_topk` selection its `Op::MoeFfn` lowering runs, with the selection
+bias and group-limited routing, nothing run on the result. That is what the run
+would have routed to had it been left alone, given the reference's routing up to
+that layer. `tolerance::metrics::RouteScore` compares it with the reference's
+selection as a set, at every position fed (prompt positions included, whether or
+not their logits are scored) and every layer. Where the two differ, the margin
+(`RouteFlip::margin`) is how far the reference's scores (selection probability
+plus bias) would have to move for its router to select the run's set: over the
+experts in exactly one of the two sets, its highest score among those only it
+selected, less its lowest among those only the run selected. For one expert
+swapped for another that is the gap between the two; a run that drops the
+reference's clear first choice is not excused by a near tie further down the
+ranking, and one that selects an expert of a group the reference masked out is
+at an infinite margin. Whether two selections differ is read off the ids alone.
+A readback that is not a selection (an expert named twice, as a top-k that did
+not mask its pick or a buffer nothing wrote would give, or an id past the
+experts) is an error of the run, not a result. A difference at a margin over the
+row's `route_near_tie` fails the gate, the routing counterpart of the top-1 near
+tie, and over a case at least `MIN_TOP1_SCORED` of the reference's selections
+must clear that margin or the check is vacuous. Hash-routed layers have no
+router selection and are left as they are.
+
+Two checks hold the mechanism itself. On the CPU, in the normal test job
+(`forced_run_reads_back_and_takes_a_routing_on_the_cpu`): a run forced along its
+own selections is the same run bit for bit, and with one selection replaced
+every earlier row keeps its bits, that position's row changes, and the router
+there still reports the selection it would have made. On a GPU
+(`gpu_seam_tolerance_own_routing_is_the_selection_it_runs`): a run left on its
+own routers and the same run forced along the selections it read back give the
+same logits bit for bit, on the replayed and the static decode, so the readback
+is the selection `Op::MoeFfn` makes; with one selection replaced the bits
+change. Nothing of this exists outside a forced run: `Op::MoeRoute` is emitted
+only when `generate_dense_backend_bound` is handed a `RouteTap`, which only
+`seam::forced_run` does. The CPU's router code is now shared between the two
+ops, and neither the op-hash suite's existing `MoeFfn` hashes nor the CPU MoE
+goldens (`cpu_golden_ernie4_5_moe`, `cpu_golden_qwen3moe`) moved.
+
 **What the decode side does not exercise.** Where the backend replays, each
 forced step builds, records and executes a fresh replay plan once: the
 record-once-replay-many mechanism (one recording replayed with advancing
@@ -55,13 +108,14 @@ order fails it.
 from the two f32 rows, on `infr_core::math` (the workspace takes no math from
 the platform library):
 
-| Metric         | Definition                                                                                                                                                         | Why                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
-| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| KL             | KL(reference ‖ test) over the full vocabulary                                                                                                                      | The primary metric: the expected extra log-loss, shift-invariant. Computed as `ln(1 + E_p[expm1(e - c)]) - E_p[e - c]` with `e = t - r`, so two rows a rounding apart score their real distance; a reference token far down the row (its `e - c` too large to exponentiate, or its f32 probability underflowed) enters the normalizer as `e^(t - lse_r - c)`, so promoting one is charged what it costs; only a term itself beyond f32's range scores infinite |
-| top-k cosine   | cosine of the two rows' probability vectors over the union of both rows' top sets (0.99 of the mass or 64 tokens each), plus one component for the mass outside it | Secondary, never the sole detector of a class of bug: sees mass moved within or out of the top tokens even when the reference's top set is one token, but only means something when the union holds most of the mass (on a high-entropy row the rest component dominates: two rows flat over different 1000-token sets of 32000 score 0.99993 at KL 30). A whole-vocabulary logit cosine cannot separate a match from a mismatch (B60)                         |
-| logit dev      | the largest difference after centring each row on its mean, over the reference row's range (max − min)                                                             | Shift-invariant; the mean does not move with the top logits, so one wrong top logit counts once                                                                                                                                                                                                                                                                                                                                                                |
-| top-1          | the argmax agrees, counted only where the reference's top-2 margin exceeds the row's near-tie threshold                                                            | A greedy flip that is not a tie. Near ties left out are reported, and each of the prefill and decode phases must score at least `MIN_TOP1_SCORED` positions over a case                                                                                                                                                                                                                                                                                        |
-| ref top-1 rank | how many tokens the test row ranks above the reference's choice                                                                                                    | Separates "second by a hair" from "lost"                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| Metric         | Definition                                                                                                                                                                                                                 | Why                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| KL             | KL(reference ‖ test) over the full vocabulary                                                                                                                                                                              | The primary metric: the expected extra log-loss, shift-invariant. Computed as `ln(1 + E_p[expm1(e - c)]) - E_p[e - c]` with `e = t - r`, so two rows a rounding apart score their real distance; a reference token far down the row (its `e - c` too large to exponentiate, or its f32 probability underflowed) enters the normalizer as `e^(t - lse_r - c)`, so promoting one is charged what it costs; only a term itself beyond f32's range scores infinite |
+| top-k cosine   | cosine of the two rows' probability vectors over the union of both rows' top sets (0.99 of the mass or 64 tokens each), plus one component for the mass outside it                                                         | Secondary, never the sole detector of a class of bug: sees mass moved within or out of the top tokens even when the reference's top set is one token, but only means something when the union holds most of the mass (on a high-entropy row the rest component dominates: two rows flat over different 1000-token sets of 32000 score 0.99993 at KL 30). A whole-vocabulary logit cosine cannot separate a match from a mismatch (B60)                         |
+| logit dev      | the largest difference after centring each row on its mean, over the reference row's range (max − min)                                                                                                                     | Shift-invariant; the mean does not move with the top logits, so one wrong top logit counts once                                                                                                                                                                                                                                                                                                                                                                |
+| top-1          | the argmax agrees, counted only where the reference's top-2 margin exceeds the row's near-tie threshold                                                                                                                    | A greedy flip that is not a tie. Near ties left out are reported, and each of the prefill and decode phases must score at least `MIN_TOP1_SCORED` positions over a case                                                                                                                                                                                                                                                                                        |
+| ref top-1 rank | how many tokens the test row ranks above the reference's choice                                                                                                                                                            | Separates "second by a hair" from "lost"                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| routing        | MoE only, per (position, layer) and not per row: the run's own router selects the reference's set of experts, counted only where the reference's margin between the experts in question exceeds the row's routing near tie | The logit rows are forced along the reference's routing and cannot see a router that selects wrongly; this is what does                                                                                                                                                                                                                                                                                                                                        |
 
 Each is aggregated per run (one prompt, one configuration, one phase) as the
 worst position, with where it was, and the mean. A NaN or infinite logit is an
@@ -208,16 +262,20 @@ in the same process, with nothing global (`crates/infr-llama/tests/planted/`).
   reverse on a NORM-rope model, which is exactly a rope kernel pairing the wrong
   elements; (h) a wrong quant nibble map: the two nibbles of every packed byte
   of one Q4_K `ffn_down` swapped; (i) a router that ignores its bias: every
-  `exp_probs_b.bias` zeroed (B174's case).
+  `exp_probs_b.bias` zeroed (B174's case). On the synthetic MoE, (d) scales one
+  layer's routed down bank (`ffn_down_exps`) and (e) swaps every layer's routed
+  gate and up banks.
 
 **What each test asserts.** A clean control runs first, twice: it must pass the
 gate, and its two runs must agree bit for bit. Every planted run must then
-differ from the clean run in the decode rows of every prompt and configuration
-(the bug reached decode). Where the gate must catch the bug, the run must fail
-it with a failure that names a metric or a non-finite logit at a prompt. Where a
-miss is on record ((c), (d) and (d1) in Int8 and in gemma-3's Float smoke row,
-(d1) in every other row), the ratio is printed and nothing more is asserted, so
-a tighter table later cannot break the test. Each bug and run prints a `PLANTED`
+differ from the clean run in the decode part of every prompt and configuration:
+its decode rows, and on a routed-expert model the experts its own routers
+selected at those positions (the bug reached decode). Where the gate must catch
+the bug, the run must fail it with a failure that names a metric, a non-finite
+logit or the routing at a prompt. Where a miss is on record ((c), (d) and (d1)
+in Int8 and in gemma-3's Float smoke row, (d1) in every other row, (d) in the
+synthetic MoE's), the ratio is printed and nothing more is asserted, so a
+tighter table later cannot break the test. Each bug and run prints a `PLANTED`
 line with its verdict and its worst ratio over the steady phases (from position
 2 on).
 
@@ -242,10 +300,10 @@ Q4_K_M in each class its rows are scored in (`gpu` Int8, `gpu-float` Float,
 not a GPU) runs them on the CPU reference against the clean model's reference,
 which gives each bug's own size on gemma with no GPU's noise in it;
 `gpu_planted_ernie_f16` runs ERNIE-4.5-0.3B F16 (a float-weight model: no
-nibbles, so no (h)) in Float; `gpu_planted_router_bias` runs (i) on a synthetic
-ERNIE-4.5 MoE (eight f32 experts, two used, a softmax router with a selection
-bias), since ERNIE-4.5-21B was not cached on the machine when these ran (it is
-now; (i) has not been planted in it yet).
+nibbles, so no (h)) in Float; `gpu_planted_router_bias` runs (i), and (d) and
+(e) in the routed expert banks, on a synthetic ERNIE-4.5 MoE (eight f32 experts,
+two used, a softmax router with a selection bias) against its own row. No bug
+has been planted in a real MoE model.
 
 **Measured 2026-11-23**, Linux 7.3.5-arch1-1, Mesa RADV 26.3.1, headless (no
 compositor running), on the final test code: `Vulkan0` RX 7900 XTX (RADV
@@ -311,37 +369,90 @@ What gemma adds:
 - **(e) gives finite logits on both GPUs here**, where on Qwen3 the RX 7900 XTX
   gives NaN.
 
-(i), the router that ignores its bias, on the synthetic MoE: the CPU
-demonstration catches it at 5274x (clean control 0); on both GPUs the planted
-run measures 5239x, but the clean control measures 4.29x (mean 1.78x) itself,
-outside the `synthetic-f32` Float row the MoE borrows (the table has no MoE
-row), at the first decode row of the long prompt. So on the GPU this is a
-measurement, not a gate verdict: `gpu_planted_router_bias` asserts only that the
-bug reaches decode. The synthetic MoE also takes no batched prefill, so only its
-decode rows are scored. The clean control's distance is one row: at most 1.03e-4
-KL on prompts 0 and 1, and on prompt 2 2.87e-3 at position 179, the first decode
-row after the 180-token prompt, the rest of that prompt averaging about 1.6e-5
-(from its mean). Both GPUs give the same values to seven digits.
+**The synthetic MoE**, against its own row (`synthetic-moe`, set the same day
+from forced-routing runs; "The table" has it), measured the same day on the same
+machine and drivers (`planted_bugs_fail_the_gate_on_the_cpu` and
+`gpu_planted_router_bias`, configuration `gpu`). The model takes no batched
+prefill, so only its decode rows are scored on logits; its routing is compared
+at every position. Cells are the worst steady KL over its bound (mean KL in
+brackets), CPU reference / `Vulkan0` / `Vulkan1`:
 
-**That row is a router near tie, not a defect** (2026-11-23, `Vulkan0`). The
-outlier does not follow the end of the prompt: with the same sequence and the
-prompt ended at 100, 150, 170, 178 or 179 tokens, position 179 is a decode row
-well past the boundary and still measures 2.87e-3, on the replayed and the
-static decode alike, while the row at each new boundary is ordinary (at most
-1.3e-5). Position 179 was only the first row the test scores, since this model
-takes no batched prefill. Scoring the earlier rows shows where it comes from:
-position 107 measures 0.371, and positions 110, 137, 138, 143 and 173 are raised
-with it. At position 107 the CPU reference's layer-0 router separates its second
-and third expert by 2.14e-4 of selection probability, the smallest margin of the
-422 router calls of the sequence (median 6.3e-2). Flipping that one pick in the
-CPU reference reproduces the GPU's profile (107: 0.371, 110: 4.65e-3, 138:
-2.31e-2, 143: 5.62e-2, 179: 2.79e-3), and against the flipped reference no GPU
-row is above 2.4e-4; that the GPU picked the other expert there is inferred from
-that match, its expert ids were not read back. Position 107's layer-1 keys and
-values then differ, and the later rows that attend to it carry the difference.
-So a clean MoE run can legitimately pick another expert at a router near tie,
-and every later row may inherit it: an MoE row in the table needs a stated rule
-for that (B207), which is why none is set here.
+| Bug                                                       | Synthetic MoE Float                                                                                                             |
+| --------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| clean control (passes)                                    | 0 / 0.22 (0.49) / 0.22 (0.49); on both GPUs one selection of the long prompt's 422 differs, at a 2.14e-4 margin                 |
+| (i) router ignores its bias                               | caught on the routing alone: 42 of 86, 70 of 130 and 216 of 422 selections differ, at margins up to 0.37; KL as the clean run's |
+| (d) every value of `blk.1.ffn_down_exps` x1.01            | **missed** on the CPU: 0.35 (mean 0.77); over the mean bound on both GPUs: 0.36 (mean 1.36)                                     |
+| (e) `ffn_gate_exps` and `ffn_up_exps` swapped, each layer | caught: 1.35e4 / 1.35e4 / 1.35e4                                                                                                |
+
+- **(i) is caught by the routing comparison and by nothing else.** Forced along
+  the reference's selections, the model with its bias zeroed computes the clean
+  model's function: on the CPU its logits are the clean run's bit for bit (KL
+  0), on the GPUs they are the clean GPU run's. What differs is what its routers
+  would select, at half the selections and at reference margins a thousand times
+  the near tie, on the CPU and on both GPUs. The test's "the bug reached decode"
+  check therefore reads a run's own selections along with its logit rows. This
+  is B174's case as a planted weight bug; a backend whose selection kernel
+  ignored the bias would show the same way, since the readback runs that kernel.
+- **(d) in the routed experts is a recorded miss.** A 1% scale of one layer's
+  whole down bank leaves the shared expert beside it unscaled; on the CPU, where
+  the clean distance is 0, it measures 0.35 of the KL bound and 0.77 of the mean
+  bound. On the GPUs the device's own distance adds to it and the mean goes over
+  (1.36); nothing is asserted either way.
+- **(e) also moves the routing**: with layer 0's experts wrong, layer 1's router
+  sees another hidden state and selects otherwise at 117 of the long prompt's
+  422 selections on the CPU, every one over the near tie, and at 118 on each
+  GPU, 117 of them over it (margins up to 1.14). A routing failure beside a
+  logit failure is a consequence; a routing failure alone, as in (i), is a
+  router.
+
+**Why the routing is forced: a router near tie** (2026-11-23, both GPUs).
+Before, the same clean run was only forced along the reference's tokens, and
+landed outside the synthetic f32 llama's row it then borrowed: worst KL at most
+1.03e-4 on prompts 0 and 1, and on prompt 2 2.87e-3 at position 179, the first
+decode row after the 180-token prompt. The outlier does not follow the end of
+the prompt (ended at 100, 150, 170, 178 or 179 tokens, position 179 still
+measures 2.87e-3, on the replayed and the static decode alike), and scoring the
+earlier rows shows where it comes from: position 107 measures 0.371, and
+positions 110, 137, 138, 143 and 173 are raised with it. At position 107 the CPU
+reference's layer-0 router separates its second and third expert by 2.14e-4 of
+selection probability, the smallest margin of the 422 router calls of the
+sequence (median 6.3e-2), and flipping that one pick in the CPU reference
+reproduces the GPU's profile. The readback now shows it directly
+(`INFR_TOL_OWN_ROUTING=1`, which leaves the GPU on its own routers as before):
+both GPUs select another expert at position 107, layer 0, at that 2.14e-4
+margin, and then at position 107, layer 1, at a margin of 9.8e-2, because layer
+1's router now sees a different hidden state. That second difference is what an
+unforced comparison cannot tell from a bug. Forced along the reference's routing
+the same runs measure a worst KL of 6.3e-5 on prompt 2 and 1.03e-4 over all
+three, and the one difference left is the near tie itself.
+
+**The same on a real model, ERNIE-4.5-21B-A3B Q4_K_M** (`measure_gpu_tolerance`,
+key `ernie-21b-moe`, the three prompts, native lanes, the same day; a
+measurement: the model has no row and no gate test). Unlike the synthetic model
+it has quantized expert banks and takes the batched prefill, so its prefill rows
+are scored and, in the shipped configurations, the supplied selections go
+through the batched expert GEMMs. Each cell is the worst KL from position 2 on /
+in the first two positions, then how many of the run's 8802 own selections
+differ from the reference's and the widest margin among them (in selection
+score; a uniform share among the model's 64 experts is 1.6e-2):
+
+| Device, configurations                                       | Routing forced                              | Routing not forced (`INFR_TOL_OWN_ROUTING`) |
+| ------------------------------------------------------------ | ------------------------------------------- | ------------------------------------------- |
+| `Vulkan0`, `gpu-float`, `gpu-float-ub32`, `gpu-float-static` | 6.1e-6 / 1.1e-6; 12 to 18 differ (2.7e-5)   | 6.8e-3 / 1.1e-6; 56 to 61 differ (4.6e-3)   |
+| `Vulkan0`, `gpu`, `gpu-ub32`                                 | 3.6e-3 / 1.2e-3; 242 to 247 differ (1.7e-3) | 1.4e-2 / 5.3e-3; 417 to 429 differ (6.5e-3) |
+| `Vulkan1`, `gpu-float`, `gpu-float-ub32`, `gpu-float-static` | 3.8e-6 / 1.5e-7; 8 to 13 differ (1.1e-5)    | not run                                     |
+| `Vulkan1`, `gpu`, `gpu-ub32`                                 | 1.3e-2 / 1.7e-3; 425 to 434 differ (3.2e-2) | not run                                     |
+
+Forcing the routing takes the int8-free runs from 6.8e-3 to 6.1e-6, three orders
+of magnitude: unforced, prompt 1's decode row at position 54 measures 6.83e-3
+with four of that position's routers selecting otherwise (layers 14, 22, 23 and
+24, margins up to 2.6e-4), and forced the same row's phase measures 2.4e-6 with
+one selection of the prompt differing, at a margin of 3.8e-6. The int8 runs keep
+their own activation quantization, and it reaches the routers: on the integrated
+GPU a selection differs at a margin of 3.2e-2, twice a uniform share, so a
+routing near tie set from the int8 runs of this model would hold almost nothing.
+What its rows should be is open (B207). The whole measurement took 64 s on
+`Vulkan0` and 343 s on `Vulkan1`.
 
 The CPU demonstration (synthetic llama, CPU reference, against the clean model's
 CPU reference, where the clean distance is exactly 0) catches every dense bug
@@ -384,16 +495,19 @@ and mean times 2, the cosine's distance from 1 times 2, the logit deviation
 times 1.5, the rank at twice the worst plus one, the near-tie margin at 1.5
 times the widest legitimate top-1 miss (at least 0.25 nats in Float, 1 nat in
 Int8 and KvQ8), each from the worst legitimate value over every device and
-configuration measured. The worst legitimate KL of a row (from position 2 on)
-moves a long way between the paths measured — the RX 7900 XTX native, its wave64
-path, its generic tuning (rows off) and the integrated GPU: within about 4x for
-most rows, but 9x to 22x for gemma-3's Float and Int8 rows and LFM3's Float and
-Int8 rows, and 83x for Qwen3.5's Float row (whose integrated-GPU figure scores
-one prefill row per chunk). A row's bound is its worst path's, so it is loose
-for the paths far below that. The margin of 2 on top is headroom for a device or
-driver not measured here, kept small because the planted bugs sit only 3 to 4.5
-times above the Float tolerance (6.4x on KL and 9.2x on mean KL above the
-legitimate worst).
+configuration measured. A routed-expert model's row is set from runs forced
+along the reference's routing, and carries a routing near tie
+(`Entry::route_near_tie`) at 1.5 times the widest reference margin at which a
+legitimate run's own router selected other experts. The worst legitimate KL of a
+row (from position 2 on) moves a long way between the paths measured — the RX
+7900 XTX native, its wave64 path, its generic tuning (rows off) and the
+integrated GPU: within about 4x for most rows, but 9x to 22x for gemma-3's Float
+and Int8 rows and LFM3's Float and Int8 rows, and 83x for Qwen3.5's Float row
+(whose integrated-GPU figure scores one prefill row per chunk). A row's bound is
+its worst path's, so it is loose for the paths far below that. The margin of 2
+on top is headroom for a device or driver not measured here, kept small because
+the planted bugs sit only 3 to 4.5 times above the Float tolerance (6.4x on KL
+and 9.2x on mean KL above the legitimate worst).
 
 **Both sides of each gap, on Qwen3-0.6B** (from the first measurement, on
 Windows; the committed demonstrations above agree with it), from position 2 on,
@@ -480,8 +594,46 @@ measures 2.3e-2 clean, with (f) at 1.56). The bug figures are from the prompts'
 own ends, and so are the Int8 row's legitimate ones; the two Float rows'
 legitimate figures include the moved ends.
 
-For every row but Qwen3-0.6B's and gemma-3's, the gap is unmeasured: the
-tolerances are set from legitimate runs only.
+**The synthetic MoE's row was set 2026-11-23**, the table's first routed-expert
+row, from `measure_gpu_tolerance` on Linux 7.3.5-arch1-1, Mesa RADV 26.3.1,
+headless, on both GPUs, every run forced along the reference's routing:
+configurations `gpu` (replayed decode) and `gpu-float-static`, native lanes,
+wave64 forced and tuning rows off at the prompts' own ends, and native lanes (on
+`Vulkan0` also wave64 forced) with every prompt ended after 4 tokens
+(`INFR_TOL_SPLIT=4`). The model takes no batched prefill, so a moved prompt end
+changes no kernel and only scores more of the same decode rows (620 against
+192); those count as legitimate. With native lanes both GPUs give the same
+values to the digits given.
+
+| Limit            | Worst legitimate value                                    | Tolerance | Smallest planted bug over it                                                      |
+| ---------------- | --------------------------------------------------------- | --------- | --------------------------------------------------------------------------------- |
+| KL max           | 2.31e-4 (prompt 2 ended after 4 tokens, position 90)      | 4.7e-4    | (e) at 1.35e4 times the bound; (d) does not cross (0.35 on the CPU)               |
+| mean KL          | 1.52e-5 (prompt 2, its own end, wave64 forced, `Vulkan0`) | 3.1e-5    | (d) on the GPUs only, 1.36 times the bound, a recorded miss (0.77 on the CPU)     |
+| top-k cosine     | 0.999750 (prompt 2 ended after 4 tokens)                  | 0.9995    | not looked at                                                                     |
+| logit deviation  | 2.89e-3 (prompt 1)                                        | 4.4e-3    | not looked at                                                                     |
+| top-1, rank      | no miss, nothing ranked above the reference's choice      | 0.25, 1   | not looked at                                                                     |
+| routing near tie | one selection, at a margin of 2.14e-4 (prompt 2, 107/0)   | 3.3e-4    | (i): 42 of prompt 0's 86 selections, the narrowest of them at a margin of 1.06e-3 |
+
+The cosine bound is the rule applied to the value as the log prints it, to six
+places (twice its distance from 1 gives 0.99950), cut to four places as
+gemma-3's rows are (0.997996 to 0.9979, 0.97904 to 0.9790).
+
+That the model takes no batched prefill is a property the test states of the
+case (`Case::batched_prefill` in `tests/support/forced.rs`), not one read off
+the run: a case so marked must produce no prefill row, and only then is the
+vacuous count of scored prefill rows dropped; any other case that produces none
+fails the gate by name (`Reference::check_prefill`).
+
+Under the earlier comparison (tokens forced, routing not) the same clean runs
+measured a worst KL of 2.87e-3 at the prompts' own ends and 0.371 with the
+earlier rows scored, so no row could have been set that a wrong expert would not
+also pass. The row is from RADV alone: Windows has run none of this. It is a toy
+model with f32 experts: it runs the per-token expert kernels (`native_idm_f32`)
+and never the batched expert GEMMs or an int8 path, which only a real MoE model
+reaches (below, and B207).
+
+For every row but Qwen3-0.6B's, gemma-3's and the synthetic MoE's, the gap is
+unmeasured: the tolerances are set from legitimate runs only.
 
 **No ratchet.** A row may be loosened only by its owner, with the measurement
 that needs it (device, driver, configuration, the run's printed values) and the
@@ -584,13 +736,20 @@ reference's margin) and the kernels the run built, and `INFR_TOL_SPLIT=<tokens>`
 keeps the reference's sequence but ends the prompt after that many tokens, so
 the same positions are scored with the prefill-to-decode boundary elsewhere (no
 shorter than the prompt a forced run accepts: `seam::forced_run` refuses one too
-short for a batched prefill). One configuration is for diagnosis only
-(`DIAGNOSIS_CONFIGS`): no gate scores it, and `measure_gpu_tolerance` runs it
-only when `INFR_TOL_ONLY` names it. `gpu-no-dp4a-kq` is the shipped
-configuration without the dp4a K-quant prefill GEMM. The three
-`gpu-float-nocoopmat*` configurations (the Float ones with the whole
-cooperative-matrix tier off) were diagnosis too until 2026-11-23; they are gated
-now, for gemma-3, and a default measurement runs them for every model.
+short for a batched prefill). On a routed-expert model each comparison against
+the reference also prints a `ROUTE` line: how many of the run's own selections
+differ from the reference's, the widest margin among them, and each one as
+`position/layer:margin`, which is what a row's routing near tie is set from.
+`INFR_TOL_OWN_ROUTING=1` leaves the Vulkan runs on their own routers'
+selections, the comparison as it was before the routing was forced: a distance
+that goes away without it was a routing difference, one that stays is
+arithmetic. One configuration is for diagnosis only (`DIAGNOSIS_CONFIGS`): no
+gate scores it, and `measure_gpu_tolerance` runs it only when `INFR_TOL_ONLY`
+names it. `gpu-no-dp4a-kq` is the shipped configuration without the dp4a K-quant
+prefill GEMM. The three `gpu-float-nocoopmat*` configurations (the Float ones
+with the whole cooperative-matrix tier off) were diagnosis too until 2026-11-23;
+they are gated now, for gemma-3, and a default measurement runs them for every
+model.
 
 **A tuning value left in the environment changes a gate verdict.** `INFR_TUNE`,
 `INFR_TUNE_NO_ROWS` and `INFR_FORCE_WAVE64` reach these tests on purpose, so a
@@ -679,6 +838,26 @@ were not run again after gemma's rows were tightened to what is in the table.
 With wave64 forced on `Vulkan0`, gemma-3's test and the kernel check passed
 under that draft too.
 
+**Results with the routing forced, 2026-11-23, same machine and drivers,
+headless**, no environment knob but `INFR_DEV`: the two new tests,
+`gpu_seam_tolerance_synthetic_moe` and
+`gpu_seam_tolerance_own_routing_is_the_selection_it_runs`, pass on both GPUs in
+under a second each, and with them the whole set: all 13 `gpu_seam_tolerance_*`
+tests on `Vulkan0` in 319 s on the final code, and on `Vulkan1` in 655 s on the
+code before a review round (which changed the routing comparison, the prefill
+check of `gate()` and the new row's cosine bound, and moved code; the two new
+tests and `gpu_planted_router_bias` were run again on both GPUs after it, and
+pass), against a table in which no row but the new one changed. The production
+MoE tests of `cpu_backend` were run on `Vulkan0` as the check that nothing
+outside a forced run moved, and pass: the exact hash of
+`gpu_seam_golden_qwen3moe`, `gpu_seam_matches_cpu_ernie4_5_moe` and its
+`_tokens` form, `gpu_seam_ernie4_5_moe_decode_replays_from_one_recording`, and
+the two paged comparisons (`gpu_seam_paged_ernie4_5_moe_matches_resident`,
+`gpu_seam_paged_moe_matches_resident_and_cpu`). Not run on `Vulkan1`. The four
+`gpu_planted_*` tests passed on both GPUs before that review round (610 s and
+1029 s), with the dense models' verdicts and ratios as the tables above have
+them; the dense three were not run again after it.
+
 **The GPU gate on RADV, 2026-11-23** (the filter above, same machine, headless,
 before gemma's rows were re-set; the full filter was not run again after). On
 `Vulkan0`: 713 tests, 712 passed, the one failure `gpu_seam_tolerance_gemma3`,
@@ -731,6 +910,10 @@ MoE).
   Vulkan seams only. A Mac owner would add a `ForcedOn::Metal` arm to
   `SeamModel::forced_logits` (the Metal seam runs the same
   `generate_dense_backend`), run `measure_gpu_tolerance` on the gated models,
-  and add Metal rows to the table from those numbers.
-- **MoE models**, quantized KV caches below 8 bits, the chained and replayed
-  decode: see B207 in [`backlog.md`](backlog.md).
+  and add Metal rows to the table from those numbers. For a routed-expert model
+  that arm also needs `Op::MoeRoute` on Metal, which refuses it by name today.
+- **Windows, for everything routed-expert**: the synthetic MoE's row, its gate
+  test, the own-routing check and its planted bugs ran under RADV only.
+- **Real MoE models** in the gate (one is measured above, none has a row), paged
+  MoE models (a forced run of one is refused), quantized KV caches below 8 bits,
+  the chained and replayed decode: see B207 in [`backlog.md`](backlog.md).

@@ -16,7 +16,7 @@ use anyhow::{anyhow, Result as AResult};
 /// Deliberately unchecked: the DeepSeek MLA absorbed `attn_k_b`/`attn_v_b` (the `Op::Mla` kernels
 /// read them in their own head-major layout), the V3.2 lightning indexer, the DeepSeek V4
 /// `ffn_gate_tid2eid` routing table (`generate_dense_backend` checks it against the vocabulary
-/// itself), the qwen35 DeltaNet tensors, the dual-FFN (gemma4 MoE / DiffusionGemma) router and
+/// itself), the remaining qwen35 DeltaNet tensors, the dual-FFN (gemma4 MoE / DiffusionGemma) router and
 /// expert banks and their extra norms, the gemma4 E2B per-layer embedding tensors,
 /// DiffusionGemma's self-conditioning MLP, and a KV-sharing layer's own `attn_k`/`attn_v` (loaded,
 /// but never read by the graph).
@@ -69,6 +69,8 @@ pub(super) fn expected_weight_shape(c: &Config, name: &str) -> Option<Vec<usize>
         "attn_sub_norm.weight" if attn => vec![qrow],
         // LFM3's per-head output gate: one logit per head (`Op::HeadGate`).
         "attn_gate.weight" if attn && c.lfm3 => vec![ne, c.n_head],
+        // Qwen3.5's time-step bias has one value per value head.
+        "ssm_dt.bias" if delta => vec![c.q35_num_v_heads()],
         // LFM's short convolution: B | C | X in-projection, the per-channel kernel, the output.
         "shortconv.in_proj.weight" if shortconv => vec![ne, 3 * ne],
         "shortconv.conv.weight" if shortconv => vec![c.shortconv_l_cache, ne],

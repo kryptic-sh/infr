@@ -72,6 +72,24 @@ pub(crate) fn fuse_qkv_decision(
         })
 }
 
+/// Some Qwen3.5 GGUFs store the time-step bias without the `.bias` suffix.
+fn qwen35_gguf_tensor_name<'a>(g: &dyn WeightSource, c: &Config, name: &'a str) -> &'a str {
+    if !c.qwen35
+        || g.as_any().downcast_ref::<infr_gguf::Gguf>().is_none()
+        || g.tensors().iter().any(|tensor| tensor.name == name)
+    {
+        return name;
+    }
+    let Some(legacy) = name.strip_suffix(".bias").filter(|name| name.ends_with(".ssm_dt")) else {
+        return name;
+    };
+    if g.tensors().iter().any(|tensor| tensor.name == legacy) {
+        legacy
+    } else {
+        name
+    }
+}
+
 /// Range-check externally-supplied token ids against the vocabulary BEFORE they index the
 /// embedding table (`tok as usize * n_embd`). An out-of-vocab id would otherwise slice the table
 /// out of bounds and panic; surface a clean error instead. Only caller-supplied ids (prompt,
@@ -917,7 +935,8 @@ pub(crate) fn generate_dense_backend_bound(
                             return Ok(bytes);
                         }
                     }
-                    Ok(g.tensor_bytes(name).map_err(|e| anyhow!("{e}"))?.to_vec())
+                    let source_name = qwen35_gguf_tensor_name(g, c, name);
+                    Ok(g.tensor_bytes(source_name).map_err(|e| anyhow!("{e}"))?.to_vec())
                 };
                 // The same tensor as `own_bytes`, but a GGUF keeps its zero-copy mmap view: the
                 // CPU paged store and `PageReleaser` need the file range a view carries, and a
@@ -928,22 +947,24 @@ pub(crate) fn generate_dense_backend_bound(
                             return Ok(WBytes::Owned(bytes));
                         }
                     }
+                    let source_name = qwen35_gguf_tensor_name(g, c, name);
                     match g.as_any().downcast_ref::<infr_gguf::Gguf>() {
                         Some(gg) => Ok(WBytes::Mmap(
-                            gg.tensor_bytes_arc(name).map_err(|e| anyhow!("{e}"))?,
+                            gg.tensor_bytes_arc(source_name).map_err(|e| anyhow!("{e}"))?,
                         )),
                         None => Ok(WBytes::Owned(
-                            g.tensor_bytes(name).map_err(|e| anyhow!("{e}"))?.to_vec(),
+                            g.tensor_bytes(source_name).map_err(|e| anyhow!("{e}"))?.to_vec(),
                         )),
                     }
                 };
                 // Found AND the shape the graph will index it as: a mismatch is refused here, naming
                 // both shapes, rather than read out of bounds by the first forward pass.
                 let info = |name: &str| {
+                    let source_name = qwen35_gguf_tensor_name(g, c, name);
                     let t = g
                         .tensors()
                         .iter()
-                        .find(|t| t.name == name)
+                        .find(|t| t.name == source_name)
                         .cloned()
                         .ok_or_else(|| anyhow!("tensor not found: {name}"))?;
                     super::wshape::check_weight_shape(c, name, &t.shape)?;
@@ -7180,9 +7201,35 @@ mod tests {
         synthetic_gguf("qwen35", &u32_keys, &tensors, f16)
     }
 
-    /// The weight-shape table accepts every tensor of a well-formed qwen35 model that has a rule,
-    /// the full-attention layer's projections, gated query and head norms among them, and refuses
-    /// each of those widened by one along its contiguous axis.
+    /// Loading a Qwen3.5 GGUF with the bare time-step bias name still binds the recurrent weights.
+    #[test]
+    fn qwen35_gguf_accepts_the_bare_legacy_dt_tensor_name() {
+        let mut gguf = qwen35_gguf(false);
+        gguf.tensors
+            .iter_mut()
+            .find(|tensor| tensor.name == "blk.0.ssm_dt.bias")
+            .unwrap()
+            .name = "blk.0.ssm_dt".into();
+        gguf.meta.extend([
+            ("tokenizer.ggml.model".into(), Meta::Str("gpt2".into())),
+            (
+                "tokenizer.ggml.tokens".into(),
+                Meta::StrArr((0..Q35_VOCAB).map(|i| format!("t{i}")).collect()),
+            ),
+            ("tokenizer.ggml.merges".into(), Meta::StrArr(Vec::new())),
+        ]);
+        let tmp = TempGguf::write("q35-legacy-dt", &gguf);
+        let model = crate::SeamModel::load_with(
+            tmp.path(),
+            None,
+            std::sync::Arc::new(EngineConfig::default()),
+        )
+        .unwrap();
+
+        assert_eq!(model.generate_cpu_ids(&[1], 1, |_| {}).unwrap().len(), 1);
+    }
+
+    /// The weight-shape table accepts each valid Qwen3.5 tensor and refuses a widened shape.
     #[test]
     fn qwen35_weight_shapes_are_checked() {
         use crate::seam::wshape::{check_weight_shape, expected_weight_shape};

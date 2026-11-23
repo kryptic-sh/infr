@@ -86,7 +86,7 @@ tokio = { version = "1", features = ["full"] }
 # comparisons are written to survive the optimizer). Already in the lockfile under sha2/rustls, so
 # a direct dep costs no new compilation unit.
 subtle = "2"
-axum = "0.7"
+axum = "0.8"
 # `env`: the CLI-presentation knob `INFR_DIFFUSION_VISUAL` is a plain clap flag
 # (docs/config-plan.md §6.10) whose env spelling stays supported — as clap's own fallback for the
 # flag, so it enters through the FLAG layer instead of a `std::env::var` deep in `cmd_run` (R3).

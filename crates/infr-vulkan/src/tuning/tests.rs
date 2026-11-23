@@ -1719,9 +1719,10 @@ fn queue_family_takes_its_three_words_only() {
     }
 }
 
-/// `attn_split.decode_min_chunk` keeps PR 105's 16 on the class it was measured on, a discrete
-/// device in the slow class, and the 64 every other device ran before it; `infr tune show` reads
-/// the same field the attention lowering does. A floor above the policy's ceiling is refused.
+/// `attn_split.decode_min_chunk` keeps PR 105's floor on the class it was measured on, a discrete
+/// device in the slow class (`SLOW_CLASS_DECODE_MIN_CHUNK`), and elsewhere the one every device
+/// ran before it (`DECODE_MIN_CHUNK`); `infr tune show` reads the same field the attention
+/// lowering does. A floor above the policy's ceiling is refused.
 #[test]
 fn decode_chunk_floor_follows_the_device_facts() {
     let floor = |id: &str| fixture_tuning(id).attn_decode_min_chunk;

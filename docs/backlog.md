@@ -7544,29 +7544,60 @@ reviewer, none was run.
   `gemv.kq_fma` device a paged model decodes on the int8 or dequant route while
   its resident twin runs fp32. `quant_linear`'s doc lists its exceptions and
   omits this one. Inherited from PR 107.
-- **About 55 GPU tests still skip silently.** `gpu_or_skip` now fails when
-  `INFR_DEV` names a device that does not open, but tests that call
-  `VulkanBackend::new()` themselves and return on an error do not go through it
-  (unit tests in `adapter.rs`, `lib.rs`, `pager.rs`, `kq_gemm_tests.rs`, and
-  `infr-llama`'s `seam/runner.rs` and `seam/weights.rs`).
+- **GPU skips: what the helper does not cover.** Every test that opened a Vulkan
+  backend or listed the devices and returned on an error now goes through
+  `infr_testkit::gpu_or_skip_noted` or `gpu_devices_or_skip_noted`
+  (`gpu_env.rs`), which fail when `INFR_FORCE_WAVE64` is set or `INFR_DEV` names
+  a Vulkan device, as `infr_core::config::vulkan_dev_spec` reads it (the
+  predicate `resolve_infr_dev_index` is built on, so a bare index or a padded
+  value counts). What is left:
+  - **Three skip policies, not one.** `tests/bench_support/mod.rs`
+    (`unavailable`) skips only on a no-driver or no-device message and fails on
+    any other init error, but only when no device is named;
+    `tests/work_split_parity.rs` fails when a device is present or named and the
+    backend did not open; the testkit helpers skip on any error unless a device
+    is named. Unifying them, and classifying "no driver, no device" against a
+    real init failure on a present GPU so that the latter fails with no device
+    named, is not done. There is no switch that makes a GPU test fail when none
+    opens and none is named (`INFR_TEST_REQUIRE_MODELS` is about models only).
+  - **A listing does not fail for a missing named device.**
+    `VulkanBackend::enumerate_devices` drops the pick error (`.ok()`) and
+    returns the list with no device marked `is_default_pick`. The tests that
+    list devices are refused in `gpu_devices_or_skip_noted` instead, which
+    panics when a Vulkan device is named and none of the listed ones is the
+    pick. The production listing is unchanged.
+  - **Left as they are, by design.** `resident_room`
+    (`infr-llama/tests/cpu_backend.rs`) treats a failed listing as "no verdict":
+    the load that follows reports the failure itself. `integrated()`
+    (`infr-vulkan/tests/work_split_parity.rs`) reads a failed listing as "not
+    integrated": the test has already opened its backend through that file's own
+    policy.
+  - **Not uniform under capture.** The integration tests under `crates/*/tests`
+    that already called `gpu_or_skip` still print their own skip line with
+    `eprintln!`, which libtest captures on a pass; only the unit tests and
+    `interconnect_probe.rs` use the noted helpers. nextest hides a passing
+    test's output either way.
+  - **Metal:** its tests open the backend with `expect` or `unwrap`; no test
+    there returns on a failed open, and no Metal skip helper exists.
+- **No host-referenced cover for windowed or canvas split-K spans.**
+  `tests/attn_split_host.rs` holds exactly-once scanning against a host
+  attention for full-causal spans only, and is ignored;
+  `tests/attn_decode_parity.rs` has windowed and ring cases but compares two
+  kernel builds. `the_chunks_cover_each_key_once`, which only checked a helper
+  of its own, is deleted.
 - **The AMD integrated `queue.family` row cannot be limited to Windows.** The
   tuning table's `Match` has no OS field, so an AMD integrated GPU on a Linux
   driver reporting the same driver id would get the compute-only family,
   unmeasured. The row also rests on one integrated GPU.
-- **`the_chunks_cover_each_key_once` cannot fail.** It checks a helper defined
-  in the test. The GPU test `attn_split_host` is the real cover check.
 - **`precise` does not cover every add in the kq_fma kernels.** `hsum`, the
   accumulator adds, the cross-subgroup sum and `subgroupAdd` are undecorated. No
   multiply is uncovered. The per-device parity tests are the guard.
 - **Smaller:** the two Q4_K kernels do not spell identical float operations (one
   multiplies by a power of two where the other shifts; equal except at subnormal
-  products); `QueueOutcome::reason` can contradict the family printed beside it;
-  `docs/config.md` says an untimed compute-only family is never picked, while
-  under `graphics` nothing warns and it is the last resort; bare literals for
-  the floor defaults and in several comments; `honour_env` carries `INFR_TUNE`
-  but not the `INFR_KQ_FMA_GEMV` and `INFR_GFX_QUEUE` aliases; the changelog
-  cites a depth-2048 figure as a floor effect where the chunk is the same at
-  either floor.
+  products); the `rule` strings of the tuning parameters in `tuning/families.rs`
+  still spell their defaults' digits beside the constants (the convention of
+  every parameter there, left alone), and comments in `adapter.rs` and
+  `recorder.rs` that spell the split policy's numbers were not touched.
 
 ### B209 — gemma-3-1b's mid-sequence CPU distance is int8 noise, not outliers (2026-11-18)
 

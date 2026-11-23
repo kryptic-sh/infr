@@ -1130,8 +1130,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
     fn seeded_kv_prefix_decodes_like_its_source_vulkan() {
-        let Ok(vk) = infr_vulkan::VulkanBackend::new() else {
-            eprintln!("skip: no Vulkan device");
+        let Some(vk) = infr_testkit::gpu_or_skip_noted(infr_vulkan::VulkanBackend::new()) else {
             return;
         };
         eprintln!("vulkan device: {}", vk.capabilities().name);

@@ -2578,7 +2578,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan GPU"]
     fn a_discarded_recording_unmarks_a_resident_layer() {
-        let Ok(be) = VulkanBackend::new() else {
+        let Some(be) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         let (stride, n_expert, buf_id) = (256usize, 4usize, 1usize);
@@ -2649,7 +2649,7 @@ mod tests {
     #[ignore = "requires a Vulkan GPU"]
     fn every_placement_change_moves_the_dense_epoch() {
         use infr_core::blockio::{BlockDesc, BlockExtent, BlockIo};
-        let Ok(be) = VulkanBackend::new() else {
+        let Some(be) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         /// The tier below: every block's bytes are produced except the one it names.
@@ -2968,7 +2968,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan GPU"]
     fn a_discarded_recording_frees_its_fill_slots() {
-        let Ok(be) = VulkanBackend::new() else {
+        let Some(be) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         let (stride, n_expert, buf_id) = (256usize, 4usize, 1usize);

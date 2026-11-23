@@ -40,7 +40,7 @@ pub mod gguf;
 pub mod gpu_env;
 pub mod llama_cpp;
 
-pub use gpu_env::{gpu_or_skip, honour_env};
+pub use gpu_env::{gpu_devices_or_skip_noted, gpu_or_skip, gpu_or_skip_noted, honour_env};
 
 use infr_core::backend::{Backend, Bindings, BufferUsage};
 use infr_core::decode_spec::{block_spec, WEIGHT_QUANTS};

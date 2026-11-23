@@ -147,10 +147,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `kernels.vulkan.gfx_queue = true` (`INFR_GFX_QUEUE`) is an alias of
   `graphics`. `infr tune show` prints the value, where it came from and the
   family picked, and the startup log says the same. A COMPUTE-only family that
-  writes no timestamps is never used, with a warning, since the submit splitter,
-  the work bound, the dropped-work check and `INFR_PROF_OPS` read timestamps
-  from the submit queue. The generation golden and the tolerance tests run on
-  both devices pass unchanged on the compute-only family.
+  writes no timestamps is passed over for the universal one, with a warning,
+  since the submit splitter, the work bound, the dropped-work check and
+  `INFR_PROF_OPS` read timestamps from the submit queue; it is taken only where
+  no other family can compute. The generation golden and the tolerance tests run
+  on both devices pass unchanged on the compute-only family.
 
 - **Tuning parameter `gemv.kq_fma`: fp32 decode GEMVs for GPUs without an
   accelerated int8 dot.** Three decode (one-row) kernels, on by default where
@@ -180,13 +181,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   discrete device in the slow class (no matrix units and no accelerated int8
   dot, or wave64-only): on an RX 580 under RADV that took
   gemma-4-E4B-it-qat-UD-Q4_K_XL decode from 39.24 to 45.74 tok/s at depth 16 and
-  from 40.73 to 41.45 at depth 2048 (`docs/perf/vulkan-decode-attn-chunk.md`).
-  Every other device keeps 64, the floor before this, so its decode output is
-  unchanged. The floor sets the chunk of every span under 32 times its value, so
-  16 changes the last bits of decode attention up to 2047 keys of context, not
-  only under 512. MTP verify batches take the same floor as decode. The combine
-  pass (`attn_combine.comp`) now issues the partial loads of 8 chunks before
-  testing their weights, on every device, with the same sums in the same order.
+  from 43.09 to 43.50 at depth 512 (`docs/perf/vulkan-decode-attn-chunk.md`; its
+  depth-2048 row, 40.73 to 41.45, is not an effect of the floor, since from 2048
+  keys up the chunk is the same at either floor). Every other device keeps 64,
+  the floor before this, so its decode output is unchanged. The floor sets the
+  chunk of every span under 32 times its value, so 16 changes the last bits of
+  decode attention up to 2047 keys of context, not only under 512. MTP verify
+  batches take the same floor as decode. The combine pass (`attn_combine.comp`)
+  now issues the partial loads of 8 chunks before testing their weights, on
+  every device, with the same sums in the same order.
 
 - **GPU logits held to the CPU reference within a tolerance.** New public module
   `infr_llama::tolerance`: `score_row` and `RunScore` (KL divergence, top-set
@@ -486,6 +489,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   nothing streams. With `infr_vulkan::linear::dense_stream_supported` and
   `dense_stream_slot_align`, the dtypes the dense streaming planner accepts and
   the slot alignment each needs.
+
+- **`infr_core::config::vulkan_dev_spec` and `PartialConfig::copy_path_to`.**
+  `vulkan_dev_spec` says which `INFR_DEV` / `--dev` values name a Vulkan device
+  (anything but unset, empty, `metal` and `cpu`); the Vulkan backend's device
+  resolver now decides that through it, with the same results as before.
+  `copy_path_to` copies what a config layer set at one dotted path onto another
+  layer as the typed value.
 
 ### Changed
 

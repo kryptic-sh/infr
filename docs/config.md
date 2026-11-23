@@ -497,12 +497,16 @@ queue.family                 auto   default; picked queue family 1 (compute-only
 
 "A queue infr cannot use" is one that writes no timestamps (`timestampValidBits`
 0): the submit splitter, the work bound, the dropped-work check and
-`INFR_PROF_OPS` all read timestamps from the submit queue, so such a family is
-never picked, under any setting, with a warning. The choice also decides which
-of the driver's watchdogs applies. amdgpu documents a longer job timeout for its
-compute rings than for the graphics ring, but the work budget does not count on
-it: the 2 s figure is the tighter one, and it is the one that was measured, on
-the graphics ring.
+`INFR_PROF_OPS` all read timestamps from the submit queue. `auto` and `compute`
+pass such a family over for the universal queue and log a warning. It is taken
+only as a last resort, on a device where no other queue can compute, and `auto`
+and `compute` warn there too. `graphics` asks for the universal queue; on a
+device without one it takes a compute-only queue, one that writes timestamps if
+there is one, and does not warn. Either way the line above names the family that
+was taken and says why. The choice also decides which of the driver's watchdogs
+applies. amdgpu documents a longer job timeout for its compute rings than for
+the graphics ring, but the work budget does not count on it: the 2 s figure is
+the tighter one, and it is the one that was measured, on the graphics ring.
 
 Each value is resolved once, when the backend is created, from these levels —
 the last one that sets a parameter wins, per parameter:

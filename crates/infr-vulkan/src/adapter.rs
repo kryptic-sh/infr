@@ -8116,7 +8116,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn replay_follows_rebound_buffers() {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         let (nh, nkv, hd) = (2usize, 1usize, 128usize);
@@ -8249,7 +8249,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn mla_oversized_dims_are_refused() {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         // One token, one head, a 2-wide nope/value part so only the latent dims vary.
@@ -8755,7 +8755,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn gated_act_silu_strided_gate_errors() {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         let (rows, nff) = (1usize, 4usize);
@@ -8798,7 +8798,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn cross_dtype_copy_src_off_errors() {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         let mut g = Graph::new();
@@ -9085,7 +9085,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn rmsnorm_graph_matches_host() {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         let (rows, dim, eps) = (2usize, 8usize, 1e-6f32);
@@ -9141,7 +9141,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn gated_rmsnorm_graph_matches_host() {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         let (rows, n_head, head_dim, eps) = (2usize, 2usize, 8usize, 1e-6f32);
@@ -9219,7 +9219,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn linear_graph_matches_host() {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         let (in_f, out_f) = (16usize, 4usize);
@@ -9269,7 +9269,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn linear_gemm_k_odd_32_matches_host() {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         if !crate::test_has_f16_coopmat(&be_, "linear_gemm_k_odd_32_matches_host") {
@@ -9346,7 +9346,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn gated_act_silu_matches_host() {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         let nff = 8usize;
@@ -9396,7 +9396,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn qk_norm_rope_graph_matches_host() {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         let (nh, hd, pos) = (2usize, 8usize, 3usize);
@@ -9479,7 +9479,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn qk_norm_f16_inplace_matches_host() {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         let (nh, hd, eps) = (2usize, 8usize, 1e-6f32);
@@ -9552,7 +9552,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn copy_f32_to_f16_cast_matches_host() {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         let n = 37usize; // not a multiple of the dispatch's local size — exercises the tail
@@ -9603,7 +9603,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn attention_graph_matches_host() {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         let (nh, nkv, hd, pos) = (2usize, 1usize, 8usize, 2usize);
@@ -9705,7 +9705,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn softmax_graph_matches_host() {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         let (rows, dim, scale) = (3usize, 300usize, 1.3f32);
@@ -9766,7 +9766,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn softmax_dyn_graph_matches_host() {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         let (rows, dim) = (3usize, 300usize);
@@ -9842,7 +9842,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn diffusion_gemma_sc_subgraph_matches_host() {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         let (cc, vocab, ne, nff) = (4usize, 512usize, 128usize, 256usize);
@@ -10078,7 +10078,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan GPU"]
     fn attention_small_m_split_matches_host() {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         let (nh, nkv, hd) = (4usize, 2usize, 64usize);
@@ -10218,8 +10218,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan GPU"]
     fn attention_canvas_long_span_matches_host() {
-        let Ok(be_) = VulkanBackend::new() else {
-            eprintln!("skip: no Vulkan device");
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return;
         };
         let (nh, nkv, hd, rows) = (2usize, 1usize, 64usize, 4usize);
@@ -10334,7 +10333,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan GPU with cooperative matrix"]
     fn attention_q8_kv_prefill_off_tile_matches_host() {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         if !crate::test_has_f16_coopmat(&be_, "attention_q8_kv_prefill_off_tile_matches_host") {
@@ -10610,7 +10609,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn moe_ffn_graph_matches_host() {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         // ne/nff = 32 is the native-block K floor, not an arbitrary small number: the expert
@@ -10761,7 +10760,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn discarded_segment_forgets_staged_expert() {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         let (slot_bytes, n_expert, buf_id) = (256usize, 2usize, 1usize);
@@ -10828,7 +10827,10 @@ mod tests {
     #[test]
     #[ignore = "requires TWO Vulkan GPUs: run with --include-ignored on a multi-GPU box"]
     fn ep_matches_single_device_synthetic() {
-        let Ok(devs) = VulkanBackend::enumerate_devices_from_env() else {
+        let Some(devs) = infr_testkit::gpu_devices_or_skip_noted(
+            VulkanBackend::enumerate_devices_from_env(),
+            |d| d.is_default_pick,
+        ) else {
             return; // no Vulkan — self-skip
         };
         if devs.len() < 2 {
@@ -11160,8 +11162,7 @@ mod tests {
                 y
             })
         };
-        let Ok(single) = VulkanBackend::new() else {
-            eprintln!("skip: no Vulkan device");
+        let Some(single) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return;
         };
         let ep = crate::ep::ExpertParallelBackend::new(
@@ -11212,7 +11213,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn moe_ffn_fused_scaled_matches_host() {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         let (ne, n_expert, n_used, nff) = (32usize, 4usize, 2usize, 32usize);
@@ -11342,7 +11343,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn moe_ffn_llama4_small_m_matches_host() {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         let (ne, n_expert, n_used, nff) = (32usize, 4usize, 1usize, 32usize);
@@ -11466,7 +11467,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn moe_ffn_llama4_batched_matches_host() {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         let (ne, n_expert, n_used, nff) = (256usize, 4usize, 1usize, 256usize);
@@ -12176,7 +12177,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn moe_ffn_batched_fused_scaled_matches_host() {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         let (ne, n_expert, n_used, nff) = (256usize, 4usize, 2usize, 32usize);
@@ -12329,7 +12330,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn moe_ffn_batched_split_q5k_down_matches_host() {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         let (ne, n_expert, n_used, nff) = (256usize, 4usize, 2usize, 256usize);
@@ -12475,7 +12476,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn moe_ffn_batched_split_q5k_gate_up_matches_host() {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         let (ne, n_expert, n_used, nff) = (256usize, 4usize, 2usize, 256usize);
@@ -12614,7 +12615,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn moe_ffn_batched_fused_q5_1_down_matches_host() {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         let (ne, n_expert, n_used, nff) = (256usize, 4usize, 2usize, 32usize);
@@ -12755,7 +12756,7 @@ mod tests {
         dequant_down: fn(&[u8]) -> Vec<f32>,
         label: &str,
     ) {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         let (ne, n_expert, n_used, nff) = (256usize, 4usize, 2usize, 32usize);
@@ -12930,7 +12931,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn moe_ffn_batched_split_q2_k_q3_k_scout_shape_matches_host() {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         let (ne, n_expert, n_used, nff) = (256usize, 4usize, 2usize, 256usize);
@@ -13365,7 +13366,9 @@ mod tests {
     fn f16_linear_add_stays_unfused_without_shader_float16() {
         let mut cfg = crate::test_config();
         cfg.kernels.vulkan.f16 = false;
-        let Ok(be_) = VulkanBackend::new_with(std::sync::Arc::new(cfg)) else {
+        let Some(be_) =
+            infr_testkit::gpu_or_skip_noted(VulkanBackend::new_with(std::sync::Arc::new(cfg)))
+        else {
             return; // no GPU — self-skip
         };
         assert!(!be_.caps().f16, "`f16 = false` must clear caps.f16");
@@ -13448,7 +13451,9 @@ mod tests {
         for (name, knob, dt) in cases {
             let mut cfg = crate::test_config();
             knob(&mut cfg.kernels.vulkan);
-            let Ok(be_) = VulkanBackend::new_with(std::sync::Arc::new(cfg)) else {
+            let Some(be_) =
+                infr_testkit::gpu_or_skip_noted(VulkanBackend::new_with(std::sync::Arc::new(cfg)))
+            else {
                 return; // no GPU — self-skip
             };
             if !be_.caps().i8_dot {
@@ -13535,7 +13540,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn qk_norm_rope_unservable_shapes_are_refused() {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         let run = |hd: usize, strided: bool, ff: bool| {
@@ -13578,7 +13583,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn record_once_rope_into_a_ring_cache_is_refused() {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         let (nh, nkv, hd, rows) = (2usize, 1usize, 64usize, 4usize);
@@ -13697,7 +13702,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn op_limits_are_refused_by_name() {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         let f32d = |d: Vec<usize>| TensorDesc::new(d, DType::F32);

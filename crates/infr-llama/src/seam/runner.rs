@@ -7285,7 +7285,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan GPU"]
     fn qwen35_strided_deltanet_vulkan_matches_cpu() {
-        let Ok(vk) = infr_vulkan::VulkanBackend::new() else {
+        let Some(vk) = infr_testkit::gpu_or_skip_noted(infr_vulkan::VulkanBackend::new()) else {
             return;
         };
         let (g, cfg) = open_synthetic("qwen35-strided-vk", &qwen35_gguf(true));
@@ -7596,8 +7596,7 @@ mod tests {
         body: impl FnOnce(&infr_vulkan::VulkanBackend, &Q35Run<'_>),
     ) {
         use std::io::Write;
-        let Ok(vk) = infr_vulkan::VulkanBackend::new() else {
-            eprintln!("skip: no Vulkan device");
+        let Some(vk) = infr_testkit::gpu_or_skip_noted(infr_vulkan::VulkanBackend::new()) else {
             return;
         };
         let name = infr_core::backend::Backend::capabilities(&vk).name;
@@ -8461,10 +8460,9 @@ mod tests {
         ]);
         ec.kernels.vulkan.no_replay = false;
         ec.sampling.ignore_eos = true;
-        let Ok(vk) = infr_vulkan::VulkanBackend::new_with(std::sync::Arc::new(ec.clone())) else {
-            eprintln!("skip: no Vulkan device");
-            return None;
-        };
+        let vk = infr_testkit::gpu_or_skip_noted(infr_vulkan::VulkanBackend::new_with(
+            std::sync::Arc::new(ec.clone()),
+        ))?;
         eprintln!(
             "vulkan device: {}",
             infr_core::backend::Backend::capabilities(&vk).name
@@ -9009,7 +9007,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan GPU"]
     fn llama4_vulkan_sessions_open_at_the_cap() {
-        if infr_vulkan::VulkanBackend::new().is_err() {
+        if infr_testkit::gpu_or_skip_noted(infr_vulkan::VulkanBackend::new()).is_none() {
             return;
         }
         let (_tmp, model) = llama4_session_model();
@@ -9122,7 +9120,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan GPU"]
     fn llama_rope_freqs_vulkan_matches_cpu() {
-        let Ok(vk) = infr_vulkan::VulkanBackend::new() else {
+        let Some(vk) = infr_testkit::gpu_or_skip_noted(infr_vulkan::VulkanBackend::new()) else {
             return;
         };
         println!(

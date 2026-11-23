@@ -678,10 +678,10 @@ pub(crate) static PARAMS: &[Param] = &[
                int8 dot, or wave64-only), where it was measured; else 64",
         default: |f, _| {
             Value::Uint(if !f.integrated && f.slow_class() {
-                16
+                crate::attn_chunk::SLOW_CLASS_DECODE_MIN_CHUNK
             } else {
-                64
-            })
+                crate::attn_chunk::DECODE_MIN_CHUNK
+            } as u64)
         },
         get: |t, _| Value::Uint(t.attn_decode_min_chunk as u64),
         set: |t, _, v| t.attn_decode_min_chunk = v.usize(),

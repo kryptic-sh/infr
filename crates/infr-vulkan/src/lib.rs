@@ -92,17 +92,12 @@ use infr_core::error::backend as be;
 ///     numbers, so a typo must fail loudly. `device_names` (`"Vulkan0=<name>"`, …) feeds the
 ///     "no such device" message.
 fn resolve_infr_dev_index(spec: Option<&str>, device_names: &[String]) -> Result<Option<usize>> {
-    let Some(spec) = spec else {
+    // Which specs name a Vulkan device at all is `vulkan_dev_spec`'s to say, shared with the
+    // test kit's skip policy.
+    let (Some(spec), Some(s)) = (spec, infr_core::config::vulkan_dev_spec(spec)) else {
         return Ok(None);
     };
-    let s = spec.trim();
-    if s.is_empty() {
-        return Ok(None);
-    }
     let lower = s.to_ascii_lowercase();
-    if lower == "metal" || lower == "cpu" {
-        return Ok(None);
-    }
     let idx_str = lower.strip_prefix("vulkan").unwrap_or(&lower);
     let idx: usize = idx_str.parse().map_err(|_| {
         be(format!(
@@ -249,42 +244,85 @@ fn check_bindable_size(bytes: usize) -> Result<()> {
     Ok(())
 }
 
-/// Why [`VulkanBackend::pick_queue_family`] chose the family it did.
+/// Why [`VulkanBackend::pick_queue_family`] chose the family it did. Each outcome fixes the kind
+/// of family that was taken, so [`QueueOutcome::reason`] cannot describe another one than the
+/// family printed beside it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum QueueOutcome {
     /// A COMPUTE-only family that writes timestamps, as `auto` or `compute` asked.
     ComputeOnly,
-    /// The setting is `graphics`.
+    /// The setting is `graphics`, and the universal family was taken.
     GraphicsAsked,
-    /// `auto` or `compute`, but the device has no COMPUTE-only family.
+    /// The setting is `graphics`, but the device has no universal family: a COMPUTE-only one was
+    /// taken.
+    NoUniversalFamily,
+    /// `auto` or `compute`, but the device has no COMPUTE-only family: the universal one was
+    /// taken.
     NoComputeFamily,
-    /// `auto` or `compute`, but no COMPUTE-only family writes timestamps.
+    /// `auto` or `compute`, but no COMPUTE-only family writes timestamps: the universal one was
+    /// taken.
     NoTimestamps,
+    /// `auto` or `compute`, no COMPUTE-only family writes timestamps and the device has no
+    /// universal family either: a COMPUTE-only family without timestamps was taken.
+    OnlyUntimed,
 }
 
+/// What reads timestamps from the submit queue, for the outcomes that turn on them.
+const QUEUE_TIMESTAMP_READERS: &str =
+    "the submit splitter, the work bound, the dropped-work check and the per-op profile";
+
 impl QueueOutcome {
-    /// The outcome in words, for the startup log and `infr tune show`.
-    fn reason(self) -> &'static str {
+    /// Whether the family taken under this outcome is the universal one (GRAPHICS and COMPUTE)
+    /// rather than a COMPUTE-only one.
+    fn takes_universal(self) -> bool {
         match self {
-            QueueOutcome::ComputeOnly => "a compute-only family that writes timestamps",
-            QueueOutcome::GraphicsAsked => "the universal family, as set",
-            QueueOutcome::NoComputeFamily => {
-                "the universal family: this device has no compute-only family"
-            }
-            QueueOutcome::NoTimestamps => {
-                "the universal family: the compute-only family writes no timestamps \
-                 (timestampValidBits 0), which the submit splitter, the work bound, the \
-                 dropped-work check and the per-op profile need"
-            }
+            QueueOutcome::GraphicsAsked
+            | QueueOutcome::NoComputeFamily
+            | QueueOutcome::NoTimestamps => true,
+            QueueOutcome::ComputeOnly
+            | QueueOutcome::NoUniversalFamily
+            | QueueOutcome::OnlyUntimed => false,
         }
     }
 
-    /// Whether the fallback is worth a warning under `setting`: always when a family was refused
-    /// for its timestamps, and for a missing family only when `compute` asked for one by name.
+    /// The outcome in words, for the startup log and `infr tune show`: the kind of family taken
+    /// ([`Self::takes_universal`]), then why.
+    fn reason(self) -> String {
+        let family = if self.takes_universal() {
+            "the universal family"
+        } else {
+            "a compute-only family"
+        };
+        match self {
+            QueueOutcome::ComputeOnly => format!("{family} that writes timestamps"),
+            QueueOutcome::GraphicsAsked => format!("{family}, as set"),
+            QueueOutcome::NoUniversalFamily => {
+                format!("{family}: this device has no universal family to take as set")
+            }
+            QueueOutcome::NoComputeFamily => {
+                format!("{family}: this device has no compute-only family")
+            }
+            QueueOutcome::NoTimestamps => format!(
+                "{family}: no compute-only family writes timestamps (timestampValidBits 0), \
+                 which {QUEUE_TIMESTAMP_READERS} need"
+            ),
+            QueueOutcome::OnlyUntimed => format!(
+                "{family} that writes no timestamps (timestampValidBits 0), which \
+                 {QUEUE_TIMESTAMP_READERS} need: no family of this device that can compute \
+                 writes them"
+            ),
+        }
+    }
+
+    /// Whether the fallback is worth a warning under `setting`: always when timestamps were the
+    /// reason, and for a missing COMPUTE-only family only when `compute` asked for one by name.
+    /// `graphics` never warns, whichever family it ends on.
     fn warns(self, setting: tuning::QueueFamily) -> bool {
         match self {
-            QueueOutcome::ComputeOnly | QueueOutcome::GraphicsAsked => false,
-            QueueOutcome::NoTimestamps => true,
+            QueueOutcome::ComputeOnly
+            | QueueOutcome::GraphicsAsked
+            | QueueOutcome::NoUniversalFamily => false,
+            QueueOutcome::NoTimestamps | QueueOutcome::OnlyUntimed => true,
             QueueOutcome::NoComputeFamily => setting == tuning::QueueFamily::Compute,
         }
     }
@@ -1662,9 +1700,11 @@ impl VulkanBackend {
     /// valid timestamp bits is never taken while another family can compute: the submit
     /// splitter's segment timing, the work bound, the dropped-work check and the per-op profile
     /// all read timestamps written on the submit queue. Without a usable one, and under
-    /// `graphics`, the universal (GRAPHICS and COMPUTE) family is taken, then any family that
-    /// can compute. The two settings differ only in whether a fallback warns
-    /// ([`QueueOutcome::warns`]). `None` = the device cannot compute at all.
+    /// `graphics`, the universal (GRAPHICS and COMPUTE) family is taken; a device with no
+    /// universal family is left with COMPUTE-only ones, a timed one first and an untimed one as
+    /// the last resort, which only `auto` and `compute` warn about. `auto` and `compute` differ
+    /// only in whether a fallback warns ([`QueueOutcome::warns`]). `None` = the device cannot
+    /// compute at all.
     fn pick_queue_family(
         families: &[vk::QueueFamilyProperties],
         setting: tuning::QueueFamily,
@@ -1676,7 +1716,7 @@ impl VulkanBackend {
         };
         let compute_only = |p: &vk::QueueFamilyProperties| compute(p) && !universal(p);
         let timed = |p: &vk::QueueFamilyProperties| p.timestamp_valid_bits > 0;
-        let outcome = if setting == tuning::QueueFamily::Graphics {
+        let asked = if setting == tuning::QueueFamily::Graphics {
             QueueOutcome::GraphicsAsked
         } else if let Some(i) = families.iter().position(|p| compute_only(p) && timed(p)) {
             return Some((i as u32, QueueOutcome::ComputeOnly));
@@ -1685,12 +1725,21 @@ impl VulkanBackend {
         } else {
             QueueOutcome::NoComputeFamily
         };
+        if let Some(i) = families.iter().position(universal) {
+            return Some((i as u32, asked));
+        }
+        // No universal family: every family left that can compute is COMPUTE-only, and the
+        // outcome has to say so.
+        let last_resort = if setting == tuning::QueueFamily::Graphics {
+            QueueOutcome::NoUniversalFamily
+        } else {
+            QueueOutcome::OnlyUntimed
+        };
         families
             .iter()
-            .position(universal)
-            .or_else(|| families.iter().position(|p| compute(p) && timed(p)))
+            .position(|p| compute(p) && timed(p))
             .or_else(|| families.iter().position(compute))
-            .map(|i| (i as u32, outcome))
+            .map(|i| (i as u32, last_resort))
     }
 
     /// Enumerate ALL Vulkan physical devices WITHOUT building a backend (a cheap instance +
@@ -5571,9 +5620,10 @@ mod tests {
     }
 
     /// The segment timing, the work bound, the dropped-work check and the per-op profile read
-    /// timestamps from the submit queue, so a COMPUTE-only family that writes none is not taken
-    /// under any setting, and the fallback warns under `auto` and `compute` alike; a second one
-    /// that does write them is taken.
+    /// timestamps from the submit queue, so a COMPUTE-only family that writes none is passed over
+    /// while the device has a universal family, and the fallback warns under `auto` and `compute`
+    /// alike; a second one that does write them is taken. (With no universal family it is the
+    /// last resort: `an_untimed_compute_only_family_is_the_last_resort`.)
     #[test]
     fn a_compute_only_family_without_timestamps_is_refused() {
         use tuning::QueueFamily::{Auto, Compute, Graphics};
@@ -5597,13 +5647,149 @@ mod tests {
         three[0].queue_flags = vk::QueueFlags::GRAPHICS;
         assert_eq!(
             VulkanBackend::pick_queue_family(&three, Graphics),
-            Some((2, QueueOutcome::GraphicsAsked))
+            Some((2, QueueOutcome::NoUniversalFamily))
         );
-        for quiet in [QueueOutcome::ComputeOnly, QueueOutcome::GraphicsAsked] {
+        for quiet in [
+            QueueOutcome::ComputeOnly,
+            QueueOutcome::GraphicsAsked,
+            QueueOutcome::NoUniversalFamily,
+        ] {
             for setting in [Auto, Compute, Graphics] {
                 assert!(!quiet.warns(setting), "{quiet:?} under {setting:?}");
             }
         }
+    }
+
+    /// Every outcome, each reached from the one before it. The match has no wildcard, so a new
+    /// variant does not compile until it is given a place in the chain.
+    fn every_queue_outcome() -> Vec<QueueOutcome> {
+        use QueueOutcome::*;
+        let next = |o: &QueueOutcome| match o {
+            ComputeOnly => Some(GraphicsAsked),
+            GraphicsAsked => Some(NoUniversalFamily),
+            NoUniversalFamily => Some(NoComputeFamily),
+            NoComputeFamily => Some(NoTimestamps),
+            NoTimestamps => Some(OnlyUntimed),
+            OnlyUntimed => None,
+        };
+        std::iter::successors(Some(ComputeOnly), next).collect()
+    }
+
+    /// The reason printed beside the picked family describes that family and that device: over
+    /// every ordered choice of up to three families out of every kind, and every setting, the
+    /// outcome's family kind is the picked family's, its words start with that kind, and what
+    /// the outcome says about the device (which kinds of family it has, which write timestamps)
+    /// holds for the family list. Every outcome is reached.
+    #[test]
+    fn the_reason_describes_the_family_that_was_picked() {
+        use tuning::QueueFamily::Graphics;
+        let can_compute =
+            |p: &vk::QueueFamilyProperties| p.queue_flags.contains(vk::QueueFlags::COMPUTE);
+        let is_universal = |p: &vk::QueueFamilyProperties| {
+            can_compute(p) && p.queue_flags.contains(vk::QueueFlags::GRAPHICS)
+        };
+        let is_compute_only = |p: &vk::QueueFamilyProperties| can_compute(p) && !is_universal(p);
+        let is_timed = |p: &vk::QueueFamilyProperties| p.timestamp_valid_bits > 0;
+        let kinds: Vec<vk::QueueFamilyProperties> = [
+            vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE,
+            vk::QueueFlags::COMPUTE,
+            vk::QueueFlags::GRAPHICS,
+            vk::QueueFlags::TRANSFER,
+        ]
+        .into_iter()
+        .flat_map(|flags| {
+            let timed = queue_family(flags);
+            let untimed = vk::QueueFamilyProperties {
+                timestamp_valid_bits: 0,
+                ..timed
+            };
+            [timed, untimed]
+        })
+        .collect();
+        let mut devices: Vec<Vec<vk::QueueFamilyProperties>> = Vec::new();
+        for a in &kinds {
+            devices.push(vec![*a]);
+            for b in &kinds {
+                devices.push(vec![*a, *b]);
+                for c in &kinds {
+                    devices.push(vec![*a, *b, *c]);
+                }
+            }
+        }
+        let mut reached = Vec::new();
+        for families in &devices {
+            let has_universal = families.iter().any(is_universal);
+            let has_compute_only = families.iter().any(is_compute_only);
+            let has_timed_compute_only = families.iter().any(|p| is_compute_only(p) && is_timed(p));
+            for (_, setting) in tuning::QueueFamily::ALL {
+                let Some((i, outcome)) = VulkanBackend::pick_queue_family(families, setting) else {
+                    assert!(
+                        !families.iter().any(can_compute),
+                        "{setting:?} on {families:?}"
+                    );
+                    continue;
+                };
+                let picked = &families[i as usize];
+                let what = format!("{setting:?} on {families:?}: family {i}, {outcome:?}");
+                assert!(can_compute(picked), "{what}");
+                assert_eq!(outcome.takes_universal(), is_universal(picked), "{what}");
+                let reason = outcome.reason();
+                let kind = if is_universal(picked) {
+                    "the universal family"
+                } else {
+                    "a compute-only family"
+                };
+                assert!(reason.starts_with(kind), "{what}: {reason}");
+                // What each outcome says about the setting and the device, held to both.
+                let graphics = setting == Graphics;
+                let holds = match outcome {
+                    QueueOutcome::ComputeOnly => !graphics && is_timed(picked),
+                    QueueOutcome::GraphicsAsked => graphics,
+                    QueueOutcome::NoUniversalFamily => graphics && !has_universal,
+                    QueueOutcome::NoComputeFamily => !graphics && !has_compute_only,
+                    QueueOutcome::NoTimestamps => {
+                        !graphics && has_compute_only && !has_timed_compute_only
+                    }
+                    QueueOutcome::OnlyUntimed => {
+                        !graphics
+                            && !is_timed(picked)
+                            && !families.iter().any(|p| can_compute(p) && is_timed(p))
+                    }
+                };
+                assert!(holds, "{what}: {reason}");
+                if !reached.contains(&outcome) {
+                    reached.push(outcome);
+                }
+            }
+        }
+        for outcome in every_queue_outcome() {
+            assert!(reached.contains(&outcome), "{outcome:?} was never reached");
+        }
+    }
+
+    /// A device whose only families that can compute are COMPUTE-only without timestamps takes
+    /// one as the last resort: `auto` and `compute` warn, `graphics` does not.
+    #[test]
+    fn an_untimed_compute_only_family_is_the_last_resort() {
+        use tuning::QueueFamily::{Auto, Compute, Graphics};
+        let mut families = [
+            queue_family(vk::QueueFlags::GRAPHICS),
+            queue_family(vk::QueueFlags::COMPUTE),
+        ];
+        families[1].timestamp_valid_bits = 0;
+        for setting in [Auto, Compute] {
+            assert_eq!(
+                VulkanBackend::pick_queue_family(&families, setting),
+                Some((1, QueueOutcome::OnlyUntimed)),
+                "{setting:?}"
+            );
+            assert!(QueueOutcome::OnlyUntimed.warns(setting), "{setting:?}");
+        }
+        assert_eq!(
+            VulkanBackend::pick_queue_family(&families, Graphics),
+            Some((1, QueueOutcome::NoUniversalFamily))
+        );
+        assert!(!QueueOutcome::NoUniversalFamily.warns(Graphics));
     }
 
     #[test]
@@ -5730,7 +5916,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan GPU"]
     fn buffers_bound_whole_are_refused_past_the_storage_range() {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         const LIMIT: usize = 1 << 20;
@@ -5758,7 +5944,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan GPU"]
     fn tp_copies_reject_out_of_bounds_extents() {
-        let Ok(be_) = VulkanBackend::new() else {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return; // no GPU — self-skip
         };
         let small = be_.alloc(256, BufferUsage::Activations).unwrap();
@@ -6214,12 +6400,8 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn resident_bda_weight_arena_roundtrip() {
-        let be = match VulkanBackend::new() {
-            Ok(b) => b,
-            Err(_) => {
-                eprintln!("skip: no Vulkan GPU");
-                return;
-            }
+        let Some(be) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
+            return;
         };
         let sizes = [1000usize, 4096, 300_000];
         let mut addrs = Vec::new();
@@ -6285,12 +6467,8 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn kv_cache_buffer_reports_device_addr() {
-        let be = match VulkanBackend::new() {
-            Ok(b) => b,
-            Err(_) => {
-                eprintln!("skip: no Vulkan GPU");
-                return;
-            }
+        let Some(be) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
+            return;
         };
         // Two independent buffers, mirroring a K/V pair for one layer. UNLIKE the resident-weight
         // BDA arena, KV buffers are deliberately NOT consolidated into one shared block in this
@@ -6349,12 +6527,8 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn backend_drop_frees_device_after_moe_pager() {
-        let be = match VulkanBackend::new() {
-            Ok(b) => b,
-            Err(_) => {
-                eprintln!("skip: no Vulkan GPU");
-                return;
-            }
+        let Some(be) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
+            return;
         };
         be.init_moe_pager(crate::pager::MoePagerLayout {
             n_blocks: 4,
@@ -6506,12 +6680,8 @@ mod ssm_tests {
     #[test]
     #[ignore = "requires a Vulkan GPU"]
     fn softcap_matches_cpu() {
-        let be = match VulkanBackend::new() {
-            Ok(b) => b,
-            Err(_) => {
-                eprintln!("skip: no Vulkan GPU");
-                return;
-            }
+        let Some(be) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
+            return;
         };
         let (n, cap) = (100usize, 30.0f32);
         let x = det(n, 0.5);
@@ -6529,12 +6699,8 @@ mod ssm_tests {
     #[test]
     #[ignore = "requires a Vulkan GPU"]
     fn deltanet_matches_cpu() {
-        let be = match VulkanBackend::new() {
-            Ok(b) => b,
-            Err(_) => {
-                eprintln!("skip: no Vulkan GPU");
-                return;
-            }
+        let Some(be) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
+            return;
         };
         let (nv, nk, kd, vd) = (4usize, 2usize, 8usize, 8usize);
         let eps = 1e-6f32;
@@ -6625,12 +6791,8 @@ mod ssm_tests {
     #[test]
     #[ignore = "requires a Vulkan GPU"]
     fn conv1d_silu_matches_cpu() {
-        let be = match VulkanBackend::new() {
-            Ok(b) => b,
-            Err(_) => {
-                eprintln!("skip: no Vulkan GPU");
-                return;
-            }
+        let Some(be) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
+            return;
         };
         let (cc, kconv) = (40usize, 4usize);
         let qkv = det(cc, 0.2);

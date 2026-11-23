@@ -218,8 +218,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan GPU with int8 cooperative matrix"]
     fn i8cm_kq_matches_its_decomposition() {
-        let Ok(be) = VulkanBackend::new() else {
-            eprintln!("i8cm_kq_matches_its_decomposition: no Vulkan device — skipped");
+        let Some(be) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return;
         };
         if !be.i8cm_kq_ready() {
@@ -273,8 +272,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan GPU with int8 dot"]
     fn dp4a_kq_matches_its_decomposition() {
-        let Ok(be) = VulkanBackend::new() else {
-            eprintln!("dp4a_kq_matches_its_decomposition: no Vulkan device — skipped");
+        let Some(be) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
             return;
         };
         if !be.caps().i8_dot {

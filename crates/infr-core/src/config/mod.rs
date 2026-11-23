@@ -1133,6 +1133,17 @@ pub fn parse_device_spec(spec: &str, min: usize) -> Result<Vec<usize>, String> {
     Ok(devs)
 }
 
+/// The part of a raw `device.dev` spec (`INFR_DEV`, `--dev`) that names a Vulkan device: the spec
+/// trimmed, or `None` when it is unset, empty, or names another backend (`metal` or `cpu`, in any
+/// case). What is left is a Vulkan index to `infr-vulkan`'s resolver (`VulkanN` or a bare `N`; an
+/// unparseable one is its hard error). That resolver and the test kit's "a Vulkan device was
+/// named" check (`infr_testkit::gpu_or_skip`) both decide through this, so they cannot disagree.
+pub fn vulkan_dev_spec(spec: Option<&str>) -> Option<&str> {
+    let s = spec?.trim();
+    let other_backend = s.eq_ignore_ascii_case("metal") || s.eq_ignore_ascii_case("cpu");
+    (!s.is_empty() && !other_backend).then_some(s)
+}
+
 /// The closest known config path to `typo`, for a did-you-mean suggestion. `None` when nothing is
 /// close enough to be worth guessing.
 pub(crate) fn suggest_path(typo: &str) -> Option<String> {

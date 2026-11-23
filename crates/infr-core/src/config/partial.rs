@@ -352,6 +352,29 @@ macro_rules! cfg_struct {
                 ::core::result::Result::Err($crate::config::SetPathError::Unknown)
             }
 
+            /// Copy what THIS layer specified at `path` onto `into`, as the typed value (no trip
+            /// through its display string). `false` = no such leaf, or this layer left it unset.
+            pub fn copy_path_to(&self, path: &str, into: &mut Self) -> bool {
+                let (head, tail) = $crate::config::partial::split_path(path);
+                $(
+                    if head == stringify!($sf) {
+                        return tail.is_some_and(|t| self.$sf.copy_path_to(t, &mut into.$sf));
+                    }
+                )*
+                $(
+                    if head == stringify!($lf) && tail.is_none() {
+                        return match &self.$lf {
+                            ::core::option::Option::Some(v) => {
+                                into.$lf = ::core::option::Option::Some(v.clone());
+                                true
+                            }
+                            ::core::option::Option::None => false,
+                        };
+                    }
+                )*
+                false
+            }
+
             /// Did THIS layer specify `path`? (`--set` vs a bespoke CLI flag.)
             pub fn is_path_set(&self, path: &str) -> bool {
                 let (head, tail) = $crate::config::partial::split_path(path);

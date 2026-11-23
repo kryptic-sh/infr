@@ -180,7 +180,10 @@ mod tests {
     #[test]
     #[ignore = "requires a discrete and an integrated Vulkan GPU"]
     fn wrappers_report_an_integrated_rank_behind_a_discrete_rank_0() {
-        let Ok(devs) = VulkanBackend::enumerate_devices_from_env() else {
+        let Some(devs) = infr_testkit::gpu_devices_or_skip_noted(
+            VulkanBackend::enumerate_devices_from_env(),
+            |d| d.is_default_pick,
+        ) else {
             return; // no Vulkan — self-skip
         };
         let open = |i: usize| VulkanBackend::new_on(i).expect("open device");

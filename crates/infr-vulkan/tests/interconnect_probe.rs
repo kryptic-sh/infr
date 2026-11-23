@@ -36,8 +36,11 @@ fn dgpu_igpu(devs: &[DeviceInfo]) -> Option<(usize, usize)> {
 #[test]
 #[ignore = "requires ≥2 Vulkan devices (a discrete + an integrated GPU); multi-device foundation gate"]
 fn two_backends_coexist() {
-    let Ok(devs) = VulkanBackend::enumerate_devices_from_env() else {
-        eprintln!("skip: no Vulkan");
+    let Some(devs) =
+        infr_testkit::gpu_devices_or_skip_noted(VulkanBackend::enumerate_devices_from_env(), |d| {
+            d.is_default_pick
+        })
+    else {
         return;
     };
     let Some((d_idx, i_idx)) = dgpu_igpu(&devs) else {
@@ -71,8 +74,11 @@ fn two_backends_coexist() {
 #[test]
 #[ignore = "requires ≥2 Vulkan devices; perf/decision spike, prints numbers, not a CI gate"]
 fn interconnect_probe() {
-    let Ok(devs) = VulkanBackend::enumerate_devices_from_env() else {
-        eprintln!("skip: no Vulkan");
+    let Some(devs) =
+        infr_testkit::gpu_devices_or_skip_noted(VulkanBackend::enumerate_devices_from_env(), |d| {
+            d.is_default_pick
+        })
+    else {
         return;
     };
     let Some((d_idx, i_idx)) = dgpu_igpu(&devs) else {
@@ -325,8 +331,11 @@ fn p2p_move(
 #[test]
 #[ignore = "requires ≥2 Vulkan devices with external-memory support; P2P transport spike, prints numbers"]
 fn p2p_external_memory_probe() {
-    let Ok(devs) = VulkanBackend::enumerate_devices_from_env() else {
-        eprintln!("skip: no Vulkan");
+    let Some(devs) =
+        infr_testkit::gpu_devices_or_skip_noted(VulkanBackend::enumerate_devices_from_env(), |d| {
+            d.is_default_pick
+        })
+    else {
         return;
     };
     let Some((d_idx, i_idx)) = dgpu_igpu(&devs) else {

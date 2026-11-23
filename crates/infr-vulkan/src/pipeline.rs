@@ -746,8 +746,10 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan GPU (two for the multi-device leg)"]
     fn kv_past_the_last_layer_is_refused_across_devices() {
-        let Ok(devs) = VulkanBackend::enumerate_devices_from_env() else {
-            eprintln!("skip: no Vulkan device");
+        let Some(devs) = infr_testkit::gpu_devices_or_skip_noted(
+            VulkanBackend::enumerate_devices_from_env(),
+            |d| d.is_default_pick,
+        ) else {
             return;
         };
         let n_layer = 2;

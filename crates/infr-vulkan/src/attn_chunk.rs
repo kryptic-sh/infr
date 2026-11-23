@@ -11,12 +11,27 @@
 //!   the chunk from the live key count each token. The tests here hold a host copy of that
 //!   expression against the shaders' text and against [`static_chunk`].
 //!
+//! How a chunk's key range is indexed is the kernels' own arithmetic, with no host copy to test
+//! here. That every live key is scanned exactly once is held on a device, against a host
+//! attention, by `tests/attn_split_host.rs`, an ignored test, and only for full-causal spans (no
+//! window, no canvas) up to its largest case. `tests/attn_decode_parity.rs` has windowed and ring
+//! cases, but compares two builds of the partial pass with each other, not with a host
+//! reference, so nothing host-referenced covers a windowed or a canvas span.
+//!
 //! The floor is the tuning parameter `attn_split.decode_min_chunk`. An MTP verify batch scores
 //! the positions a decode step would, so it takes the decode floor too (`uses_decode_floor`).
 
 use infr_core::tier::{self, AttnSplitCfg};
 
 use crate::adapter::{ATTN_MAX_CHUNKS, ATTN_SPLIT};
+
+/// The default of `attn_split.decode_min_chunk` on a discrete device in the slow class, the class
+/// PR 105 measured it on (`docs/perf/vulkan-decode-attn-chunk.md`).
+pub(crate) const SLOW_CLASS_DECODE_MIN_CHUNK: usize = 16;
+
+/// The default of `attn_split.decode_min_chunk` everywhere else: the floor of the prefill rows'
+/// policy, which every device's decode ran before PR 105.
+pub(crate) const DECODE_MIN_CHUNK: usize = ATTN_SPLIT.min_chunk;
 
 /// Decode's split policy at the floor `min_chunk`: [`ATTN_SPLIT`]'s shape with that floor.
 fn decode_split(min_chunk: usize) -> AttnSplitCfg {
@@ -47,26 +62,19 @@ pub(crate) fn baked_min_chunk(cap_rows: usize, min_chunk: usize) -> usize {
 mod tests {
     use super::*;
 
-    /// The contributor's floor (PR 105) and the one every device ran before it.
-    const FLOORS: [usize; 2] = [16, 64];
+    /// Both defaults of the floor.
+    const FLOORS: [usize; 2] = [SLOW_CLASS_DECODE_MIN_CHUNK, DECODE_MIN_CHUNK];
 
     /// What the replay shaders compute per token from the baked floor and the live span.
     fn live_chunk(baked: usize, span: usize) -> usize {
         baked.max((span / 32).clamp(1, 512))
     }
 
-    /// The key ranges a plan of `chunk` keys cuts `[lo, kv_len)` into, as the kernels index them
-    /// (`j0 = lo + c * chunk`, clipped to the live keys).
-    fn ranges(lo: usize, kv_len: usize, chunk: usize) -> Vec<std::ops::Range<usize>> {
-        (0..tier::n_chunks(kv_len - lo, chunk))
-            .map(|c| lo + c * chunk..(lo + (c + 1) * chunk).min(kv_len))
-            .collect()
-    }
-
     /// The plan, as literals. A change of the floor, of the target chunk count or of the ceiling
     /// has to face these.
     #[test]
     fn the_plan_is_pinned_at_both_floors() {
+        assert_eq!(FLOORS, [16, 64]);
         // (span, chunk at floor 16, chunk at floor 64)
         for (span, at16, at64) in [
             (1usize, 16usize, 64usize),
@@ -102,49 +110,6 @@ mod tests {
                 tier::adaptive_chunk(span, &ATTN_SPLIT),
                 "span {span}"
             );
-        }
-    }
-
-    /// Every key of the span lands in exactly one chunk, no chunk is empty, and the count stays
-    /// inside what the combine's shared array holds, for full-context and windowed spans alike.
-    #[test]
-    fn the_chunks_cover_each_key_once() {
-        for floor in FLOORS {
-            for (lo, kv_len) in [
-                (0usize, 1usize),
-                (0, 15),
-                (0, 16),
-                (0, 17),
-                (0, 81),
-                (0, 513),
-                (0, 2049),
-                (0, 40_000),
-                (488, 1000),
-                (2700, 3213),
-            ] {
-                let chunk = static_chunk(kv_len - lo, floor);
-                let cut = ranges(lo, kv_len, chunk);
-                assert!(
-                    cut.len() <= ATTN_MAX_CHUNKS,
-                    "floor {floor} [{lo}, {kv_len})"
-                );
-                let mut next = lo;
-                for r in &cut {
-                    assert_eq!(
-                        r.start, next,
-                        "floor {floor} [{lo}, {kv_len}): a gap or overlap"
-                    );
-                    assert!(
-                        r.end > r.start,
-                        "floor {floor} [{lo}, {kv_len}): an empty chunk"
-                    );
-                    next = r.end;
-                }
-                assert_eq!(
-                    next, kv_len,
-                    "floor {floor} [{lo}, {kv_len}): keys left out"
-                );
-            }
         }
     }
 

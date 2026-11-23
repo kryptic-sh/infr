@@ -5,6 +5,8 @@ use clap::{Parser, Subcommand};
 use infr_core::config::{Config, ConfigOverrides, PartialConfig};
 use std::sync::Arc;
 
+mod tune_check;
+
 #[derive(Parser)]
 #[command(
     name = "infr",
@@ -327,6 +329,15 @@ impl SamplingOpts {
     }
 }
 
+/// What `infr tune check` scores a device against. One variant today: clap derives the flag's
+/// accepted values, its help and its usage error from this enum, so another reference is
+/// another variant here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum Against {
+    /// The CPU backend's reference mode, the one reference every GPU is held to.
+    CpuReference,
+}
+
 /// `infr tune` actions.
 #[derive(Subcommand)]
 enum TuneCmd {
@@ -350,6 +361,57 @@ enum TuneCmd {
         #[arg(long)]
         dev: Option<String>,
     },
+    /// Score a Vulkan device, with the tuning in effect (table rows, tuning file, `INFR_TUNE`,
+    /// `--set`), against the CPU reference on `model`, and say whether it is within the model's
+    /// rows of the GPU tolerance table (docs/gpu-tolerance.md). For a changed tuning parameter
+    /// or a new driver: the same evaluation the `gpu_seam_tolerance_*` tests run, without the
+    /// test suite.
+    ///
+    /// The CPU reference generates greedily from the gate's prompts, the device is fed the same
+    /// tokens in each of the model's gate configurations (the shipped kernels, and for a
+    /// quantized model the same with the int8-activation kernels off, which is the sensitive
+    /// check), and the logits at every position are held to the model's rows: first rows,
+    /// batched prefill and decode. Then the device's own greedy decode (chained and replayed) is
+    /// held to its per-token path bit for bit, and its tokens to the reference outside near
+    /// ties. The reference itself always runs under the shipped defaults, so a setting that
+    /// changes its arithmetic (a KV format) shows as a distance.
+    ///
+    /// Each gate configuration is an edit on top of your settings, and writes over the ones it
+    /// is about (the int8 kernel switches, the prefill chunk height, the KV format): the report
+    /// says, per configuration, which of your settings it ran without.
+    ///
+    /// Only a model with rows in the table can be checked; any other is an error, never a pass.
+    /// The rows are found by the GGUF's file name and nothing else: a renamed file, or another
+    /// quantizer's file under the same name, is scored against rows measured on a different
+    /// file. The report names the row it matched and what the file says of itself, and a file
+    /// whose weights are float where the rows are of a quantized file (or the reverse) is
+    /// refused. A model with no row is refused before anything is downloaded when its file name
+    /// is known from the reference (a path, a cached model, an explicit `.gguf` selector); a
+    /// quant selector of a repository not yet in the cache is fetched first.
+    ///
+    /// stdout carries the table, or with `--json` one document: `against`, `model`, `row`,
+    /// `file`, `device`, `tune_hash`, `pass`, `runs` (each `config`, `class`, `overridden` and
+    /// `checks`: `phase`, `metric`, `measured`, `limit` (`at_most` | `at_least`), `bound`,
+    /// `pass`), `greedy` (the same shape), `failures` (every crossed limit, described) and
+    /// `not_exercised` (what a pass does not cover on this device and model). Progress goes to
+    /// stderr (`RUST_LOG=debug` adds every prompt's values).
+    ///
+    /// Exit status: 0 within tolerance, 3 outside it, 1 when the check could not run, 2 on a
+    /// usage error; 101 is a panic, a bug in infr.
+    Check {
+        /// The model to score on: a path to a `.gguf` or an `org/repo[:quant]` reference, as
+        /// `infr run` takes it.
+        model: String,
+        /// What the device is scored against.
+        #[arg(long, value_enum, default_value = "cpu-reference")]
+        against: Against,
+        /// Vulkan device (`Vulkan0`, `Vulkan1`, …). Unset = the default device.
+        #[arg(long)]
+        dev: Option<String>,
+        /// Print JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -361,7 +423,8 @@ enum Cmd {
     /// handle. Reports each device's external-memory extensions (GPU↔GPU / dma-buf feasibility).
     Devices,
     /// The per-device Vulkan kernel tuning parameters: which value each one has on a device and
-    /// where it came from (`show`), or every parameter with its range and default rule (`list`).
+    /// where it came from (`show`), every parameter with its range and default rule (`list`), or
+    /// whether the device is still within tolerance of the CPU reference with them (`check`).
     Tune {
         #[command(subcommand)]
         action: TuneCmd,
@@ -577,7 +640,36 @@ fn exit_if_signalled() {
     std::process::exit(128 + signo);
 }
 
-fn main() -> anyhow::Result<()> {
+/// The exit status of a command that failed with `e`, for every command: a command's own
+/// status where its error carries one (`infr tune check` outside tolerance), else the general
+/// failure status.
+fn exit_status(e: &anyhow::Error) -> u8 {
+    /// What a failed command exits with unless its error says otherwise.
+    const FAILURE: u8 = 1;
+    if e.is::<tune_check::OutOfTolerance>() {
+        tune_check::EXIT_OUT_OF_TOLERANCE
+    } else {
+        FAILURE
+    }
+}
+
+fn main() -> std::process::ExitCode {
+    let Err(e) = run() else {
+        return std::process::ExitCode::SUCCESS;
+    };
+    use std::io::Write;
+    std::io::stdout().flush().ok();
+    if e.is::<tune_check::OutOfTolerance>() {
+        // print-ok: the CLI's own exit notice, after the report it refers to is flushed.
+        eprintln!("infr: {e}");
+    } else {
+        // print-ok: the CLI's error report, in the form a `main` returning the error prints.
+        eprintln!("Error: {e:?}");
+    }
+    std::process::ExitCode::from(exit_status(&e))
+}
+
+fn run() -> anyhow::Result<()> {
     // DIAGNOSTICS GO TO STDERR, never stdout. `tracing_subscriber::fmt()` defaults to stdout, and
     // once `refactor: route library diagnostics through tracing` (a6e9131) moved the device-probe
     // and placement lines off `eprintln!` onto `tracing`, that default interleaved them with
@@ -678,7 +770,9 @@ fn cli_flag_layer(cmd: &Cmd) -> anyhow::Result<PartialConfig> {
             }
         }
         Cmd::Tune { action } => {
-            let (TuneCmd::Show { dev, .. } | TuneCmd::List { dev, .. }) = action;
+            let (TuneCmd::Show { dev, .. }
+            | TuneCmd::List { dev, .. }
+            | TuneCmd::Check { dev, .. }) = action;
             if let Some(d) = dev.as_deref() {
                 match parse_dev_spec(d).with_context(|| format!("invalid --dev `{d}`"))? {
                     backend @ Backend::Vulkan(_) => {
@@ -994,22 +1088,26 @@ fn cmd_devices(cfg: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `infr tune show|list` — the tuning parameter set of one Vulkan device, resolved exactly as a
-/// run on it would resolve it (the same config, environment and command line), by creating the
-/// backend.
+/// `infr tune`: `show` and `list` print the tuning parameter set of one Vulkan device, resolved
+/// exactly as a run on it would resolve it (the same config, environment and command line), by
+/// creating the backend; `check` is [`tune_check::run`].
 fn cmd_tune(action: &TuneCmd, cfg: &Arc<Config>) -> anyhow::Result<()> {
-    let be = infr_vulkan::VulkanBackend::new_with(Arc::clone(cfg)).map_err(|e| anyhow!("{e}"))?;
-    let report = be.tuning_report();
     match action {
-        TuneCmd::Show { json: false, .. } => {
-            // print-ok: program OUTPUT — the `infr tune show` listing users pipe and paste.
-            print!("{}", report.show());
-        }
-        TuneCmd::Show { json: true, .. } => {
-            // print-ok: program OUTPUT — the `infr tune show --json` document.
-            println!("{}", serde_json::to_string_pretty(&tune_json(report))?);
+        TuneCmd::Show { json, .. } => {
+            let be = tune_backend(cfg)?;
+            let report = be.tuning_report();
+            if *json {
+                // print-ok: program OUTPUT — the `infr tune show --json` document.
+                println!("{}", serde_json::to_string_pretty(&tune_json(report))?);
+            } else {
+                // print-ok: program OUTPUT — the `infr tune show` listing users pipe and paste.
+                print!("{}", report.show());
+            }
+            Ok(())
         }
         TuneCmd::List { family, .. } => {
+            let be = tune_backend(cfg)?;
+            let report = be.tuning_report();
             if let Some(f) = family.as_deref() {
                 let known = report
                     .params
@@ -1027,9 +1125,21 @@ fn cmd_tune(action: &TuneCmd, cfg: &Arc<Config>) -> anyhow::Result<()> {
             }
             // print-ok: program OUTPUT — the `infr tune list` listing.
             print!("{}", report.list(family.as_deref()));
+            Ok(())
         }
+        TuneCmd::Check {
+            model,
+            against: Against::CpuReference,
+            json,
+            ..
+        } => tune_check::run(model, *json, cfg),
     }
-    Ok(())
+}
+
+/// The Vulkan backend `infr tune` reads a device's tuning from: the one a run under `cfg` would
+/// create.
+fn tune_backend(cfg: &Arc<Config>) -> anyhow::Result<infr_vulkan::VulkanBackend> {
+    infr_vulkan::VulkanBackend::new_with(Arc::clone(cfg)).map_err(|e| anyhow!("{e}"))
 }
 
 /// `infr tune show --json`'s document.

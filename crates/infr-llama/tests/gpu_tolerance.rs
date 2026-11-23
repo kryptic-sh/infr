@@ -6,7 +6,8 @@
 //! and one decode step per generated token — with `infr_llama::tolerance`'s metrics, against the
 //! tolerance table for the model's path class. Each case then generates greedily on the
 //! production path and holds the chained and the replayed decode to that per-token one, and the
-//! tokens to the reference (`support/greedy.rs`).
+//! tokens to the reference. The evaluation is `infr_llama::tolerance::gate`, the one
+//! `infr tune check` runs; `support/forced.rs` opens the cases and drives it.
 //!
 //! ```text
 //! INFR_DEV=Vulkan0 cargo nextest run -p infr-llama --release --test gpu_tolerance \
@@ -46,39 +47,7 @@ fn measure_gpu_tolerance() {
     }
 }
 
-use infr_llama::tolerance::PathClass::{self, Float, FloatNoCoopmat, Int8, KvQ8};
-
-/// A quantized model: the production kernels at both prefill chunk heights, and the same with
-/// every int8-activation kernel off, once more on the static per-token decode path.
-const QUANT_RUNS: &[(&str, PathClass)] = &[
-    ("gpu", Int8),
-    ("gpu-ub32", Int8),
-    ("gpu-float", Float),
-    ("gpu-float-ub32", Float),
-    ("gpu-float-static", Float),
-];
-
-/// The int8-free runs once more with the cooperative-matrix tier off, for a model whose Float row
-/// cannot be tight on the f16 operands of the cooperative-matrix prefill GEMMs (gemma-3): the
-/// prefill GEMMs then take f32 operands on every device, at both chunk heights and on the static
-/// per-token decode path.
-const NOCOOPMAT_RUNS: &[(&str, PathClass)] = &[
-    ("gpu-float-nocoopmat", FloatNoCoopmat),
-    ("gpu-float-nocoopmat-ub32", FloatNoCoopmat),
-    ("gpu-float-nocoopmat-static", FloatNoCoopmat),
-];
-
-/// A float-weight model: the production kernels at both prefill chunk heights, and the static
-/// per-token decode path.
-const FLOAT_RUNS: &[(&str, PathClass)] = &[
-    ("gpu", Float),
-    ("gpu-ub32", Float),
-    ("gpu-float-static", Float),
-];
-
-/// A routed-expert model with float expert banks: the production kernels on the replayed
-/// per-token decode, and on the static one.
-const MOE_RUNS: &[(&str, PathClass)] = &[("gpu", Float), ("gpu-float-static", Float)];
+use infr_llama::tolerance::PathClass::Float;
 
 /// The red path, in the normal test job: a synthetic model with one projection's weights scaled
 /// by [`RED_SCALE`], driven on the CPU reference against the unmodified model's CPU reference, must
@@ -103,6 +72,83 @@ fn tolerance_gate_goes_red_on_a_scaled_weight_cpu() {
     assert!(
         red.iter().any(|f| f.contains("KL")),
         "a {RED_SCALE}x {RED_TENSOR} passed the gate: {red:?}"
+    );
+}
+
+/// The verdict `infr tune check` prints is the evaluation's: on the same two CPU-reference cases
+/// as [`tolerance_gate_goes_red_on_a_scaled_weight_cpu`], the clean model's run has a line per
+/// limit and every one passes, and the scaled model's run has a failing KL line; either way a
+/// run has a failing line exactly when the evaluation recorded a failure, and the measured value
+/// of a failing line is on the wrong side of its bound.
+#[test]
+fn tolerance_checks_go_red_with_the_evaluation_cpu() {
+    use infr_llama::tolerance::{gate, Limit};
+    const TABLE: &str = "synthetic-f32";
+    let clean = forced::open_case("synthetic-f32").expect("synthetic model");
+    let scaled = forced::open_case_scaled("synthetic-f32", Some((RED_TENSOR, RED_SCALE)))
+        .expect("synthetic model");
+    let reference = forced::reference(&clean);
+    let runs = gate::runs_for(TABLE).expect("the synthetic model's row");
+    let evaluate = |test: &forced::Case| {
+        let cmp = gate::Comparison {
+            key: TABLE,
+            table: TABLE,
+            reference: &reference,
+            test,
+            on: infr_llama::seam::ForcedOn::CpuReference,
+        };
+        gate::evaluate_with(&cmp, &runs, |_, _, _, _| {}, &mut |_| {}).expect("the evaluation ran")
+    };
+    let green = evaluate(&clean);
+    assert!(green.failures.is_empty(), "{:?}", green.failures);
+    assert_eq!(green.runs.len(), runs.len());
+    for run in &green.runs {
+        let checks = run.checks();
+        for phase in ["first", "prefill", "decode"] {
+            for metric in ["kl_max", "kl_mean", "topk_cos_min", "logit_dev_max"] {
+                assert!(
+                    checks
+                        .iter()
+                        .any(|(p, c)| *p == phase && c.metric == metric),
+                    "{}: no {phase} {metric} line",
+                    run.name
+                );
+            }
+        }
+        assert!(checks.iter().any(|(_, c)| c.metric == "top1_scored"));
+        let failing: Vec<_> = checks.iter().filter(|(_, c)| !c.pass).collect();
+        assert!(failing.is_empty(), "{}: {failing:?}", run.name);
+    }
+    let red = evaluate(&scaled);
+    assert!(!red.failures.is_empty(), "the scaled model passed");
+    for run in &red.runs {
+        let checks = run.checks();
+        let failed = red
+            .failures
+            .iter()
+            .any(|f| f.starts_with(&format!("{} ", run.name)));
+        assert_eq!(
+            checks.iter().any(|(_, c)| !c.pass),
+            failed,
+            "{}: its lines and the evaluation's failures disagree: {checks:?} / {:?}",
+            run.name,
+            red.failures
+        );
+        for (phase, c) in checks.iter().filter(|(_, c)| !c.pass) {
+            let over = match c.limit {
+                Limit::AtMost(b) => c.measured > b,
+                Limit::AtLeast(b) => c.measured < b,
+            };
+            assert!(over, "{} {phase} {c:?} fails inside its bound", run.name);
+        }
+    }
+    assert!(
+        red.runs
+            .iter()
+            .flat_map(|r| r.checks())
+            .any(|(_, c)| c.metric == "kl_max" && !c.pass),
+        "no failing KL line: {:?}",
+        red.failures
     );
 }
 
@@ -290,13 +336,13 @@ fn gpu_seam_tolerance_nocoopmat_runs_build_no_coopmat_gemm() {
 #[test]
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_tolerance_synthetic_f32() {
-    forced::gate("synthetic-f32", FLOAT_RUNS);
+    forced::gate("synthetic-f32");
 }
 
 #[test]
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_tolerance_synthetic_f16() {
-    forced::gate("synthetic-f16", FLOAT_RUNS);
+    forced::gate("synthetic-f16");
 }
 
 /// The synthetic routed-expert model, forced along the reference's expert selections, on the
@@ -305,7 +351,7 @@ fn gpu_seam_tolerance_synthetic_f16() {
 #[test]
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_tolerance_synthetic_moe() {
-    forced::gate(forced::SYNTHETIC_MOE, MOE_RUNS);
+    forced::gate(forced::SYNTHETIC_MOE);
 }
 
 /// What a forced run reads back as a router's own selection is the selection its expert layer
@@ -334,7 +380,8 @@ fn gpu_seam_tolerance_own_routing_is_the_selection_it_runs() {
     let bits = |g: &infr_llama::seam::ForcedLogits| {
         g.logits.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
     };
-    for &(name, _) in MOE_RUNS {
+    let runs = infr_llama::tolerance::gate::runs_for(forced::SYNTHETIC_MOE).expect("its row");
+    for (name, _) in runs {
         let edit = forced::gpu_config_edit(name);
         let run = |route| {
             forced::forced_along(
@@ -370,35 +417,31 @@ fn gpu_seam_tolerance_own_routing_is_the_selection_it_runs() {
 #[test]
 #[ignore = "needs Qwen3-0.6B Q4_K_M and a Vulkan GPU"]
 fn gpu_seam_tolerance_qwen3() {
-    let mut runs = QUANT_RUNS.to_vec();
-    runs.push(("gpu-kv-q8-float", KvQ8));
-    forced::gate("qwen3-0.6b", &runs);
+    forced::gate("qwen3-0.6b");
 }
 
 #[test]
 #[ignore = "needs gemma-3-1b-it Q4_K_M and a Vulkan GPU"]
 fn gpu_seam_tolerance_gemma3() {
-    let mut runs = QUANT_RUNS.to_vec();
-    runs.extend_from_slice(NOCOOPMAT_RUNS);
-    forced::gate("gemma3-1b", &runs);
+    forced::gate("gemma3-1b");
 }
 
 #[test]
 #[ignore = "needs Qwen3.5-0.8B Q4_K_M and a Vulkan GPU"]
 fn gpu_seam_tolerance_qwen35() {
-    forced::gate("qwen35-0.8b", QUANT_RUNS);
+    forced::gate("qwen35-0.8b");
 }
 
 #[test]
 #[ignore = "needs LFM3-1.7B Q4_K_M and F16 and a Vulkan GPU"]
 fn gpu_seam_tolerance_lfm3() {
-    forced::gate("lfm3-q4", QUANT_RUNS);
-    forced::gate("lfm3-f16", FLOAT_RUNS);
+    forced::gate("lfm3-q4");
+    forced::gate("lfm3-f16");
 }
 
 #[test]
 #[ignore = "needs ERNIE-4.5-0.3B Q4_K_M and F16 and a Vulkan GPU"]
 fn gpu_seam_tolerance_ernie() {
-    forced::gate("ernie-0.3b-q4", QUANT_RUNS);
-    forced::gate("ernie-0.3b-f16", FLOAT_RUNS);
+    forced::gate("ernie-0.3b-q4");
+    forced::gate("ernie-0.3b-f16");
 }

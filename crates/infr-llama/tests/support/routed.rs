@@ -93,22 +93,15 @@ pub fn synthetic_moe() -> SyntheticModel {
 }
 
 /// `test`'s own expert selections against `reference`'s at the near tie `near_tie`
-/// ([`RouteScore`]); `None` for a model with no router-selected layer. Panics when only one of the
-/// two runs carries a routing, or the two cannot be compared.
+/// (`gate::score_routing`); `None` for a model with no router-selected layer. Panics when only
+/// one of the two runs carries a routing, or the two cannot be compared.
 pub fn score_routing(
     reference: &ForcedLogits,
     test: &ForcedLogits,
     near_tie: f64,
 ) -> Option<RouteScore> {
-    match (&reference.routing, &test.routing) {
-        (None, None) => None,
-        (Some(want), Some(got)) => {
-            let mut s = RouteScore::new(near_tie);
-            s.add(want, got).unwrap_or_else(|e| panic!("{e}"));
-            Some(s)
-        }
-        _ => panic!("one run of a pair read its routing back and the other did not"),
-    }
+    infr_llama::tolerance::gate::score_routing(reference, test, near_tie)
+        .unwrap_or_else(|e| panic!("{e}"))
 }
 
 /// One machine-readable line for the measurement log with a pair's routing comparison, every

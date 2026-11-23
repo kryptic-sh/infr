@@ -375,7 +375,7 @@ fn run_case(
         }
     };
     let mut failures = forced::evaluate_with(label, table, reference, test, on, runs, &mut seen);
-    reference.check_prefill(label, &mut failures);
+    forced::check_prefill(reference, label, &mut failures);
     Outcome {
         failures,
         ratios,
@@ -408,7 +408,7 @@ fn demonstrate(t: &Target, on: ForcedOn, runs: &[(&str, PathClass)], bugs: &[Bug
         _ => format!("{on:?}"),
     };
     let t0 = std::time::Instant::now();
-    let reference = Reference::new(&clean);
+    let reference = forced::reference(&clean);
     let control = run_case("clean control", t.table, &reference, &clean, on, runs);
     let again = run_case(
         "clean control, again",

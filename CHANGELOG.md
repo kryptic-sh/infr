@@ -57,6 +57,29 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`infr tune check <model>`: is this GPU still within tolerance of the CPU
+  reference?** It scores a Vulkan device, under the tuning in effect (table
+  rows, the tuning file, `INFR_TUNE`, `--set kernels.vulkan.tune.…`), against
+  the CPU reference on a model that has rows in the GPU tolerance table, and
+  prints every limit with the measured value, its bound and a verdict: the
+  logits at every position of the gate's prompts, in each of the model's gate
+  configurations, then the device's greedy decode held to its per-token path and
+  its tokens to the reference. It is the evaluation the `gpu_seam_tolerance_*`
+  tests run, for a changed tuning parameter or a new driver, without the test
+  suite. The report also says which of your settings a configuration ran without
+  (each configuration sets the ones it is about), what the verdict does not
+  cover on the device (an integrated GPU has no chained decode to compare), and
+  which row it matched: rows are found by the GGUF's file name alone, so a
+  renamed or re-quantized file is scored against another file's rows, and only a
+  float file under a quantized model's name (or the reverse) is refused.
+  `--json` prints one document; the exit status is 0 within tolerance, 3 outside
+  it, 1 when the check could not run (a model with no row is an error, never a
+  pass, and is refused before any download when the reference names its file)
+  and 2 on a usage error. `--against cpu-reference` is the default and the only
+  reference. See `docs/gpu-tolerance.md`, "The command". For developers, the
+  evaluation is public as `infr_llama::tolerance::gate` and
+  `infr_llama::tolerance::greedy`, with `SeamModel::engine_config`,
+  `tolerance::lookup` and `tolerance::{Check, Limit}`.
 - **`response_format` is enforced by `infr serve`.** `{"type":"json_object"}`
   constrains the reply to a JSON object and
   `{"type":"json_schema","json_schema":{"schema":…}}` to that schema, streamed

@@ -146,7 +146,7 @@ on), the three `PROMPTS` (12 to 185 tokens) and `N_DECODE` forced decode steps,
 by `measure_gpu_tolerance`. Each cell is the worst KL at any position (that
 position) / the worst KL from position 2 on / the mean KL from position 2 on.
 "GPU int8" is the shipped default; "GPU float" turns every int8-activation
-kernel off (`vulkan_float` in `tests/support/forced.rs`).
+kernel off (`vulkan_float` in `infr_llama::tolerance::gate`).
 
 | Model                 | CPU prod vs ref                | GPU int8 vs ref                | GPU float vs ref               | GPU int8 vs CPU prod     |
 | --------------------- | ------------------------------ | ------------------------------ | ------------------------------ | ------------------------ |
@@ -231,10 +231,10 @@ text and exact-token comparisons with the CPU, which a legitimate change of a
 decode kernel's arithmetic breaks: `gpu_seam_golden_qwen3` failed for
 `attn_split.decode_min_chunk` at 16 and for `gemv.kq_fma`, both inside the
 tolerance (B227), and under RADV it failed on the integrated GPU as blessed.
-Every `gate()` case now runs this instead
-(`crates/infr-llama/tests/support/greedy.rs`), in each of its configurations
-that holds a set of decode kernels of its own (`GREEDY_CONFIGS`: the shipped
-kernels, the int8-free ones, the q8 KV cache's).
+Every `gate()` case now runs this instead (`infr_llama::tolerance::greedy`,
+`crates/infr-llama/src/tolerance/greedy.rs`), in each of its configurations that
+holds a set of decode kernels of its own (`GREEDY_CONFIGS`: the shipped kernels,
+the int8-free ones, the q8 KV cache's).
 
 **The prompts** are the case's three plain-text ones and, for a real model, one
 more rendered through the model's own chat template (`greedy::chat_prompt`), so
@@ -827,8 +827,8 @@ places (twice its distance from 1 gives 0.99950), cut to four places as
 gemma-3's rows are (0.997996 to 0.9979, 0.97904 to 0.9790).
 
 That the model takes no batched prefill is a property the test states of the
-case (`Case::batched_prefill` in `tests/support/forced.rs`), not one read off
-the run: a case so marked must produce no prefill row, and only then is the
+case (`Case::batched_prefill` in `infr_llama::tolerance::gate`), not one read
+off the run: a case so marked must produce no prefill row, and only then is the
 vacuous count of scored prefill rows dropped; any other case that produces none
 fails the gate by name (`Reference::check_prefill`).
 
@@ -850,6 +850,16 @@ make a failing run pass without that evidence. A device that lands outside a row
 is a finding first. The same rule is in `TABLE`'s doc comment.
 
 ## Running it
+
+The evaluation is library code, `infr_llama::tolerance::gate` and `greedy`
+(`crates/infr-llama/src/tolerance/`): the prompts, the configurations
+(`GPU_CONFIGS`), which of them a model runs and against which class's row
+(`runs_for`, read off the rows the table has for the model), the scoring, and
+`gate::check`, which runs the forced comparison and then the greedy check. Two
+things call `gate::check`: the tests below, and the command `infr tune check`
+("The command" further down). The test support code (`tests/support/forced.rs`)
+keeps what only tests need: opening a case by key or from a synthetic or planted
+file, the measurement, the watchdog and the skips.
 
 The gate's tests are `gpu_seam_tolerance_*` in
 `crates/infr-llama/tests/gpu_tolerance.rs`, ignored by default like every GPU
@@ -1111,6 +1121,187 @@ the reference against itself, at a distance of exactly 0. The int8-free check
 reads the kernels a run BUILT, which are built lazily when first recorded: a
 superset of what ran, so its negative check is the conservative one; its marker
 list is typed by hand (B207).
+
+## The command: `infr tune check`
+
+`infr tune check <model>` runs the gate on one model from the shipped binary,
+with no test suite: for a tuning parameter someone is changing, a new driver, or
+a device no table row was written for.
+
+```text
+infr tune check unsloth/Qwen3-0.6B-GGUF:Q4_K_M --dev Vulkan0
+INFR_TUNE=gemv.kq_fma=true infr tune check unsloth/Qwen3-0.6B-GGUF:Q4_K_M
+infr tune check model.gguf --set kernels.vulkan.tune.attn_split.decode_min_chunk=16 --json
+```
+
+**What it runs** is `gate::check`, the function the `gpu_seam_tolerance_*` tests
+call, on the runs `gate::runs_for` reads off the model's rows: for a quantized
+model the shipped kernels (held to its Int8 row) and the same with every
+int8-activation kernel off (its Float row, the check that can see a small
+error), at both prefill chunk heights and on the static decode, plus whatever
+other rows the model has; then the greedy check on the configurations it covers.
+The prompts, the number of decode steps and the limits are the tests'.
+
+**What is under test** is the device under the configuration the invocation
+resolves: the tuning table's rows for the device, the tuning file, `INFR_TUNE`,
+`--set` and a config file all apply, in every run, since each gate configuration
+is an edit on top of that configuration. The CPU reference is not: it is loaded
+under the shipped defaults, so a setting that would change the reference's own
+arithmetic (a KV format) cannot move it along with the device. Such a setting
+then shows as a distance, which is the honest answer: the rows are of the
+shipped KV format. The prompts are tokenized with the GGUF's own vocabulary, as
+in the tests, never a `tokenizer.json` beside the file.
+
+**A configuration's edit writes over the settings it is about**: the int8 kernel
+switches in the `gpu-float*` runs, the prefill chunk height in the `*-ub32`
+runs, the KV format in `gpu-kv-q8-float`, the replay switch in the `*-static`
+runs. Where that replaces something the invocation set, the run is not of what
+was set, and the report says so under that configuration: one line per setting,
+with the value set and the value the run ran with (`overridden` in the JSON).
+The list is read by walking every config path before and after the edit
+(`gate::overridden`), so it follows the edits; a setting given at its default
+value is not listed, since nothing distinguishes it from one not given.
+
+**The model** is required, given as `infr run` takes one. Only a model with rows
+can be checked: any other is an error that names the file and the models that do
+have rows, exit status 1, and scores nothing. There is no fallback to another
+model's row and no mode that prints distances without a verdict (B220). The
+refusal comes before anything is downloaded wherever the reference itself gives
+the file name: a path, a model already in the cache, an explicit `.gguf`
+selector. A quant selector (`org/repo:Q4_K_M`) of a repository not in the cache
+names no file until the hub is asked, so that one is fetched first and refused
+after (B234).
+
+**Rows are found by file name and by nothing else.** A renamed file, or another
+quantizer's file under the same name, is scored against rows that were measured
+on a different file. The report names the row it matched and how (`row`), and
+what the file says of itself (`file`: its path, `general.architecture`,
+`general.name`, whether its weights are quantized, its tensor count and their
+bytes), on stdout, in the JSON and in a log line, so a reader can see a
+mismatch. One mismatch is refused, the only one the rows themselves can show: a
+model with an Int8 row was measured on a quantized file and one without on a
+float file, and a file of the other kind exits 1 unscored (`gate::check_file`).
+Nothing ties a row to its file's contents beyond that (B234).
+
+**`--against cpu-reference`** is the default and the only value; another is a
+usage error. The op-level families that plan 11 first named for this command are
+not in it: they are test binaries of `infr-vulkan`, which a shipped binary does
+not carry.
+
+**Output.** stdout has the row and the file, then per configuration and phase
+each limit with the worst value measured over the prompts, its bound and `ok` or
+`FAIL`; then the greedy check's token counts; then, when anything failed, the
+evaluation's own description of each failure (the position, the prompt); then
+what the verdict does not cover on this device and model; then the verdict. The
+verdict is the evaluation's failure list, the one the tests assert empty, so a
+failure with no line of its own (a row that could not be scored, a chained
+decode that left other KV behind) still fails the command and is listed. **What
+was not exercised** is part of the verdict block, not a log line: on a device
+that runs one decode step per submit (an integrated GPU) no chained decode
+exists to compare, and a PASS there says so right above itself; a model that
+takes no batched prefill, and a routed-expert model's greedy tokens, are named
+the same way (`not_exercised` in the JSON). The log goes to stderr;
+`RUST_LOG=debug` adds every prompt's values.
+
+```text
+row:      Qwen3-0.6B-Q4_K_M.gguf (matched by file name only)
+file:     ~/.cache/huggingface/hub/models--unsloth--Qwen3-0.6B-GGUF/snapshots/50968a4468ef4233ed78cd7c3de230dd1d61a56b/Qwen3-0.6B-Q4_K_M.gguf
+          architecture qwen3, general.name "Qwen3-0.6B", quantized weights, 310 tensors, 390753280 bytes of them
+device:   Vulkan0 AMD Radeon RX 7900 XTX (RADV NAVI31) (tune:af2eda63)
+against:  cpu-reference
+
+gpu (Int8)
+  phase    metric             measured  bound           verdict
+  first    kl_max             3.168e-6  <= 0.070000     ok
+  ...
+gpu-float (Float)
+  phase    metric             measured  bound           verdict
+  ...
+  decode   kl_max             1.602e-5  <= 8.500e-5     ok
+  decode   kl_mean            2.788e-6  <= 7.300e-6     ok
+  decode   topk_cos_min       0.999986  >= 0.999900     ok
+  decode   logit_dev_max      6.985e-4  <= 0.001900     ok
+  decode   top1_misses               0  <= 0            ok
+  decode   rank_max                  1  <= 1            ok
+  decode   top1_scored              90  >= 16           ok
+...
+greedy decode, gpu-float (Float)
+  phase    metric             measured  bound           verdict
+  tokens   token_misses              0  <= 0            ok
+  tokens   token_scored            123  >= 16           ok
+
+verdict:  PASS
+```
+
+`--json` prints one document instead: `against`, `model`, `row` (`model`,
+`matched_by`), `file` (`path`, `architecture`, `name`, `quantized`, `tensors`,
+`tensor_bytes`), `device`, `tune_hash`, `pass`, `runs` and `greedy` (each an
+array of `config`, `class`, `overridden` (`path`, `set`, `ran`) and `checks`,
+and each check `phase`, `metric`, `measured`, `limit` (`at_most` or `at_least`),
+`bound` and `pass`), `failures` and `not_exercised`. The metric names are
+`kl_max`, `kl_mean`, `topk_cos_min`, `logit_dev_max`, `top1_misses`, `rank_max`,
+`top1_scored`, `route_misses`, `route_scored`, `token_misses` and
+`token_scored`.
+
+**Exit status:** 0 within tolerance, 3 outside it, 1 when the check could not
+run (no row, a file of the wrong kind for its rows, no Vulkan device, a failed
+load or run), 2 on a usage error. 101 is a panic: a bug in infr, not a verdict.
+The mapping is one function (`exit_status` in `crates/infr-cli/src/main.rs`),
+which a test holds to these values.
+
+**Recorded runs, 2026-11-23** (Linux 7.3.5-arch1-1, RADV, headless; the release
+binary; Qwen3-0.6B Q4_K_M, whose six configurations and three greedy
+configurations make 126 lines). "Closest" is the largest share of its bound any
+KL, cosine or logit-deviation line reached (the cosine by its distance from 1).
+
+| Device    | Forced                                                     | Verdict, exit | Lines `ok` / `FAIL` | Closest to a bound                            |
+| --------- | ---------------------------------------------------------- | ------------- | ------------------- | --------------------------------------------- |
+| `Vulkan0` | nothing                                                    | PASS, 0       | 126 / 0             | 0.49: `gpu-float` prefill mean KL             |
+| `Vulkan1` | nothing                                                    | PASS, 0       | 126 / 0             | 0.66: `gpu` (Int8) first-rows logit deviation |
+| `Vulkan0` | `--set kernels.vulkan.tune.attn_split.decode_min_chunk=16` | PASS, 0       | 126 / 0             | 0.53: `gpu-float-ub32` decode logit deviation |
+| `Vulkan0` | `INFR_TUNE=gemv.kq_fma=true`                               | PASS, 0       | 126 / 0             | 0.57: `gpu-float-ub32` decode logit deviation |
+| `Vulkan0` | `--set device.ubatch=64`                                   | PASS, 0       | 126 / 0             | 0.49: `gpu-float` prefill mean KL             |
+| `Vulkan0` | `--set kv.type_v=q4_0`                                     | FAIL, 3       | 60 / 66             | over: an int8-free run's worst KL is 0.134    |
+
+The two tuning rows are the case this command was wanted for (B227): each
+parameter alone moves the values and stays inside the rows; they were taken
+before the report gained its row, file, override and not-exercised lines, the
+other four after.
+
+The `Vulkan1` pass ends with what it does not cover, above the verdict:
+
+```text
+not exercised (the verdict says nothing of these):
+  Qwen3-0.6B-Q4_K_M.gguf: this device runs one decode step per submit; its greedy decode is one replay per token, and no chained run is compared
+verdict:  PASS
+```
+
+With `--set device.ubatch=64` the two runs whose configuration sets the chunk
+height say that they did not run at 64, and the others ran at it:
+
+```text
+gpu-ub32 (Int8)
+  ran with device.ubatch = 32, not the 64 that was set: this configuration sets it
+```
+
+The last row is how the command was shown to fail: a 4-bit V cache on the device
+against the reference's shipped f16 one puts the int8-free runs' worst KL at
+0.134, against a bound of 8.5e-5, and the Int8 smoke rows over too; the greedy
+check fails as well, with no line of its own (with that cache each generation of
+the `gpu` and `gpu-float` configurations made no decode recording, and the
+failure list says so for every prompt). `gpu-kv-q8-float` still passes there,
+and says why: `ran with kv.type_v = Q8_0, not the Q4_0 that was set`. A model
+with no row exits 1 with the error naming it, whether it is in the cache
+(`unsloth/Qwen3-1.7B-GGUF:Q4_K_M`) or named by an explicit file of a repository
+that is not (`…:Some-Model-Q4_K_M.gguf`, refused with nothing fetched);
+`--against gpu` exits 2, `--dev cpu` exits 1. On `Vulkan0` a run takes about 75
+s (the forced runs 49.4 s, the greedy check 25.1 s), on `Vulkan1` about 160 s
+(81.4 s and 76.6 s).
+
+**What it does not do.** It has no watchdog and no host-memory check (the tests
+have both: a hang is the user's to interrupt, and on an integrated GPU the model
+must fit beside the reference in host memory). It checks one device per run. It
+runs on Vulkan only. What it leaves otherwise is what the gate leaves (B207).
 
 ## The exact and cosine GPU tests: what G4 did with each
 

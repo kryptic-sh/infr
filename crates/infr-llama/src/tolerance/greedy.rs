@@ -10,11 +10,17 @@
 //! same KV behind, bit for bit: one more per-token step after each generation, which attends over
 //! every row it wrote, must give the same logits. That comparison is between runs of one device
 //! and needs no tolerance. The tokens are then held to the CPU reference fed the same tokens, by
-//! the table's top-1 rule ([`infr_llama::tolerance::TokenScore`]).
+//! the table's top-1 rule ([`TokenScore`]).
+//!
+//! Like [`super::gate`], this is the one check the tests and `infr tune check` both run, and it
+//! prints nothing itself: measured values go to the caller's [`Log`], and what it could not
+//! compare on the device or model comes back in [`GreedyOutcome::not_exercised`].
 
-use super::{argmax, env_cfg, gpu_config, kv_types, Case, Reference};
-use infr_llama::seam::{ForcedLogits, ForcedOn, GreedyTail, PrefillHead};
-use infr_llama::tolerance::{tolerance, PathClass, TokenScore, MIN_TOP1_SCORED};
+use super::gate::{argmax, entry, gpu_config, kv_types, Case, Event, GpuConfig, Log, Reference};
+use super::{Check, PathClass, TokenScore, MIN_TOP1_SCORED};
+use crate::seam::{ForcedLogits, ForcedOn, GreedyTail, PrefillHead};
+use crate::EngineConfig;
+use anyhow::{Context, Result};
 
 /// The configurations of a gate's runs the greedy check drives as well: one per set of decode
 /// kernels a recording can hold (the shipped ones, the int8-free ones, and the q8 KV cache's).
@@ -34,21 +40,21 @@ pub const GREEDY_STEPS: usize = 33;
 /// its own chat template ([`chat_prompt`]).
 const CHAT_MESSAGE: &str = "The capital of France is";
 
-/// [`CHAT_MESSAGE`] rendered through `model`'s chat template and tokenized: a prompt whose
+/// `CHAT_MESSAGE` rendered through `model`'s chat template and tokenized: a prompt whose
 /// special tokens (the template's role and turn markers) go through the device's embedding
 /// gather, which the plain-text prompts of the forced runs never feed.
-pub fn chat_prompt(model: &infr_llama::SeamModel) -> Vec<u32> {
-    let rendered = model.render_chat(CHAT_MESSAGE).expect("render chat");
-    model.encode(&rendered).expect("encode")
+pub fn chat_prompt(model: &crate::SeamModel) -> Result<Vec<u32>> {
+    let rendered = model.render_chat(CHAT_MESSAGE).context("render chat")?;
+    model.encode(&rendered).context("encode")
 }
 
-/// Whether the test device packs several decode steps into one submit
+/// Whether the Vulkan device `cfg` selects packs several decode steps into one submit
 /// (`Backend::max_decode_chain`): an integrated GPU, which has to keep each submit short, does
 /// not, and its production greedy decode is one replay per token.
-pub fn device_chains() -> bool {
-    let vk = infr_vulkan::VulkanBackend::new_with(std::sync::Arc::new(env_cfg()))
-        .expect("the gate's Vulkan device");
-    infr_core::backend::Backend::max_decode_chain(&vk) >= 2
+pub fn device_chains(cfg: &std::sync::Arc<EngineConfig>) -> Result<bool> {
+    let vk = infr_vulkan::VulkanBackend::new_with(cfg.clone())
+        .map_err(|e| anyhow::anyhow!("the gate's Vulkan device: {e}"))?;
+    Ok(infr_core::backend::Backend::max_decode_chain(&vk) >= 2)
 }
 
 /// The most steps the runner puts in one chained submit, whatever `spec.decode_chain` asks.
@@ -77,6 +83,43 @@ fn bit_diff(a: &[f32], b: &[f32]) -> Option<(usize, usize)> {
     Some((first, (0..a.len()).filter(differs).count()))
 }
 
+/// What the greedy check measured of one configuration: the production tokens held to the
+/// reference by the top-1 rule, over every prompt. `tokens` is `None` for a routed-expert model,
+/// whose tokens are not held to the reference's.
+#[derive(Clone, Debug)]
+pub struct GreedyRun {
+    pub name: String,
+    pub class: PathClass,
+    pub tokens: Option<TokenScore>,
+}
+
+impl GreedyRun {
+    /// The limits the configuration's greedy tokens were held to, each with what was measured:
+    /// no counted token may differ from the reference's, and at least [`MIN_TOP1_SCORED`] steps
+    /// must be counted. Empty for a routed-expert model. The bit-for-bit comparisons with the
+    /// per-token path have no line: one that fails is in [`GreedyOutcome::failures`].
+    pub fn checks(&self) -> Vec<Check> {
+        let Some(t) = &self.tokens else {
+            return Vec::new();
+        };
+        vec![
+            Check::at_most("token_misses", t.misses.len() as f64, 0.0),
+            Check::at_least("token_scored", t.scored as f64, MIN_TOP1_SCORED as f64),
+        ]
+    }
+}
+
+/// What [`greedy`] found: per configuration it drove what the token rule measured, and
+/// everything that failed, described. The check passes when `failures` is empty.
+#[derive(Clone, Debug, Default)]
+pub struct GreedyOutcome {
+    pub runs: Vec<GreedyRun>,
+    pub failures: Vec<String>,
+    /// What the check could not compare on this device or model, described (a device that does
+    /// not chain, a routed-expert model's tokens): a pass says nothing about these.
+    pub not_exercised: Vec<String>,
+}
+
 /// Run the greedy check on every prompt of `test`, its chat prompt included, in each of `runs`
 /// that [`GREEDY_CONFIGS`] names, and return what failed, described. `reference` is the clean
 /// model's (the two cases differ only where `test` carries a planted bug) and `table` its
@@ -90,7 +133,7 @@ fn bit_diff(a: &[f32], b: &[f32]) -> Option<(usize, usize)> {
 ///   token, both fail.
 /// - Each generation ran the path it stands for: one decode recording; with the chain off no
 ///   chained token; on a device that chains, for a model [`Case::chains`] marks as chaining,
-///   exactly the tokens the length and the chain imply ([`chained_of`]), and a full-length
+///   exactly the tokens the length and the chain imply (`chained_of`), and a full-length
 ///   generation must hold chained tokens and at least one that is not.
 /// - Each generation's tokens are the driver's, and its tail row is the driver's row at that
 ///   position bit for bit.
@@ -100,22 +143,36 @@ fn bit_diff(a: &[f32], b: &[f32]) -> Option<(usize, usize)> {
 /// A routed-expert model's tokens are not: left to its own routers a run legitimately parts from
 /// the reference at a router near tie (`docs/gpu-tolerance.md`), which the token rule cannot tell
 /// from a wrong token.
+///
+/// The device and the chain length are those of the engine configuration `test`'s model was
+/// loaded with. An error is a run that could not be made, a run naming no configuration, or a
+/// class the table has no row of for the model; never a failed check.
+///
+/// # Panics
+///
+/// If a run hands back fewer tokens or logit rows than it was asked for, or rows of another
+/// vocabulary size than the model's: what `SeamModel::forced_logits` and
+/// `SeamModel::greedy_tail_vulkan` guarantee of their results.
 pub fn greedy(
     key: &str,
     table: &str,
     reference: &Reference,
     test: &Case,
     runs: &[(&str, PathClass)],
-) -> Vec<String> {
+    log: Log,
+) -> Result<GreedyOutcome> {
     let mut failures = Vec::new();
-    let chains = device_chains();
+    let mut outcomes = Vec::new();
+    let mut not_exercised = Vec::new();
+    let ecfg = test.model.engine_config();
+    let chains = device_chains(ecfg)?;
     if !chains {
-        eprintln!(
+        not_exercised.push(format!(
             "{key}: this device runs one decode step per submit; its greedy decode is one replay \
              per token, and no chained run is compared"
-        );
+        ));
     }
-    let chain = env_cfg().spec.decode_chain;
+    let chain = ecfg.spec.decode_chain;
     let cfg = test.model.config();
     let is_end = |id: u32| cfg.eos_ids.contains(&id) || id == cfg.eos;
     let prompts: Vec<(String, &Vec<u32>)> = test
@@ -136,13 +193,17 @@ pub fn greedy(
     let mut ran = 0;
     for &(name, class) in runs.iter().filter(|r| GREEDY_CONFIGS.contains(&r.0)) {
         ran += 1;
-        let &(_, edit, kv) = gpu_config(name);
-        let near = tolerance(table, class).steady.near_tie;
+        let &GpuConfig {
+            edit,
+            reference_kv: kv,
+            ..
+        } = gpu_config(name)?;
+        let near = entry(table, class)?.steady.near_tie;
         let mut tokens = TokenScore::new(near);
         let mut routed = false;
         for (pi, (label, ids)) in prompts.iter().enumerate() {
             let at = format!("{name} {label} greedy");
-            let tail = |what: &str, chain: Option<usize>| -> GreedyTail {
+            let tail = |what: &str, chain: Option<usize>| -> Result<GreedyTail> {
                 test.model
                     .greedy_tail_vulkan(
                         |c| {
@@ -154,10 +215,10 @@ pub fn greedy(
                         ids,
                         GREEDY_STEPS,
                     )
-                    .unwrap_or_else(|e| panic!("{at}, {what}: {e:#}"))
+                    .with_context(|| format!("{at}, {what}"))
             };
-            let replayed = tail("one replay per token", Some(1));
-            let chained = chains.then(|| tail("chained", None));
+            let replayed = tail("one replay per token", Some(1))?;
+            let chained = chains.then(|| tail("chained", None)).transpose()?;
             // One step more than the generations sample, so the driver has a row at the position
             // of each generation's tail row.
             let stepped = test
@@ -171,7 +232,7 @@ pub fn greedy(
                     None,
                     |_, row| argmax(row),
                 )
-                .unwrap_or_else(|e| panic!("{at}, teacher-forced driver: {e:#}"));
+                .with_context(|| format!("{at}, teacher-forced driver"))?;
             routed |= stepped.routing.is_some();
             let (plen, v) = (ids.len(), stepped.vocab);
             let decode_rows = &stepped.logits[stepped.prefill_rows * v..];
@@ -261,7 +322,7 @@ pub fn greedy(
                     ));
                 }
             }
-            println!(
+            log(Event::Values(&format!(
                 "GREEDY {key} {name} {label} ({plen} tokens): {}; {} decode recording(s) for the \
                  per-token generation's {} tokens{}",
                 match &chained {
@@ -275,7 +336,7 @@ pub fn greedy(
                 } else {
                     ""
                 },
-            );
+            )));
 
             if routed {
                 continue;
@@ -303,7 +364,7 @@ pub fn greedy(
                             None,
                             |s, _| chosen[s],
                         )
-                        .unwrap_or_else(|e| panic!("{at}, the reference along its tokens: {e:#}"));
+                        .with_context(|| format!("{at}, the reference along its tokens"))?;
                     along.push((seq, run));
                     along.len() - 1
                 }
@@ -322,13 +383,21 @@ pub fn greedy(
             tokens.merge(&one);
         }
         if routed {
-            eprintln!(
+            not_exercised.push(format!(
                 "{key} {name}: a routed-expert model; its greedy tokens are not held to the \
                  reference's"
-            );
+            ));
+            outcomes.push(GreedyRun {
+                name: name.to_string(),
+                class,
+                tokens: None,
+            });
             continue;
         }
-        println!("{key} {name} ({class:?}), greedy:\n{}", tokens.report());
+        log(Event::Values(&format!(
+            "{key} {name} ({class:?}), greedy:\n{}",
+            tokens.report()
+        )));
         if tokens.scored < MIN_TOP1_SCORED {
             failures.push(format!(
                 "{name} greedy: only {} of {} steps clear the {near}-nat near-tie margin (at \
@@ -337,6 +406,11 @@ pub fn greedy(
                 tokens.scored + tokens.near_ties
             ));
         }
+        outcomes.push(GreedyRun {
+            name: name.to_string(),
+            class,
+            tokens: Some(tokens),
+        });
     }
     if ran == 0 {
         failures.push(format!(
@@ -344,5 +418,9 @@ pub fn greedy(
              the replayed decode were not compared"
         ));
     }
-    failures
+    Ok(GreedyOutcome {
+        runs: outcomes,
+        failures,
+        not_exercised,
+    })
 }

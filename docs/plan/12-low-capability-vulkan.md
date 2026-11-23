@@ -47,7 +47,7 @@ integrated GPU (`Vulkan1`, RDNA2, 2 CUs, AMD proprietary driver, initial cap
 128), not through GCN's emulated dot but through a submit containing the GPU
 tolerance harness's prefill head (a vocabulary-wide float GEMM over every
 prefill-chunk row) with every int8 kernel off **[ran]**. Qwen3.5-0.8B Q4_K_M,
-its 180-token prompt (`tests/support/forced.rs` `PROMPTS[2]`), configuration
+its 180-token prompt (`infr_llama::tolerance::gate::PROMPTS[2]`), configuration
 `gpu-float`:
 
 | Variant (one change each)             | Result (runs)                                                 |

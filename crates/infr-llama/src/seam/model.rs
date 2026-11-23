@@ -1000,6 +1000,12 @@ impl SeamModel {
         Ok(stats)
     }
 
+    /// The engine configuration this model was loaded with, which every backend and session it
+    /// opens shares.
+    pub fn engine_config(&self) -> &std::sync::Arc<crate::EngineConfig> {
+        &self.ecfg
+    }
+
     pub fn config(&self) -> &Config {
         &self.cfg
     }

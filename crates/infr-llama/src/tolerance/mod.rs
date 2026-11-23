@@ -9,9 +9,17 @@
 //! selections as well, so the rows compare the two backends' arithmetic under one routing, and
 //! what each router would have selected itself is compared on its own
 //! ([`metrics::RouteScore`]). See `docs/gpu-tolerance.md`.
+//!
+//! [`metrics`] has the distances, [`table`] the bounds, and [`gate`] and [`greedy`] the
+//! evaluation that holds a model to them: what the GPU tolerance tests and `infr tune check` run.
 
+pub mod gate;
+pub mod greedy;
 pub mod metrics;
 pub mod table;
 
 pub use metrics::{score_row, RouteFlip, RouteScore, RowError, RowScore, RunScore, TokenScore};
-pub use table::{tolerance, Entry, PathClass, Tolerance, FIRST_ROWS, MIN_TOP1_SCORED, TABLE};
+pub use table::{
+    lookup, tolerance, Check, Entry, Limit, PathClass, Tolerance, FIRST_ROWS, MIN_TOP1_SCORED,
+    TABLE,
+};

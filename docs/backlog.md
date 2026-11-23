@@ -7312,6 +7312,55 @@ values. What it leaves:
   the routed-expert entry above), KV formats other than f16 and q8_0, models not
   cached here (B60's Qwen3.5-MoE and DiffusionGemma), Metal (no Apple hardware:
   the doc says how a Mac owner would add it), and every device but these two.
+- **`infr tune check` sees what the gate sees and no more** (2026-11-23). It is
+  the same evaluation on the same prompts, so every blind spot above is the
+  command's too: a tuning parameter whose effect lives only in an int8 kernel is
+  judged by the Int8 smoke row; one that acts only past the prompts' depth (the
+  longest prompt is under 200 tokens and each run decodes 32 steps), in a
+  context deeper than that, in a batch shape the prompts never make, in the
+  chained sampler or at another chain length, is not exercised at all. A PASS
+  says the device is inside the model's rows on these runs, not that the
+  parameter is safe at every shape. B220 has what the command itself left out.
+
+### B234 — tolerance rows are keyed by file name: key them by content, and name a hub file without fetching it (2026-11-23)
+
+**Tag:** gpu · tolerance · cli · hub · **Kind:** design gap, needs a decision
+
+`tolerance::table::TABLE` finds a model's rows by its GGUF file name
+(`Entry::model`), which is all `infr tune check` and the `gpu_seam_tolerance_*`
+tests have to go by. **[read]**
+
+- **A renamed file, or another repository's or quantizer's file under the same
+  name, is scored against rows measured on a different file.** What stands in
+  the way today: the command prints the row it matched and what the file says of
+  itself (`general.architecture`, `general.name`, quantized or float weights,
+  tensor count and bytes), and `gate::check_file` refuses a file whose weights
+  are float where the model has an Int8 row, or quantized where it has none.
+  That is the one fact the rows carry about their file. Two Q4_K_M files of one
+  model from two quantizers (different imatrix, different per-tensor formats)
+  pass it, and their distances to the CPU reference are not the same.
+- **What keying by content would take.** A column per model in the table (not
+  per row: a model's rows share a file): the file's identity as measured, for
+  example the hub's LFS sha256 of the blob (the cache already names blobs by it,
+  so a cached model costs a `readlink`, and a plain path costs a hash of the
+  whole file), or a cheaper digest of the tensor directory (names, formats,
+  shapes, sizes), which tells quantizers and re-quantizations apart without
+  reading the weights and misses a file with the same layout and other values.
+  Options: refuse a mismatch; or score it and mark the verdict as "of another
+  file". The table's existing rows would need their files' identities read on
+  the machines that have them (both GPUs' rows were measured on files from the
+  `unsloth`, `LiquidAI` and `Qwen` repositories of `MODELS` in
+  `tests/support/forced.rs`; the hashes were not recorded with the
+  measurements). Not decided: which identity, and refuse or mark.
+- **`infr tune check org/repo:QUANT` downloads the model before it can say there
+  is no row**, when the repository is not in the cache. The file name such a
+  reference resolves to comes from the hub's file listing (`repo_info` and
+  `pick_gguf` in `infr-hub`), which only `infr_hub::pull` reaches, and it
+  downloads what it picked. A path, a cached model and an explicit `.gguf`
+  selector are refused before any fetch (`name_without_fetching` in
+  `crates/infr-cli/src/tune_check.rs`, tested without network). Closing the rest
+  takes a public `infr-hub` call that returns the picked file name from the
+  listing alone; `infr-hub` was outside the slice that built the command.
 
 ### B231 — RADV runs on the generic Vulkan tuning: no table row matches it (2026-11-23)
 
@@ -7412,22 +7461,42 @@ Linux machine as well as on the Windows box.
   `gpu_seam_tolerance_*` tests. `docs/gpu-tolerance.md` has the check ("The
   greedy check") and the record of every exact and cosine GPU test with what
   covers it ("The exact and cosine GPU tests"); B207 has what the check leaves.
-- **`infr tune check --against cpu-reference` is not started.** `infr tune` has
-  `show` and `list` only (`cmd_tune` in `crates/infr-cli/src/main.rs`). What it
-  needs, read from the code and not built:
-  - The gate's evaluation is test support code
-    (`crates/infr-llama/tests/support/forced.rs` and `greedy.rs`: `Reference`,
-    `evaluate_with`, `greedy`, `GPU_CONFIGS`, `PROMPTS`). A command cannot call
-    it there. It has to move into `infr_llama::tolerance` first, with the tests
-    calling the library, and that move is a slice of its own to review.
-  - Decisions the command needs: which model it scores when the user names none
-    (the table's rows are keyed by GGUF file name, and the smallest gated file
-    is ERNIE-4.5-0.3B Q4_K_M); what it does for a model with no row (print the
-    distances with no verdict, or refuse); whether the "op-level families" of
-    plan 11's wording are in it at all, since those are test binaries of
-    `infr-vulkan` and nothing a shipped binary can run today.
-  - Conventions to follow from `infr tune show`: the listing on stdout, logs on
-    stderr, `--json`, `--dev VulkanN`, a non-zero exit on a failed check.
+- **Done, 2026-11-23: `infr tune check <model>`.** The gate's evaluation is
+  library code now (`infr_llama::tolerance::gate` and `greedy`; the
+  `gpu_seam_tolerance_*` tests and the command both call `gate::check`, and
+  `gate::runs_for` reads a model's runs off its rows), and the command scores a
+  Vulkan device under the tuning in effect against a model's rows
+  (`docs/gpu-tolerance.md`, "The command", has the interface and the recorded
+  runs). What it left:
+  - **No measuring mode.** A model with no row is an error. Printing distances
+    with no verdict (`--measure`) was left out: without a row there is no class
+    to pick the runs by and no near-tie margin to score top-1 at, so it would be
+    `measure_gpu_tolerance` rebuilt in the command (every configuration, margins
+    at 0, the three-way comparison) rather than a flag. Worth doing when someone
+    without a checkout has to set a row.
+  - **No op-level families**, which plan 11's first wording gave it: they are
+    test binaries of `infr-vulkan`. Plan 10 (section 3.5) still lists
+    `check [family]` as each family's known-answer check at the resolved
+    parameters, a different command under the same name; the two need
+    reconciling when plan 10's S5 is taken up (a subcommand argument, or another
+    name). Not decided.
+  - **No watchdog and no host-memory check**, which the tests have. On an
+    integrated GPU a model that does not fit beside the reference in host memory
+    is not refused.
+  - **Run by hand only on RADV** (both GPUs, Qwen3-0.6B Q4_K_M). No automated
+    test runs the command against a GPU: the tests cover its arguments, its
+    refusal of a model with no row and its report, and the evaluation under it
+    is the gate's. Windows has not run it.
+  - **The reference is loaded under the shipped defaults**, apart from the
+    configuration under test, so a setting that changes the CPU reference's
+    arithmetic (a KV format) shows as a distance. Each run reports the settings
+    its own edit wrote over (`gate::overridden`), but a setting given at its
+    default value is not listed (the resolved configuration does not say which
+    layer set a value), and nothing lists the settings that differ from the
+    defaults and were left alone; `tune_hash` and `infr tune show` are how to
+    see the tuning.
+  - **Rows are found by file name only, and a quant selector of an uncached
+    repository is downloaded before it can be refused** (B234).
 - **Tests still to convert, each needing a row first** (the record in
   `docs/gpu-tolerance.md` lists them one by one): `gpu_seam_golden_qwen3moe`,
   the last text hash, and the real-MoE token and cosine tests (the Int8 routing
@@ -7441,7 +7510,8 @@ Linux machine as well as on the Windows box.
   with the greedy check in them, which has run under RADV only.
 - **What the retired golden unblocks:** `attn_split.decode_min_chunk` on the RX
   7900 XTX, held at 64 by that hash where 16 measured about 4% faster decode at
-  shallow depth (B227 has the measurement and what the change still needs).
+  shallow depth. `infr tune check` with the floor at 16 alone passes there under
+  RADV (B227 has the measurement, the verdict and what the change still needs).
 
 Then:
 
@@ -8023,18 +8093,36 @@ device's default path and is not expected to hold under a forced kernel.
   bit instead, B207), so no hash holds the floor any more. Measured that day on
   the RX 7900 XTX under RADV with
   `INFR_TUNE=gemv.kq_fma=true,attn_split.decode_min_chunk=16` (both forced
-  together; the built kernels show `native_gemv_kq_fma_*`, the floor's effect
-  was not observed on its own): every model's `gpu_seam_tolerance_*` case
-  passes, greedy check included. One test of the set fails there,
+  together; the built kernels show `native_gemv_kq_fma_*`): every model's
+  `gpu_seam_tolerance_*` case passes, greedy check included. One test of the set
+  fails under the two together,
   `gpu_seam_tolerance_float_runs_build_no_int8_kernel`, at its own guard: with
   `gemv.kq_fma` forced the shipped configuration builds no int8 kernel under
   RADV (the int8 prefill GEMM does not run there either, B231), so the check
-  says it cannot fail. Still to do before the default changes: the whole GPU
-  gate with the floor at 16 alone, on the Windows driver the speed was measured
-  on; neither was run. To try it: `INFR_TUNE=attn_split.decode_min_chunk=16`,
-  which reaches the tests too. If it is taken, a class row in `table.toml` for
+  says it cannot fail. Each alone, the same day, device and driver, with
+  `infr tune check` on Qwen3-0.6B Q4_K_M (every check of the model's six
+  configurations and the greedy check; no default was changed):
+
+  | Forced                                                     | Verdict | Closest to a bound                                                          | Decode worst KL, `gpu` (Int8) | Decode worst KL, `gpu-float` (Float, bound 8.5e-5) |
+  | ---------------------------------------------------------- | ------- | --------------------------------------------------------------------------- | ----------------------------- | -------------------------------------------------- |
+  | nothing                                                    | PASS    | 0.49 of it: `gpu-float` prefill mean KL 3.575e-6 against 7.3e-6             | 4.626e-3                      | 1.602e-5                                           |
+  | `--set kernels.vulkan.tune.attn_split.decode_min_chunk=16` | PASS    | 0.53 of it: `gpu-float-ub32` decode logit deviation 1.014e-3 against 1.9e-3 | 7.588e-3                      | 1.411e-5                                           |
+  | `INFR_TUNE=gemv.kq_fma=true`                               | PASS    | 0.57 of it: `gpu-float-ub32` decode logit deviation 1.091e-3 against 1.9e-3 | 1.564e-5                      | 1.564e-5                                           |
+
+  Each override is seen in the values. Against the unforced run's table, 27
+  decode lines, one prefill line (`gpu-ub32`'s logit deviation) and one greedy
+  token count differ with the floor at 16; 23 decode lines, the same prefill
+  line and one token count with `gemv.kq_fma`, where the shipped configuration's
+  decode lands at the int8-free one's distance (its decode GEMVs are then the
+  fp32 ones). So on this device and driver, for this model, each is inside the
+  rows on its own. Still to do before the default changes: the whole GPU gate
+  with the floor at 16 alone, on the Windows driver the speed was measured on;
+  neither was run. To try it: `INFR_TUNE=attn_split.decode_min_chunk=16`, which
+  reaches the tests too, and `infr tune check <model>` under it for one model at
+  a time. If it is taken, a class row in `table.toml` for
   `vendor = "amd", driver = "AMD_PROPRIETARY", integrated = false` is the place,
   with these figures as its source.
+
 - **The decode floor on the integrated GPU** stays 64: 16 measured slower there
   at depths 256 and 1024 and within the samples' spread elsewhere.
 - **The compute-only family on the RX 7900 XTX** is the default

@@ -313,6 +313,14 @@ gemv_sg.rows                2      default
 `--json` prints the same as a document. The `hash` is also in the device banner
 (`tune:7751091e`), so a log says whether two runs tuned alike.
 
+`infr tune check <model>` says whether the device, with the values in effect, is
+still within tolerance of the CPU reference on that model: run it after forcing
+a parameter (`INFR_TUNE=…` or `--set kernels.vulkan.tune.…` on the same command
+line), after a driver update, or on hardware no table row was written for. It
+needs a model that has rows in the tolerance table, exits 0 within tolerance and
+3 outside it, and takes `--dev` and `--json` like `show`
+([`gpu-tolerance.md`](gpu-tolerance.md), "The command").
+
 Three parameters carry kernels and choices contributed from an RX 580 under RADV
 (PRs 105 to 107). The first two default to what was measured there on that class
 of device only, so every other device runs what it ran before them; the third is

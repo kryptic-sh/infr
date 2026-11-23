@@ -319,61 +319,157 @@ pub const TABLE: &[Entry] = &[
     ),
 ];
 
-/// The [`TABLE`] entry for `model` and `class`.
+/// The [`TABLE`] entry for `model` and `class`, if the table has one.
+pub fn lookup(model: &str, class: PathClass) -> Option<&'static Entry> {
+    TABLE.iter().find(|e| e.model == model && e.class == class)
+}
+
+/// The [`TABLE`] entry for `model` and `class`, for a caller that has already established the
+/// model's rows ([`lookup`] is the question).
+///
+/// # Panics
+///
+/// If the table has no such entry.
 pub fn tolerance(model: &str, class: PathClass) -> &'static Entry {
-    TABLE
-        .iter()
-        .find(|e| e.model == model && e.class == class)
-        .unwrap_or_else(|| panic!("no tolerance for {model} {class:?}"))
+    lookup(model, class).unwrap_or_else(|| panic!("no tolerance for {model} {class:?}"))
+}
+
+/// Which side of a bound a measured value must stay on.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Limit {
+    /// The value may be at most this.
+    AtMost(f64),
+    /// The value must be at least this.
+    AtLeast(f64),
+}
+
+/// One limit a run was held to, with what was measured: a line of a verdict.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Check {
+    /// The metric's stable name (`kl_max`, `kl_mean`, `topk_cos_min`, `logit_dev_max`,
+    /// `top1_misses`, `rank_max`; the counts of [`super::gate`] and [`super::greedy`] add their
+    /// own).
+    pub metric: &'static str,
+    pub measured: f64,
+    pub limit: Limit,
+    pub pass: bool,
+}
+
+impl Check {
+    /// A value that may be at most `bound`.
+    pub fn at_most(metric: &'static str, measured: f64, bound: f64) -> Self {
+        Check {
+            metric,
+            measured,
+            limit: Limit::AtMost(bound),
+            // "Not over the bound": an empty run's mean is NaN and crosses nothing.
+            pass: measured.partial_cmp(&bound) != Some(std::cmp::Ordering::Greater),
+        }
+    }
+
+    /// A value that must be at least `bound`.
+    pub fn at_least(metric: &'static str, measured: f64, bound: f64) -> Self {
+        Check {
+            metric,
+            measured,
+            limit: Limit::AtLeast(bound),
+            pass: measured.partial_cmp(&bound) != Some(std::cmp::Ordering::Less),
+        }
+    }
+
+    /// The worse of two checks of one metric against one bound: a failing one before a passing
+    /// one, then the value further toward the bound's wrong side.
+    ///
+    /// # Panics
+    ///
+    /// In a debug build, if the two are not of one metric and one bound.
+    pub fn worse(self, o: Check) -> Check {
+        debug_assert_eq!((self.metric, self.limit), (o.metric, o.limit));
+        let further = match self.limit {
+            Limit::AtMost(_) => o.measured > self.measured,
+            Limit::AtLeast(_) => o.measured < self.measured,
+        };
+        if (self.pass && !o.pass) || (self.pass == o.pass && further) {
+            o
+        } else {
+            self
+        }
+    }
 }
 
 impl Tolerance {
-    /// Every metric of `s` that is outside this tolerance, described; empty when the run passes.
-    /// `s` must have been scored with this tolerance's near-tie threshold.
-    pub fn violations(&self, s: &RunScore) -> Vec<String> {
+    /// Every limit of this tolerance against `s`, in a fixed order, each with the measured
+    /// value.
+    ///
+    /// # Panics
+    ///
+    /// If `s` was not scored with this tolerance's near-tie threshold.
+    pub fn checks(&self, s: &RunScore) -> [Check; 6] {
         assert_eq!(
             s.near_tie, self.near_tie,
             "scored at another near-tie threshold"
         );
-        let mut v = Vec::new();
-        if s.kl.worst.value > self.kl_max {
-            v.push(format!(
-                "KL {:.4e} at position {} over {:.4e}",
-                s.kl.worst.value, s.kl.worst.pos, self.kl_max
-            ));
-        }
-        if s.kl.mean() > self.kl_mean {
-            v.push(format!(
-                "mean KL {:.4e} over {:.4e}",
-                s.kl.mean(),
-                self.kl_mean
-            ));
-        }
-        if s.topk_cos.worst.value < self.topk_cos_min {
-            v.push(format!(
-                "top-k cosine {:.6} at position {} under {:.6}",
-                s.topk_cos.worst.value, s.topk_cos.worst.pos, self.topk_cos_min
-            ));
-        }
-        if s.logit_dev.worst.value > self.logit_dev_max {
-            v.push(format!(
-                "logit deviation {:.4e} at position {} over {:.4e}",
-                s.logit_dev.worst.value, s.logit_dev.worst.pos, self.logit_dev_max
-            ));
-        }
-        if !s.top1_misses.is_empty() {
-            v.push(format!(
-                "top-1 differs at positions {:?}, each with a reference margin over {} nats",
-                s.top1_misses, self.near_tie
-            ));
-        }
-        if s.ref_top1_rank.worst.value > self.rank_max as f64 {
-            v.push(format!(
-                "the reference's top-1 ranked {} at position {} (at most {} above it allowed)",
-                s.ref_top1_rank.worst.value, s.ref_top1_rank.worst.pos, self.rank_max
-            ));
-        }
-        v
+        [
+            Check::at_most("kl_max", s.kl.worst.value, self.kl_max),
+            Check::at_most("kl_mean", s.kl.mean(), self.kl_mean),
+            Check::at_least("topk_cos_min", s.topk_cos.worst.value, self.topk_cos_min),
+            Check::at_most("logit_dev_max", s.logit_dev.worst.value, self.logit_dev_max),
+            Check::at_most("top1_misses", s.top1_misses.len() as f64, 0.0),
+            Check::at_most(
+                "rank_max",
+                s.ref_top1_rank.worst.value,
+                self.rank_max as f64,
+            ),
+        ]
+    }
+
+    /// Every metric of `s` that is outside this tolerance, described; empty when the run passes.
+    /// These are the [`checks`](Self::checks) that do not pass, so the two cannot disagree.
+    ///
+    /// # Panics
+    ///
+    /// If `s` was not scored with this tolerance's near-tie threshold.
+    pub fn violations(&self, s: &RunScore) -> Vec<String> {
+        // One description per check, in the order `checks` gives them.
+        let describe: [&dyn Fn() -> String; 6] = [
+            &|| {
+                format!(
+                    "KL {:.4e} at position {} over {:.4e}",
+                    s.kl.worst.value, s.kl.worst.pos, self.kl_max
+                )
+            },
+            &|| format!("mean KL {:.4e} over {:.4e}", s.kl.mean(), self.kl_mean),
+            &|| {
+                format!(
+                    "top-k cosine {:.6} at position {} under {:.6}",
+                    s.topk_cos.worst.value, s.topk_cos.worst.pos, self.topk_cos_min
+                )
+            },
+            &|| {
+                format!(
+                    "logit deviation {:.4e} at position {} over {:.4e}",
+                    s.logit_dev.worst.value, s.logit_dev.worst.pos, self.logit_dev_max
+                )
+            },
+            &|| {
+                format!(
+                    "top-1 differs at positions {:?}, each with a reference margin over {} nats",
+                    s.top1_misses, self.near_tie
+                )
+            },
+            &|| {
+                format!(
+                    "the reference's top-1 ranked {} at position {} (at most {} above it allowed)",
+                    s.ref_top1_rank.worst.value, s.ref_top1_rank.worst.pos, self.rank_max
+                )
+            },
+        ];
+        self.checks(s)
+            .iter()
+            .zip(describe)
+            .filter(|(c, _)| !c.pass)
+            .map(|(_, d)| d())
+            .collect()
     }
 }
 
@@ -473,7 +569,35 @@ mod tests {
             }
             let v = tol.violations(&s);
             assert!(v.len() == 1 && v[0].contains(name), "{name}: {v:?}");
+            let failing = tol.checks(&s).iter().filter(|c| !c.pass).count();
+            assert_eq!(failing, 1, "{name}: one failing check per violation");
         }
+    }
+
+    /// A check passes on its bound and fails past it, on either side; an empty run's NaN mean
+    /// crosses nothing; and the worse of two is the failing one, then the one further out.
+    #[test]
+    fn a_check_fails_past_its_bound() {
+        assert!(Check::at_most("m", 1.0, 1.0).pass);
+        assert!(!Check::at_most("m", 1.5, 1.0).pass);
+        assert!(Check::at_least("m", 1.0, 1.0).pass);
+        assert!(!Check::at_least("m", 0.5, 1.0).pass);
+        assert!(Check::at_most("m", f64::NAN, 1.0).pass);
+        assert!(TOL
+            .checks(&RunScore::new(TOL.near_tie))
+            .iter()
+            .all(|c| c.pass));
+        let (ok, bad, worse) = (
+            Check::at_most("m", 0.5, 1.0),
+            Check::at_most("m", 1.5, 1.0),
+            Check::at_most("m", 2.0, 1.0),
+        );
+        assert_eq!(ok.worse(bad), bad);
+        assert_eq!(bad.worse(ok), bad);
+        assert_eq!(bad.worse(worse), worse);
+        assert_eq!(ok.worse(Check::at_most("m", 0.25, 1.0)), ok);
+        let low = Check::at_least("m", 0.5, 1.0);
+        assert_eq!(Check::at_least("m", 2.0, 1.0).worse(low), low);
     }
 
     /// The table is well formed: one row per (model, class), every limit in its range.

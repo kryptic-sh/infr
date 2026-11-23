@@ -3,7 +3,7 @@
 //! each recording once, and what the check's token rule sees of a bug in the model.
 
 use super::{open_clean, open_planted, run_case, Bug, QWEN3};
-use crate::forced::{self, Reference};
+use crate::forced;
 use infr_llama::seam::ForcedOn;
 use infr_llama::tolerance::PathClass::{self, Float, Int8};
 
@@ -68,7 +68,7 @@ fn recording_bug_fails_the_greedy_check(bug: Bug, says: &str, never: &str) {
         return;
     };
     let _guard = forced::watchdog("a recording bug's red path", forced::GATE_TIMEOUT);
-    let reference = Reference::new(&clean);
+    let reference = forced::reference(&clean);
     let on = ForcedOn::Vulkan;
     let control = run_case("clean control", t.table, &reference, &clean, on, RUNS);
     assert!(
@@ -183,7 +183,7 @@ fn gpu_planted_greedy_tokens() {
         return;
     };
     let _guard = forced::watchdog("the greedy token demonstration", forced::GATE_TIMEOUT);
-    let reference = Reference::new(&clean);
+    let reference = forced::reference(&clean);
     let green = forced::greedy(t.key, t.table, &reference, &clean, RUNS);
     assert!(
         green.is_empty(),

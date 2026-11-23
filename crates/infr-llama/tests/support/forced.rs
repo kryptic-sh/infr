@@ -1,51 +1,57 @@
-//! The teacher-forced comparison: the CPU reference's greedy run, the same tokens forced through
-//! another backend, and the two scored with `infr_llama::tolerance`.
+//! The teacher-forced comparison as the tests drive it: the cases they score (cached models by
+//! key, synthetic models, planted copies), the measurement, and the gate with its watchdog and
+//! skips. The evaluation itself is the library's (`infr_llama::tolerance::gate` and `greedy`),
+//! the one `infr tune check` runs too; the functions of the same names here call it, print what
+//! it logs, and panic where it returns an error.
 
 use infr_llama::seam::{ForcedLogits, ForcedOn, PrefillHead, Routing};
-use infr_llama::tolerance::{
-    tolerance, PathClass, RouteScore, RunScore, FIRST_ROWS, MIN_TOP1_SCORED,
+use infr_llama::tolerance::gate;
+pub use infr_llama::tolerance::gate::{
+    argmax, kv_types, try_score, vulkan_float, vulkan_float_nocoopmat, GpuConfig, Reference,
+    Scored, GPU_CONFIGS, N_DECODE, SMALL_UBATCH,
 };
+use infr_llama::tolerance::{PathClass, RunScore};
 
 /// The routed-expert (MoE) half: the synthetic model, the routing comparison, its self-check.
 #[path = "routed.rs"]
 mod routed;
 use infr_llama::{EngineConfig, SeamModel};
 use infr_testkit::gguf::{Fill, Meta, SyntheticModel, TempGguf, TensorSpec};
-pub use routed::{
-    route_line, score_routing, self_check_on_a_synthetic_moe, synthetic_moe, SYNTHETIC_MOE,
-};
+pub use routed::{route_line, self_check_on_a_synthetic_moe, synthetic_moe, SYNTHETIC_MOE};
 
-/// The production greedy decode held to the per-token path, and its tokens to the reference.
-#[path = "greedy.rs"]
-pub mod greedy;
+/// The greedy check's test-side entry points, for the planted-bug demonstrations (the gate runs
+/// the check inside [`gate::check`]).
+#[cfg(feature = "mutations")]
+pub mod greedy {
+    use infr_llama::tolerance::greedy as check;
+    use infr_llama::tolerance::PathClass;
+
+    /// Whether the test device packs several decode steps into one submit
+    /// ([`check::device_chains`] on the test environment's configuration).
+    pub fn device_chains() -> bool {
+        check::device_chains(&std::sync::Arc::new(super::env_cfg()))
+            .unwrap_or_else(|e| panic!("{e:#}"))
+    }
+
+    /// The library's greedy check ([`check::greedy`]) on a test case: its report lines printed,
+    /// its failures returned, a run that could not be made a panic.
+    pub fn greedy(
+        key: &str,
+        table: &str,
+        reference: &super::Reference,
+        test: &super::Case,
+        runs: &[(&str, PathClass)],
+    ) -> Vec<String> {
+        let found = check::greedy(key, table, reference, test, runs, &mut |e| println!("{e}"))
+            .unwrap_or_else(|e| panic!("{e:#}"));
+        for n in &found.not_exercised {
+            eprintln!("{n}");
+        }
+        found.failures
+    }
+}
+#[cfg(feature = "mutations")]
 pub use greedy::greedy;
-
-/// Decode steps forced after each prompt.
-pub const N_DECODE: usize = 32;
-
-/// The prefill chunk height of the second prefill run: small enough that the longest prompt
-/// spans several chunks and that every prompt's chunks take the small-`m` GEMM tiers.
-pub const SMALL_UBATCH: usize = 32;
-
-/// The three prompts every model is scored on: short, medium, and long enough to span several
-/// [`SMALL_UBATCH`] chunks.
-pub const PROMPTS: [&str; 3] = [
-    "The capital of France is Paris. The capital of Japan is",
-    "Write a short story about a lighthouse keeper who finds a message in a bottle. \
-     The keeper had lived alone on the island for eleven years, and in all that time",
-    "Explain how a CPU instruction pipeline works. A classic five-stage pipeline \
-     divides the execution of each instruction into fetch, decode, execute, memory access \
-     and write-back. While one instruction is being decoded, the next one is already being \
-     fetched, so in the ideal case one instruction completes every cycle. Hazards break \
-     this ideal. A structural hazard occurs when two instructions need the same hardware \
-     resource in the same cycle. A data hazard occurs when an instruction depends on the \
-     result of an earlier instruction that has not yet written it back; forwarding paths \
-     and pipeline stalls are the usual remedies. A control hazard occurs at a branch, \
-     because the processor does not know which instruction to fetch next until the branch \
-     is resolved. Branch prediction guesses the outcome and, if the guess was wrong, the \
-     speculatively fetched instructions are flushed. List the hazards again, and for each \
-     one give a concrete example from a real processor:",
-];
 
 /// A model the tests can find in the HF cache: `(key, repo, file)`.
 pub const MODELS: &[(&str, &str, &str)] = &[
@@ -107,29 +113,29 @@ pub const MODELS: &[(&str, &str, &str)] = &[
     ),
 ];
 
-/// A model to score and the token ids of its prompts.
+/// A [`gate::Case`] the tests opened, with what only they need of it.
 pub struct Case {
-    pub model: SeamModel,
-    pub prompts: Vec<Vec<u32>>,
+    case: gate::Case,
     /// The model file's size, for the host-memory check on unified-memory devices.
     pub bytes: u64,
-    /// Whether the model's prompt goes through the batched prefill. `false` only for a model
-    /// known to have none (the synthetic MoE: float expert banks have no batched kernel), whose
-    /// prompt positions are then not scored on logits ([`Reference::check_prefill`]).
-    pub batched_prefill: bool,
-    /// Whether the model's greedy decode chains several steps into one submit on a device that
-    /// allows it. `false` for the synthetic models, whose token embedding is gathered on the
-    /// host, so every step has host work between it and the next.
-    pub chains: bool,
-    /// The prompt the greedy check also generates from: a chat-templated one
-    /// ([`greedy::chat_prompt`]), for a model with a chat template. `None` for the synthetic
-    /// models, whose vocabulary spells nothing.
-    pub chat_prompt: Option<Vec<u32>>,
     /// The synthetic model's file, kept for as long as the model maps it.
     _file: Option<TempGguf>,
 }
 
-/// The [`Case`] for a [`MODELS`] key — [`PROMPTS`] tokenized — or for `synthetic-f32` /
+impl std::ops::Deref for Case {
+    type Target = gate::Case;
+    fn deref(&self) -> &gate::Case {
+        &self.case
+    }
+}
+
+impl std::ops::DerefMut for Case {
+    fn deref_mut(&mut self) -> &mut gate::Case {
+        &mut self.case
+    }
+}
+
+/// The [`Case`] for a [`MODELS`] key — [`gate::PROMPTS`] tokenized — or for `synthetic-f32` /
 /// `synthetic-f16` ([`synthetic_llama`] with f32 or f16 projections) or [`SYNTHETIC_MOE`]
 /// ([`synthetic_moe`]), each prompted with ids at the same three lengths; `None` when a cached
 /// model is not downloaded.
@@ -173,26 +179,14 @@ pub fn open_case_scaled(key: &str, scaled: Option<(&str, f32)>) -> Option<Case> 
     let bytes = std::fs::metadata(&path).map_or(0, |md| md.len());
     let model = load(&path);
     Some(Case {
-        prompts: real_prompts(&model),
-        chat_prompt: Some(greedy::chat_prompt(&model)),
-        model,
+        case: gate::Case::of_model(model).expect("the model's prompts"),
         bytes,
-        batched_prefill: true,
-        chains: true,
         _file: None,
     })
 }
 
-/// [`PROMPTS`], tokenized by `model`.
-pub fn real_prompts(model: &SeamModel) -> Vec<Vec<u32>> {
-    PROMPTS
-        .iter()
-        .map(|t| model.encode(t).expect("encode"))
-        .collect()
-}
-
-/// The prompts of a synthetic model, one per role of [`PROMPTS`] (short, medium, long enough to
-/// span several [`SMALL_UBATCH`] chunks), as ids of its vocabulary.
+/// The prompts of a synthetic model, one per role of [`gate::PROMPTS`] (short, medium, long
+/// enough to span several [`SMALL_UBATCH`] chunks), as ids of its vocabulary.
 pub fn synthetic_prompts() -> Vec<Vec<u32>> {
     [12usize, 34, 180]
         .iter()
@@ -207,21 +201,27 @@ pub fn synthetic_prompts() -> Vec<Vec<u32>> {
 
 /// The [`Case`] of a model written to `file`, which it keeps for as long as the model maps it:
 /// prompted with the [`synthetic_prompts`] when `synthetic` (its vocabulary spells nothing), else
-/// with [`PROMPTS`]. `batched_prefill` is [`Case::batched_prefill`].
+/// with [`gate::PROMPTS`]. `batched_prefill` is [`Case::batched_prefill`].
 pub fn open_file(file: TempGguf, synthetic: bool, batched_prefill: bool) -> Case {
     let bytes = std::fs::metadata(file.path()).map_or(0, |md| md.len());
     let model = load(file.path());
+    let case = if synthetic {
+        gate::Case {
+            prompts: synthetic_prompts(),
+            chat_prompt: None,
+            model,
+            batched_prefill,
+            chains: false,
+        }
+    } else {
+        gate::Case {
+            batched_prefill,
+            ..gate::Case::of_model(model).expect("the model's prompts")
+        }
+    };
     Case {
-        prompts: if synthetic {
-            synthetic_prompts()
-        } else {
-            real_prompts(&model)
-        },
-        chat_prompt: (!synthetic).then(|| greedy::chat_prompt(&model)),
-        model,
+        case,
         bytes,
-        batched_prefill,
-        chains: !synthetic,
         _file: Some(file),
     }
 }
@@ -265,29 +265,13 @@ pub fn load(path: &std::path::Path) -> SeamModel {
     SeamModel::load_with(path, None, std::sync::Arc::new(env_cfg())).expect("model load")
 }
 
-/// The argmax of a logit row, the lowest index on an exact tie.
-pub fn argmax(row: &[f32]) -> u32 {
-    (0..row.len()).fold(0, |b, i| if row[i] > row[b] { i } else { b }) as u32
-}
-
-/// The CPU reference's greedy run on `prompt`: [`N_DECODE`] tokens, the logits at every
-/// position.
+/// The CPU reference's greedy run on `prompt` ([`gate::forced_reference`]).
 pub fn forced_reference(model: &SeamModel, prompt: &[u32], n: usize) -> ForcedLogits {
-    model
-        .forced_logits(
-            ForcedOn::CpuReference,
-            |_| {},
-            prompt,
-            n,
-            PrefillHead::All,
-            None,
-            |_, row| argmax(row),
-        )
-        .expect("cpu reference run")
+    gate::forced_reference(model, prompt, n).unwrap_or_else(|e| panic!("{e:#}"))
 }
 
 /// `reference`'s tokens, and on a routed-expert model its expert selections, forced through
-/// `on`, its engine configuration adjusted by `edit`.
+/// `on`, its engine configuration adjusted by `edit` ([`gate::forced`]).
 pub fn forced(
     model: &SeamModel,
     on: ForcedOn,
@@ -309,7 +293,7 @@ pub fn forced_with(
 }
 
 /// [`forced_with`] along `reference`'s tokens and the expert selections `route` holds (`None`:
-/// every router's own).
+/// every router's own) ([`gate::forced_along`]).
 pub fn forced_along(
     model: &SeamModel,
     on: ForcedOn,
@@ -318,57 +302,10 @@ pub fn forced_along(
     reference: &ForcedLogits,
     route: Option<&Routing>,
 ) -> ForcedLogits {
-    let steps = reference.positions.len() - reference.prefill_rows;
-    let p = reference.seq.len() - steps;
-    let got = model
-        .forced_logits(on, edit, &reference.seq[..p], steps, head, route, |s, _| {
-            reference.seq[p + s]
-        })
-        .unwrap_or_else(|e| panic!("forced run on {on:?}: {e:#}"));
-    if head != PrefillHead::All {
-        assert!(
-            got.positions
-                .iter()
-                .all(|q| reference.positions.contains(q)),
-            "{on:?} scored positions the reference has no row for"
-        );
-        return got;
-    }
-    assert_eq!(
-        got.seq, reference.seq,
-        "{on:?} was not fed the reference's tokens"
-    );
-    assert_eq!(
-        got.positions, reference.positions,
-        "{on:?} scored other positions"
-    );
-    got
+    gate::forced_along(model, on, edit, head, reference, route).unwrap_or_else(|e| panic!("{e:#}"))
 }
 
-/// One comparison, split by where the rows came from: the first [`FIRST_ROWS`] positions (whose
-/// hidden states carry a model's largest activations, and which every quantized path misses by
-/// the most), the rest of the batched prefill's rows, and the decode steps' rows.
-pub struct Scored {
-    pub first: RunScore,
-    pub prefill: RunScore,
-    pub decode: RunScore,
-}
-
-impl Scored {
-    /// The three phases with their names, first rows first.
-    pub fn phases(&self) -> [(&'static str, &RunScore); 3] {
-        [
-            ("first", &self.first),
-            ("prefill", &self.prefill),
-            ("decode", &self.decode),
-        ]
-    }
-}
-
-/// Score every row of `test` against the reference's row at the same position: the first rows at
-/// the `near_first` near-tie margin, the rest at `near_steady`. `test` may score a subset of the
-/// reference's prefill positions ([`PrefillHead::LastOfChunk`]); its decode rows are the
-/// reference's.
+/// [`try_score`], panicking on a row that cannot be scored.
 pub fn score(
     reference: &ForcedLogits,
     test: &ForcedLogits,
@@ -376,49 +313,6 @@ pub fn score(
     near_first: f64,
 ) -> Scored {
     try_score(reference, test, near_steady, near_first).unwrap_or_else(|e| panic!("{e}"))
-}
-
-/// [`score`], returning a row that cannot be scored (a NaN or infinite logit, named with its
-/// position) as an error instead of panicking.
-pub fn try_score(
-    reference: &ForcedLogits,
-    test: &ForcedLogits,
-    near_steady: f64,
-    near_first: f64,
-) -> Result<Scored, String> {
-    let v = reference.vocab;
-    let ref_decode = &reference.positions[reference.prefill_rows..];
-    assert_eq!(
-        &test.positions[test.prefill_rows..],
-        ref_decode,
-        "decode positions differ"
-    );
-    let mut s = Scored {
-        first: RunScore::new(near_first),
-        prefill: RunScore::new(near_steady),
-        decode: RunScore::new(near_steady),
-    };
-    for (r, &pos) in test.positions.iter().enumerate() {
-        let k = reference
-            .positions
-            .iter()
-            .position(|&q| q == pos)
-            .unwrap_or_else(|| panic!("the reference has no row at position {pos}"));
-        let phase = if pos < FIRST_ROWS {
-            &mut s.first
-        } else if r < test.prefill_rows {
-            &mut s.prefill
-        } else {
-            &mut s.decode
-        };
-        phase.add_rows(
-            &reference.logits[k * v..(k + 1) * v],
-            &test.logits[r * v..(r + 1) * v],
-            v,
-            &[pos],
-        )?;
-    }
-    Ok(s)
 }
 
 /// One line for the measurement log with every scored position's KL, in position order, as
@@ -480,112 +374,16 @@ pub fn line(tag: &str, s: &Scored) -> String {
         .join("\n")
 }
 
-/// Turn every int8-activation Vulkan kernel off: the int8 coopmat and dp4a K-quant prefill GEMMs,
-/// the dp4a `mmq` GEMMs (the coopmat tier's and the non-coopmat tier's, which wave64 and devices
-/// without coopmat take), the int8 multi-row and decode GEMVs: `i8_dot` gates every packed-int8
-/// dot kernel; the rest name the tiers it does not.
-pub fn vulkan_float(c: &mut EngineConfig) {
-    let v = &mut c.kernels.vulkan;
-    v.i8cm_kq = false;
-    v.dp4a_kq = false;
-    v.mmq = false;
-    v.mmv_mw = Some(false);
-    v.mrow = false;
-    v.i8_dot = false;
-}
-
-/// [`vulkan_float`] with the whole cooperative-matrix tier off as well (`kernels.vulkan.coopmat`,
-/// what `INFR_NO_COOPMAT` sets): the prefill GEMMs then take f32 operands, on every device.
-pub fn vulkan_float_nocoopmat(c: &mut EngineConfig) {
-    vulkan_float(c);
-    c.kernels.vulkan.coopmat = false;
-}
-
-/// A KV-format pair as a config edit — the `INFR_KV_TYPE_K`/`_V` pair, typed.
-pub fn kv_types(c: &mut EngineConfig, k: &str, v: &str) {
-    c.kv.type_k = infr_core::budget::parse_kv_dtype(k);
-    c.kv.type_k_specified = true;
-    c.kv.type_v = infr_core::budget::parse_kv_dtype(v);
-    c.kv.type_v_specified = true;
-}
-
-/// A named Vulkan configuration of the measurement: its edit, and the KV format the CPU reference
-/// it is scored against runs (`None`: the reference's own default).
-type GpuConfig = (
-    &'static str,
-    fn(&mut EngineConfig),
-    Option<(&'static str, &'static str)>,
-);
-
-/// Every configuration [`measure`] can run; `INFR_TOL_ONLY` (comma-separated names) picks some.
-pub const GPU_CONFIGS: &[GpuConfig] = &[
-    ("gpu", |_| {}, None),
-    ("gpu-ub32", |c| c.device.ubatch = Some(SMALL_UBATCH), None),
-    ("gpu-float", vulkan_float, None),
-    (
-        "gpu-float-ub32",
-        |c| {
-            vulkan_float(c);
-            c.device.ubatch = Some(SMALL_UBATCH);
-        },
-        None,
-    ),
-    (
-        "gpu-float-static",
-        |c| {
-            vulkan_float(c);
-            c.kernels.vulkan.no_replay = true;
-        },
-        None,
-    ),
-    ("gpu-float-nocoopmat", vulkan_float_nocoopmat, None),
-    (
-        "gpu-float-nocoopmat-ub32",
-        |c| {
-            vulkan_float_nocoopmat(c);
-            c.device.ubatch = Some(SMALL_UBATCH);
-        },
-        None,
-    ),
-    (
-        "gpu-float-nocoopmat-static",
-        |c| {
-            vulkan_float_nocoopmat(c);
-            c.kernels.vulkan.no_replay = true;
-        },
-        None,
-    ),
-    (
-        "gpu-kv-q8",
-        |c| kv_types(c, "q8_0", "q8_0"),
-        Some(("q8_0", "q8_0")),
-    ),
-    (
-        "gpu-kv-q4v",
-        |c| kv_types(c, "f16", "q4_0"),
-        Some(("f16", "q4_0")),
-    ),
-    (
-        "gpu-kv-turbo3v",
-        |c| kv_types(c, "f16", "turbo3"),
-        Some(("f16", "turbo3")),
-    ),
-    (
-        "gpu-kv-q8-float",
-        |c| {
-            kv_types(c, "q8_0", "q8_0");
-            vulkan_float(c);
-        },
-        Some(("q8_0", "q8_0")),
-    ),
-];
-
 /// Configurations for diagnosis, run by [`measure`] only when `INFR_TOL_ONLY` names them and
 /// scored by no gate.
 pub const DIAGNOSIS_CONFIGS: &[GpuConfig] = &[
     // The shipped configuration without the dp4a K-quant prefill GEMM (`kernels.vulkan.dp4a_kq`):
     // its weights then take the `mmq` GEMM, still on int8 activations.
-    ("gpu-no-dp4a-kq", |c| c.kernels.vulkan.dp4a_kq = false, None),
+    GpuConfig {
+        name: "gpu-no-dp4a-kq",
+        edit: |c| c.kernels.vulkan.dp4a_kq = false,
+        reference_kv: None,
+    },
 ];
 
 /// The three-way measurement on one model: CPU production against the CPU reference, then each
@@ -666,9 +464,16 @@ pub fn measure(key: &str) {
             println!("{l}");
         }
         let named = |name: &str| only.as_ref().is_some_and(|o| o.iter().any(|n| n == name));
-        let diagnosis = DIAGNOSIS_CONFIGS.iter().filter(|c| named(c.0));
-        let gated = GPU_CONFIGS.iter().filter(|c| only.is_none() || named(c.0));
-        for &(name, edit, kv) in gated.chain(diagnosis) {
+        let diagnosis = DIAGNOSIS_CONFIGS.iter().filter(|c| named(c.name));
+        let gated = GPU_CONFIGS
+            .iter()
+            .filter(|c| only.is_none() || named(c.name));
+        for &GpuConfig {
+            name,
+            edit,
+            reference_kv: kv,
+        } in gated.chain(diagnosis)
+        {
             let reference = match kv {
                 None => r.clone(),
                 Some((k, v)) => forced(model, ForcedOn::CpuReference, |c| kv_types(c, k, v), &r),
@@ -770,15 +575,9 @@ pub fn watchdog(what: &str, limit: std::time::Duration) -> Watchdog {
 
 /// The config edit of the [`GPU_CONFIGS`] entry named `name`.
 pub fn gpu_config_edit(name: &str) -> fn(&mut EngineConfig) {
-    gpu_config(name).1
-}
-
-/// The [`GPU_CONFIGS`] entry named `name`.
-fn gpu_config(name: &str) -> &'static GpuConfig {
-    GPU_CONFIGS
-        .iter()
-        .find(|c| c.0 == name)
-        .unwrap_or_else(|| panic!("no configuration {name:?}"))
+    gate::gpu_config(name)
+        .unwrap_or_else(|e| panic!("{e:#}"))
+        .edit
 }
 
 /// Host bytes a model resident on a unified-memory device takes per byte of its file, and the
@@ -844,18 +643,13 @@ pub fn device_for(key: &str, bytes: u64) -> Option<String> {
     Some(device)
 }
 
-/// The gate: on every prompt of the `key` model, each named [`GPU_CONFIGS`] entry must be within
-/// the tolerance table's entry for (`key`, its class) of the CPU reference: the first
-/// [`FIRST_ROWS`] positions within its `first` bound, the batched prefill's other rows and the
-/// decode rows each within its `steady` bound, and each of those two phases must score at least
-/// [`MIN_TOP1_SCORED`] positions above the near-tie margin. Then the greedy check ([`greedy`])
-/// holds the chained and the replayed decode, which no forced run exercises, to the per-token
-/// path, and the greedy tokens to the reference. Skips, with a printed line, without
-/// the model (failing instead under `INFR_TEST_REQUIRE_MODELS`), without a Vulkan device, and on
-/// an integrated device without the host memory for the model. Fails a run that outlives
-/// [`GATE_TIMEOUT`]. Prints every measured value, so a new device's numbers can be read off the
-/// log.
-pub fn gate(key: &str, runs: &[(&str, PathClass)]) {
+/// The gate ([`gate::check`], with the runs the table's rows give the `key` model,
+/// [`gate::runs_for`]): each run within the model's rows of the CPU reference on every prompt,
+/// then the greedy check. Skips, with a printed line, without the model (failing instead under
+/// `INFR_TEST_REQUIRE_MODELS`), without a Vulkan device, and on an integrated device without the
+/// host memory for the model. Fails a run that outlives [`GATE_TIMEOUT`]. Prints every measured
+/// value, so a new device's numbers can be read off the log.
+pub fn gate(key: &str) {
     let _guard = watchdog(&format!("the {key} tolerance case"), GATE_TIMEOUT);
     let Some(case) = open_or_skip(key) else {
         return;
@@ -864,23 +658,14 @@ pub fn gate(key: &str, runs: &[(&str, PathClass)]) {
         return;
     };
     let t_case = std::time::Instant::now();
-    let reference = Reference::new(&case);
-    let mut failures = evaluate_with(
-        key,
-        table_name(key),
-        &reference,
-        &case,
-        ForcedOn::Vulkan,
-        runs,
-        |_, _, _, _| {},
-    );
-    reference.check_prefill(key, &mut failures);
-    let t_greedy = std::time::Instant::now();
-    failures.extend(greedy(key, table_name(key), &reference, &case, runs));
-    eprintln!(
-        "time {key}: the greedy check {:.1}s",
-        t_greedy.elapsed().as_secs_f64()
-    );
+    let table = table_name(key);
+    let runs = gate::runs_for(table).unwrap_or_else(|| panic!("no tolerance row for {table}"));
+    let verdict = gate::check(key, table, &case, &case, &runs, &mut |e| println!("{e}"))
+        .unwrap_or_else(|e| panic!("{e:#}"));
+    for n in verdict.not_exercised() {
+        eprintln!("{n}");
+    }
+    let failures = verdict.failures();
     eprintln!(
         "time {key}: {:.1}s on {device}",
         t_case.elapsed().as_secs_f64()
@@ -903,7 +688,7 @@ pub fn evaluate(
     on: ForcedOn,
     runs: &[(&str, PathClass)],
 ) -> Vec<String> {
-    let reference = Reference::new(reference);
+    let reference = self::reference(reference);
     evaluate_with(
         key,
         table_name(key),
@@ -915,68 +700,24 @@ pub fn evaluate(
     )
 }
 
-/// A case with its CPU reference's greedy run on each prompt, computed once for every
-/// [`evaluate_with`] that scores against it.
-pub struct Reference<'a> {
-    pub case: &'a Case,
-    pub runs: Vec<ForcedLogits>,
+/// `case` with its CPU reference's greedy run on each prompt ([`Reference::new`]).
+pub fn reference(case: &Case) -> Reference<'_> {
+    Reference::new(case).unwrap_or_else(|e| panic!("{e:#}"))
 }
 
-impl<'a> Reference<'a> {
-    pub fn new(case: &'a Case) -> Self {
-        let runs = case
-            .prompts
-            .iter()
-            .map(|ids| forced_reference(&case.model, ids, N_DECODE))
-            .collect();
-        Self { case, runs }
-    }
-
-    /// Hold the reference's prefill rows to what the case says of its model, adding to
-    /// `failures`. A case marked as having no batched prefill ([`Case::batched_prefill`]) must
-    /// have produced no prefill row on any prompt; [`evaluate_with`]'s count of scored prefill
-    /// rows then reports zero of zero, which says nothing about the run, and that one failure is
-    /// dropped, with a printed line (the decode rows are scored, and a routed model's routing at
-    /// every position). Any other case must have prefill rows on every prompt: a model that
-    /// lost its batched prefill fails here by name.
-    pub fn check_prefill(&self, label: &str, failures: &mut Vec<String>) {
-        let without: Vec<usize> = (0..self.runs.len())
-            .filter(|&pi| self.runs[pi].prefill_rows == 0)
-            .collect();
-        if self.case.batched_prefill {
-            if !without.is_empty() {
-                failures.push(format!(
-                    "{label}: the reference took no batched prefill on prompts {without:?}, and \
-                     the case is not one marked as having none"
-                ));
-            }
-            return;
-        }
-        if without.len() != self.runs.len() {
-            failures.push(format!(
-                "{label}: the case is marked as having no batched prefill, and the reference \
-                 took one on {} of its {} prompts",
-                self.runs.len() - without.len(),
-                self.runs.len()
-            ));
-            return;
-        }
-        eprintln!(
-            "{label}: the model takes no batched prefill; its decode rows are scored, and a \
-             routed model's routing at every position"
-        );
-        failures.retain(|f| !f.contains(" prefill: only 0 of 0 positions"));
+/// [`Reference::check_prefill`], what it could not exercise printed, for the planted-bug
+/// demonstrations.
+#[cfg(feature = "mutations")]
+pub fn check_prefill(reference: &Reference, label: &str, failures: &mut Vec<String>) {
+    let mut not_exercised = Vec::new();
+    reference.check_prefill(label, failures, &mut not_exercised);
+    for n in not_exercised {
+        eprintln!("{n}");
     }
 }
 
-/// [`evaluate`] against a [`Reference`] computed once, scored against the table's entry for
-/// `table` (a model's [`table_name`]), with `seen(prompt, run name, run, score)` called after each
-/// run: the score is `None` when a row could not be scored, which is then a failure naming it.
-///
-/// A routed-expert model is forced along the reference's expert selections too, and its own
-/// selections are held to the entry's `route_near_tie` at every position and layer; over a case,
-/// at least [`MIN_TOP1_SCORED`] of the reference's selections must clear that margin. A row
-/// with a routing near tie and a run without a routing, or the reverse, is a failure.
+/// The library's evaluation ([`gate::evaluate_with`]) on test cases: its report lines printed,
+/// the limits that were crossed returned, a run that could not be made a panic.
 pub fn evaluate_with(
     key: &str,
     table: &str,
@@ -984,120 +725,18 @@ pub fn evaluate_with(
     test: &Case,
     on: ForcedOn,
     runs: &[(&str, PathClass)],
-    mut seen: impl FnMut(usize, &str, &ForcedLogits, Option<&Scored>),
+    seen: impl FnMut(usize, &str, &ForcedLogits, Option<&Scored>),
 ) -> Vec<String> {
-    let mut failures = Vec::new();
-    // Per run, the steady phases merged over every prompt, for the top-1 count.
-    let mut merged: Vec<[Option<RunScore>; 2]> = vec![[None, None]; runs.len()];
-    // Per run, the routing comparison merged over every prompt.
-    let mut routed: Vec<Option<RouteScore>> = vec![None; runs.len()];
-    for (pi, (ids, r)) in reference
-        .case
-        .prompts
-        .iter()
-        .zip(&reference.runs)
-        .enumerate()
-    {
-        for (ri, &(name, class)) in runs.iter().enumerate() {
-            let &(_, edit, kv) = gpu_config(name);
-            let entry = tolerance(table, class);
-            let reference_run = match kv {
-                None => r.clone(),
-                Some((k, v)) => forced(
-                    &reference.case.model,
-                    ForcedOn::CpuReference,
-                    |c| kv_types(c, k, v),
-                    r,
-                ),
-            };
-            let g = forced_with(&test.model, on, edit, PrefillHead::All, r);
-            match (entry.route_near_tie, g.routing.is_some()) {
-                (Some(near), true) => {
-                    let rs = score_routing(r, &g, near).expect("both runs carry a routing");
-                    println!(
-                        "{key} {name} ({class:?}) prompt {pi} ({} tokens):\n{}",
-                        ids.len(),
-                        rs.report()
-                    );
-                    for v in rs.violations() {
-                        failures.push(format!("{name} prompt {pi} routing: {v}"));
-                    }
-                    match &mut routed[ri] {
-                        Some(m) => m.merge(&rs),
-                        slot => *slot = Some(rs),
-                    }
-                }
-                (None, false) => {}
-                (near, _) => failures.push(format!(
-                    "{name} prompt {pi} routing: the {table} {class:?} row has {} routing near \
-                     tie and the run has {} routing",
-                    if near.is_some() { "a" } else { "no" },
-                    if near.is_some() { "no" } else { "a" },
-                )),
-            }
-            let s = match try_score(
-                &reference_run,
-                &g,
-                entry.steady.near_tie,
-                entry.first.near_tie,
-            ) {
-                Ok(s) => s,
-                Err(e) => {
-                    seen(pi, name, &g, None);
-                    failures.push(format!("{name} prompt {pi}: {e}"));
-                    continue;
-                }
-            };
-            seen(pi, name, &g, Some(&s));
-            for (phase, ps) in s.phases() {
-                if ps.positions == 0 {
-                    continue;
-                }
-                println!(
-                    "{key} {name} ({class:?}) prompt {pi} ({} tokens), {phase}:\n{}",
-                    ids.len(),
-                    ps.report()
-                );
-                let tol = if phase == "first" {
-                    &entry.first
-                } else {
-                    &entry.steady
-                };
-                for v in tol.violations(ps) {
-                    failures.push(format!("{name} prompt {pi} {phase}: {v}"));
-                }
-            }
-            for (slot, ps) in merged[ri].iter_mut().zip([&s.prefill, &s.decode]) {
-                match slot {
-                    Some(m) => m.merge(ps),
-                    None => *slot = Some(ps.clone()),
-                }
-            }
-        }
-    }
-    for (&(name, _), rs) in runs.iter().zip(&routed) {
-        if let Some(rs) = rs.as_ref().filter(|rs| rs.scored < MIN_TOP1_SCORED) {
-            failures.push(format!(
-                "{name} routing: only {} of {} selections clear the {:.3e} near tie (at least \
-                 {MIN_TOP1_SCORED} needed, or the routing check is vacuous)",
-                rs.scored, rs.calls, rs.near_tie
-            ));
-        }
-    }
-    for (&(name, _), m) in runs.iter().zip(&merged) {
-        for (phase, ps) in ["prefill", "decode"].iter().zip(m) {
-            // No score: every prompt's row of this run failed to score, each a failure above.
-            let Some(ps) = ps else { continue };
-            if ps.top1_scored < MIN_TOP1_SCORED {
-                failures.push(format!(
-                    "{name} {phase}: only {} of {} positions clear the {}-nat near-tie margin \
-                     (at least {MIN_TOP1_SCORED} needed, or the top-1 check is vacuous)",
-                    ps.top1_scored, ps.positions, ps.near_tie
-                ));
-            }
-        }
-    }
-    failures
+    let cmp = gate::Comparison {
+        key,
+        table,
+        reference,
+        test,
+        on,
+    };
+    gate::evaluate_with(&cmp, runs, seen, &mut |e| println!("{e}"))
+        .unwrap_or_else(|e| panic!("{e:#}"))
+        .failures
 }
 
 // ─── the driver's own check ──────────────────────────────────────────────────────

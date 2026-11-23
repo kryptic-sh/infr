@@ -185,6 +185,16 @@ fn argmax(row: &[f32]) -> usize {
     (0..row.len()).fold(0, |b, i| if row[i] > row[b] { i } else { b })
 }
 
+/// A row's top token and its margin over the runner-up, in nats of logit (infinite for a row of
+/// one token).
+fn top_margin(row: &[f32]) -> (usize, f64) {
+    let top = argmax(row);
+    let second = (0..row.len())
+        .filter(|&i| i != top)
+        .fold(f64::NEG_INFINITY, |a, i| a.max(row[i] as f64));
+    (top, row[top] as f64 - second)
+}
+
 /// A row's top set: its most probable tokens, most probable first (index order on ties, so it is
 /// deterministic), until they hold [`TOPK_MASS`] or [`TOPK_MAX`] is reached. Only the first
 /// `TOPK_MAX` of that order can be read, so they are selected (linear in the vocabulary) and only
@@ -269,11 +279,7 @@ pub fn score_row(reference: &[f32], test: &[f32]) -> Result<RowScore, RowError> 
         f64::INFINITY
     };
 
-    let top = argmax(reference);
-    let second = (0..n)
-        .filter(|&i| i != top)
-        .fold(f64::NEG_INFINITY, |a, i| a.max(reference[i] as f64));
-    let margin = reference[top] as f64 - second;
+    let (top, margin) = top_margin(reference);
     let t_top = test[top];
     let ref_top1_rank = test.iter().filter(|&&v| v > t_top).count();
     Ok(RowScore {
@@ -468,6 +474,96 @@ impl RunScore {
             } else {
                 format!("; misses at {:?}", self.top1_misses)
             }
+        )
+    }
+}
+
+/// A backend's own greedy tokens against the reference's rows along them: the top-1 rule of
+/// [`RunScore`] for a path that hands back the tokens it chose and no logits (the chained decode).
+/// The reference is fed the backend's tokens, so the two see the same context at every step, and
+/// the backend's choice must be the reference's top token wherever the reference's top-2 margin
+/// is above `near_tie`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TokenScore {
+    /// The reference top-2 margin (nats) at or below which a step is a near tie: the choice is not
+    /// counted there.
+    pub near_tie: f64,
+    /// Steps whose reference margin is above `near_tie`, where the choice is counted.
+    pub scored: usize,
+    /// Of `scored`, the positions where the backend chose another token, in order.
+    pub misses: Vec<usize>,
+    /// Steps left out as near ties.
+    pub near_ties: usize,
+    /// The largest reference margin at which the backend chose another token, counted or not (0
+    /// when it never did).
+    pub widest_miss: f64,
+}
+
+impl TokenScore {
+    pub fn new(near_tie: f64) -> Self {
+        TokenScore {
+            near_tie,
+            scored: 0,
+            misses: Vec::new(),
+            near_ties: 0,
+            widest_miss: 0.0,
+        }
+    }
+
+    /// Add the step at `pos`: `reference` is the reference's row after the tokens up to `pos`,
+    /// `chosen` the token the backend chose next.
+    pub fn add(&mut self, pos: usize, reference: &[f32], chosen: u32) -> Result<(), RowError> {
+        if reference.is_empty() {
+            return Err(RowError::Empty);
+        }
+        check_finite(reference, "reference")?;
+        let (top, margin) = top_margin(reference);
+        let agrees = chosen as usize == top;
+        if !agrees {
+            self.widest_miss = self.widest_miss.max(margin);
+        }
+        if margin > self.near_tie {
+            self.scored += 1;
+            if !agrees {
+                self.misses.push(pos);
+            }
+        } else {
+            self.near_ties += 1;
+        }
+        Ok(())
+    }
+
+    /// Fold another run's steps into this one (both must use the same near-tie threshold).
+    pub fn merge(&mut self, o: &TokenScore) {
+        assert_eq!(self.near_tie, o.near_tie, "merging runs scored differently");
+        self.scored += o.scored;
+        self.misses.extend_from_slice(&o.misses);
+        self.near_ties += o.near_ties;
+        self.widest_miss = self.widest_miss.max(o.widest_miss);
+    }
+
+    /// The misses, described; empty when every counted choice is the reference's.
+    pub fn violations(&self) -> Vec<String> {
+        if self.misses.is_empty() {
+            return Vec::new();
+        }
+        vec![format!(
+            "the greedy token differs from the reference's at positions {:?}, each with a \
+             reference margin over {} nats",
+            self.misses, self.near_tie
+        )]
+    }
+
+    /// One line for a test log.
+    pub fn report(&self) -> String {
+        format!(
+            "  greedy tokens  {} of {} are the reference's above a {:.3}-nat margin ({} near ties \
+             left out; widest miss at a {:.3}-nat margin)\n",
+            self.scored - self.misses.len(),
+            self.scored,
+            self.near_tie,
+            self.near_ties,
+            self.widest_miss
         )
     }
 }
@@ -942,6 +1038,37 @@ mod tests {
             "{err}"
         );
         assert!(score_row(&r, &[1.0, 2.0]).is_err());
+    }
+
+    /// A backend's own tokens are held to the reference's top token only above the near-tie
+    /// margin: the reference's choice passes, another token at a near tie is left out and
+    /// recorded as the widest miss, and another token at a clear margin is a miss at its position.
+    #[test]
+    fn token_score_counts_other_choices_above_the_near_tie() {
+        let clear = [4.0f32, 1.0, 0.0, -1.0];
+        let tie = [4.0f32, 3.9, 0.0, -1.0];
+        let mut s = TokenScore::new(0.5);
+        s.add(3, &clear, 0).unwrap();
+        s.add(4, &tie, 1).unwrap();
+        assert!(s.violations().is_empty(), "{:?}", s.violations());
+        assert_eq!((s.scored, s.near_ties), (1, 1));
+        assert!(close(s.widest_miss, 0.1, 1e-6), "{}", s.widest_miss);
+        s.add(5, &clear, 1).unwrap();
+        assert_eq!(s.misses, vec![5]);
+        assert_eq!(s.widest_miss, 3.0);
+        let v = s.violations();
+        assert!(v.len() == 1 && v[0].contains("[5]"), "{v:?}");
+        // A token outside the vocabulary is another token, not an error of the reference's row.
+        s.add(6, &clear, 99).unwrap();
+        assert_eq!(s.misses, vec![5, 6]);
+        let mut both = TokenScore::new(0.5);
+        both.merge(&s);
+        both.merge(&s);
+        assert_eq!((both.scored, both.misses.len(), both.near_ties), (6, 4, 2));
+        assert!(matches!(
+            TokenScore::new(0.5).add(0, &[1.0, f32::NAN], 0),
+            Err(RowError::NonFinite { index: 1, .. })
+        ));
     }
 
     /// Top-1 agreement is counted only above the near-tie margin, and the near ties are counted

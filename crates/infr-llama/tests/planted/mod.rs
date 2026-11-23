@@ -10,7 +10,13 @@
 //! reached decode); where the gate must catch the bug, the run must fail it, naming a metric;
 //! where the doc records that it misses, the measured distance is printed and nothing more is
 //! asserted, so a tighter table later cannot break the test.
+//!
+//! The greedy check's demonstrations are in [`greedy`]: bugs in how a decode recording is
+//! driven, which no teacher-forced run can show and that check must, and what its token rule sees
+//! of the bugs here.
 
+/// The greedy check's demonstrations.
+mod greedy;
 mod patch;
 
 use super::forced::{self, Case, Reference, Scored};
@@ -34,6 +40,8 @@ enum Bug {
     RopePairing,
     NibbleMap,
     RouterIgnoresBias,
+    ReplayFeedsStaleToken,
+    ReplayRewritesLastRow,
 }
 
 /// What [`Bug::RmsEpsScaled`] multiplies the RMSNorm epsilon by.
@@ -55,6 +63,10 @@ impl Bug {
             Bug::RopePairing => "(g) rope pairs the wrong elements",
             Bug::NibbleMap => "(h) Q4_K nibbles swapped in one ffn_down",
             Bug::RouterIgnoresBias => "(i) MoE router ignores its bias",
+            Bug::ReplayFeedsStaleToken => "(j) a replayed decode step fed the token before its own",
+            Bug::ReplayRewritesLastRow => {
+                "(k) a replayed decode leaves the last V row it wrote negated"
+            }
         }
     }
 
@@ -67,6 +79,8 @@ impl Bug {
             Bug::AttnResidualDropped => Some(Planted::AttnResidualDropped {
                 layer: t.resid_layer,
             }),
+            Bug::ReplayFeedsStaleToken => Some(Planted::ReplayFeedsStaleToken),
+            Bug::ReplayRewritesLastRow => Some(Planted::ReplayRewritesLastRow),
             _ => None,
         }
     }
@@ -282,7 +296,9 @@ fn open_planted(t: &Target, bug: Bug) -> Case {
         Bug::RopeQueryAhead
         | Bug::MaskDropsLastKey
         | Bug::RmsEpsScaled
-        | Bug::AttnResidualDropped => {}
+        | Bug::AttnResidualDropped
+        | Bug::ReplayFeedsStaleToken
+        | Bug::ReplayRewritesLastRow => {}
     }
     let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"));
     let file = TempGguf::write_copy(dir, &format!("planted-{}-{bug:?}", t.key), &p.bytes);

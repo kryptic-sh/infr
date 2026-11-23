@@ -8,7 +8,10 @@
 //! the clean copy's CPU reference. Bugs that live in the weights (a mis-scaled block, a wrong
 //! nibble map, swapped projections, a RoPE pairing error, a router bias ignored) are not here: the
 //! tests write them into a copy of the model file, where the backend under test runs its
-//! production code on wrong weights.
+//! production code on wrong weights. Some are of neither kind: [`Planted::ReplayFeedsStaleToken`]
+//! and [`Planted::ReplayRewritesLastRow`] are in how the runner drives a decode recording, for
+//! the check that holds the replayed and the chained decode to the per-token path
+//! (`docs/gpu-tolerance.md`, "The greedy check").
 
 use crate::Config;
 use infr_core::graph::Graph;
@@ -30,6 +33,16 @@ pub enum Planted {
     RmsEpsScaled(f32),
     /// The attention sublayer's output of this layer is never added to the residual stream.
     AttnResidualDropped { layer: usize },
+    /// Not a bug of the graph but of how one decode recording is driven: every execution of it
+    /// after the first within a generation is fed the token before the one it should be (a
+    /// replayed step's, and the first step's of every chained submit after the first). A plan
+    /// executed once, which is all a teacher-forced run ever does with one, cannot show it.
+    ReplayFeedsStaleToken,
+    /// Also in the driving: a generation that executed its decode recording more than once
+    /// leaves the first layer's V row of the last position it wrote with every value's sign
+    /// flipped. Every sampled token is already out and none changes; what the generation leaves
+    /// in the KV cache does.
+    ReplayRewritesLastRow,
 }
 
 impl Planted {
@@ -82,6 +95,27 @@ pub(crate) fn attention_span(c: &Config, start_pos: usize, batch: usize) -> (u32
 /// Whether layer `l`'s attention output is added to the residual stream.
 pub(crate) fn keeps_attn_residual(c: &Config, l: usize) -> bool {
     c.planted != Some(Planted::AttnResidualDropped { layer: l })
+}
+
+/// The token the decode step at `pos` feeds: `cur[pos]`, or for
+/// [`Planted::ReplayFeedsStaleToken`], when the generation's one recording has `executed` before,
+/// the token before it.
+pub(crate) fn fed_token(c: &Config, cur: &[u32], pos: usize, executed: bool) -> u32 {
+    let stale = c.planted == Some(Planted::ReplayFeedsStaleToken) && executed && pos > 0;
+    cur[pos - usize::from(stale)]
+}
+
+/// Whether a generation whose one recording executed more than once (`replayed`) leaves its
+/// last written V row negated ([`Planted::ReplayRewritesLastRow`]).
+pub(crate) fn negates_last_row(c: &Config, replayed: bool) -> bool {
+    c.planted == Some(Planted::ReplayRewritesLastRow) && replayed
+}
+
+/// Flip the sign of every f16 value in `row` (little-endian bytes).
+pub(crate) fn negate_f16(row: &mut [u8]) {
+    for v in row.as_chunks_mut::<2>().0 {
+        v[1] ^= 0x80;
+    }
 }
 
 /// Opt `g` out of the replayed decode when its bug is baked at its build position.

@@ -233,12 +233,15 @@ fn resident_verdict_skips_only_what_starves_a_unified_host() {
 
 // ─── CPU-only correctness (no GPU) ───────────────────────────────────────────────
 //
-// The CPU and GPU goldens use SEPARATE hashes: the CPU does the math in f32 while the GPU uses f16 +
-// native-quant kernels, so greedy decode can split on near-ties (precision, not a bug) — comparing
-// the two token-for-token is brittle. Instead each backend locks its own FNV-1a golden, captured
-// with `INFR_BLESS=1` and read to confirm it's coherent + correct, so any op regression flips the
-// hash. Kernel-level math (the Q4_K/Q6_K dot vs the f32 reference) is unit-tested in
-// `src/seam.rs`.
+// The CPU backend gives the same bits on every system, so each CPU case locks an FNV-1a golden of
+// its greedy text, captured with `INFR_BLESS=1` and read to confirm it is coherent and correct: any
+// op regression flips the hash. A GPU does not reproduce those bits, and its kernels are tunable
+// per device, so `gpu_tolerance.rs` holds a model with a row in the tolerance table to the CPU
+// reference instead (`docs/gpu-tolerance.md`): its logits within the row, its chained and replayed
+// decode to its per-token one bit for bit, its greedy tokens to the reference's outside near
+// ties. The GPU-against-CPU tests in this file are the ones that page records as kept, each
+// with its reason (a model, a quantization or a KV format with no row, or a row Windows has not
+// run), beside the GPU-against-GPU comparisons.
 
 /// Stable FNV-1a-64 over a string. (`std::hash::DefaultHasher` is NOT stable across toolchains, so we
 /// roll our own for golden values.)
@@ -296,23 +299,6 @@ fn check_golden_with(
             assert_eq!(
                 h, *want,
                 "golden hash changed for {prompt:?} (n={n})\n  out: {out:?}\n  got 0x{h:016x} want 0x{want:016x}"
-            );
-        }
-    }
-}
-
-/// Assert (or, with `INFR_BLESS=1`, print) the GPU golden hash for each `(prompt, n, fnv1a)` case.
-fn check_gpu_golden(gen: impl Fn(&str, usize) -> String, cases: &[(&str, usize, u64)]) {
-    let bless = std::env::var("INFR_BLESS").is_ok();
-    for (prompt, n, want) in cases {
-        let out = gen(prompt, *n);
-        let h = fnv1a(&out);
-        if bless {
-            println!("    ({prompt:?}, {n}, 0x{h:016x}),  // {out:?}");
-        } else {
-            assert_eq!(
-                h, *want,
-                "GPU golden changed for {prompt:?} (n={n})\n  out: {out:?}\n  got 0x{h:016x} want 0x{want:016x}"
             );
         }
     }
@@ -861,65 +847,6 @@ fn cpu_kv_mainline_quants_coherent() {
     assert_kv_formats_track_the_f32_cache(&path, &formats[1..]);
 }
 
-// Captured + verified coherent on the Vulkan backend via the agnostic compute seam (the SAME dense
-// `Graph` the CPU oracle builds, mapped op-for-op to GPU kernels). Should reproduce the production
-// GPU path (QWEN3_GPU_GOLDEN).
-const QWEN3_SEAM_GOLDEN: &[(&str, usize, u64)] = &[
-    (
-        "The capital of France is",
-        32,
-        // RE-BLESSED (2026-07-13) for `de987d7`: **Q6_K** joined the AMD int8-activation DECODE
-        // tier (`mmv_int8_decode_dtypes`). unsloth's Qwen3-0.6B-**Q4_K_M** is a MIXED GGUF — its
-        // tied lm_head/embed is Q6_K — so flipping Q6_K moved that tensor's decode GEMV from
-        // f32-exact dequant to int8 dp4a. Same class of real-but-benign numerics shift as the
-        // Q4_K re-blessing this comment used to describe: int8-activation rounding shifts a
-        // close-margin greedy argmax and the token path diverges, while the answer stays right.
-        //
-        // Verified coherent AND correct before re-blessing (greedy, same prompt):
-        //   "<think>\nOkay, the user is asking about the capital of France. I need to make sure I
-        //    recall the correct answer. France's capital is Paris. …"
-        //   → "The capital of France is **Paris**."
-        //
-        // MY PROCESS FAILURE, recorded so it isn't repeated: `de987d7` shipped this numerics flip
-        // and I did NOT re-bless — this golden has been RED on main ever since (found only when a
-        // later agent tripped over it). A precision-policy flip is exactly the change that stales a
-        // golden; re-bless it IN THE SAME COMMIT, with the generated text pasted in as proof, or
-        // don't ship the flip.
-        0xfd63781ea3bfa785,
-    ),
-    (
-        "Explain how a computer works in simple terms.",
-        48,
-        // RE-BLESSED for the same reason as the France case above. Verified coherent: "<think>
-        // \nOkay, the user wants an explanation of how a computer works in simple terms. Let me
-        // start by breaking down the basic components. First, there's the hardware, like the CPU,
-        // RAM, and storage. Then the software," (coincidentally now bit-for-bit the same trajectory
-        // as the CPU-only oracle's QWEN3_GOLDEN second case, 0xcf56ba8c4bb5c455 — not required to
-        // match, just a real outcome of the shifted numerics).
-        0xcf56ba8c4bb5c455,
-    ),
-];
-
-/// End-to-end dense parity: run the full Qwen3-0.6B dense forward on the **Vulkan** backend through
-/// the agnostic compute seam ([`SeamModel::generate_dense_vulkan`]) and lock its golden. The seam runs
-/// the identical `Graph` the CPU reference builds; this proves the dense forward maps faithfully to
-/// the GPU and reproduces the production GPU path (`gpu_golden_qwen3`).
-#[test]
-#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
-fn gpu_seam_golden_qwen3() {
-    let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
-    let mut _tlk = test_serial_lock();
-    let model = model_default(&path);
-    check_gpu_golden(
-        |p, n| {
-            model
-                .generate_dense_vulkan(&model.render_chat(p).expect("render chat"), n)
-                .expect("seam gen")
-        },
-        QWEN3_SEAM_GOLDEN,
-    );
-}
-
 /// IQ4_XS (non-linear 4-bit codebook quant: 4-bit codes index KV_IQ4NL → signed int8, per-32 scale)
 /// through the Vulkan seam vs the CPU oracle. The GPU IQ4_XS decode/prefill runs the word-parallel
 /// `dqblk` (whole-u32 code loads + hoisted codebook gather) and — on ≥48M/≥8M weights (none on this
@@ -978,53 +905,14 @@ fn gpu_seam_matches_cpu_qwen3_q8_0_i8coopmat() {
     );
 }
 
-/// Flash-attention prefill parity: a prompt LONG ENOUGH (>64 tokens) that the seam's batched prefill
-/// takes the FlashAttention-2 path (`attention_prefill_flash`, rows≥64) + the tiled GEMM/mmq Linear,
-/// must generate the SAME greedy continuation as the CPU reference oracle (which uses the naive
-/// per-token attention). Guards the m>1 prefill kernels the short-prompt goldens never exercise.
-#[test]
-#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
-fn gpu_seam_flash_matches_cpu() {
-    let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
-    let mut _tlk = test_serial_lock();
-    let model = model_default(&path);
-    // ~100+ tokens → pf_m ≥ 64 → flash prefill on the seam.
-    let long = "Photosynthesis is the process by which green plants, algae, and some bacteria \
-        convert light energy into chemical energy stored in glucose, using carbon dioxide and water \
-        and releasing oxygen as a byproduct. It happens in two connected stages: the light-dependent \
-        reactions in the thylakoid membranes, and the light-independent Calvin cycle in the stroma. \
-        Explain each stage carefully, name the key molecules involved, and then summarize in one \
-        sentence why this process is essential for life on Earth.";
-    let mut cpu_txt = String::new();
-    model
-        // REFERENCE oracle — see `seam_vulkan_matches_cpu`'s doc.
-        .generate_cpu_reference(long, 24, None, |p| cpu_txt.push_str(p))
-        .expect("cpu gen");
-    let gpu_txt = model.generate_dense_vulkan(long, 24).expect("seam gen");
-    // The f16 GPU flash/GEMM kernels and the f32 CPU oracle accumulate in different precision, so a
-    // long greedy continuation eventually hits a near-tie argmax and forks into an equally-coherent
-    // alternative (the exact split `seam_vulkan_matches_cpu`'s doc predicts). What the flash-prefill
-    // kernels must guarantee is a LONG shared prefix — a real attention bug corrupts the context and
-    // diverges immediately, not 20 tokens in. Assert a substantial common prefix instead of full
-    // bit-identity; print both on failure.
-    let (ct, gt) = (cpu_txt.trim(), gpu_txt.trim());
-    let common = ct
-        .char_indices()
-        .zip(gt.chars())
-        .take_while(|((_, a), b)| a == b)
-        .count();
-    assert!(
-        common >= 60,
-        "flash-prefill seam diverged from the CPU oracle too early (common prefix {common} chars):\n\
-         cpu: {ct:?}\ngpu: {gt:?}"
-    );
-}
-
 /// Vulkan-seam vs CPU-oracle parity for one model: greedy `n`-token continuation of `prompt`
 /// (rendered through the model's chat template) must match token-for-token. Proves the arch's ops
 /// lower correctly through the Vulkan adapter — the CPU seam runs the IDENTICAL Graph. A near-tie
 /// argmax split (f16 GPU kernels vs f32 CPU) would show here as an early divergence; none of the
 /// covered models exhibit one on these prompts today, so keep the strict compare until it flakes.
+/// `gpu_tolerance.rs` holds the greedy tokens of every model with a row in the tolerance table to
+/// the same oracle outside near ties (`docs/gpu-tolerance.md`, "The greedy check"); the callers
+/// here are the cases that page lists as kept.
 ///
 /// The oracle is the REFERENCE CPU backend (`CpuBackend::reference`: weights decoded to f32, f32
 /// dot), NOT the production int8-activation kernels. Those carry ~4e-3 relative error on every
@@ -1464,7 +1352,7 @@ fn gpu_seam_matches_cpu_gemma3() {
 /// the f16-GPU/f32-CPU split forks it into an equally-coherent alternative — verified forking
 /// IDENTICALLY on the pre-IQ4_NL-warp tree, so it's the model, not the kernels. A real dequant
 /// or GEMM bug corrupts the context and diverges immediately; assert a substantial common prefix
-/// instead (the `flash_prefill_seam_matches_cpu` precedent).
+/// instead.
 #[test]
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_matches_cpu_gemma3_q2k_iq4nl() {
@@ -2400,33 +2288,6 @@ fn gpu_seam_ernie4_5_moe_decode_replays_from_one_recording() {
     );
 }
 
-/// The Vulkan seam must match the CPU oracle token-for-token on ERNIE 4.5 0.3B. Run on the F16
-/// file: at Q4_K_M, after "The ocean is a vast,", the f32-activation oracle picks " vast" where
-/// the Vulkan seam, infr's production CPU path and llama.cpp's CPU all pick " dynamic" and then
-/// agree for the rest of the 32 tokens, so the Q4_K_M weights put this prompt on a near tie
-/// between the two activation regimes rather than on an arch difference.
-#[test]
-#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
-fn gpu_seam_matches_cpu_ernie4_5() {
-    let path = need_model!(ernie4_5_03b_f16(), "ERNIE-4.5-0.3B-PT F16");
-    let mut _tlk = test_serial_lock();
-    seam_vulkan_matches_cpu(&path, "Write a short paragraph about the ocean.", 32);
-}
-
-/// The Vulkan quantized kernels on ERNIE's shapes (Q4_K/Q6_K projections, 128-wide heads over a
-/// 1024-wide residual) against the CPU oracle, on the Q4_K_M file. The prompt was picked for its
-/// margins: along the whole 9-token answer ("The chemical symbol for gold is **Au**.") the top-1
-/// logit leads the runner-up by at least 1.46 on infr's production CPU prefill and on both GPUs'
-/// prefill (measured 2026-11-13, docs/plan/02-ernie4-5.md), far above the int8-activation error
-/// that splits the ocean prompt above. Past the ninth token the answer reaches a near tie.
-#[test]
-#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
-fn gpu_seam_matches_cpu_ernie4_5_q4_k_m() {
-    let path = need_model!(ernie4_5_03b(), "ERNIE-4.5-0.3B-PT");
-    let mut _tlk = test_serial_lock();
-    seam_vulkan_matches_cpu(&path, "What is the chemical symbol for gold?", 9);
-}
-
 /// ERNIE 4.5 writes every K through the rope→WriteKv pair the replay fuses, so its decode is one
 /// record-once replay, as Qwen3's is (see [`gpu_seam_qwen3_decode_replays_from_one_recording`]).
 #[test]
@@ -2531,18 +2392,6 @@ fn cpu_golden_qwen35() {
 // branch (see `docs/qwen35.md`) — so `SeamModel::load` on a qwen35 GGUF drives the SAME shared
 // runner every other arch uses, and production routing (`infr run`/`serve`/`bench` in infr-cli)
 // sends qwen35 through this path unconditionally.
-
-/// The unified Vulkan seam (`SeamModel::generate_dense_vulkan`) must match the unified CPU oracle
-/// (`SeamModel::generate_cpu`) token-for-token — the seam twin of every other arch's
-/// `gpu_seam_matches_cpu_*` test, now exercising `MixerW::DeltaNet` (Conv1dSilu/DeltaNet ops) AND
-/// the qwen35 attention layers' interleaved q+gate split + sigmoid output gate through Vulkan.
-#[test]
-#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
-fn unified_qwen35_gpu_seam_matches_cpu() {
-    let path = need_model!(qwen35_08b(), "Qwen3.5-0.8B");
-    let mut _tlk = test_serial_lock();
-    seam_vulkan_matches_cpu(&path, "What is bash? Answer briefly.", 24);
-}
 
 /// qwen35's gated-DeltaNet recurrent state is an APPEND-ONLY summary — it can't rewind to an
 /// arbitrary shared prefix the way a real KV cache can (see docs/qwen35.md and the no-rewind rule
@@ -3242,26 +3091,6 @@ fn cpu_golden_lfm3() {
     let mut _tlk = test_serial_lock();
     let model = model_default(&path);
     check_golden(&model, LFM3_GOLDEN);
-}
-
-/// The Vulkan seam against the CPU oracle on the LFM3 F16 file, token for token: prefill and then
-/// decode one token at a time, so the short convolution's history is carried through both the
-/// batch and the token-serial kernels.
-#[test]
-#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
-fn gpu_seam_matches_cpu_lfm3() {
-    let path = need_model!(lfm3_17b_f16(), "LFM3-1.7B F16");
-    let mut _tlk = test_serial_lock();
-    seam_vulkan_matches_cpu(&path, "Write a short paragraph about the ocean.", 32);
-}
-
-/// The same on the Q4_K_M file, whose quantized kernels the F16 run does not reach.
-#[test]
-#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
-fn gpu_seam_matches_cpu_lfm3_q4_k_m() {
-    let path = need_model!(lfm3_17b(), "LFM3-1.7B");
-    let mut _tlk = test_serial_lock();
-    seam_vulkan_matches_cpu(&path, "What is the chemical symbol for gold?", 16);
 }
 
 /// LFM3's decode is one record-once replay: the short convolution and the head gate carry no

@@ -773,6 +773,12 @@ pub(crate) fn generate_dense_vulkan(
     )
 }
 
+/// The binder of a WARM call: every weight is already bound, so asking it for one is a broken
+/// invariant, reported by name.
+fn warm_binder<'a>() -> Box<BindWeight<'a>> {
+    Box::new(|name: &str, _tb, _dt, _n| Err(anyhow!("warm session must not re-bind {name}")))
+}
+
 /// [`generate_dense_vulkan`] with a caller-held [`SeamKv`]: hold `state` (+ a `want_ctx` capacity)
 /// across calls and each turn prefills only the suffix that differs from the cached tokens —
 /// ChatSession-style KV reuse on the agnostic seam.
@@ -802,10 +808,8 @@ pub(crate) fn generate_dense_vulkan_session(
     // building the full `vulkan_moe_binder` — which re-resolves the placement tiers and allocs a
     // Box — is pure per-turn waste. Skip it: a no-op binder that errors loudly if the invariant
     // ever breaks.
-    let warm_binder: Box<BindWeight<'_>> =
-        Box::new(|name: &str, _tb, _dt, _n| Err(anyhow!("warm session must not re-bind {name}")));
     let bind = if state.is_some() {
-        warm_binder
+        warm_binder()
     } else {
         let _gp = req.and_then(|r| r.gate_pass());
         vulkan_moe_binder(vk, g, cfg, ec, true, want_ctx)?
@@ -4363,7 +4367,7 @@ pub struct ForcedLogits {
 /// (parameters advancing across replays of one recording) and the chained decode (several steps
 /// per submit, the production greedy path) are NOT exercised; the static per-token path runs when
 /// the configuration sets `kernels.vulkan.no_replay`. Forcing needs every step's logits, which the
-/// chain does not read back.
+/// chain does not read back; [`greedy_tail_vulkan`] is how those two are compared with this path.
 ///
 /// A model whose prompt takes no batched prefill (MoE without the batched kernels, gemma-4 E2B)
 /// returns no prefill rows; its prompt positions are not scored.
@@ -4576,6 +4580,112 @@ pub(crate) fn forced_run_vulkan(
     )?;
     out.kernels = vk.built_kernel_names();
     Ok(out)
+}
+
+/// What a production greedy generation on Vulkan produced, and what it left in its session
+/// ([`crate::SeamModel::greedy_tail_vulkan`]).
+#[derive(Clone, Debug)]
+pub struct GreedyTail {
+    /// The tokens the generation sampled, in order.
+    pub ids: Vec<u32>,
+    /// How many of them came back from chained submits ([`GenStats::n_chained`]).
+    pub chained: usize,
+    /// The record-once decode recordings the generation made: one where the whole decode replayed
+    /// a single recording, none where the backend does not replay the model.
+    pub recordings: u64,
+    /// The generation ended itself on an end token ([`GenStats::natural_stop`]), which is then
+    /// the last of `ids`; otherwise it ran the length it was asked for.
+    pub natural_stop: bool,
+    /// The logits after `prompt ++ ids`: one more per-token step on the same session, which feeds
+    /// the last sampled token and attends over every KV row the generation wrote.
+    pub row: Vec<f32>,
+}
+
+/// Generate `n` greedy tokens after `prompt` on a fresh Vulkan backend for `ec`'s device through
+/// [`generate_dense_vulkan_session`], the function [`generate_dense_vulkan`] is (the production
+/// placement, prefill and decode: chained where `spec.decode_chain` and the device allow, else
+/// one replay of a single recording per token, else the static per-token path), then run one more
+/// per-token step on the same session and return its logits. That row is how a caller sees what
+/// the generation left in the KV cache, which the chain itself never reads back.
+///
+/// One thing differs from [`generate_dense_vulkan`]: the session is opened with room for that
+/// extra step, a context one row longer than the one-shot call asks for.
+pub(crate) fn greedy_tail_vulkan(
+    g: &Gguf,
+    cfg: &Config,
+    ec: &std::sync::Arc<EngineConfig>,
+    token_embd: TokenEmbd<'_>,
+    ple: Option<&PerLayerEmbd>,
+    prompt: &[u32],
+    n: usize,
+) -> AResult<GreedyTail> {
+    let vk = infr_vulkan::VulkanBackend::new_with(ec.clone())
+        .map_err(|e| anyhow!("vulkan init: {e}"))?;
+    let want_ctx = prompt.len() + n + 2;
+    let mut state = None;
+    let (ids, stats) = generate_dense_vulkan_session(
+        &vk,
+        g,
+        cfg,
+        ec,
+        token_embd,
+        ple,
+        prompt,
+        n,
+        |_| {},
+        &mut state,
+        want_ctx,
+        None,
+        None,
+    )?;
+    let recordings = vk.decode_recordings();
+    let seq: Vec<u32> = prompt.iter().chain(&ids).copied().collect();
+    let mut row = Vec::new();
+    let (_, tail) = runner::generate_dense_backend(
+        &vk,
+        &*warm_binder(),
+        g,
+        cfg,
+        ec,
+        token_embd,
+        ple,
+        &seq,
+        1,
+        |_| {},
+        &mut state,
+        want_ctx,
+        None,
+        None,
+        None,
+        Some(&mut row),
+        None,
+        None,
+        None,
+    )?;
+    // A step that re-prefilled would score a prefill, not the KV the generation wrote.
+    if (tail.n_cached, tail.n_prompt) != (seq.len() - 1, 1) {
+        return Err(anyhow!(
+            "the step after the generation reused {} of {} tokens and fed {}, not exactly the last \
+             sampled one",
+            tail.n_cached,
+            seq.len(),
+            tail.n_prompt
+        ));
+    }
+    if row.len() != cfg.vocab {
+        return Err(anyhow!(
+            "the step after the generation returned {} logits, not {}",
+            row.len(),
+            cfg.vocab
+        ));
+    }
+    Ok(GreedyTail {
+        ids,
+        chained: stats.n_chained,
+        recordings,
+        natural_stop: stats.natural_stop,
+        row,
+    })
 }
 
 /// Backend-generic dense decode runner. Builds the agnostic decode [`Graph`] per token and runs it

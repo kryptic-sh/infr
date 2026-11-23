@@ -5178,12 +5178,14 @@ confirmed them. To run them in CI: add `unsloth/ERNIE-4.5-0.3B-PT-GGUF`
 are the same on Windows and Linux (WSL, 2026-11-14), but its file is 13331015456
 bytes, which is not a download for the `cpu-goldens` job.
 
-`gpu_seam_matches_cpu_ernie4_5` runs the ocean prompt on the F16 file (723955168
-bytes) because on Q4_K_M it fails on both GPUs: after "The ocean is a vast," the
-f32-activation CPU oracle (`generate_cpu_reference`) picks " vast", while the
-Vulkan decode, infr's production CPU path and llama.cpp's CPU pick " dynamic".
-Prefill logits at that token, measured 2026-11-13 (they reproduce the review's
-figures):
+`gpu_seam_matches_cpu_ernie4_5` (retired 2026-11-23 to
+`gpu_seam_tolerance_ernie`, which holds the GPU's greedy tokens to the reference
+only outside near ties; `docs/gpu-tolerance.md`) ran the ocean prompt on the F16
+file (723955168 bytes) because on Q4_K_M it failed on both GPUs: after "The
+ocean is a vast," the f32-activation CPU oracle (`generate_cpu_reference`) picks
+" vast", while the Vulkan decode, infr's production CPU path and llama.cpp's CPU
+pick " dynamic". Prefill logits at that token, measured 2026-11-13 (they
+reproduce the review's figures):
 
 | path                         | " dynamic" (11290) | " vast" (12791) | top-1 by |
 | ---------------------------- | -----------------: | --------------: | -------- |
@@ -5195,10 +5197,12 @@ The reference backend's own value is not exposed (no reference-mode prefill).
 The docs on `SeamModel::generate_cpu_reference`, `seam_vulkan_matches_cpu`,
 `CpuBackend::reference` and `generate_dense_cpu_mode` said the int8 activation
 error is invisible at Q4_K and above; they now say it can flip a near tie.
-`gpu_seam_matches_cpu_ernie4_5_q4_k_m` covers the Q4_K_M kernels on a prompt
-chosen for its margins instead. Its 9-token answer is clear by at least 1.46 on
-every path, which also makes it blind to a Vulkan rope base off by 1000x (the
-32-token F16 case catches that one); it does catch a halved attention scale.
+`gpu_seam_matches_cpu_ernie4_5_q4_k_m` (retired the same day to the same case)
+covered the Q4_K_M kernels on a prompt chosen for its margins instead. Its
+9-token answer was clear by at least 1.46 on every path, which also made it
+blind to a Vulkan rope base off by 1000x (the 32-token F16 case caught that
+one); it did catch a halved attention scale. Neither red path has been shown
+again on `gpu_seam_tolerance_ernie`.
 
 ### B169 — the llama.cpp logit oracle passes an ERNIE 4.5 with permuted Q/K (2026-11-13)
 
@@ -5918,19 +5922,23 @@ Vulkan1 126.3 against 186.83; CPU tg128 49.6 against 56.64).
   1128.14-1141.88 and 1120.53-1151.13, tg128 56.83 and 56.72 against
   59.88-60.24. What is left on the CPU is in B173.
 
-**Considered and declined, with what was measured:**
+**Open, measured once:**
 
 - **The int8 decode GEMV for the small k/v projections on an integrated GPU**
   (dropping `mmv_mw_choice`'s 2M-element floor when `Capabilities::integrated`).
   Measured on the RDNA2 iGPU, LFM3-1.7B: the 2048x512 k/v went from 64.4 / 80.0
   us (Q4_K / Q6_K, dequant GEMV) to 19.7 us on average, tg128 26.7 to 27.5 t/s.
-  Declined because it moves numerics: int8 activations on those GEMVs flip
+  It was declined because it moves numerics and so flipped the text hash
   `gpu_seam_golden_qwen3` on that device (got `0xe91c03c96815974c`, text still
-  coherent: "Okay, the user is asking about the capital of France. Let me think.
-  I know that France is a country in Europe, and its capital is"), while the
-  7900 XTX keeps the f32 GEMV there and the golden is one hash for every device.
-  Taking it needs a per-device golden, or the floor lowered on every device and
-  the golden re-blessed (measured nowhere but this iGPU).
+  coherent). That hash is retired since 2026-11-23 (plan 11's G4), so the reason
+  is gone and the change is open. What it needs now: the `gpu_seam_tolerance_*`
+  tests passing on the integrated GPU with the floor dropped (int8 activations
+  on those GEMVs are Int8-class arithmetic, which the rows already admit; not
+  run), and the speed measured again in a quiet window on more than LFM3, under
+  both drivers (the one figure is from the Windows driver).
+
+**Considered and declined, with what was measured:**
+
 - **Tiles for the dp4a K-quant GEMM on the integrated GPU** (Qwen3-1.7B pp512,
   one rep each, before the attention change; per-call gate/up and Q6_K
   `ffn_down`): 64 tokens x 128 rows, 8x8 per thread, 128 threads: 183.1 t/s, 8.0
@@ -7156,32 +7164,54 @@ values. What it leaves:
     GEMM, which is what the Float smoke row and the op-level tests are left to
     catch.
 
-- **`gpu_seam_golden_qwen3` fails on the integrated GPU under RADV; the blessed
-  hash is one device's path.** In the full GPU gate of 2026-11-23 (Linux, Mesa
-  26.3.1, headless) its first prompt hashes to `0xe91c03c96815974c` where
-  `0xfd63781ea3bfa785` is blessed; the same test passes on the RX 7900 XTX under
-  RADV, and `gpu_seam_tolerance_qwen3` passes on both. The same hash is on
-  record for this GPU under Windows ("Considered and declined", the int8 decode
-  GEMV for the small k/v projections): the hash is of the generated text, and
-  both runs print the same text ("Okay, the user is asking about the capital of
-  France. Let me think. I know that France…"), so it marks the other branch of
-  one near tie, not one cause. That lead was checked and does not explain this
-  run: `mmv_mw_choice` still returns `None` under its element floor (read in
-  `adapter.rs`), and the kernels a shipped Qwen3-0.6B run builds on this GPU
-  hold the same decode GEMVs as the RX 7900 XTX's (the f32 `native_q4k_rm2_reg`
-  and `native_q6k`, the int8 `native_mmv_mrow_*`), differing in the prefill
-  GEMMs (`native_gemm_mmq_*_streamed` for `native_gemm_warp_*`) and in the
-  residual builds of the int8 GEMV. Which op takes the other branch under RADV
-  where the Windows driver did not (B227) was not found. What it means for the
-  golden: one text hash cannot hold across drivers on a prompt with a near tie
-  in its first tokens, which is the case for retiring it in G4.
-- **The decode the forced runs exercise is the per-token path.** Each forced
-  step records and executes a fresh replay plan once, so record-once-replay-many
-  (one recording replayed with advancing parameters) and the chained decode
-  (`decode_chain`, the production greedy path) are never run; the exact GPU
-  goldens and exact-token tests cover them today, and G4 must not drop those
-  without a replacement. A forced chain would need the chain to read back every
-  step's logits. The static per-token path is gated (`gpu-float-static`).
+- **What the greedy check leaves** (2026-11-23; `docs/gpu-tolerance.md`, "The
+  greedy check"). A forced run records and executes a fresh decode plan per
+  step, so it never replays one recording at advancing positions and never
+  chains. Each gate case now also generates greedily three ways (chained, one
+  replay per token, the forced driver on its own argmax), from its plain prompts
+  and from one chat-templated prompt, requires the same stop, the same tokens
+  and bit-identical logits one step later, and holds the tokens to the CPU
+  reference outside near ties. Open:
+  - **Lost with the retired tests:** a 48-token generation (the longest is now
+    33), the text hash through detokenization (token ids are compared; the CPU
+    goldens still hash text), and the red paths shown on the old tests (a Vulkan
+    rope base cut 1000×, a halved attention scale, LFM3's history rebuild), none
+    shown again on a gate case.
+  - **Windows has not run it.** Bit-for-bit agreement of a chain, a replay and a
+    fresh recording was measured under RADV only, on both GPUs. A difference
+    under the Windows driver would be a finding about that driver's replays, and
+    would show as a red gate case, not a silent pass.
+  - **The integrated GPU chains nothing** (`Backend::max_decode_chain` is 1 on a
+    device that splits its submits), so on the Linux machine the chained decode
+    is compared on the RX 7900 XTX alone; the integrated GPU compares the
+    replayed decode with the stepped one.
+  - **A chained step's logits are never read.** The check sees a chain through
+    its tokens and through the one row after it. An error in the head or the
+    argmax of a chained step that flips no token is not seen. A forced chain
+    would need the chain to read back every step's logits.
+  - **Not exercised:** the chained sampler (`Op::Sample`'s uniform ring,
+    temperature above 0), a chain length other than the shipped
+    `spec.decode_chain`, a chain or a replay on a KV format other than f16 and
+    coupled q8_0, on a session continued from an earlier turn, and on every
+    model without a gate case.
+  - **The token rule sees gross bugs only.** On Qwen3-0.6B, both GPUs
+    (`gpu_planted_greedy_tokens`): gate and up swapped and the rope pairing put
+    several tokens of a prompt past the near tie in both classes; the nibble map
+    and a dropped attention residual one token each (the residual, in Int8, on
+    the chat prompt alone); the epsilon and the 1% scale none. The logit rows of
+    the forced runs are what catch those.
+  - **The stop rule and the chained count were shown red by throwaway edits**,
+    not by a committed test (the runner returning after its first chained
+    submit; the chained generation ignoring end tokens). A planted bug for each
+    would make that permanent.
+  - **A routed-expert model's greedy tokens are not held to the reference.**
+    Left to its own routers a run parts from the reference at a router near tie,
+    which the token rule cannot tell from a wrong token; a rule that reads the
+    routing along the GPU's own tokens would be needed. Its chained, replayed
+    and stepped generations are compared with each other. Only the synthetic MoE
+    is a gate case, and it does not chain.
+  - **The synthetic models do not chain** (their token embedding is gathered on
+    the host), so the chained decode is exercised on real model files only.
 - **The `Vulkan1` table data predates the full prefill head there.** Until
   2026-11-22 the integrated GPU's int8-off runs scored the prefill on each
   chunk's last row only, under a submit cap of 4, because the full head (one
@@ -7251,6 +7281,33 @@ values. What it leaves:
 - **Qwen2.5-0.5B's float prefill is twenty times further than the other Qwens'**
   (worst KL 8.1e-4, one top-1 flip; decode is normal). It carries q/k/v biases,
   which the others do not. Not looked into; Qwen2.5 has no gate row.
+- **On the integrated GPU the gate filter leaves out every test named `moe` or
+  `ernie`** (`& not (test(moe) | test(ernie))`, `docs/gpu-tolerance.md`,
+  "Running it"). Pre-existing, and the doc gives no reason beside it; the reason
+  inferred from the doc's other sections is host memory, since a resident MoE
+  model on a unified-memory device takes twice its file plus a margin and the
+  real MoE files are ERNIE-4.5-21B and Qwen3-30B. The cost: `test(ernie)` also
+  drops `gpu_seam_tolerance_ernie` and the other tests of the 240 MB
+  ERNIE-4.5-0.3B, and `test(moe)` drops the synthetic MoE's tolerance case, so
+  those run there only when someone runs them by hand (2026-11-23: the whole
+  `gpu_seam_tolerance_*` set was, and passes). Every ERNIE-21B GPU test has
+  `moe` in its name, so `test(moe)` alone would keep the real MoE models out and
+  let the small ERNIE cases back in, and the two synthetic MoE tolerance tests
+  could be named back in; not changed here because the filter is the record of
+  what was run.
+- **`gpu_seam_tolerance_float_runs_build_no_int8_kernel` fails at its own guard
+  when `gemv.kq_fma` is forced on under RADV** (2026-11-23, RX 7900 XTX,
+  `INFR_TUNE=gemv.kq_fma=true,attn_split.decode_min_chunk=16`): the shipped run
+  then builds no int8 kernel at all (fp32 decode GEMVs, and no int8 prefill GEMM
+  under RADV, B231), and the test says it cannot fail. It is right to refuse to
+  pass, and wrong to count as a gate failure on a device whose shipped path is
+  int8-free: such a device (an RX 580 class under RADV, by default) cannot run
+  the tolerance set green. What the test should do instead: when the shipped run
+  builds no int8 kernel, print that the Int8 and Float classes run the same
+  kernels on this device and assert that the two kernel lists are equal, the way
+  `gpu_seam_tolerance_nocoopmat_runs_build_no_coopmat_gemm` treats a device
+  without the cooperative-matrix tier. Not done: it changes what a pass of that
+  test means, which is the owner's call.
 - **Not covered by the gate:** every real MoE model (the synthetic one is; see
   the routed-expert entry above), KV formats other than f16 and q8_0, models not
   cached here (B60's Qwen3.5-MoE and DiffusionGemma), Metal (no Apple hardware:
@@ -7338,39 +7395,53 @@ XTX under RADV 26.3.1 hold `native_gemm_warp_*` and no `native_gemm_i8cm_*`
 - **Not run: a whole f16-weight model.** No F16 GGUF is cached here; the f16
   dot's gain (native 0.321 to 0.084 ns per element) is from the microbench.
 
-### B220 — next up: plan 11 G3 and G4 first; then the queues (2026-11-22)
+### B220 — next up: the rest of plan 11's G4; then the queues (2026-11-22)
 
 **Tag:** handoff · **Kind:** queue
 
-**Top priority, the first slice when work resumes: plan 11's G4**
-(`docs/plan/11-cpu-bit-identical.md`, section 6). It can be done on the Linux
-machine as well as on the Windows box.
+**Top priority, the first slice when work resumes: what is left of plan 11's
+G4** (`docs/plan/11-cpu-bit-identical.md`, section 6). It can be done on the
+Linux machine as well as on the Windows box.
 
-- **G3 is done** (2026-11-23): the planted-bug demonstrations are committed
-  behind `infr-llama`'s `mutations` feature and ran on both GPUs of the Linux
-  machine (`docs/gpu-tolerance.md`, Mutations). What they leave is in B207.
-  gemma-3's rows were re-set the same day (a fine row scored without the
-  cooperative-matrix tier, its Float and Int8 rows as smoke rows), with gemma-3
-  a planted-bug target, and `gpu_seam_tolerance_gemma3` passes on both RADV
-  GPUs; Windows has not run the new rows (B207). MoE rows are scored forced
-  along the reference's routing since the same day; no real MoE model has a row
-  yet (B207).
-- **G4, what it converts:** the whole-vocabulary cosine tests and the exact-hash
-  GPU goldens in `crates/infr-llama/tests/cpu_backend.rs` (`gpu_seam_golden_*`)
-  move to the tolerance test, and `infr tune check --against cpu-reference` is
-  wired to `SeamModel::forced_logits` and `tolerance::table::TABLE`.
-- **Order:** G3's demonstrations are committed and run, so G4 may retire the
-  goldens from the gate once the conversion lands.
-- **Why it is first:** on 2026-11-22 the golden `gpu_seam_golden_qwen3` failed
-  twice for changes the tolerance tests passed: PR 105's decode attention floor
-  of 16, and `gemv.kq_fma` forced on (B227). It is what holds
-  `attn_split.decode_min_chunk` at 64 on the RX 7900 XTX, where 16 measured
-  about 4% faster decode at shallow depth (B227). After G4 that default can
-  change on a tolerance pass alone, with no hash to bless.
-- **What the Linux machine adds:** the tolerance table is set from two GPUs on
-  one Windows box; a run there is a third driver. Every model is cached, and
-  every `gpu_seam_tolerance_*` test passes on each GPU since gemma-3's rows were
-  re-set from that run (B207 has what the re-set leaves open).
+- **Done, 2026-11-23:** every gate case runs the greedy check (the chained and
+  the replayed decode against the per-token path bit for bit, from plain and
+  chat-templated prompts, with the stop and the chain-to-replay hand-off held,
+  the greedy tokens against the reference outside near ties), and
+  `gpu_seam_golden_qwen3`, `gpu_seam_flash_matches_cpu` and the exact-token
+  tests of ERNIE-4.5-0.3B, Qwen3.5-0.8B and LFM3 are retired to their models'
+  `gpu_seam_tolerance_*` tests. `docs/gpu-tolerance.md` has the check ("The
+  greedy check") and the record of every exact and cosine GPU test with what
+  covers it ("The exact and cosine GPU tests"); B207 has what the check leaves.
+- **`infr tune check --against cpu-reference` is not started.** `infr tune` has
+  `show` and `list` only (`cmd_tune` in `crates/infr-cli/src/main.rs`). What it
+  needs, read from the code and not built:
+  - The gate's evaluation is test support code
+    (`crates/infr-llama/tests/support/forced.rs` and `greedy.rs`: `Reference`,
+    `evaluate_with`, `greedy`, `GPU_CONFIGS`, `PROMPTS`). A command cannot call
+    it there. It has to move into `infr_llama::tolerance` first, with the tests
+    calling the library, and that move is a slice of its own to review.
+  - Decisions the command needs: which model it scores when the user names none
+    (the table's rows are keyed by GGUF file name, and the smallest gated file
+    is ERNIE-4.5-0.3B Q4_K_M); what it does for a model with no row (print the
+    distances with no verdict, or refuse); whether the "op-level families" of
+    plan 11's wording are in it at all, since those are test binaries of
+    `infr-vulkan` and nothing a shipped binary can run today.
+  - Conventions to follow from `infr tune show`: the listing on stdout, logs on
+    stderr, `--json`, `--dev VulkanN`, a non-zero exit on a failed check.
+- **Tests still to convert, each needing a row first** (the record in
+  `docs/gpu-tolerance.md` lists them one by one): `gpu_seam_golden_qwen3moe`,
+  the last text hash, and the real-MoE token and cosine tests (the Int8 routing
+  near tie of a real MoE model is undecided, B207); the exact-token tests of
+  Qwen2.5, Llama-3.2-1B and SmolLM3 (measured on Windows, no row); the KV-format
+  cosine tests (only the coupled q8_0 cache has a row; turbo3's distance is
+  unexplained, B207); the models not cached on the Linux machine.
+  `gpu_seam_matches_cpu_gemma3` goes once `gpu_seam_tolerance_gemma3` has passed
+  on the Windows box against the rows re-set under RADV.
+- **Owed on the Windows box:** the `gpu_seam_tolerance_*` tests on both GPUs
+  with the greedy check in them, which has run under RADV only.
+- **What the retired golden unblocks:** `attn_split.decode_min_chunk` on the RX
+  7900 XTX, held at 64 by that hash where 16 measured about 4% faster decode at
+  shallow depth (B227 has the measurement and what the change still needs).
 
 Then:
 
@@ -7426,9 +7497,6 @@ reviewer, none was run.
   but not the `INFR_KQ_FMA_GEMV` and `INFR_GFX_QUEUE` aliases; the changelog
   cites a depth-2048 figure as a floor effect where the chunk is the same at
   either floor.
-- **Not checked:** whether `gpu_seam_golden_qwen3` can pass on a device where
-  `gemv.kq_fma` is the default. With the parameter forced on, on the RX 7900
-  XTX, it fails (B227). G4 above retires it.
 
 ### B209 — gemma-3-1b's mid-sequence CPU distance is int8 noise, not outliers (2026-11-18)
 
@@ -7950,10 +8018,21 @@ device's default path and is not expected to hold under a forced kernel.
   every context under 2048 keys, and `gpu_seam_golden_qwen3` then generates a
   different continuation (hash `0x94f246b09d34db5d` where the blessed one is
   `0xcf56ba8c4bb5c455`, from the test's failure message; the text it printed
-  reads as a normal answer). Taking the gain means re-blessing that golden and
-  running the whole GPU gate at 16 to see which others move; that was not done.
-  To try it: `INFR_TUNE=attn_split.decode_min_chunk=16`, which reaches the tests
-  too. If it is taken, a class row in `table.toml` for
+  reads as a normal answer). That golden is retired since 2026-11-23 (plan 11's
+  G4: the chained and the replayed decode are held to the per-token path bit for
+  bit instead, B207), so no hash holds the floor any more. Measured that day on
+  the RX 7900 XTX under RADV with
+  `INFR_TUNE=gemv.kq_fma=true,attn_split.decode_min_chunk=16` (both forced
+  together; the built kernels show `native_gemv_kq_fma_*`, the floor's effect
+  was not observed on its own): every model's `gpu_seam_tolerance_*` case
+  passes, greedy check included. One test of the set fails there,
+  `gpu_seam_tolerance_float_runs_build_no_int8_kernel`, at its own guard: with
+  `gemv.kq_fma` forced the shipped configuration builds no int8 kernel under
+  RADV (the int8 prefill GEMM does not run there either, B231), so the check
+  says it cannot fail. Still to do before the default changes: the whole GPU
+  gate with the floor at 16 alone, on the Windows driver the speed was measured
+  on; neither was run. To try it: `INFR_TUNE=attn_split.decode_min_chunk=16`,
+  which reaches the tests too. If it is taken, a class row in `table.toml` for
   `vendor = "amd", driver = "AMD_PROPRIETARY", integrated = false` is the place,
   with these figures as its source.
 - **The decode floor on the integrated GPU** stays 64: 16 measured slower there

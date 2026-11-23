@@ -4,7 +4,9 @@
 //! teacher-forces the very same tokens through the Vulkan seam and compares the two backends'
 //! full-vocabulary logits at every position — the batched prefill's rows (at two chunk heights)
 //! and one decode step per generated token — with `infr_llama::tolerance`'s metrics, against the
-//! tolerance table for the model's path class.
+//! tolerance table for the model's path class. Each case then generates greedily on the
+//! production path and holds the chained and the replayed decode to that per-token one, and the
+//! tokens to the reference (`support/greedy.rs`).
 //!
 //! ```text
 //! INFR_DEV=Vulkan0 cargo nextest run -p infr-llama --release --test gpu_tolerance \

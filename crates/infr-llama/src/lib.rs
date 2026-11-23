@@ -110,6 +110,10 @@ pub struct GenStats {
     /// it did not run out of budget even when `n_gen` reached it (the EOS token is counted).
     /// Reported by the dense seam runner; `false` from paths that do not track it.
     pub natural_stop: bool,
+    /// Of `n_gen`, the tokens that came back from chained submits (several decode steps in one
+    /// submission, `spec.decode_chain`); the rest took one step each. Reported by the dense seam
+    /// runner; 0 from paths that do not chain.
+    pub n_chained: usize,
 }
 
 /// Whether a generation that asked for `asked` tokens, was given only `budget` because the

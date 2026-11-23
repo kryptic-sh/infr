@@ -5493,6 +5493,7 @@ pub(crate) fn generate_dense_backend_bound(
                 n_cached: 0,
                 ctx_full: false,
                 natural_stop: false,
+                n_chained: 0,
             },
         ));
     }
@@ -5661,6 +5662,7 @@ pub(crate) fn generate_dense_backend_bound(
                 n_cached: 0,
                 ctx_full: false,
                 natural_stop: false,
+                n_chained: 0,
             },
         ));
     }
@@ -5735,6 +5737,8 @@ pub(crate) fn generate_dense_backend_bound(
     let mut prompt_t = std::time::Duration::ZERO;
     let mut decode_t = std::time::Duration::ZERO;
     let mut decode_n = 0usize;
+    // Of `decode_n`, the tokens that came back from chained submits (`GenStats::n_chained`).
+    let mut chained_n = 0usize;
     // Set where the decode loop ends because the model finished (EOS, or a constrained span
     // completing) rather than on the budget or an abort — see `GenStats::natural_stop`.
     let mut natural_stop = false;
@@ -6436,11 +6440,12 @@ pub(crate) fn generate_dense_backend_bound(
                 // sampled id is already there device-side, but forced/first tokens aren't) and
                 // the position (read ONCE, at replay-record time — the chain may be the very
                 // first decode step, before the per-token path ever wrote pos_buf).
-                be.upload(
-                    dec_ids_buf.as_ref(),
-                    bytemuck::cast_slice(&[cur[pos] as i32]),
-                )
-                .map_err(|e| anyhow!("{e}"))?;
+                #[cfg(feature = "mutations")]
+                let seed = crate::mutation::fed_token(c, &cur, pos, pos > decode_start);
+                #[cfg(not(feature = "mutations"))]
+                let seed = cur[pos];
+                be.upload(dec_ids_buf.as_ref(), bytemuck::cast_slice(&[seed as i32]))
+                    .map_err(|e| anyhow!("{e}"))?;
                 be.upload(pos_buf.as_ref(), bytemuck::cast_slice(&[pos as i32]))
                     .map_err(|e| anyhow!("{e}"))?;
                 // GPU stochastic sampling: draw this chunk's `n` uniforms from the SAME xorshift
@@ -6472,6 +6477,7 @@ pub(crate) fn generate_dense_backend_bound(
                     for &id in &ids {
                         out.push(id);
                         decode_n += 1;
+                        chained_n += 1;
                         fed += 1;
                         let is_eos = !ignore_eos && (c.eos_ids.contains(&id) || id == c.eos);
                         if is_eos {
@@ -6514,6 +6520,11 @@ pub(crate) fn generate_dense_backend_bound(
             }
         }
         let step_t0 = std::time::Instant::now();
+        // The loop's first step is the first execution of the record-once plan in this call.
+        #[cfg(feature = "mutations")]
+        let tok =
+            crate::mutation::fed_token(c, &cur, pos, ro.is_some() && pos > decode_start) as usize;
+        #[cfg(not(feature = "mutations"))]
         let tok = cur[pos] as usize;
         // The 4-byte token id, uploaded whenever the graph declared the ids Input: for the embed
         // gather (`gpu_embed`), and for a deepseek4 hash-routed layer's `ffn_gate_tid2eid`
@@ -6766,6 +6777,24 @@ pub(crate) fn generate_dense_backend_bound(
     // So take one last turn and drop it deliberately. (The prefill chunk plans are declared INSIDE
     // their gated scope, so they already drop before that scope's baton is released — drop order is
     // reverse-declaration and `_gp` is declared first.)
+    #[cfg(feature = "mutations")]
+    if let (Some(_), Some(last)) = (&ro, last_written) {
+        if crate::mutation::negates_last_row(c, last > decode_start) {
+            if v_fmt != DType::F16 {
+                return Err(anyhow!(
+                    "the planted row negation is written for an f16 V cache, not {v_fmt:?}"
+                ));
+            }
+            let _gp = req.and_then(|r| r.gate_pass());
+            let row = infr_core::budget::kv_fmt_bytes(v_fmt, super::kv_row_elems(c, 0).1);
+            let mut rows = vec![0u8; (last + 1) * row];
+            be.download(vbufs[0].as_ref(), &mut rows)
+                .map_err(|e| anyhow!("{e}"))?;
+            crate::mutation::negate_f16(&mut rows[last * row..]);
+            be.upload(vbufs[0].as_ref(), &rows)
+                .map_err(|e| anyhow!("{e}"))?;
+        }
+    }
     {
         let _gp = req.and_then(|r| r.gate_pass());
         drop(ro);
@@ -6859,6 +6888,7 @@ pub(crate) fn generate_dense_backend_bound(
         // Only the callers that lower `max_new` to the context left know it was lowered.
         ctx_full: false,
         natural_stop,
+        n_chained: chained_n,
     };
     Ok((out, stats))
 }

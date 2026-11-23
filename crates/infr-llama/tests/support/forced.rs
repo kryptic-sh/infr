@@ -15,6 +15,11 @@ pub use routed::{
     route_line, score_routing, self_check_on_a_synthetic_moe, synthetic_moe, SYNTHETIC_MOE,
 };
 
+/// The production greedy decode held to the per-token path, and its tokens to the reference.
+#[path = "greedy.rs"]
+pub mod greedy;
+pub use greedy::greedy;
+
 /// Decode steps forced after each prompt.
 pub const N_DECODE: usize = 32;
 
@@ -112,6 +117,14 @@ pub struct Case {
     /// known to have none (the synthetic MoE: float expert banks have no batched kernel), whose
     /// prompt positions are then not scored on logits ([`Reference::check_prefill`]).
     pub batched_prefill: bool,
+    /// Whether the model's greedy decode chains several steps into one submit on a device that
+    /// allows it. `false` for the synthetic models, whose token embedding is gathered on the
+    /// host, so every step has host work between it and the next.
+    pub chains: bool,
+    /// The prompt the greedy check also generates from: a chat-templated one
+    /// ([`greedy::chat_prompt`]), for a model with a chat template. `None` for the synthetic
+    /// models, whose vocabulary spells nothing.
+    pub chat_prompt: Option<Vec<u32>>,
     /// The synthetic model's file, kept for as long as the model maps it.
     _file: Option<TempGguf>,
 }
@@ -161,9 +174,11 @@ pub fn open_case_scaled(key: &str, scaled: Option<(&str, f32)>) -> Option<Case> 
     let model = load(&path);
     Some(Case {
         prompts: real_prompts(&model),
+        chat_prompt: Some(greedy::chat_prompt(&model)),
         model,
         bytes,
         batched_prefill: true,
+        chains: true,
         _file: None,
     })
 }
@@ -202,9 +217,11 @@ pub fn open_file(file: TempGguf, synthetic: bool, batched_prefill: bool) -> Case
         } else {
             real_prompts(&model)
         },
+        chat_prompt: (!synthetic).then(|| greedy::chat_prompt(&model)),
         model,
         bytes,
         batched_prefill,
+        chains: !synthetic,
         _file: Some(file),
     }
 }
@@ -831,7 +848,9 @@ pub fn device_for(key: &str, bytes: u64) -> Option<String> {
 /// the tolerance table's entry for (`key`, its class) of the CPU reference: the first
 /// [`FIRST_ROWS`] positions within its `first` bound, the batched prefill's other rows and the
 /// decode rows each within its `steady` bound, and each of those two phases must score at least
-/// [`MIN_TOP1_SCORED`] positions above the near-tie margin. Skips, with a printed line, without
+/// [`MIN_TOP1_SCORED`] positions above the near-tie margin. Then the greedy check ([`greedy`])
+/// holds the chained and the replayed decode, which no forced run exercises, to the per-token
+/// path, and the greedy tokens to the reference. Skips, with a printed line, without
 /// the model (failing instead under `INFR_TEST_REQUIRE_MODELS`), without a Vulkan device, and on
 /// an integrated device without the host memory for the model. Fails a run that outlives
 /// [`GATE_TIMEOUT`]. Prints every measured value, so a new device's numbers can be read off the
@@ -856,6 +875,12 @@ pub fn gate(key: &str, runs: &[(&str, PathClass)]) {
         |_, _, _, _| {},
     );
     reference.check_prefill(key, &mut failures);
+    let t_greedy = std::time::Instant::now();
+    failures.extend(greedy(key, table_name(key), &reference, &case, runs));
+    eprintln!(
+        "time {key}: the greedy check {:.1}s",
+        t_greedy.elapsed().as_secs_f64()
+    );
     eprintln!(
         "time {key}: {:.1}s on {device}",
         t_case.elapsed().as_secs_f64()

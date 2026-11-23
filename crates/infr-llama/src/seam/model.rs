@@ -1260,6 +1260,33 @@ impl SeamModel {
         }
     }
 
+    /// A production greedy generation of `n` tokens after `prompt` on a fresh Vulkan backend, and
+    /// the logits of one more per-token step on its session
+    /// ([`crate::seam::GreedyTail`]). `edit` adjusts a copy of this model's engine
+    /// configuration for the run, as in [`forced_logits`](Self::forced_logits):
+    /// `spec.decode_chain` picks between the chained decode and one replay per token. Together
+    /// with a [`forced_logits`](Self::forced_logits) run along the same tokens this is how the
+    /// chained and the replayed decode, which no teacher-forced run exercises, are held to the
+    /// per-token path one does.
+    pub fn greedy_tail_vulkan(
+        &self,
+        edit: impl FnOnce(&mut crate::EngineConfig),
+        prompt: &[u32],
+        n: usize,
+    ) -> Result<crate::seam::GreedyTail> {
+        let mut ec = (*self.ecfg).clone();
+        edit(&mut ec);
+        crate::seam::greedy_tail_vulkan(
+            &self.gguf,
+            &self.cfg,
+            &std::sync::Arc::new(ec),
+            self.embd(),
+            self.per_layer_embd.as_ref(),
+            prompt,
+            n,
+        )
+    }
+
     /// Plant `bug` in this model (`mutations` feature only): every graph it builds from now on, on
     /// every backend, carries it; no other loaded model does. One bug per model.
     #[cfg(feature = "mutations")]
@@ -1998,6 +2025,7 @@ impl SeamModel {
             n_cached: 0,
             ctx_full: false,
             natural_stop: false,
+            n_chained: 0,
         })
     }
 

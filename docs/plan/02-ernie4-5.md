@@ -119,19 +119,26 @@ shown to go red:
 - `cpu_golden_ernie4_5` (ignored, model-gated, Q4_K_M; hashes captured on
   Windows only, no Linux hash computed — B167): red when `ernie4_5` permutes
   Q/K.
-- `gpu_seam_matches_cpu_ernie4_5` (ignored, Vulkan, F16 file, 32 tokens): green
-  on Vulkan0 (RX 7900 XTX) and Vulkan1 (integrated). Red on the Q4_K_M file on
-  both devices (a near tie, B167), and red on Vulkan0 with the Vulkan rope base
-  cut 1000×.
-- `gpu_seam_matches_cpu_ernie4_5_q4_k_m` (ignored, Vulkan, Q4_K_M, "What is the
-  chemical symbol for gold?", 9 tokens): green on both GPUs. Chosen by a scan of
-  seventeen chat prompts for top-1 margins along the answer; this one leads the
-  runner-up by at least 1.630 on infr's production CPU prefill, 1.493 on Vulkan0
-  and 1.461 on Vulkan1 at every one of its 9 tokens. Each of the others split
-  between the CPU and a GPU, had a step under 0.6 on some path (down to 0.003),
-  or answered in three tokens or fewer. Red on Vulkan0 with the Vulkan attention
-  scale halved; not red with the rope base cut 1000×, which the F16 case
-  catches.
+- `gpu_seam_tolerance_ernie` (ignored, Vulkan, `tests/gpu_tolerance.rs`; both
+  files) is what holds the Vulkan seam to the CPU reference since 2026-11-23:
+  its logits within the tolerance table's rows at every prefill and decode
+  position, its chained and replayed decode against the per-token one bit for
+  bit, and its greedy tokens against the reference outside near ties
+  ([`gpu-tolerance.md`](../gpu-tolerance.md)). It replaced two exact-token
+  tests, and the red paths below were shown on those, not shown again on it:
+  - `gpu_seam_matches_cpu_ernie4_5` (F16 file, 32 tokens) was green on Vulkan0
+    (RX 7900 XTX) and Vulkan1 (integrated), red on the Q4_K_M file on both
+    devices (a near tie, B167), and red on Vulkan0 with the Vulkan rope base cut
+    1000×.
+  - `gpu_seam_matches_cpu_ernie4_5_q4_k_m` (Q4_K_M, "What is the chemical symbol
+    for gold?", 9 tokens) was green on both GPUs. The prompt was chosen by a
+    scan of seventeen chat prompts for top-1 margins along the answer; this one
+    led the runner-up by at least 1.630 on infr's production CPU prefill, 1.493
+    on Vulkan0 and 1.461 on Vulkan1 at every one of its 9 tokens. Each of the
+    others split between the CPU and a GPU, had a step under 0.6 on some path
+    (down to 0.003), or answered in three tokens or fewer. It was red on Vulkan0
+    with the Vulkan attention scale halved, and not red with the rope base cut
+    1000×, which the F16 case caught.
 - `qkv_biases_follow_the_tensors` (`config.rs`) and
   `qkv_biases_are_added_on_a_non_qwen2_arch` (`seam::runner`, synthetic
   `ernie4_5` model: zero biases leave the logits exact, nonzero ones move them):

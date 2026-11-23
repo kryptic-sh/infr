@@ -37,9 +37,9 @@ The standing goal: any model size on any hardware, disk to DRAM to VRAM.
 Priority: phase 11 goes ahead of the rest of phase 10, which needs the fixed CPU
 reference to judge tuned values against.
 
-| Phase | What                                                                                               | Status                                                              |
-| ----- | -------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------- |
-| 11    | [CPU output bit-identical on every platform, GPUs within tolerance of it](11-cpu-bit-identical.md) | S0-S4 and S6 done (S5 in S2), G1-G3 done; **G4 next, top priority** |
+| Phase | What                                                                                               | Status                                                                                                       |
+| ----- | -------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| 11    | [CPU output bit-identical on every platform, GPUs within tolerance of it](11-cpu-bit-identical.md) | S0-S4 and S6 done (S5 in S2), G1-G3 done; G4 partly done (the Qwen3 golden retired); **the rest of G4 next** |
 
 ## Vulkan backend
 

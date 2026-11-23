@@ -90,10 +90,10 @@ goldens (`cpu_golden_ernie4_5_moe`, `cpu_golden_qwen3moe`) moved.
 forced step builds, records and executes a fresh replay plan once: the
 record-once-replay-many mechanism (one recording replayed with advancing
 parameters) and the chained decode (`decode_chain`, several steps per submit,
-the production greedy path) are never run, because forcing needs every step's
-logits and the chain does not read them back. The exact GPU goldens and the
-exact-token GPU-against-CPU tests are what cover those paths today, and G4 must
-not drop them without a replacement. The static per-token path
+the production greedy path) are never run by a forced run, because forcing needs
+every step's logits and the chain does not read them back. They are held to the
+per-token path by a comparison of their own, which every gate case runs as well
+("The greedy check" below). The static per-token path
 (`kernels.vulkan.no_replay`, which production takes for some model families and
 quantized-KV configurations) is gated: every model runs a `gpu-float-static`
 configuration.
@@ -222,6 +222,205 @@ change the RX 7900 XTX's native prefill and change nothing measured under wave64
 (the wave64 rows-off combination was therefore not re-measured after the
 first-row split).
 
+## The greedy check
+
+A forced run never replays one recording at advancing positions and never chains
+several decode steps into one submit ("The comparison"). Until 2026-11-23 those
+two paths, the production greedy decode, were held by exact hashes of generated
+text and exact-token comparisons with the CPU, which a legitimate change of a
+decode kernel's arithmetic breaks: `gpu_seam_golden_qwen3` failed for
+`attn_split.decode_min_chunk` at 16 and for `gemv.kq_fma`, both inside the
+tolerance (B227), and under RADV it failed on the integrated GPU as blessed.
+Every `gate()` case now runs this instead
+(`crates/infr-llama/tests/support/greedy.rs`), in each of its configurations
+that holds a set of decode kernels of its own (`GREEDY_CONFIGS`: the shipped
+kernels, the int8-free ones, the q8 KV cache's).
+
+**The prompts** are the case's three plain-text ones and, for a real model, one
+more rendered through the model's own chat template (`greedy::chat_prompt`), so
+that the template's special tokens go through the device's embedding gather,
+which the forced runs' prompts never feed. That prompt is in the greedy check
+only: the forced rows are not scored on it, because the table's rows were not
+measured with it.
+
+**Three generations of each prompt, on one device and configuration**, each
+asked for `GREEDY_STEPS` greedy tokens. That count is one more than a whole
+number of chained submits at the shipped `spec.decode_chain`, so on a device
+that chains the call ends with a single replayed step after its last chain: the
+hand-off from a chain to one replay inside a call. It is a constant of its own;
+the forced runs keep `N_DECODE`, which the rows were measured at.
+
+- **chained**: `SeamModel::greedy_tail_vulkan` on the configuration as it is,
+  which calls the function `generate_dense_vulkan` is
+  (`generate_dense_vulkan_session`: the production placement, prefill and
+  decode) and chains `spec.decode_chain` steps per submit. Run only on a device
+  that chains (`Backend::max_decode_chain`); an integrated GPU runs one step per
+  submit, and its production decode is the next one.
+- **replayed**: the same with `spec.decode_chain = 1`: one recording, replayed
+  once per token with its position advancing.
+- **stepped**: the teacher-forced driver left to its own argmax
+  (`forced_logits`, no prefill head), which records a fresh plan for every step:
+  the path every forced run scores against the table.
+
+After each of the first two, one more per-token step on the same session returns
+the logits after the last sampled token (`GreedyTail::row`). That step attends
+over every KV row the generation wrote, so it is how the test reads what a chain
+left behind, which the chain itself never hands back.
+
+**What is asserted**, per prompt and configuration:
+
+- **Each generation stops where the per-token path does.** The stepped driver
+  does not stop itself, so its tokens say where a generation must: at its first
+  end token, or at the length asked for. Each generation must have sampled
+  exactly that many tokens and report a natural stop
+  (`GreedyTail::natural_stop`) exactly when the last of them is an end token.
+  One cut short and one that runs past its end token both fail.
+- **Each generation ran the path it stands for.** Each made exactly one decode
+  recording; the replayed one reports no token from a chained submit
+  (`GenStats::n_chained`); the chained one reports exactly the count its length
+  and the chain imply, and a full-length one must hold both chained tokens and a
+  token that is not, or the hand-off was not exercised. Whether a model chains
+  is a property the test states of the case (`Case::chains`), as
+  `Case::batched_prefill` is: the synthetic models are marked as not chaining
+  (their token embedding is gathered on the host, so every step has host work
+  before the next) and must then chain nothing. A case none of whose runs is in
+  `GREEDY_CONFIGS` fails, instead of passing with nothing compared.
+- **The three choose the same tokens, and each tail row is the stepped run's row
+  at that position bit for bit.** One device compared with itself: no tolerance,
+  no table row, and a tuning change that moves the arithmetic moves all three
+  alike. This is the part that replaces what the hashes covered and the forced
+  runs do not.
+- **The production tokens are the reference's outside near ties.** The CPU
+  reference is forced along the tokens the GPU chose, with the configuration's
+  KV format, so both see the same context at every step. Wherever the
+  reference's top-2 margin is above the row's steady near tie, the GPU's token
+  must be the reference's top token (`tolerance::TokenScore`: the table's top-1
+  rule, for a path that returns tokens and no logits), and over a configuration
+  at least `MIN_TOP1_SCORED` steps must clear the margin. A routed-expert
+  model's tokens are not held to the reference: left to its own routers a run
+  legitimately parts from it at a router near tie ("Mutations", the synthetic
+  MoE), which this rule cannot tell from a wrong token. Its three generations
+  are still compared with each other.
+
+**What it does not see:**
+
+- **A chained step's logits.** The chain is seen through its tokens and through
+  the one row after it. An error in the head or the argmax of a chained step
+  that flips no token is invisible.
+- **Fine bugs, through the tokens.** The token rule sees far less than the logit
+  rows (the table below); the forced runs are what catch those.
+- **Not exercised:** the chained sampler (`Op::Sample`, temperature above 0), a
+  chain length other than the shipped `spec.decode_chain`, a chain or a replay
+  on a KV format other than f16 and coupled q8_0, on a session continued from an
+  earlier turn, and on any model without a gate case.
+- **Windows.** Bit-for-bit agreement of a chain, a replay and a fresh recording
+  was measured under RADV only.
+
+**Measured 2026-11-23**, Linux 7.3.5-arch1-1, Mesa RADV 26.3.1, headless, no
+environment knob but `INFR_DEV` (the `gpu_seam_tolerance_*` tests, with their
+output). On every model, configuration and prompt below the generations stopped
+at the same step, chose the same tokens and left bit-identical tail rows: on
+`Vulkan0` (RX 7900 XTX) chained, replayed and stepped, every full-length
+generation of a real model taking 32 of its 33 tokens from chained submits and
+the last from one replay; on `Vulkan1` (the integrated GPU, which does not
+chain) replayed and stepped. Each cell is the steps whose reference margin
+clears the near tie, all of which chose the reference's token, then the widest
+reference margin at which a token differed, in nats (0: the GPU's tokens are the
+reference's own). A configuration generates over four prompts, 132 steps unless
+a generation ends itself.
+
+| Model, configuration (class)                | `Vulkan0`  | `Vulkan1` |
+| ------------------------------------------- | ---------- | --------- |
+| Qwen3-0.6B Q4_K_M, `gpu` (Int8)             | 93; 0.148  | 95; 0.106 |
+| Qwen3-0.6B Q4_K_M, `gpu-float` (Float)      | 123; 0.009 | 125; 0    |
+| Qwen3-0.6B Q4_K_M, `gpu-kv-q8-float` (KvQ8) | 95; 0.146  | 90; 0.030 |
+| Qwen3.5-0.8B Q4_K_M, `gpu` (Int8)           | 96; 0      | 98; 0.026 |
+| Qwen3.5-0.8B Q4_K_M, `gpu-float` (Float)    | 123; 0     | 123; 0    |
+| gemma-3-1b Q4_K_M, `gpu` (Int8)             | 66; 0      | 69; 1.185 |
+| gemma-3-1b Q4_K_M, `gpu-float` (Float)      | 105; 0.004 | 105; 0    |
+| LFM3-1.7B Q4_K_M, `gpu` (Int8)              | 93; 0      | 93; 0     |
+| LFM3-1.7B Q4_K_M, `gpu-float` (Float)       | 119; 0     | 119; 0    |
+| LFM3-1.7B F16, `gpu` (Float)                | 116; 0     | 116; 0    |
+| ERNIE-4.5-0.3B Q4_K_M, `gpu` (Int8)         | 75; 0.120  | 76; 0.120 |
+| ERNIE-4.5-0.3B Q4_K_M, `gpu-float` (Float)  | 95; 0      | 95; 0     |
+| ERNIE-4.5-0.3B F16, `gpu` (Float)           | 91; 0      | 91; 0     |
+
+No model's row failed the token rule on the chat prompt. gemma-3's Int8 miss on
+the integrated GPU is the near tie the row's margin was set from (prompt 2,
+position 179, "The table"). Generations that end themselves, the same on both
+GPUs: the chat prompt's on ERNIE (9 tokens on the Q4_K_M file, 8 on the F16 one)
+and on gemma-3 (10), all from chained submits on `Vulkan0`; the others run the
+full length. The synthetic models end on their end token on their shorter
+prompts (57 steps counted on both GPUs for the f32 model, 57 and 50 for the f16
+one, whose long prompt ends after 26 tokens on `Vulkan1` and runs the full
+length on `Vulkan0`). The check takes 0.3 to 25.2 s of a model's case on
+`Vulkan0` and up to 108.3 s on `Vulkan1` (LFM3 Q4_K_M).
+
+**The motivating case, run the same day on `Vulkan0`** with the check as first
+written (32-token generations, no chat prompt, no stop rule; not run again after
+those were added): with
+`INFR_TUNE=gemv.kq_fma=true,attn_split.decode_min_chunk=16`, the two values
+`gpu_seam_golden_qwen3` failed for, every model's case passed, forced rows and
+greedy check alike (the shipped runs then build the `native_gemv_kq_fma_*`
+kernels). One test of the set fails under it,
+`gpu_seam_tolerance_float_runs_build_no_int8_kernel`, at its own guard: with the
+fp32 decode GEMVs forced, the shipped configuration builds no int8 kernel under
+RADV, so the check reports that it cannot fail (B207).
+
+**Shown to fail** (`--features mutations`, `tests/planted/greedy.rs`;
+2026-11-23, Linux 7.3.5-arch1-1, Mesa RADV 26.3.1, headless, both GPUs;
+Qwen3-0.6B Q4_K_M, `gpu` and `gpu-float`):
+
+- **Bugs no forced run can carry.** With (j) or (k) planted ("Mutations") every
+  forced run is the clean model's bit for bit, which each test asserts by
+  digest, and the gate's rows pass. The greedy check passes on the clean model
+  in the same test and must then fail on every prompt (the chat prompt included)
+  and configuration, for the replayed generation and, on a device that chains,
+  for the chained one, each failure naming its generation:
+  - **The token half** (`gpu_planted_replay_feeds_stale_token`, (j)): on the RX
+    7900 XTX the chained generation parts from the per-token path at step 8, the
+    first token of its second submit, and the replayed one at step 1; on the
+    integrated GPU the replayed one at step 1. No failure of it may be the KV
+    comparison's.
+  - **The KV half** (`gpu_planted_replay_rewrites_last_row`, (k)): every
+    generation samples the per-token path's tokens, so the test requires that no
+    failure names a token, and the row one step later differs from the per-token
+    path's at every token of the vocabulary or all but one. This is the
+    comparison that reads what a chain left behind, failing on its own.
+- **The stop and the chained count**, by throwaway edits on ERNIE-4.5-0.3B
+  (`gpu_seam_tolerance_ernie`, `Vulkan0`; restored after). With the runner
+  returning after its first chained submit, the chained generation fails as "8
+  tokens and did not stop itself, where the per-token path is still generating
+  after 33", and its chained count as 8 where the chain implies 32 of 33. With
+  the chained generation told to ignore end tokens, it fails on the chat prompt
+  as "33 tokens and did not stop itself, where the per-token path reaches its
+  end token after 9".
+- **What the token rule sees of a bug in the model**
+  (`gpu_planted_greedy_tokens`): the planted copy generates on the GPU and its
+  tokens are held to the clean copy's CPU reference. The verdicts are the same
+  on both GPUs:
+
+  | Bug                                     | Int8 (`gpu`)           | Float (`gpu-float`)    |
+  | --------------------------------------- | ---------------------- | ---------------------- |
+  | (c) RMSNorm epsilon x10                 | **missed**             | **missed**             |
+  | (d) every block of one `ffn_down` x1.01 | **missed**             | **missed**             |
+  | (e) gate and up swapped                 | caught, several tokens | caught, several tokens |
+  | (f) one attention residual dropped      | caught, one token      | caught, one token      |
+  | (g) rope pairs the wrong elements       | caught, several tokens | caught, several tokens |
+  | (h) Q4_K nibbles swapped                | caught, one token      | caught, one token      |
+
+  A cell counts the tokens past the near tie on the first prompt that fails,
+  which is all the test prints; (f) in Int8 shows on the chat prompt alone. The
+  test requires (e) and (g) in both classes and prints the rest. It also
+  requires that no bug of the model makes a generation part from the per-token
+  path: such a bug is in all three generations alike, so the bit-for-bit half
+  says nothing about the model and everything about how its decode is driven.
+  (a) and (b) are left out: their graphs opt out of the replayed decode, and the
+  check then stops at the missing recording.
+
+- **The rule itself** has a unit test in the normal job
+  (`token_score_counts_other_choices_above_the_near_tie`).
+
 ## Mutations
 
 The gate is shown to fail by planting bugs and scoring them, in committed tests
@@ -265,6 +464,15 @@ in the same process, with nothing global (`crates/infr-llama/tests/planted/`).
   `exp_probs_b.bias` zeroed (B174's case). On the synthetic MoE, (d) scales one
   layer's routed down bank (`ffn_down_exps`) and (e) swaps every layer's routed
   gate and up banks.
+- **Bugs in how a decode recording is driven**, neither in a graph nor in a
+  weight, for the greedy check ("The greedy check"); a forced run executes each
+  recording once and cannot carry them. (j) Every execution of a recording after
+  its first within a generation is fed the token before the one it should be
+  (`Planted::ReplayFeedsStaleToken`: a replayed step's token, and the first
+  token of every chained submit after the first). (k) A generation that executed
+  its recording more than once leaves the first layer's V row of the last
+  position it wrote with every sign flipped (`Planted::ReplayRewritesLastRow`):
+  no sampled token changes, only what is left in the KV cache.
 
 **What each test asserts.** A clean control runs first, twice: it must pass the
 gate, and its two runs must agree bit for bit. Every planted run must then
@@ -880,6 +1088,22 @@ which is ignored as "MTP parked", was run by name: it passed on `Vulkan0` and
 failed on `Vulkan1`, where the speculative stream differs from plain greedy from
 its first words, the failure its own doc comment describes.
 
+**Results with the greedy check in every case, 2026-11-23, same machine and
+drivers, headless**, on the check as it stands (the chat prompt, the stop rule,
+`GREEDY_STEPS`). The GPU gate on `Vulkan0` (the filter above; no knob but
+`INFR_DEV`, a model that is not cached printing `skip:`): 709 tests, 709 passed,
+659 s. The 13 `gpu_seam_tolerance_*` tests alone: 430 s on `Vulkan0` (ERNIE both
+files 51 s, gemma-3 115 s, LFM3 both files 110 s, Qwen3 74 s, Qwen3.5 70 s) and
+1070 s on `Vulkan1` (94 s, 281 s, 385 s, 157 s, 139 s). The seven
+`gpu_planted_*` tests, the three of the greedy check among them: 838 s on
+`Vulkan0`, 1602 s on `Vulkan1`, all passing (the misses on record are printed,
+not asserted, and were not compared with the tables under "Mutations" again).
+The full gate filter was not run again on `Vulkan1` after the check changed; it
+ran there with the check as first written (32-token generations, no chat prompt,
+no stop rule): 649 tests, 649 passed, 1157 s, with the integrated GPU's
+exclusion. `gpu_seam_int8_prefill_tracks_cpu` printed its skip line on `Vulkan0`
+(no int8 cooperative-matrix prefill GEMM under RADV).
+
 The red-path tests scale `blk.1.ffn_down.weight` of the synthetic model by 1.02.
 On the CPU a 1.01 scale already trips the gate and 1.008 and below pass
 (measured in review), so 1.02 is about twice the threshold; the green control is
@@ -888,21 +1112,121 @@ reads the kernels a run BUILT, which are built lazily when first recorded: a
 superset of what ran, so its negative check is the conservative one; its marker
 list is typed by hand (B207).
 
-## The existing exact GPU tests across the matrix
+## The exact and cosine GPU tests: what G4 did with each
 
-For G4: `cpu_backend`'s exact-hash GPU goldens and exact-token GPU-against-CPU
-tests (`gpu_seam_golden_*`, `gpu_seam_matches_cpu_*`, 24 tests) all passed on
-2026-11-18 on the RX 7900 XTX natively and with wave64 forced, tuning rows on
-and off, and on the integrated GPU natively (20 tests, the MoE ones left out by
-the memory rule). Most self-skip for want of a cached model: 12 or 13 actually
-ran on the 7900 XTX (the Qwen3 and Qwen3-MoE goldens, ERNIE 0.3B and 21B,
-gemma-3, LFM3, Qwen2, SmolLM3, unified Qwen3.5) and 9 on the integrated GPU. So
-today's exact tests do not yet distinguish the configurations; they will once
-tuned kernels change bits per device. They are also what covers the chained and
-replayed decode the tolerance tests do not exercise. Not measured with the new
-metrics: B60's cases (Qwen3.5-MoE, DiffusionGemma: not cached here) and B174's
-router-bias case on ERNIE-4.5-21B (the Mutations section has it on a synthetic
-MoE).
+Before plan 11's G4 the GPU side of `crates/infr-llama/tests/cpu_backend.rs` was
+held by exact hashes of generated text, exact tokens against the CPU reference
+and whole-vocabulary logit cosines against the CPU. This is every one of them,
+the path it exercises, whether the tolerance gate exercises that path, and what
+was done (2026-11-23). "Production greedy" is `generate_dense_vulkan`: the
+batched prefill where the model has one, then the decode the model takes
+(chained on a device that chains, else one replay of a single recording per
+token, else the static per-token path). A test is retired only where the gate
+runs the same path on the same model file; everything else is in place,
+unchanged, with what it would take.
+
+**Retired**, each now covered by the model's `gpu_seam_tolerance_*` test: its
+forced runs score the batched prefill's rows and the per-token decode's against
+the table, and its greedy check holds the chained and the replayed decode to
+that per-token path bit for bit and the greedy tokens to the CPU reference
+outside near ties.
+
+| Test                                   | Model file            | Asserted                                  | Path                                                                               | Now covered by                                                                                                                                                                                           |
+| -------------------------------------- | --------------------- | ----------------------------------------- | ---------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `gpu_seam_golden_qwen3`                | Qwen3-0.6B Q4_K_M     | hash of the greedy text, two chat prompts | production greedy on the shipped int8 kernels                                      | `gpu_seam_tolerance_qwen3`: `gpu`, `gpu-ub32` (Int8), `gpu-float*` (Float), `gpu-kv-q8-float` (KvQ8); greedy check on `gpu`, `gpu-float` and `gpu-kv-q8-float`                                           |
+| `gpu_seam_flash_matches_cpu`           | Qwen3-0.6B Q4_K_M     | a common prefix with the CPU reference    | flash-attention batched prefill of a prompt over 64 tokens, then the greedy decode | the same test: its long prompt prefills in one default chunk through `attn_flash_warp` and `attn_flash_combine` (the kernel list of a `gpu` run, `INFR_TOL_ROWS=1`), and every one of its rows is scored |
+| `gpu_seam_matches_cpu_ernie4_5`        | ERNIE-4.5-0.3B F16    | exact tokens against the CPU reference    | production greedy, float weights                                                   | `gpu_seam_tolerance_ernie`, the F16 case (Float), with its greedy check                                                                                                                                  |
+| `gpu_seam_matches_cpu_ernie4_5_q4_k_m` | ERNIE-4.5-0.3B Q4_K_M | exact tokens against the CPU reference    | production greedy, int8 kernels                                                    | `gpu_seam_tolerance_ernie`, the Q4_K_M case (Int8 and Float), with its greedy check                                                                                                                      |
+| `unified_qwen35_gpu_seam_matches_cpu`  | Qwen3.5-0.8B Q4_K_M   | exact tokens against the CPU reference    | production greedy through the DeltaNet layers and the gated attention              | `gpu_seam_tolerance_qwen35` (Int8 and Float), with its greedy check                                                                                                                                      |
+| `gpu_seam_matches_cpu_lfm3`            | LFM3-1.7B F16         | exact tokens against the CPU reference    | production greedy; the short convolution's history through prefill and decode      | `gpu_seam_tolerance_lfm3`, the F16 case (Float), with its greedy check                                                                                                                                   |
+| `gpu_seam_matches_cpu_lfm3_q4_k_m`     | LFM3-1.7B Q4_K_M      | exact tokens against the CPU reference    | the same on the quantized kernels                                                  | `gpu_seam_tolerance_lfm3`, the Q4_K_M case (Int8 and Float), with its greedy check                                                                                                                       |
+
+What was lost with them, stated plainly:
+
+- **The exact prompts and lengths.** The golden generated 32 and 48 tokens after
+  two chat prompts; the greedy check generates 33 after three plain prompts and
+  one chat prompt. No generation is 48 tokens long any more.
+- **The text hash end to end.** The golden hashed detokenized text, so it also
+  held the tokenizer's decode of the GPU's tokens; the greedy check compares
+  token ids. The CPU goldens still hash detokenized text of the same models.
+- **Exactness against the CPU on a chosen prompt.** The exact-token tests failed
+  on any difference from the reference; the token rule lets a near tie pass,
+  which is the point, and catches far less than a hash through tokens alone
+  ("The greedy check" has what it misses).
+- **Red paths shown on the old tests** (a Vulkan rope base cut 1000×, a halved
+  attention scale, LFM3's history rebuild) have not been shown again on the gate
+  cases.
+
+What is kept that a first look might count as lost: special tokens through the
+device's embedding gather (the chat prompt of the greedy check), a generation
+that ends on its end token, and the hand-off from a chained submit to a single
+replay (the 9-token ERNIE test drove it; `GREEDY_STEPS` does now). Every row
+these replacements rest on was set on Windows (`TABLE`'s provenance), and the
+greedy check's bit-for-bit half needs no row; the greedy check itself has run
+under RADV only.
+
+In the tables below, "here" is the Linux machine's `Vulkan0` gate of 2026-11-23,
+run with every test's output: **ran** means the test printed no `skip:` line and
+passed, **skipped** that it printed one (the model file is not in the cache
+unless another reason is given) and so counted as passed without running.
+
+**Kept, an exact hash:**
+
+| Test                       | Model file           | Path                                                                                                        | Here                                                                                                                                      | Why it stays                                                                                                                                                                              |
+| -------------------------- | -------------------- | ----------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `gpu_seam_golden_qwen3moe` | Qwen3-30B-A3B Q4_K_M | production greedy of a real MoE model: batched GPU-routed prefill on the int8 expert GEMMs, then the decode | ran: 3.2 s for its 8 tokens. Both of its early returns print `skip:` and neither did; past them it asserts the hash of the generated text | No real MoE model has a row, and what its Int8 routing check should be is undecided (B207). It is the one text hash left, and a tuning change that moves its tokens still has to bless it |
+
+**Kept, exact tokens against the CPU** (`seam_vulkan_matches_cpu` unless noted),
+each on a prompt picked for clear margins. None but gemma-3 has a row, so
+retiring one is a measurement on both GPUs with `measure_gpu_tolerance`, a row
+by the table's rule, the planted bugs re-run, and a `gpu_seam_tolerance_*` case;
+the greedy check then comes with the case.
+
+| Test                                               | Model file                   | Path beyond production greedy                                                    | Here    | Note                                                                                                                                                          |
+| -------------------------------------------------- | ---------------------------- | -------------------------------------------------------------------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `gpu_seam_matches_cpu_gemma3`                      | gemma-3-1b Q4_K_M            | sliding-window layers, dual rope, sandwich norms                                 | ran     | The one kept although its model has rows and `gpu_seam_tolerance_gemma3` runs its path: those rows were re-set under RADV and Windows has not run them (B207) |
+| `gpu_seam_matches_cpu_gemma3_q2k_iq4nl`            | gemma-3-1b Q2_K              | the IQ4_NL GEMM family and its decode GEMV                                       | ran     | A common prefix, not equality                                                                                                                                 |
+| `gpu_seam_matches_cpu_qwen2`                       | Qwen2.5-0.5B Q4_K_M          | q/k/v biases                                                                     | ran     | Measured on Windows, no row: its float prefill is twenty times further than the other Qwens' (B207)                                                           |
+| `gpu_seam_matches_cpu_qwen3_iq4xs`                 | Qwen3-0.6B IQ4_XS            | the IQ4_XS kernels                                                               | skipped |                                                                                                                                                               |
+| `gpu_seam_matches_cpu_qwen3_q2k`                   | Qwen3-0.6B Q2_K              | the Q2_K and Q3_K kernels                                                        | skipped |                                                                                                                                                               |
+| `gpu_seam_matches_cpu_qwen3_q8_0_i8coopmat`        | Qwen3-0.6B Q8_0              | the int8 cooperative-matrix Q8_0 prefill GEMM (`kernels.vulkan.i8_coopmat`)      | skipped | An opt-in kernel                                                                                                                                              |
+| `gpu_seam_bf16_matches_cpu`                        | Qwen3-0.6B BF16              | bf16 projections converted to f16                                                | skipped | Against the production CPU, not the reference                                                                                                                 |
+| `gpu_seam_matches_cpu_llama`                       | Llama-3.2-1B Q8_0            | interleaved rope, its replayed f16 rope                                          | skipped | The cache here holds the Q4_K_M file only, which this test does not load; the Q4_K_M file was measured on Windows (the three-way table) and has no row        |
+| `gpu_seam_matches_cpu_smollm3`                     | SmolLM3-3B Q4_K_M            | NoPE layers; the static decode, which records nothing                            | ran     | Measured on Windows, no row                                                                                                                                   |
+| `gpu_seam_matches_cpu_gemma4`                      | gemma-4-12b Q4_K_M           | heterogeneous head widths                                                        | ran     |                                                                                                                                                               |
+| `gpu_seam_matches_cpu_gemma4_e2b`                  | gemma-4-E2B Q4_K_M           | per-layer token embeddings (no chain)                                            | ran     | Its prompt takes no batched prefill, so a forced run would score its decode rows only                                                                         |
+| `gpu_seam_matches_cpu_ernie4_5_moe_tokens`         | ERNIE-4.5-21B-A3B Q4_K_M     | a real MoE model on its own routers                                              | ran     | Measured forced along the reference's routing, no row (B207)                                                                                                  |
+| `gpu_seam_paged_moe_matches_resident_and_cpu`      | Qwen3-30B-A3B Q4_K_M         | paged expert cache, one-row prefill chunks, against the resident run and the CPU | ran     | A paged MoE model cannot be forced (B207)                                                                                                                     |
+| `gpu_seam_paged_moe_matches_scout_oracle`          | Llama-4-Scout                | paged expert cache with real eviction, against a recorded prefix                 | skipped |                                                                                                                                                               |
+| `gpu_seam_dense_stream_matches_resident_and_cpu`   | Qwen3-1.7B Q4_K_M            | streamed dense weights, against the resident run and the CPU                     | ran     | The GPU-against-GPU half needs no row                                                                                                                         |
+| `gpu_seam_dense_stream_matches_resident_qwen3_14b` | Qwen3-14B Q8_0               | the same on the fused q/k/v form                                                 | not run | The gate filter leaves it out (`not test(qwen3_14b)`), and the file is not cached here                                                                        |
+| `mtp_head_cpu_vulkan_parity`                       | Qwen3.5-4B (UD-Q4_K_XL, MTP) | the MTP head's draft ids, CPU against Vulkan                                     | ran     | No forced run drives the head                                                                                                                                 |
+
+**Kept, a whole-vocabulary logit cosine against the CPU** (B60: such a cosine
+cannot separate a match from a mismatch; each also asserts something else):
+
+| Test                                           | Model file               | Path                                                                       | Here    | Why it stays                                                                                                                                                                       |
+| ---------------------------------------------- | ------------------------ | -------------------------------------------------------------------------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `gpu_seam_kv_q8_tracks_cpu`                    | Qwen3-0.6B Q4_K_M        | the q8_0 KV cache, coupled and on one side only                            | ran     | Only the coupled cache has a row (KvQ8, which the gate and the greedy check run); the one-sided ones have none                                                                     |
+| `gpu_seam_kv_formats_track_cpu`                | Qwen3-0.6B Q4_K_M        | every other KV cache format                                                | ran     | No row below 8 bits, and turbo3's distance is unexplained (B207)                                                                                                                   |
+| `gpu_seam_int8_prefill_tracks_cpu`             | Qwen3-0.6B Q4_K_M        | the int8 cooperative-matrix K-quant prefill GEMM, with a check that it ran | skipped | Skips because that GEMM does not run under RADV (B231), not for a missing file. Qwen3's Int8 row scores the same prefill wherever the kernel runs, which could not be checked here |
+| `gpu_seam_matches_cpu_ernie4_5_moe`            | ERNIE-4.5-21B-A3B Q4_K_M | a real MoE model's prefill, last row                                       | ran     | No real MoE row (B207)                                                                                                                                                             |
+| `gpu_seam_matches_cpu_qwen35moe`               | Qwen3.6-35B-A3B          | the same on the DeltaNet skeleton                                          | skipped | B60                                                                                                                                                                                |
+| `gpu_seam_matches_cpu_diffusion_gemma`         | DiffusionGemma-26B-A4B   | causal prefill, last row                                                   | skipped |                                                                                                                                                                                    |
+| `gpu_seam_matches_cpu_diffusion_gemma_denoise` | DiffusionGemma-26B-A4B   | a canvas denoise step                                                      | skipped | A forced run does not drive a denoise step                                                                                                                                         |
+| `gpu_seam_matches_cpu_bitnet`                  | bitnet_b1_58-large       | TQ2_0 prefill, last row                                                    | skipped |                                                                                                                                                                                    |
+| `gpu_seam_matches_cpu_deepseek2`               | DeepSeek-V2-Lite         | MLA attention and MoE prefill, last row                                    | skipped |                                                                                                                                                                                    |
+| `gpu_prefill_matches_llama_debug_dump`         | a llama.cpp dump's model | prefill against llama.cpp's logits                                         | skipped | Skips without `INFR_LLAMA_DUMP`. Not a comparison with the CPU: llama.cpp comparisons stay tolerance-based by plan 11 section 4                                                    |
+
+**Not in scope, unchanged:** the GPU-against-GPU comparisons (session reuse and
+prefix sharing against a fresh prefill, paged and streamed against resident,
+replay against static for DiffusionGemma, the multi-GPU splits against one
+device, the MTP draft chain against its per-step form), the tests that count
+decode recordings (`*_decode_replays_from_one_recording`), and the synthetic
+models' Vulkan-against-CPU tests (`gpu_synthetic_*`, `synthetic_lfm3_vulkan_*`),
+which bound a logit difference on a fixture rather than hash, token or cosine.
+`mtp_spec_matches_target_only_greedy` is parked and fails on `Vulkan1` as its
+doc comment says; it was not touched.
 
 ## Not measured
 
@@ -916,4 +1240,6 @@ MoE).
   test, the own-routing check and its planted bugs ran under RADV only.
 - **Real MoE models** in the gate (one is measured above, none has a row), paged
   MoE models (a forced run of one is refused), quantized KV caches below 8 bits,
-  the chained and replayed decode: see B207 in [`backlog.md`](backlog.md).
+  and what the greedy check leaves of the chained and the replayed decode (the
+  chained sampler, other chain lengths, Windows): see B207 in
+  [`backlog.md`](backlog.md).

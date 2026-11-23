@@ -662,6 +662,7 @@ pub fn diffusion_generate(
             n_cached: 0,
             ctx_full: false,
             natural_stop: false,
+            n_chained: 0,
         },
         steps: steps_total,
         blocks: blocks_run,

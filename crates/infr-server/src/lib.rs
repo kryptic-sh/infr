@@ -5,7 +5,7 @@
 //!
 //! Routes (`auth` = gated by `serve.api_key` when one is configured — see `auth_gate`):
 //!   GET  /health                -> 200 OK                                              (open)
-//!   GET  /v1/models             -> { object: "list", data: [{ id, object, owned_by }] } (auth)
+//!   GET  /v1/models             -> { object: "list", data: [{ id, object, owned_by, context_length }] } (auth)
 //!   GET  /metrics               -> Prometheus text exposition (see `metrics`)          (auth)
 //!   GET  /status                -> JSON: per-model backend, device, ctx, slots, memory (auth)
 //!   POST /v1/chat/completions   -> chat.completion | SSE chat.completion.chunk stream   (auth)
@@ -1215,6 +1215,8 @@ pub struct ModelCard {
     pub id: String,
     pub object: &'static str,
     pub owned_by: &'static str,
+    /// The per-slot window the server admits, `null` when the generator cannot report it.
+    pub context_length: Option<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2235,6 +2237,10 @@ async fn models_handler(State(state): State<AppState>, headers: HeaderMap) -> Re
                 id: m.id.to_string(),
                 object: "model",
                 owned_by: "local",
+                context_length: m
+                    .engine
+                    .as_ref()
+                    .and_then(|g| g.status().ctx_per_slot.and_then(|n| u32::try_from(n).ok())),
             })
             .collect(),
     })
@@ -3592,6 +3598,8 @@ mod tests {
         assert_eq!(card["id"], "test-model");
         assert_eq!(card["object"], "model");
         assert_eq!(card["owned_by"], "local");
+        // No engine in the headless state: the honest "unknown", not a made-up window.
+        assert!(card["context_length"].is_null());
     }
 
     /// The vocabulary every test generator reports, for the `logit_bias` id check.
@@ -3724,6 +3732,10 @@ mod tests {
             .map(|c| c["id"].as_str().unwrap())
             .collect();
         assert_eq!(ids, vec!["alpha", "beta"]);
+        // Each card reports the window its own generator admits (EchoGen: 4096).
+        for card in json["data"].as_array().unwrap() {
+            assert_eq!(card["context_length"], 4096);
+        }
     }
 
     /// A request naming `beta` must be answered by beta's generator; an unknown name falls to the
@@ -4189,6 +4201,7 @@ mod tests {
                 id: "my-model".into(),
                 object: "model",
                 owned_by: "local",
+                context_length: Some(4096),
             }],
         };
         let v: serde_json::Value = serde_json::to_value(&resp).unwrap();
@@ -4196,6 +4209,7 @@ mod tests {
         assert_eq!(v["data"][0]["id"], "my-model");
         assert_eq!(v["data"][0]["object"], "model");
         assert_eq!(v["data"][0]["owned_by"], "local");
+        assert_eq!(v["data"][0]["context_length"], 4096);
     }
 
     // --- sampling param plumbing -------------------------------------------

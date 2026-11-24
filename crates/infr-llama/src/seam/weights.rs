@@ -101,7 +101,9 @@ pub(super) struct MoeSharedW {
 /// per-layer embeddings) stays on [`LayerW`].
 pub(super) struct AttnW {
     pub(super) wq: TensorId,
-    pub(super) wk: TensorId,
+    /// `None` only on a gemma4 KV-sharing layer whose file omits `attn_k` (it reads an earlier
+    /// layer's cache and computes no K of its own).
+    pub(super) wk: Option<TensorId>,
     pub(super) wv: Option<TensorId>,
     // q/k/v projection biases (`Config::qkv_bias`, e.g. Qwen2/2.5); `None` on a bias-free file.
     pub(super) qb: Option<TensorId>,
@@ -319,6 +321,12 @@ pub(super) struct LayerW {
 pub(crate) struct SessionStable {
     /// Per-layer presence of an explicit V projection (gemma4 full-attention layers omit it).
     pub(super) has_wv: Vec<bool>,
+    /// Per-layer: whether the layer's `attn_k` / `attn_k_norm` is loaded. Always on a layer that
+    /// computes its own K/V (a file missing one is refused by name); on a gemma4 KV-sharing
+    /// layer only when the file ships it, since llama.cpp treats both as optional there and the
+    /// graph never reads them.
+    pub(super) has_wk: Vec<bool>,
+    pub(super) has_k_norm: Vec<bool>,
     /// gemma4 per-layer output scalar (`layer_output_scale` / `enc_layer_output_scale`), dequanted.
     pub(super) out_scale: Vec<Option<f32>>,
     /// diffusion-gemma DECODER per-layer output scalar (`layer_output_scale`), dequanted.

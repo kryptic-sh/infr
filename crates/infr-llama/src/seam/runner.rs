@@ -176,6 +176,22 @@ fn session_stable(
                 .any(|t| t.name == format!("blk.{l}.attn_v.weight"))
         })
         .collect();
+    // gemma4 KV sharing: a layer past `n_layer_kv_from_start` reads an earlier layer's cache, and
+    // llama.cpp's `gemma4.cpp` loads its `attn_k`/`attn_k_norm` with `TENSOR_NOT_REQUIRED`
+    // (`attn_v` is optional on every layer, covered by `has_wv`). A layer that owns its KV always
+    // loads them, so a file missing one is still refused by name in `wload`.
+    let loads_kv_tensor = |l: usize, role: &str| {
+        c.has_own_kv(l)
+            || g.tensors()
+                .iter()
+                .any(|t| t.name == format!("blk.{l}.{role}"))
+    };
+    let has_wk: Vec<bool> = (0..c.n_layer)
+        .map(|l| loads_kv_tensor(l, "attn_k.weight"))
+        .collect();
+    let has_k_norm: Vec<bool> = (0..c.n_layer)
+        .map(|l| loads_kv_tensor(l, "attn_k_norm.weight"))
+        .collect();
     // gemma4 per-layer output scale (`layer_output_scale.weight`, a single scalar multiplying the
     // layer output before the next layer). Read host-side; applied as an `Op::Scale`. diffusion-
     // gemma ships TWO per-layer scalars (encoder for the prompt, decoder for the canvas); Phase 1
@@ -320,6 +336,8 @@ fn session_stable(
     };
     Ok(SessionStable {
         has_wv,
+        has_wk,
+        has_k_norm,
         out_scale,
         dec_out_scale,
         rope_freqs,
@@ -652,6 +670,8 @@ pub(crate) fn generate_dense_backend_bound(
     // Local views into the session-stable derivations (the code below reads these under their
     // original names; `rope_freqs` is read directly as `stable.rope_freqs` at its two sites).
     let has_wv = &stable.has_wv;
+    let has_wk = &stable.has_wk;
+    let has_k_norm = &stable.has_k_norm;
     let out_scale = &stable.out_scale;
     let dec_out_scale = &stable.dec_out_scale;
     let fuse_gu = stable.fuse_gu;
@@ -1143,7 +1163,9 @@ pub(crate) fn generate_dense_backend_bound(
                     ])?;
                 } else {
                     wload(&[&p("attn_q.weight")])?;
-                    wload(&[&p("attn_k.weight")])?;
+                    if has_wk[l] {
+                        wload(&[&p("attn_k.weight")])?;
+                    }
                     if has_wv[l] {
                         wload(&[&p("attn_v.weight")])?;
                     }
@@ -1157,7 +1179,9 @@ pub(crate) fn generate_dense_backend_bound(
                 }
                 if qk_norm && !is_delta && !is_sc && !is_mla {
                     wload(&[&p("attn_q_norm.weight")])?;
-                    wload(&[&p("attn_k_norm.weight")])?;
+                    if has_k_norm[l] {
+                        wload(&[&p("attn_k_norm.weight")])?;
+                    }
                 }
                 // V4's output projection is the low-rank `attn_output_a`/`_b` pair loaded above; it has
                 // no single `attn_output` tensor, so it is excluded here alongside MLA and DeltaNet.
@@ -2262,10 +2286,14 @@ pub(crate) fn generate_dense_backend_bound(
                 // projection's `w_off` slice); split form declares three.
                 let (wq, wk, wv) = if fuse_qkv {
                     let wqkv = wpush(&mut g, &mut weights);
-                    (wqkv, wqkv, Some(wqkv))
+                    (wqkv, Some(wqkv), Some(wqkv))
                 } else {
                     let wq = wpush(&mut g, &mut weights);
-                    let wk = wpush(&mut g, &mut weights);
+                    let wk = if has_wk[l] {
+                        Some(wpush(&mut g, &mut weights))
+                    } else {
+                        None
+                    };
                     let wv = if has_wv[l] {
                         Some(wpush(&mut g, &mut weights))
                     } else {
@@ -2286,10 +2314,13 @@ pub(crate) fn generate_dense_backend_bound(
                     (None, None, None)
                 };
                 let (q_norm, k_norm) = if qk_norm {
-                    (
-                        Some(wpush(&mut g, &mut weights)),
-                        Some(wpush(&mut g, &mut weights)),
-                    )
+                    let q_norm = wpush(&mut g, &mut weights);
+                    let k_norm = if has_k_norm[l] {
+                        Some(wpush(&mut g, &mut weights))
+                    } else {
+                        None
+                    };
+                    (Some(q_norm), k_norm)
                 } else {
                     (None, None)
                 };
@@ -4001,7 +4032,9 @@ pub(crate) fn generate_dense_backend_bound(
                     if !fuse_qkv {
                         g.push(Op::Linear {
                             x: hn,
-                            weight: aw.wk,
+                            weight: aw
+                                .wk
+                                .expect("a layer that owns its KV always loads attn_k (has_wk)"),
                             dst: k,
                             m: batch as u32,
                             in_f: ne as u32,

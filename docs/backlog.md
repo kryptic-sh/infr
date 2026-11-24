@@ -1366,7 +1366,8 @@ confidence or the loader does not go through `wload`:
   head-major layout), and the V3.2 lightning indexer.
 - qwen35 DeltaNet tensors, the dual-FFN router / banks / extra norms, E2B
   per-layer embedding tensors, DiffusionGemma's self-conditioning MLP.
-- A KV-sharing layer's `attn_k` / `attn_v` (loaded, never read).
+- A KV-sharing layer's `attn_k` / `attn_v` (loaded when the file ships them,
+  never read).
 - `token_embd` when only the host embedding path reads it (CPU backend, untied
   `output.weight`): that path does not call `check_weight_shape`, so a wrong
   `ne0` is read at the wrong stride. Applies to every arch, not only V4.
@@ -1374,6 +1375,39 @@ confidence or the loader does not go through `wload`:
 - V4's `ffn_gate_tid2eid` is checked, but by `generate_dense_backend`'s own
   vocabulary check rather than by `wshape.rs`.
 - A LEADING size-1 dim is not ignored; no GGUF writer is known to emit one.
+
+### B-G4-SHARED-KV — what the optional shared-layer K/V slice did NOT verify (2026-11-25)
+
+`session_stable` now loads a gemma4 KV-sharing layer's `attn_k` / `attn_k_norm`
+only when the file ships them (`SessionStable::has_wk` / `has_k_norm`; `attn_v`
+was already presence-gated by `has_wv`), and `AttnW::wk` is an `Option`.
+Verified: `tests/synthetic_gemma4.rs` (CPU, plus Vulkan on both local devices),
+and unsloth `gemma-4-E4B-it-qat-UD-Q2_K_XL.gguf` against `llama-debug` logits on
+a 10-token prompt (CPU and Vulkan, 5/5 top-5, same argmax). Not verified:
+
+- Metal: runs only in CI, and no CI test loads a file with stripped shared
+  layers on Metal.
+- Tensor parallelism and pipeline split on such a file (never run; both key
+  weights by name, so a missing tensor should simply not appear).
+  `dense_multi_gpu_guard` refuses every file with per-layer embeddings, so the
+  real E2B and E4B files cannot reach either path; only a gemma4 file that
+  shares KV without per-layer embeddings could.
+- Depth: the real-file oracle prompt is shorter than the 512-token window, so
+  the shared window layers reading past it was not exercised on the real file
+  (the synthetic test does exercise it, with a 4-token window).
+- Greedy text against `llama-cli`: the local `llama-cli` build ignored `-no-cnv`
+  and ran a chat turn, so only the logits oracle was compared.
+- `Config::kv_src_layer` is llama.cpp's reuse rule as written (the lambda next
+  to `n_layer_kv_from_start` in `llama-model.cpp`), assumption included: the
+  last own-KV layer is full attention and the one before it sliding-window. That
+  holds for E2B and E4B. Neither implementation checks the source layer's window
+  type or head width against the sharing layer; whether infr validates that
+  anywhere else was not checked.
+- Found by the review, older than this slice and not fixed: `has_wv` in
+  `session_stable` is gated by the tensor's presence on every architecture, so a
+  file of any family missing `attn_v` would run with V = K where only gemma4
+  defines that. Read in code; whether another per-architecture tensor check
+  refuses such a file first was not checked.
 
 ### B58 — what the concurrent-pull slice did NOT verify (2026-08-10)
 

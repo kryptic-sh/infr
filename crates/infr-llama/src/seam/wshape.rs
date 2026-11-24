@@ -18,8 +18,8 @@ use anyhow::{anyhow, Result as AResult};
 /// `ffn_gate_tid2eid` routing table (`generate_dense_backend` checks it against the vocabulary
 /// itself), the qwen35 DeltaNet tensors, the dual-FFN (gemma4 MoE / DiffusionGemma) router and
 /// expert banks and their extra norms, the gemma4 E2B per-layer embedding tensors,
-/// DiffusionGemma's self-conditioning MLP, and a KV-sharing layer's own `attn_k`/`attn_v` (loaded,
-/// but never read by the graph).
+/// DiffusionGemma's self-conditioning MLP, and a KV-sharing layer's own `attn_k`/`attn_v` (loaded
+/// when the file ships them, but never read by the graph).
 ///
 /// The DeepSeek V4 rules transcribe `deepseek4.cpp::load_arch_tensors` at the head width the V4
 /// graph indexes by, [`Config::head_dim`] (`attention.key_length`). llama.cpp sizes those tensors

@@ -1168,6 +1168,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **gemma4 files whose KV-sharing layers omit their K/V tensors now load.** A
+  file that declares `gemma4.attention.shared_kv_layers` may leave `attn_k`,
+  `attn_v` and `attn_k_norm` out of the layers that read an earlier layer's
+  cache, as llama.cpp allows; the `gemma-4-E4B-it-qat-GGUF` files checked
+  (unsloth UD-Q2_K_XL, prithivMLmods Q2_K) drop them from 18 of 42 layers. The
+  loader required `attn_k` and `attn_k_norm` on every attention layer and
+  refused such a file with `tensor not found: blk.24.attn_k.weight`. They are
+  now loaded on a sharing layer only when present; a layer that computes its own
+  K/V still refuses a missing one by name, and files that ship them on every
+  layer (gemma-4-E2B) load exactly as before.
 - **A Vulkan context is sized before the weights load as the load will leave it,
   so a device too small for a usable window is refused before the weights load,
   and no run keeps a context too small to use.** The fit before the load (the

@@ -72,6 +72,24 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`infr serve` enforces a reasoning budget.** `reasoning_effort` on
+  `/v1/chat/completions` used to be flattened to on/off, so `low` and `high`
+  were the same request. Each level now resolves to a token count the decode
+  loop honours: it counts the ids emitted since the reasoning block opened and,
+  at the limit, forces the template's own close sequence instead of sampling, so
+  the block ends exactly there and the answer continues. An exact count arrives
+  as the new `think_max_tokens` field (a positive integer; anything else is a
+  `400`). The numbers are `sampling.think_budget_low` / `_medium` / `_high`
+  (512 / 2048 / 8192, env `INFR_THINK_BUDGET_LOW` / `_MEDIUM` / `_HIGH`) and
+  `sampling.think_budget_tokens` (env `INFR_THINK_BUDGET_TOKENS`) for one number
+  at every level; `0` at a level turns that level's budget off. A budget a model
+  obeys costs the pipelined decode chain: every id has to reach the host for the
+  count, so a budgeted reply decodes on the ordinary per-token path.
+  `infr_llama::sampling` gains `ThinkBlock`, `ThinkTracker` and
+  `RequestSampling::think`; `infr_chat` gains `think_markers` and
+  `ThinkMarkers`, the two-rendering diff that says which marker closes a
+  template's block.
+
 - **The KV prefix cache is a list of pluggable stores.** `[[kv.tiers]]` replaces
   `kv.store_mb`, `kv.store_file` and `kv.store_url`: one entry per store, fastest
   first, each naming a `backend` and its own `size`. A write that no longer fits

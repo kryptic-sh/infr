@@ -17,4 +17,4 @@ pub use infr_chat::{
 };
 
 /// A streamed piece of a response (re-exported from the single splitter in `infr-chat`).
-pub use infr_chat::{prompt_prefills_think, ChatStream, Delta};
+pub use infr_chat::{prompt_prefills_think, thinking_enabled, ChatStream, Delta};

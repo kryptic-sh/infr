@@ -181,6 +181,10 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     p.sampling.max_new = num(get, "INFR_MAX_NEW");
     p.sampling.ignore_eos = presence(get, "INFR_IGNORE_EOS");
     p.sampling.no_think = set_not_zero(get, "INFR_NO_THINK");
+    p.sampling.think_budget_low = num(get, "INFR_THINK_BUDGET_LOW");
+    p.sampling.think_budget_medium = num(get, "INFR_THINK_BUDGET_MEDIUM");
+    p.sampling.think_budget_high = num(get, "INFR_THINK_BUDGET_HIGH");
+    p.sampling.think_budget_tokens = opt_num(get, "INFR_THINK_BUDGET_TOKENS");
 
     // ── kv ───────────────────────────────────────────────────────────────────
     // An unparseable name still counts as SPECIFIED (it suppresses auto-q8) while yielding no

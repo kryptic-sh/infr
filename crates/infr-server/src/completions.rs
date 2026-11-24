@@ -70,6 +70,7 @@ impl CompletionRequest {
             reasoning_effort: None,
             chat_template_kwargs: None,
             think: None,
+            think_max_tokens: None,
             response_format: None,
         }
     }

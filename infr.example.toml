@@ -85,6 +85,19 @@ ignore_eos = false
 # Suppress the model's `<think>` block where the template supports one.
 no_think = false
 
+# Reasoning-token budgets, one per effort level. A served request that asks for
+# `reasoning_effort: low` gets the low budget; the decode loop counts the tokens
+# of the think block and forces the template's own close sequence when the count
+# runs out, so a reply never spends more than this on reasoning. 0 at a level
+# disables that level's budget. Defaults: 512, 2048, 8192.
+# think_budget_low = 512
+# think_budget_medium = 2048
+# think_budget_high = 8192
+
+# One budget for every level, replacing the table above. A request's
+# `think_max_tokens` still wins over it. Default: unset.
+# think_budget_tokens = 1024
+
 # ── kv cache ─────────────────────────────────────────────────────────────────
 
 [kv]

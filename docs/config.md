@@ -218,7 +218,14 @@ GPU dropped hung the process forever with one core spinning
 detect about dropped work is in `docs/backlog.md` B222.
 
 **`[sampling]`** — `temp` (0 = greedy), `top_k`, `top_p`, `seed`, `max_new`,
-`ignore_eos`, `no_think`. **Provenance matters here**: `infr run` / `infr serve`
+`ignore_eos`, `no_think`, and the reasoning budgets `think_budget_low` /
+`_medium` / `_high` (512 / 2048 / 8192; `0` turns a level off) plus
+`think_budget_tokens` for one number at every level. A served request picks a
+level with `reasoning_effort` (`minimal` uses the low budget) or overrides the
+number with `think_max_tokens`; the decode loop counts the ids of the think
+block and, at the budget, forces the template's own close sequence instead of
+sampling, so the answer always follows. With thinking off there is no block and
+no budget. **Provenance matters here**: `infr run` / `infr serve`
 fill `temp` / `top_k` / `top_p` / `max_new` from the model's own recommended
 sampling (an arch-family table, then any `generation_config.json` beside the
 model, then the GGUF's own `general.sampling.*` keys, the last one winning) only

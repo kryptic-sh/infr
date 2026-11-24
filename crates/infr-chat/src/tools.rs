@@ -11,7 +11,7 @@ use serde_json::Value;
 // ---------------------------------------------------------------------------
 
 /// The marker that begins the final-answer channel.
-const FINAL_MARK: &str = "<channel|>";
+pub(crate) const FINAL_MARK: &str = "<channel|>";
 
 /// All marker substrings that should be stripped when cleaning channel text.
 const MARKERS: &[&str] = &[
@@ -617,7 +617,7 @@ pub(crate) fn parse_bare_json_call(text: &str) -> Option<ToolCall> {
 // ---------------------------------------------------------------------------
 
 const THINK_OPEN: &str = "<think>";
-const THINK_CLOSE: &str = "</think>";
+pub(crate) const THINK_CLOSE: &str = "</think>";
 
 /// Format-aware reasoning split: channel-marker output (E2B/gpt-oss `<|channel>thought…<channel|>`)
 /// goes through [`split_channels`], everything else through [`split_think`]. THE one entry point

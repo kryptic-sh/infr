@@ -30,6 +30,10 @@ headline.
 - **[cpu.md](cpu.md)** — the CPU backend's perf notes: the two-regime model
   (decode DRAM-bound, prefill cache-bound) and the native int8-quant landing
   history. Open items are in `backlog.md` § B101.
+- **[reasoning-budget.md](reasoning-budget.md)** — plan 21's think-block token
+  budget measured through `infr serve`: what the levels cost in reasoning
+  tokens and time to the first answer token, and why a budgeted reply loses the
+  pipelined decode chain.
 - **[vulkan-review.md](vulkan-review.md)** — multi-vendor review of the Vulkan
   backend: what is RDNA3-tuned versus genuinely portable, and the per-vendor
   gaps (Intel Arc, NVIDIA) that follow from it.

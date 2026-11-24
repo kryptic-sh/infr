@@ -266,7 +266,11 @@ a per-request OpenAI `temperature`/`top_p` still overrides them. See
 Per-request sampling fields: `temperature`, `top_p`, `top_k`, `min_p`, `seed`,
 `presence_penalty`, `frequency_penalty`, `repeat_penalty`, `logit_bias`, `stop`,
 `max_tokens` / `max_completion_tokens`, and `logprobs` / `top_logprobs`. `n` above 1
-is not supported and answers `400`. Log probabilities are returned by the dense seam
+is not supported and answers `400`. The thinking switches are `reasoning_effort`
+(`none` / `minimal` / `low` / `medium` / `high`) and `think`, and above `none` each
+level is a token budget the engine enforces: it counts the think block's tokens and
+forces the template's own close when they run out, so `low` really is shorter than
+`high`. `think_max_tokens` overrides the number for one request. Log probabilities are returned by the dense seam
 (Vulkan, CPU, reference Metal) on `/v1/chat/completions` and `/v1/completions`, in
 the OpenAI shapes, streaming and non-streaming; `top_logprobs` defaults to 20 when
 `logprobs` is true, as in llama.cpp. A backend with its own decode loop (diffusion,

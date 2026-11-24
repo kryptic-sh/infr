@@ -2090,6 +2090,12 @@ pub(crate) fn generate_dense_backend_bound(
     // does).
     let mut penalties = crate::sampling::Penalties::resolve(req);
     let penalize = penalties.is_some();
+    // The request's reasoning budget, advanced with every id the loop emits. It is what turns the
+    // chained decode off above: a chain hands the host no point at which to take an id away from
+    // the model.
+    let mut think = req
+        .and_then(|r| r.sampling().think.as_ref())
+        .map(crate::sampling::ThinkBlock::tracker);
     // GPU-resident greedy sampling (`Op::Argmax` appended to the decode graph): only the 4-byte
     // token id is read back per step — the [vocab] logits stay in VRAM (downloaded only for the
     // one-time `logits_out` hook). Grammar-constrained decodes need host logits every step
@@ -6764,6 +6770,9 @@ pub(crate) fn generate_dense_backend_bound(
         && ro.is_some()
         && chain_n >= 2
         && ipl_buf.is_none()
+        // A reasoning budget has to inspect every id to know when the block has ended, and a
+        // chain hands the host no such point.
+        && req.is_none_or(|r| r.sampling().think.is_none())
         && ec.kernels.vulkan.gpu_pos;
     // A recurrent model (qwen35, LFM3): a chain runs every one of its steps on the device, so a turn
     // that stops partway leaves the recurrent state past what `cached` will record. Snapshot it
@@ -7128,22 +7137,32 @@ pub(crate) fn generate_dense_backend_bound(
                     break;
                 }
             } else {
-                let next = if gpu_argmax || gpu_sample {
-                    // Device-side sampling (Op::Argmax / Op::Sample): read back the 4-byte id.
-                    let mut idb = [0u8; 4];
-                    be.download(id_out, &mut idb).map_err(|e| anyhow!("{e}"))?;
-                    u32::from_le_bytes(idb)
-                } else {
-                    // Serve-only: logit_bias and repetition penalties patch the row in place (no-op
-                    // allocation-wise — `penalties` is `None` on every other path, so this is one
-                    // branch per token).
-                    if let Some(p) = penalties.as_ref() {
-                        p.apply(&mut logits);
+                let forced = think.as_mut().and_then(|t| t.forced());
+                let next = match forced {
+                    // The reasoning budget decided this id: written without sampling, so it spends
+                    // no RNG draw. A logprobs request still reports it below, from the same row.
+                    Some(id) => id,
+                    None if gpu_argmax || gpu_sample => {
+                        // Device-side sampling (Op::Argmax / Op::Sample): read back the 4-byte id.
+                        let mut idb = [0u8; 4];
+                        be.download(id_out, &mut idb).map_err(|e| anyhow!("{e}"))?;
+                        u32::from_le_bytes(idb)
                     }
-                    crate::sampling::sample_logits(&logits, sampler, &mut rng)
+                    None => {
+                        // Serve-only: logit_bias and repetition penalties patch the row in place
+                        // (no-op allocation-wise — `penalties` is `None` on every other path, so
+                        // this is one branch per token).
+                        if let Some(p) = penalties.as_ref() {
+                            p.apply(&mut logits);
+                        }
+                        crate::sampling::sample_logits(&logits, sampler, &mut rng)
+                    }
                 };
                 if let Some(p) = penalties.as_mut() {
                     p.observe(next);
+                }
+                if let Some(t) = think.as_mut() {
+                    t.observe(next);
                 }
                 let is_eos = !ignore_eos && (c.eos_ids.contains(&next) || next == c.eos);
                 out.push(next);
@@ -7151,6 +7170,9 @@ pub(crate) fn generate_dense_backend_bound(
                 decode_n += 1;
                 if !is_eos {
                     if let (Some(top_n), Some(req)) = (logprobs, req) {
+                        // A forced id reports the model's own probability at its step: the row is
+                        // on the host here (`logprobs` rules out both GPU sampling paths), and one
+                        // entry per emitted id is what keeps the text-to-logprob mapping aligned.
                         req.push_logprob(crate::sampling::token_logprob(
                             &logits, sampler, next, top_n,
                         ));

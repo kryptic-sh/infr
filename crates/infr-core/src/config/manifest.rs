@@ -141,6 +141,10 @@ knobs! {
     "INFR_MAX_NEW"              => "sampling.max_new",    Int,        Ignored, "256",  migrated;
     "INFR_IGNORE_EOS"           => "sampling.ignore_eos", Presence,   Ignored, "1",    migrated;
     "INFR_NO_THINK"             => "sampling.no_think",   SetNotZero, Ignored, "1",    migrated;
+    "INFR_THINK_BUDGET_LOW"     => "sampling.think_budget_low",    Int, Ignored, "512",  migrated;
+    "INFR_THINK_BUDGET_MEDIUM"  => "sampling.think_budget_medium", Int, Ignored, "2048", migrated;
+    "INFR_THINK_BUDGET_HIGH"    => "sampling.think_budget_high",   Int, Ignored, "8192", migrated;
+    "INFR_THINK_BUDGET_TOKENS"  => "sampling.think_budget_tokens", Int, Ignored, "1024", migrated;
 
     // ── kv ───────────────────────────────────────────────────────────────────
     "INFR_KV_TYPE_K"            => "kv.type_k",              Dtype,       Ignored, "q8_0", migrated;

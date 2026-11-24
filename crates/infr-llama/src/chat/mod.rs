@@ -469,6 +469,29 @@ impl OaiRenderer {
             .response_constraint(&self.tokenizer, vocab, &[self.eos], schema, tools)
     }
 
+    /// The reasoning block this model's template opens, bounded to `budget` tokens — `None` when the
+    /// template has none, read off the close marker the no-think rendering ends with.
+    pub fn think_block(
+        &self,
+        prompt: &str,
+        messages: &[infr_chat::ChatMessage],
+        tools: Option<&serde_json::Value>,
+        budget: usize,
+        level: &'static str,
+    ) -> Result<Option<crate::sampling::ThinkBlock>> {
+        let no_think = self.render_no_think(messages, tools)?;
+        let Some(markers) = infr_chat::think_markers(prompt, &no_think) else {
+            return Ok(None);
+        };
+        let close = self
+            .tokenizer
+            .encode(markers.close, false)
+            .map_err(|e| anyhow::anyhow!("encode: {e}"))?
+            .get_ids()
+            .to_vec();
+        Ok((!close.is_empty()).then(|| crate::sampling::ThinkBlock::new(close, budget, level)))
+    }
+
     /// How many tokens `prompt` is, tokenized exactly as the generation paths tokenize a rendered
     /// prompt (`SeamModel::encode`: special tokens parsed, nothing added).
     pub fn count_tokens(&self, prompt: &str) -> Result<usize> {

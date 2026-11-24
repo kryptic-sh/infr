@@ -415,6 +415,8 @@ pub struct ChatRequest {
     #[serde(default)]
     pub stream_options: Option<StreamOptions>,
     /// OpenAI: `"none"` turns thinking off; `"minimal"`/`"low"`/`"medium"`/`"high"` turn it on.
+    /// The level also picks the reasoning-token budget (`sampling.think_budget_low` and friends,
+    /// see `docs/config.md`), so `low` and `high` reach the engine as different numbers.
     #[serde(default)]
     pub reasoning_effort: Option<String>,
     /// vLLM/llama.cpp: `{"enable_thinking": bool}`; other keys are ignored.
@@ -423,6 +425,12 @@ pub struct ChatRequest {
     /// Ollama: `true`/`false`, or an effort level string (thinking on).
     #[serde(default)]
     pub think: Option<serde_json::Value>,
+    /// This request's reasoning-token budget: the engine closes the think block once this many
+    /// reasoning tokens have been emitted, so a long thinker answers a one-line question in
+    /// bounded time. Wins over [`Self::reasoning_effort`]'s level and the process default
+    /// (`sampling.think_budget_tokens`). Positive only; inert for a reply that is not thinking.
+    #[serde(default)]
+    pub think_max_tokens: Option<serde_json::Value>,
     /// OpenAI `response_format`, as sent; validated into [`GenParams::response_format`], so a
     /// malformed one is a `400` naming the field rather than a body rejection.
     #[serde(default)]
@@ -615,6 +623,30 @@ where
     }
 }
 
+/// A reasoning-effort word from the request, resolved to a token count by
+/// [`GenParams::think_budget_tokens`] against the `sampling.think_budget_*` table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThinkLevel {
+    /// OpenAI's `minimal`; shares `low`'s budget — there is no fourth number to keep.
+    Minimal,
+    Low,
+    Medium,
+    High,
+}
+
+/// The reasoning-token budget a request asked for, before the level table turns it into a number.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ThinkBudget {
+    /// The request named no budget: `sampling.think_budget_tokens` decides, and with it unset the
+    /// block ends only when the model ends it.
+    #[default]
+    Unset,
+    /// `reasoning_effort` / `think: "low"`: a level from the process table.
+    Level(ThinkLevel),
+    /// `think_max_tokens`: this many reasoning tokens, whatever the table says.
+    Exact(usize),
+}
+
 /// The validated, per-request generation config handed to [`ChatGenerator::chat`]. `None` fields
 /// mean "the request didn't say" — the generator leaves the process default (`INFR_TEMP` /
 /// `INFR_TOP_K` / `INFR_TOP_P` / `INFR_MAX_NEW`) in charge for exactly those.
@@ -642,6 +674,8 @@ pub struct GenParams {
     pub stop: Vec<String>,
     /// The request's thinking switch; `None` keeps the server default (`--no-think`/`--think`).
     pub think: Option<bool>,
+    /// The request's reasoning-token budget; inert unless the reply is thinking.
+    pub think_budget: ThinkBudget,
     /// The request's images (decoded `image_url` data URIs), in the order their
     /// [`infr_engine::IMAGE_MARKER`]s appear in the flattened messages. Filled by the
     /// handler, not by [`GenParams::from_request`] (the messages are flattened separately).
@@ -791,7 +825,7 @@ impl GenParams {
         }
 
         let logit_bias = parse_logit_bias(req.logit_bias.as_ref())?;
-        let think = request_think(req)?;
+        let ThinkRequest { on, budget } = request_think(req)?;
 
         Ok(Self {
             // OpenAI renamed `max_tokens` -> `max_completion_tokens`; the new name wins.
@@ -808,10 +842,45 @@ impl GenParams {
             logprobs,
             top_logprobs,
             stop,
-            think,
+            think: on,
+            think_budget: budget,
             images: Vec::new(),
             response_format: ResponseFormat::from_request(req.response_format.as_ref())?,
         })
+    }
+
+    /// The reasoning-token budget this request resolves to and the knob that set it, or `None` for
+    /// no budget at all.
+    ///
+    /// `thinking` is the request's resolved switch (its own field or the process default): a
+    /// reply that is not thinking has no block to budget. An exact `think_max_tokens` wins, then
+    /// the flat `sampling.think_budget_tokens`, then the level the request named — `minimal` and
+    /// `low` share one number. A level configured to `0` disables the budget for that level rather
+    /// than closing the block on its first token.
+    pub fn think_budget_tokens(
+        &self,
+        thinking: bool,
+        cfg: &infr_core::config::SamplingCfg,
+    ) -> Option<(usize, &'static str)> {
+        if !thinking {
+            return None;
+        }
+        if let ThinkBudget::Exact(tokens) = self.think_budget {
+            return Some((tokens, "exact"));
+        }
+        if let Some(tokens) = cfg.think_budget_tokens.filter(|&n| n > 0) {
+            return Some((tokens, "config"));
+        }
+        let ThinkBudget::Level(level) = self.think_budget else {
+            return None;
+        };
+        let (tokens, knob) = match level {
+            ThinkLevel::Minimal => (cfg.think_budget_low, "minimal"),
+            ThinkLevel::Low => (cfg.think_budget_low, "low"),
+            ThinkLevel::Medium => (cfg.think_budget_medium, "medium"),
+            ThinkLevel::High => (cfg.think_budget_high, "high"),
+        };
+        (tokens > 0).then_some((tokens, knob))
     }
 
     /// The `logit_bias` ids against the routed model's vocabulary: an id at or past `vocab` names
@@ -912,51 +981,93 @@ fn parse_logit_bias(v: Option<&LogitBiasArg>) -> Result<Vec<(u32, f32)>, ParamEr
     Ok(out)
 }
 
-/// The request's thinking switch. Precedence: `chat_template_kwargs.enable_thinking`, then
-/// `think`, then `reasoning_effort`.
-fn request_think(req: &ChatRequest) -> Result<Option<bool>, ParamError> {
+/// What the request asked about reasoning: the on/off switch and the token budget it wants the
+/// block to fit in.
+struct ThinkRequest {
+    on: Option<bool>,
+    budget: ThinkBudget,
+}
+
+/// The request's thinking switch and budget. Switch precedence: `chat_template_kwargs.
+/// enable_thinking`, then `think`, then `reasoning_effort`. Budget precedence: an exact
+/// `think_max_tokens`, then the level `think` or `reasoning_effort` named.
+fn request_think(req: &ChatRequest) -> Result<ThinkRequest, ParamError> {
     let kw = req
         .chat_template_kwargs
         .as_ref()
         .and_then(|v| v.get("enable_thinking"));
-    match kw {
-        None | Some(serde_json::Value::Null) => {}
-        Some(serde_json::Value::Bool(b)) => return Ok(Some(*b)),
+    let kw_on = match kw {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::Bool(b)) => Some(*b),
         Some(_) => {
             return Err(ParamError {
                 param: "chat_template_kwargs",
                 message: "chat_template_kwargs.enable_thinking must be a boolean".into(),
             })
         }
-    }
-    match &req.think {
-        None | Some(serde_json::Value::Null) => {}
-        Some(serde_json::Value::Bool(b)) => return Ok(Some(*b)),
-        Some(serde_json::Value::String(s)) => return effort_think("think", s).map(Some),
+    };
+    // `think`: a bool names the switch only, a string names the switch and a level.
+    let think_field: Option<(bool, Option<ThinkLevel>)> = match &req.think {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::Bool(b)) => Some((*b, None)),
+        Some(serde_json::Value::String(s)) => Some(effort_switch("think", s)?),
         Some(_) => {
             return Err(ParamError {
                 param: "think",
                 message: "think must be a boolean or an effort level string".into(),
             })
         }
-    }
-    req.reasoning_effort
-        .as_deref()
-        .map(|s| effort_think("reasoning_effort", s))
-        .transpose()
+    };
+    let effort = match req.reasoning_effort.as_deref() {
+        None => None,
+        Some(s) => Some(effort_switch("reasoning_effort", s)?),
+    };
+
+    let on = kw_on
+        .or(think_field.map(|(on, _)| on))
+        .or(effort.map(|(on, _)| on));
+    // The level travels with whichever field named one; a bool `think` leaves the effort word to
+    // say what budget the client expected.
+    let level = think_field
+        .and_then(|(_, level)| level)
+        .or_else(|| effort.and_then(|(_, level)| level));
+    let budget = match whole_number("think_max_tokens", req.think_max_tokens.as_ref())? {
+        Some(n) if n < 1 => {
+            return Err(ParamError {
+                param: "think_max_tokens",
+                message: format!("think_max_tokens must be >= 1, got {n}"),
+            })
+        }
+        Some(n) => ThinkBudget::Exact(usize::try_from(n).map_err(|_| ParamError {
+            param: "think_max_tokens",
+            message: format!("think_max_tokens is too large, got {n}"),
+        })?),
+        None => level.map_or(ThinkBudget::Unset, ThinkBudget::Level),
+    };
+    Ok(ThinkRequest { on, budget })
 }
 
-fn effort_think(param: &'static str, effort: &str) -> Result<bool, ParamError> {
-    match effort {
-        "none" => Ok(false),
-        "minimal" | "low" | "medium" | "high" => Ok(true),
-        other => Err(ParamError {
-            param,
-            message: format!(
-                "{param} must be one of none, minimal, low, medium, high; got {other:?}"
-            ),
-        }),
-    }
+/// An effort word as `(thinking on, level)`: `none` is no reasoning, `minimal` shares `low`'s
+/// budget.
+fn effort_switch(
+    param: &'static str,
+    effort: &str,
+) -> Result<(bool, Option<ThinkLevel>), ParamError> {
+    Ok(match effort {
+        "none" => (false, None),
+        "minimal" => (true, Some(ThinkLevel::Minimal)),
+        "low" => (true, Some(ThinkLevel::Low)),
+        "medium" => (true, Some(ThinkLevel::Medium)),
+        "high" => (true, Some(ThinkLevel::High)),
+        other => {
+            return Err(ParamError {
+                param,
+                message: format!(
+                    "{param} must be one of none, minimal, low, medium, high; got {other:?}"
+                ),
+            })
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -4397,6 +4508,57 @@ mod tests {
                 GenParams::from_request(&req(&format!(r#"{{"model":"m","messages":[]{body}}}"#)))
                     .unwrap_err();
             assert_eq!(e.param, param);
+        }
+    }
+
+    #[test]
+    fn the_effort_levels_reach_the_generator_as_different_budgets() {
+        let cfg = infr_core::config::SamplingCfg::default();
+        let budget = |body: &str| {
+            GenParams::from_request(&req(&format!(r#"{{"model":"m","messages":[]{body}}}"#)))
+                .unwrap()
+                .think_budget_tokens(true, &cfg)
+        };
+        let low = budget(r#","reasoning_effort":"low""#);
+        let high = budget(r#","reasoning_effort":"high""#);
+        assert_eq!(low, Some((cfg.think_budget_low, "low")));
+        assert_eq!(
+            budget(r#","reasoning_effort":"medium""#),
+            Some((cfg.think_budget_medium, "medium"))
+        );
+        assert_eq!(high, Some((cfg.think_budget_high, "high")));
+        assert_ne!(low, high, "the levels must not flatten into one number");
+        // An exact count wins over the level it arrives with, and `none` is still off rather than
+        // a budget of zero.
+        assert_eq!(
+            budget(r#","reasoning_effort":"high","think_max_tokens":64"#),
+            Some((64, "exact"))
+        );
+        assert_eq!(budget(r#","reasoning_effort":"none""#), None);
+        let p = GenParams::from_request(&req(
+            r#"{"model":"m","messages":[],"reasoning_effort":"high"}"#,
+        ))
+        .unwrap();
+        assert_eq!(
+            p.think_budget_tokens(false, &cfg),
+            None,
+            "a reply that is not thinking has no block to budget"
+        );
+    }
+
+    #[test]
+    fn an_invalid_think_budget_is_a_400() {
+        for (body, message) in [
+            (r#","think_max_tokens":0"#, "must be >= 1"),
+            (r#","think_max_tokens":-4"#, "must be >= 1"),
+            (r#","think_max_tokens":1.5"#, "must be an integer"),
+            (r#","think_max_tokens":"64""#, "must be an integer"),
+        ] {
+            let e =
+                GenParams::from_request(&req(&format!(r#"{{"model":"m","messages":[]{body}}}"#)))
+                    .unwrap_err();
+            assert_eq!(e.param, "think_max_tokens", "{body}");
+            assert!(e.message.contains(message), "{}: {}", e.message, message);
         }
     }
 

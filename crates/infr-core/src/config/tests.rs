@@ -1471,6 +1471,10 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_SERVE_ALLOWED_HOSTS",
         "INFR_SERVE_SSE_KEEPALIVE_SECS",
         "INFR_SERVE_MAX_BODY_BYTES",
+        "INFR_THINK_BUDGET_LOW",
+        "INFR_THINK_BUDGET_MEDIUM",
+        "INFR_THINK_BUDGET_HIGH",
+        "INFR_THINK_BUDGET_TOKENS",
     ];
 
     let mut got: Vec<&str> = KEYS.iter().filter(|k| k.migrated).map(|k| k.env).collect();

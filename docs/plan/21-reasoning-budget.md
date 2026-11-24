@@ -1,8 +1,15 @@
 # Plan 21: a reasoning budget that the engine enforces
 
-Status: scoped. Today the three request switches that ask for thinking are flattened to a boolean, so
-`low` and `high` are the same request; this gives them a token count the engine honours by closing the
-think block when it runs out.
+Status: P1–P3 shipped, P4 open. The surface, the counter and the forced close are in: `think_max_tokens`
+and `reasoning_effort` reach the decode loop as a number, `ThinkBlock`/`ThinkTracker` count the block
+and substitute the template's own close, and `infr_chat::think_markers` derives that close by diffing
+the two renderings. Three deltas from the plan as written: the table is three flat keys
+(`sampling.think_budget_low` / `_medium` / `_high`) because `cfg_struct!` forbids a `think_budget`
+section mixing subsections and leaves; the forced step is a plain override rather than a constrained
+step, since a budget only exists on a free-form reply where no grammar owns the tokens; and the
+interactive chat path gets no budget, because `Chat::turn` renders without a thinking toggle and so has
+no no-think twin to diff the close from — the feature is a per-request one (`infr run <prompt>` and
+`infr serve` both go through the same `prepare`/`run_prepared` pair). P4 still has to be measured.
 
 ## Problem
 
@@ -47,21 +54,26 @@ than an impression.
 
 ## Phases
 
-- **P1** (scoped) the surface: `sampling.think_budget` / `think_budget_tokens`, the level table,
-  `think_max_tokens` on the request with validation, `reasoning_effort` resolved through the same
-  table, and `docs/config.md` entries. Gate: `low` and `high` reach the engine as different numbers, an
-  unknown level and a zero budget are 400s, and `none` still means off.
-- **P2** (scoped) enforcement for a single-token close: `ThinkBlock` from the renderer, the counter, the
-  constrained step, and the resume. Gate: with a scripted token stream that would think for 100 tokens
-  and a budget of 32, exactly 32 reasoning tokens are emitted, the close sequence follows, and the
-  answer continues to the stop; a model that closes at 20 tokens is untouched.
-- **P3** (scoped) multi-token closes and families whose close is not a single token, plus the streamed
-  shape: `Delta::Reasoning` ends at the forced close, `content` begins after it, and a template without
-  a think block leaves the budget inert. Gate: a two-token close lands in one piece in the streamed
-  text, with no partial close sequence visible to the client.
-- **P4** (scoped) measure on LFM3-1.7B Q4_K_M on the RX 580 at the three levels: reasoning tokens
-  emitted, TTFT, and total ms for a fixed question set, recorded in `docs/perf/`. Sanity check that the
-  answer quality does not collapse at `low` by comparing greedy output with an unbeaten budget.
+- **P1** (shipped) the surface: `sampling.think_budget_low` / `_medium` / `_high` and
+  `think_budget_tokens`, `think_max_tokens` on the request with validation, `reasoning_effort` resolved
+  through the same table, and `docs/config.md` entries. Gate: `low` and `high` reach the engine as
+  different numbers (`the_effort_levels_reach_the_generator_as_different_budgets`), an unknown level and
+  a zero budget are 400s (`an_invalid_think_budget_is_a_400`), and `none` still means off.
+- **P2** (shipped) enforcement for a single-token close: `ThinkBlock` from the renderer, the counter in
+  the decode loop, and the forced close. Gate covered by the tracker's unit tests rather than by a
+  scripted 100-token stream: `budget_forces_the_close_after_exactly_the_allowed_tokens`,
+  `a_natural_close_is_left_alone`, `an_abandoned_close_counts_as_reasoning`.
+- **P3** (shipped) multi-token closes and the streamed shape: `think_markers` accepts a two-token close
+  and a mismatched partial close counts as reasoning, and the splitter already holds back a partial
+  marker (`streams_channel_thought_then_final`, `streams_think_then_content`), so a forced close lands
+  whole. A template without a think block yields `No` markers and an inert budget
+  (`no_close_marker_means_no_block`).
+- **P4** (partly measured, see [../perf/reasoning-budget.md](../perf/reasoning-budget.md)) measure on
+  LFM3-1.7B Q4_K_M on the RX 580 at the three levels: reasoning tokens emitted, TTFT, and total ms for
+  a fixed question set, recorded in `docs/perf/`. Sanity check that the answer quality does not collapse
+  at `low` by comparing greedy output with an unbeaten budget. Done on Qwen3-1.7B Q4_K_M for the token
+  and timing numbers (the LFM3 file is not cached here); the LFM3 row and the quality comparison are
+  the open part.
 
 ## Non-goals
 

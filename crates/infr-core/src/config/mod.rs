@@ -113,6 +113,16 @@ cfg_struct! {
         ignore_eos: bool = false,
         /// `INFR_NO_THINK`: suppress the model's thinking block. Set AND `!= "0"`.
         no_think: bool = false,
+        /// `INFR_THINK_BUDGET_LOW`: reasoning tokens allowed for `reasoning_effort: "low"`
+        /// (`"minimal"` uses the same number).
+        think_budget_low: usize = 512,
+        /// `INFR_THINK_BUDGET_MEDIUM`: reasoning tokens allowed for `reasoning_effort: "medium"`.
+        think_budget_medium: usize = 2048,
+        /// `INFR_THINK_BUDGET_HIGH`: reasoning tokens allowed for `reasoning_effort: "high"`.
+        think_budget_high: usize = 8192,
+        /// `INFR_THINK_BUDGET_TOKENS`: one budget for every thinking request, replacing the
+        /// level table above. A request's `think_max_tokens` still wins. `None`/`0` = unset.
+        think_budget_tokens: Option<usize> = None,
     }
 }
 

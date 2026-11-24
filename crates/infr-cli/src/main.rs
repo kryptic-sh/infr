@@ -2613,6 +2613,30 @@ enum Plan {
 struct Prepared {
     prompt: String,
     plan: Plan,
+    /// The reasoning block this prompt opens, with the budget the request resolves to. Only a free
+    /// reply has one: a constrained grammar owns every token of its answer.
+    think: Option<infr_llama::sampling::ThinkBlock>,
+}
+
+/// The reasoning block `prompt` opens, bounded to the budget `params` resolves to — `None` when
+/// there is nothing to bound: thinking is off, no budget is configured, or the template writes no
+/// reasoning block at all.
+fn think_block(
+    be: &dyn GenBackend,
+    prompt: &str,
+    messages: &[infr_engine::ChatMessage],
+    tools: Option<&serde_json::Value>,
+    params: &infr_server::GenParams,
+) -> anyhow::Result<Option<infr_llama::sampling::ThinkBlock>> {
+    let ecfg = be.renderer().engine_cfg();
+    let thinking = params
+        .think
+        .unwrap_or_else(|| infr_engine::thinking_enabled(ecfg));
+    let Some((budget, level)) = params.think_budget_tokens(thinking, &ecfg.sampling) else {
+        return Ok(None);
+    };
+    be.renderer()
+        .think_block(prompt, messages, tools, budget, level)
 }
 
 /// Render the request's prompt and build the constraint it needs.
@@ -2659,13 +2683,17 @@ fn prepare(
         return Ok(Prepared {
             prompt: format!("{prompt}<tool_call>\n"),
             plan: Plan::ForcedTool(constraint),
+            think: None,
         });
     }
     let calls = tool_parsing_allowed(tools, tool_choice);
     let Some(format) = &params.response_format else {
+        let prompt = be.renderer().render(messages, tools, params.think)?;
+        let think = think_block(be, &prompt, messages, tools, params)?;
         return Ok(Prepared {
-            prompt: be.renderer().render(messages, tools, params.think)?,
+            prompt,
             plan: Plan::Free { tools: calls },
+            think,
         });
     };
     need_constraint("response_format")?;
@@ -2676,6 +2704,7 @@ fn prepare(
     Ok(Prepared {
         prompt: be.renderer().render_no_think(messages, tools)?,
         plan: Plan::Json { constraint, calls },
+        think: None,
     })
 }
 
@@ -2760,7 +2789,11 @@ fn run_prepared(
     // sign that anything was wrong. One `fstat` per request, on the request thread. See
     // `infr_gguf::watch` for what this can and cannot see.
     be.weights().check()?;
-    let Prepared { prompt, plan } = prepared;
+    let Prepared {
+        prompt,
+        plan,
+        think,
+    } = prepared;
     // The request's images, in marker order, for the prompt encoder (`infr_llama::media`).
     // Scoped to this call — every generate below runs on this thread.
     let _media = infr_llama::media::MediaScope::enter(params.images.clone());
@@ -2774,9 +2807,13 @@ fn run_prepared(
     // turn. Owned by this call — not installed anywhere ambient — so it cannot be observed by,
     // or leak into, any other in-flight request. The server's `cancel` (client disconnect or
     // deadline) is linked in rather than copied from a piece callback, so it also stops a
-    // prefill that has not produced a piece yet.
+    // prefill that has not produced a piece yet. The reasoning budget travels with the sampling,
+    // because the decode loop enforces it token by token.
     let req = be
-        .request_ctx(request_sampling(params))
+        .request_ctx(infr_llama::sampling::RequestSampling {
+            think,
+            ..request_sampling(params)
+        })
         .with_cancel(cancel.clone());
     // A failure that is the request's fault, as the typed error serve answers `400`; `param` is
     // the field whose constraint a backend without grammar support could not apply, `None` for an

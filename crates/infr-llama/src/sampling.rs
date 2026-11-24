@@ -109,6 +109,9 @@ pub struct RequestSampling {
     /// up to `n` most likely alternatives. `None` = no log probabilities. A request with
     /// `logprobs: true` and no `top_logprobs` sets `Some(20)`, matching llama.cpp.
     pub logprobs: Option<usize>,
+    /// A reasoning block to keep within a token budget. `None` = the request did not ask for one,
+    /// or the template has no block to bound; then the decode loop never inspects a token.
+    pub think: Option<ThinkBlock>,
 }
 
 impl Default for RequestSampling {
@@ -128,7 +131,167 @@ impl Default for RequestSampling {
             min_p: None,
             logit_bias: Vec::new(),
             logprobs: None,
+            think: None,
         }
+    }
+}
+
+/// The reasoning block a chat template opens, and the budget the request allows it.
+///
+/// The budget is enforced by the decode loop: once the tracker has seen `budget` reasoning tokens
+/// it stops sampling and emits the block's close sequence itself, one id per step. A model that
+/// closes earlier is never touched, so a budget can only shorten a block, never move its text.
+#[derive(Clone, Debug)]
+pub struct ThinkBlock {
+    /// Token ids of the close sequence (`"</think>"`, one to three ids).
+    close: Vec<u32>,
+    /// Reasoning tokens the block may spend before its close is forced. Always `> 0`.
+    budget: usize,
+    /// The knob that produced the budget, for the log line: `"low"`, `"medium"`, `"high"`,
+    /// `"minimal"` or `"exact"`.
+    level: &'static str,
+}
+
+impl ThinkBlock {
+    /// A block the decode loop bounds. `budget` is a token count; a zero budget is refused because
+    /// a caller that wants no reasoning asks for thinking to be off instead.
+    pub fn new(close: Vec<u32>, budget: usize, level: &'static str) -> Self {
+        debug_assert!(
+            budget > 0,
+            "a think budget of zero must be turned off earlier"
+        );
+        debug_assert!(!close.is_empty(), "a think block needs a close sequence");
+        Self {
+            close,
+            budget,
+            level,
+        }
+    }
+
+    /// The reasoning tokens this block may spend.
+    pub fn budget(&self) -> usize {
+        self.budget
+    }
+
+    /// A fresh tracker for one generation.
+    pub fn tracker(&self) -> ThinkTracker {
+        ThinkTracker {
+            block: self.clone(),
+            state: ThinkState::Inside { tokens: 0 },
+            announced: false,
+        }
+    }
+}
+
+/// Where a generation is relative to its reasoning block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ThinkState {
+    /// Inside the reasoning content, `tokens` reasoning tokens emitted.
+    Inside { tokens: usize },
+    /// `matched` ids of the close sequence emitted, after `tokens` reasoning tokens. `forcing`
+    /// means the budget decided them, so every remaining id follows without sampling.
+    Closing {
+        matched: usize,
+        tokens: usize,
+        forcing: bool,
+    },
+    /// The block's close sequence is complete.
+    Closed,
+}
+
+/// One generation's progress through its [`ThinkBlock`], fed one token id per decode step.
+pub struct ThinkTracker {
+    block: ThinkBlock,
+    state: ThinkState,
+    announced: bool,
+}
+
+impl ThinkTracker {
+    /// The id the decode loop must emit next, when the budget has taken the choice away from the
+    /// model: the start of the close while inside the block, then each remaining id of it.
+    pub fn forced(&self) -> Option<u32> {
+        match self.state {
+            ThinkState::Inside { tokens } if tokens >= self.block.budget => Some(self.close()[0]),
+            ThinkState::Closing {
+                matched,
+                forcing: true,
+                ..
+            } => Some(self.close()[matched]),
+            _ => None,
+        }
+    }
+
+    /// Take one emitted token. `id` is what the model sampled, or the id this tracker forced.
+    pub fn observe(&mut self, id: u32) {
+        self.state = match self.state {
+            ThinkState::Inside { tokens } => self.inside(tokens, id),
+            ThinkState::Closing {
+                matched,
+                tokens,
+                forcing,
+            } => self.closing(matched, tokens, forcing, id),
+            ThinkState::Closed => ThinkState::Closed,
+        };
+    }
+
+    fn inside(&mut self, tokens: usize, id: u32) -> ThinkState {
+        if id != self.close()[0] {
+            return ThinkState::Inside { tokens: tokens + 1 };
+        }
+        let forcing = tokens >= self.block.budget;
+        self.announce(tokens, forcing);
+        self.started(tokens, forcing)
+    }
+
+    /// The close sequence's first id arrived; a one-id close is complete right here.
+    fn started(&self, tokens: usize, forcing: bool) -> ThinkState {
+        if self.close().len() == 1 {
+            return ThinkState::Closed;
+        }
+        ThinkState::Closing {
+            matched: 1,
+            tokens,
+            forcing,
+        }
+    }
+
+    fn closing(&mut self, matched: usize, tokens: usize, forcing: bool, id: u32) -> ThinkState {
+        if id == self.close()[matched] {
+            if matched + 1 == self.close().len() {
+                return ThinkState::Closed;
+            }
+            return ThinkState::Closing {
+                matched: matched + 1,
+                tokens,
+                forcing,
+            };
+        }
+        // A close that started and did not finish was reasoning text after all, so its ids join the
+        // reasoning count. A forced id never mismatches, and if one somehow did there is no count to
+        // recover, so the block simply continues.
+        let content = tokens + matched;
+        if id == self.close()[0] {
+            return self.started(content, false);
+        }
+        ThinkState::Inside {
+            tokens: content + 1,
+        }
+    }
+
+    fn announce(&mut self, tokens: usize, forcing: bool) {
+        if forcing && !self.announced {
+            self.announced = true;
+            tracing::info!(
+                level = self.block.level,
+                limit = self.block.budget,
+                reasoning_tokens = tokens,
+                "reasoning budget spent; forcing the think block's close"
+            );
+        }
+    }
+
+    fn close(&self) -> &[u32] {
+        &self.block.close
     }
 }
 
@@ -356,10 +519,14 @@ pub(crate) fn abort_requested(req: Option<&RequestCtx>) -> bool {
 }
 
 /// Does this request need the decode loop's ordinary per-token sampling path rather than the MTP
-/// draft-verify loop? A `logit_bias` or a penalty rewrites the row, and logprobs need the whole
-/// row on the host; MTP's draft head does neither.
+/// draft-verify loop? A `logit_bias` or a penalty rewrites the row, logprobs need the whole row on
+/// the host, and a reasoning budget decides the id before sampling — MTP's draft head does none of
+/// those.
 pub(crate) fn adjusts_logits(req: Option<&RequestCtx>) -> bool {
-    req.is_some_and(|r| r.sampling().patches_logits() || r.sampling().wants_logprobs())
+    req.is_some_and(|r| {
+        let s = r.sampling();
+        s.patches_logits() || s.wants_logprobs() || s.think.is_some()
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1028,6 +1195,62 @@ mod tests {
     }
 
     use super::*;
+
+    /// A two-id close, so the tests exercise the partial-match path a `</think>` spelling can
+    /// produce.
+    fn block(budget: usize) -> ThinkBlock {
+        ThinkBlock::new(vec![9, 10], budget, "low")
+    }
+
+    /// Reasoning the model does not end itself is cut at the budget, and the close the tracker
+    /// forces is the template's own sequence, not a guess at one.
+    #[test]
+    fn budget_forces_the_close_after_exactly_the_allowed_tokens() {
+        let mut t = block(4).tracker();
+        for _ in 0..3 {
+            assert_eq!(t.forced(), None);
+            t.observe(11);
+        }
+        assert_eq!(t.forced(), None, "three of four reasoning tokens spent");
+        t.observe(11);
+        assert_eq!(t.forced(), Some(9));
+        t.observe(9);
+        assert_eq!(t.forced(), Some(10));
+        t.observe(10);
+        assert_eq!(t.forced(), None, "the block is closed");
+    }
+
+    /// A model that closes under budget keeps its own ending: no forced id, no truncation.
+    #[test]
+    fn a_natural_close_is_left_alone() {
+        let mut t = block(4).tracker();
+        for _ in 0..2 {
+            t.observe(11);
+        }
+        assert_eq!(t.forced(), None);
+        t.observe(9);
+        assert_eq!(
+            t.forced(),
+            None,
+            "closing naturally in two ids is not forced"
+        );
+        t.observe(10);
+        assert_eq!(t.forced(), None);
+    }
+
+    /// A close that started and did not finish was reasoning text after all, and the ids it spent
+    /// count against the budget rather than restarting it.
+    #[test]
+    fn an_abandoned_close_counts_as_reasoning() {
+        let mut t = block(2).tracker();
+        t.observe(9);
+        t.observe(11);
+        assert_eq!(
+            t.forced(),
+            Some(9),
+            "one reasoning token plus the close prefix spent two"
+        );
+    }
 
     fn cfg(temp: f32, seed: u64) -> RequestSampling {
         RequestSampling {

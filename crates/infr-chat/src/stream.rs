@@ -13,6 +13,96 @@ pub fn prompt_prefills_think(prompt: &str) -> bool {
     prompt.trim_end().ends_with("<think>")
 }
 
+/// The block markers a chat template writes, as they appear in a rendered prompt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ThinkMarkers {
+    /// What ends the block.
+    pub close: &'static str,
+    /// The thinking rendering ends inside the block, so there is no opener to wait for.
+    pub starts_inside: bool,
+}
+
+/// How much may follow the close marker for it to count as the template's own; beyond this, the
+/// difference between the two renderings is conversation text rather than a block marker.
+const MARKER_TAIL_CHARS: usize = 16;
+
+/// The reasoning block of a chat template, read off the same conversation rendered twice: with
+/// thinking on and with it forced off.
+///
+/// `None` when no close marker sits at the end of the no-think rendering, or when one sits at the
+/// end of the thinking rendering too (the template already closed the block, so no reply text
+/// belongs inside it). That `None` is what leaves a budget inert on a template with no reasoning
+/// block, instead of guessing one.
+pub fn think_markers(thinking: &str, no_think: &str) -> Option<ThinkMarkers> {
+    let close = [crate::tools::THINK_CLOSE, crate::tools::FINAL_MARK]
+        .into_iter()
+        .find(|marker| ends_with_marker(no_think, marker))?;
+    if ends_with_marker(thinking, close) {
+        return None;
+    }
+    Some(ThinkMarkers {
+        close,
+        starts_inside: prompt_prefills_think(thinking),
+    })
+}
+
+fn ends_with_marker(prompt: &str, marker: &str) -> bool {
+    prompt
+        .rsplit_once(marker)
+        .is_some_and(|(_, tail)| tail.chars().count() <= MARKER_TAIL_CHARS)
+}
+
+#[cfg(test)]
+mod think_marker_tests {
+    use super::*;
+
+    /// A template that leaves the block to the model closes it in the no-think rendering, and the
+    /// close it writes there is the sequence a budget has to force.
+    #[test]
+    fn the_close_comes_from_the_no_think_rendering() {
+        let markers = think_markers(
+            "<|im_start|>assistant\n",
+            "<|im_start|>assistant\n</think>\n\n",
+        )
+        .expect("the no-think rendering closes the block");
+        assert_eq!(markers.close, "</think>");
+        assert!(!markers.starts_inside);
+    }
+
+    /// A prefilled block has no opener to wait for: the model's first token is already reasoning.
+    #[test]
+    fn a_prefilled_block_starts_inside() {
+        let markers = think_markers(
+            "<|im_start|>assistant\n<think>",
+            "<|im_start|>assistant\n</think>\n\n",
+        )
+        .expect("a prefilled block still shows its close");
+        assert!(markers.starts_inside);
+    }
+
+    /// A template with no reasoning block leaves the budget inert rather than guessing one.
+    #[test]
+    fn no_close_marker_means_no_block() {
+        assert_eq!(think_markers("a\nb", "a\nb"), None);
+    }
+
+    /// A template that closes the block even with thinking on has no block left to bound, and
+    /// forcing the close into the answer would only corrupt it.
+    #[test]
+    fn a_block_the_template_already_closed_is_not_budgeted() {
+        let rendered = "<|im_start|>assistant\n</think>\n\n";
+        assert_eq!(think_markers(rendered, rendered), None);
+    }
+
+    /// The channel format's final-answer marker is a close a budget can force just as well.
+    #[test]
+    fn the_channel_marker_closes_the_block() {
+        let markers = think_markers("<|channel>thought", "<channel|>")
+            .expect("the channel format closes on its final-answer marker");
+        assert_eq!(markers.close, "<channel|>");
+    }
+}
+
 /// A streamed piece of a response.
 #[derive(Clone, Debug)]
 pub enum Delta {

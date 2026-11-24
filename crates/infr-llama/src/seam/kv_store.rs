@@ -225,6 +225,34 @@ fn write_block(w: &mut impl Write, h: &mut Fnv, b: &Block) -> std::io::Result<()
     put_u64(w, h, b.used)
 }
 
+/// Write one stored block's rows into a sliding-window ring at the block's own position, wrapping
+/// at `rcap` so the newest rows end up where the window reads them.
+#[allow(clippy::too_many_arguments)]
+fn write_ring_block(
+    be: &dyn Backend,
+    dst: &dyn Buffer,
+    fmt: DType,
+    row: usize,
+    rcap: usize,
+    start: usize,
+    len: usize,
+    bytes: &[u8],
+) -> Result<()> {
+    if len == 0 || rcap == 0 {
+        return Ok(());
+    }
+    let first = start % rcap;
+    let head = len.min(rcap - first);
+    let hb = kv_fmt_bytes(fmt, head * row);
+    be.upload_at(dst, kv_fmt_bytes(fmt, first * row), &bytes[..hb])?;
+    if head < len {
+        let tail = len - head;
+        let tb = kv_fmt_bytes(fmt, tail * row);
+        be.upload_at(dst, 0, &bytes[hb..hb + tb])?;
+    }
+    Ok(())
+}
+
 fn read_block(r: &mut impl Read, h: &mut Fnv) -> Result<Block> {
     let id = get_u64(r, h)?;
     let len = get_u32(r, h)? as usize;
@@ -855,8 +883,10 @@ impl KvPrefixStore {
     /// Copy the longest stored run of blocks into `kv` (a device upload per layer) and mark those
     /// tokens materialized. Returns the number of tokens restored.
     ///
-    /// The destination must be a ring that has not wrapped: a wrapped SWA ring has recycled the
-    /// early rows a block holds. An unwrapped ring is fine up to its row count.
+    /// A sliding-window ring is written at each block's own ring position (`start % rows`), so a
+    /// prefix longer than the ring still seeds it: the newest blocks overwrite the oldest, which
+    /// is exactly the window attention will read. Only a destination whose own cache already
+    /// wrapped is refused — its rows no longer describe its `cached`.
     pub(crate) fn restore(
         &mut self,
         be: &dyn Backend,
@@ -881,7 +911,6 @@ impl KvPrefixStore {
                     if kv.cached.len() > rows {
                         return Ok(0);
                     }
-                    p = p.min(rows);
                 }
             }
         }
@@ -915,6 +944,40 @@ impl KvPrefixStore {
                 continue;
             }
             let (k_row, v_row) = kv_row_elems(cfg, l);
+            if kv.kv_ring && cfg.is_swa_layer(l) {
+                let rcap = kv_rows_at(cfg, l, kv.max_ctx, true, ubatch_rows(ec), be.kv_row_align());
+                let mut start = 0usize;
+                for i in &keep {
+                    let b = &self.blocks[*i];
+                    // A block captured before the ring's window was recycled has no rows.
+                    if !b.k[l].is_empty() {
+                        write_ring_block(
+                            be,
+                            kv.kbufs[l].as_ref(),
+                            kv.k_fmt,
+                            k_row,
+                            rcap,
+                            start,
+                            b.len,
+                            &b.k[l],
+                        )?;
+                        if v_row > 0 && !b.v[l].is_empty() {
+                            write_ring_block(
+                                be,
+                                kv.vbufs[l].as_ref(),
+                                kv.v_fmt,
+                                v_row,
+                                rcap,
+                                start,
+                                b.len,
+                                &b.v[l],
+                            )?;
+                        }
+                    }
+                    start += b.len;
+                }
+                continue;
+            }
             let kb = kv_fmt_bytes(kv.k_fmt, n * k_row);
             let mut buf = Vec::with_capacity(kb);
             for i in &keep {
@@ -988,6 +1051,13 @@ impl KvPrefixStore {
             return Ok(0);
         }
         let p = upto.min(kv.cached.len()).min(kv.max_ctx);
+        tracing::debug!(
+            upto,
+            cached = kv.cached.len(),
+            p,
+            snaps = kv.recurrent_snaps.len(),
+            "kv store: capture plan"
+        );
         if p < MIN_PREFIX_TOKENS {
             return Ok(0);
         }
@@ -1023,7 +1093,10 @@ impl KvPrefixStore {
         while start < p {
             let len = BLOCK_TOKENS.min(p - start);
             id = block_id(id, &tokens[start..start + len]);
-            if start >= safe_start && self.find(id, &tokens[start..start + len]).is_none() {
+            // Keep the chain complete from token 0: a block whose ring rows were recycled is
+            // still stored (with its tokens and any full-attention rows), so `matched` can walk
+            // across it to the newest snapshot.
+            if self.find(id, &tokens[start..start + len]).is_none() {
                 missing.push((start, len, id));
             }
             start += len;
@@ -1049,7 +1122,7 @@ impl KvPrefixStore {
                 dirty: true,
             });
         }
-        let filled = self.fill_from_device(be, cfg, kv, p, &missing, base);
+        let filled = self.fill_from_device(be, cfg, kv, p, safe_start, &missing, base);
         if let Err(e) = filled {
             self.blocks.truncate(base);
             return Err(e);
@@ -1088,6 +1161,11 @@ impl KvPrefixStore {
                 self.blocks[i].bytes += snap.bytes;
                 self.blocks[i].snap = Some(snap.clone());
                 self.blocks[i].dirty = true;
+                tracing::debug!(
+                    pos = snap.pos,
+                    block = i,
+                    "kv store: attached a recurrent snapshot"
+                );
             }
         }
     }
@@ -1114,6 +1192,7 @@ impl KvPrefixStore {
         cfg: &Config,
         kv: &SeamKv,
         p: usize,
+        safe_start: usize,
         missing: &[(usize, usize, u64)],
         base: usize,
     ) -> Result<()> {
@@ -1122,6 +1201,55 @@ impl KvPrefixStore {
                 continue;
             }
             let (k_row, v_row) = kv_row_elems(cfg, l);
+            // A sliding-window ring holds only its last `rows` positions, at `pos % rows`; the
+            // bulk read below would run past its buffer once the conversation is longer than the
+            // window.
+            if kv.kv_ring && cfg.is_swa_layer(l) {
+                let rcap = kv_rows_at(cfg, l, kv.max_ctx, true, kv.ubatch, be.kv_row_align());
+                for (j, (start, len, _)) in missing.iter().enumerate() {
+                    if *start < safe_start {
+                        continue;
+                    }
+                    let first = start % rcap;
+                    let n1 = (*len).min(rcap - first);
+                    let mut kslice = vec![0u8; kv_fmt_bytes(kv.k_fmt, *len * k_row)];
+                    be.download_at(
+                        kv.kbufs[l].as_ref(),
+                        kv_fmt_bytes(kv.k_fmt, first * k_row),
+                        &mut kslice[..kv_fmt_bytes(kv.k_fmt, n1 * k_row)],
+                    )?;
+                    if n1 < *len {
+                        be.download_at(
+                            kv.kbufs[l].as_ref(),
+                            0,
+                            &mut kslice[kv_fmt_bytes(kv.k_fmt, n1 * k_row)..],
+                        )?;
+                    }
+                    let vslice = if v_row > 0 {
+                        let mut buf = vec![0u8; kv_fmt_bytes(kv.v_fmt, *len * v_row)];
+                        be.download_at(
+                            kv.vbufs[l].as_ref(),
+                            kv_fmt_bytes(kv.v_fmt, first * v_row),
+                            &mut buf[..kv_fmt_bytes(kv.v_fmt, n1 * v_row)],
+                        )?;
+                        if n1 < *len {
+                            be.download_at(
+                                kv.vbufs[l].as_ref(),
+                                0,
+                                &mut buf[kv_fmt_bytes(kv.v_fmt, n1 * v_row)..],
+                            )?;
+                        }
+                        buf
+                    } else {
+                        Vec::new()
+                    };
+                    let b = &mut self.blocks[base + j];
+                    b.bytes += kslice.len() + vslice.len();
+                    b.k[l] = kslice;
+                    b.v[l] = vslice;
+                }
+                continue;
+            }
             let mut kbuf = vec![0u8; kv_fmt_bytes(kv.k_fmt, p * k_row)];
             Self::read_rows(
                 be,
@@ -1436,6 +1564,28 @@ mod tests {
         tier.rewrite(key, DType::F16, DType::F16, &[])
             .expect("clear");
         assert!(tier.load(key).expect("load").is_none(), "nothing left");
+    }
+
+    /// A stored block lands at its own ring position and wraps at the capacity, so a prefix
+    /// longer than the ring still leaves the newest rows where attention reads them.
+    #[test]
+    fn a_ring_block_wraps_at_its_capacity() {
+        use infr_core::backend::BufferUsage;
+        let be = infr_cpu::CpuBackend::new();
+        let buf = be.alloc(4 * 512, BufferUsage::KvCache).expect("buffer");
+        let mut rows = Vec::with_capacity(300 * 4);
+        for i in 0..300u32 {
+            rows.extend_from_slice(&i.to_le_bytes());
+        }
+        write_ring_block(&be, buf.as_ref(), DType::F32, 1, 512, 400, 300, &rows).expect("write");
+        let mut out = vec![0u8; 4 * 512];
+        be.download(buf.as_ref(), &mut out).expect("read");
+        let at = |row: usize| u32::from_le_bytes(out[row * 4..row * 4 + 4].try_into().unwrap());
+        assert_eq!(at(400), 0);
+        assert_eq!(at(511), 111);
+        assert_eq!(at(0), 112);
+        assert_eq!(at(187), 299);
+        assert_eq!(at(188), 0, "nothing past the block");
     }
 
     fn temp_path(name: &str) -> std::path::PathBuf {

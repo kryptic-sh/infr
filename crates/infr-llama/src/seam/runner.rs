@@ -6562,6 +6562,8 @@ pub(crate) fn generate_dense_backend_bound(
                                     error = %e,
                                     "recurrent-state snapshot failed; this boundary re-prefills"
                                 );
+                            } else {
+                                tracing::debug!(pos = cend, "recurrent-state snapshot taken");
                             }
                         }
                         if cend >= prefill_next_report && prompt.len().saturating_sub(start) >= 4096

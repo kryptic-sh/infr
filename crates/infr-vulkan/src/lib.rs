@@ -1540,6 +1540,23 @@ struct BdaBlockHandle {
     base_addr: u64,
 }
 
+/// How a resident weight load is charged against the device's budget beyond its tensors' bytes,
+/// from [`VulkanBackend::weight_load_cost`]. The arena rounds each upload up to `align` and places
+/// it first-fit in a block; an upload of at least `block_min` bytes gets a block of exactly its
+/// size, and a smaller one shares blocks of `block_min` bytes, so the blocks the small uploads open
+/// are never fewer than their rounded total divided by `block_min`, rounded up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WeightLoadCost {
+    /// The byte alignment of every upload within its block.
+    pub align: u64,
+    /// The size of a block opened by an upload smaller than it.
+    pub block_min: u64,
+    /// The upload staging ring's bytes where the memory it is allocated in counts against the
+    /// budget [`VulkanBackend::vram`] reports, else `0`. It is allocated at the first weight upload
+    /// and freed when the weight-load scope (`Backend::weight_progress`) ends.
+    pub staging: u64,
+}
+
 /// One [`BdaWeightArena`] block: the shared keepalive handle plus its live bump cursor. Split apart
 /// from `BdaBlockHandle` so the cursor can be mutated (behind `VulkanBackend::bda_weight_arena`'s
 /// `Mutex`) while sub-tensors hold their own `Arc` clone of the handle without needing `&mut`
@@ -4111,6 +4128,38 @@ impl VulkanBackend {
     /// the room only before this backend has allocated — which is when placement runs.
     pub fn alloc_room(&self) -> u64 {
         self.vram().alloc_room()
+    }
+
+    /// What a resident weight load takes from [`alloc_room`](Self::alloc_room) besides the
+    /// tensors' own bytes, as this backend can say before the load: how the resident-BDA arena
+    /// places them (see [`WeightLoadCost`]) and the upload staging ring live while they are copied.
+    pub fn weight_load_cost(&self) -> WeightLoadCost {
+        let mp = unsafe {
+            self.shared
+                .instance
+                .get_physical_device_memory_properties(self.shared.physical_device)
+        };
+        // The ring is `MemoryLocation::CpuToGpu`, which gpu-allocator places in a host-visible,
+        // coherent, device-local type when the device has one with room, else in a host heap.
+        // `vram_info` counts every heap on a unified-memory part and the device-local ones on a
+        // discrete card, so either way a ring in that type is charged against the budget and is
+        // priced here; one sent to a host heap by a full device-local type is not foreseen.
+        let staging_type = vk::MemoryPropertyFlags::HOST_VISIBLE
+            | vk::MemoryPropertyFlags::HOST_COHERENT
+            | vk::MemoryPropertyFlags::DEVICE_LOCAL;
+        let counted = self.shared.caps.unified_memory
+            || mp.memory_types[..mp.memory_type_count as usize]
+                .iter()
+                .any(|t| t.property_flags.contains(staging_type));
+        WeightLoadCost {
+            align: BDA_WEIGHT_ALIGN,
+            block_min: BDA_BLOCK_MIN.min(self.shared.max_mem_alloc_size),
+            staging: if counted {
+                (RING_SLOTS * RING_SLOT_BYTES) as u64
+            } else {
+                0
+            },
+        }
     }
 
     /// Live `VkDeviceMemory` objects this backend holds, exactly: every gpu-allocator block

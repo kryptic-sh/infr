@@ -2040,7 +2040,9 @@ const CTX_FIT_SEARCH_CAP: usize = 1 << 22;
 
 /// The EXACT largest context whose KV cache + activation reserve fit `available` bytes alongside
 /// `weights` — the arithmetic half of [`SeamModel::kv_fit_ctx_fmt`], split out so it is testable
-/// without a GPU (`kv_fit_*` in `seam_helper_tests`).
+/// without a GPU (`kv_fit_*` in `seam_helper_tests`). `weights` is everything the device holds
+/// beside the cache and the reserve: `SeamModel::preload_held` passes the weights as the arena
+/// commits them, the upload staging and [`POST_KV_DEVICE_RESERVE`].
 ///
 /// Two things make it exact where the old estimator was not:
 ///
@@ -2094,11 +2096,14 @@ pub(crate) fn kv_fit_ctx_for(
 /// the largest context whose KV cache plus its activation reserve fit `budget` bytes.
 ///
 /// Split out because the two callers know the weight bytes with very different confidence. Before
-/// the load, [`kv_fit_ctx_for`] can only subtract an ESTIMATE of them (`weight_footprint`, which
-/// prices tensor bytes and not the arena block tails they land in). After the load, the runner
-/// asks the device what is left (`Backend::device_alloc_room`) and passes that here — a budget with
-/// the tails, the retained staging and the driver's own memory already netted out, because they
-/// have been allocated. Same arithmetic either way; only the confidence in the input differs.
+/// the load, [`kv_fit_ctx_for`] can only subtract an ESTIMATE of them (for a dense model
+/// `SeamModel::preload_held`: the arena's commitment at the least ([`weight_arena_floor`]), the
+/// upload staging and [`POST_KV_DEVICE_RESERVE`], but not the tails first-fit strands past that
+/// floor nor the driver's own memory; for an MoE model the bare `weight_footprint`). After the
+/// load, the runner asks the device what is left (`Backend::device_alloc_room`) and passes that
+/// here — a budget with the tails, the retained staging and the driver's own memory already
+/// netted out, because they have been allocated. Same arithmetic either way; only the confidence
+/// in the input differs.
 ///
 /// `moe_reserve` is the MoE arm's flat headroom in place of the dense activation reserve (`None`
 /// for a dense model).
@@ -2147,6 +2152,66 @@ pub(crate) fn kv_fit_ctx_in_budget(
     Some(lo)
 }
 
+/// The units a fully resident weight load uploads, in bytes: each tensor at the bytes the runner
+/// uploads it as ([`crate::weights::tensor_resident_bytes`]), except that a layer's q/k/v
+/// projections, and its gate/up projections, are one unit each wherever the runner uploads them
+/// concatenated ([`runner::fuse_qkv_decision`], [`runner::fuse_gu_decision`]). Not covered: the
+/// tensors the runner widens to f32 by name (B193) count at their file size, and the small
+/// ones-vectors some architectures upload count not at all.
+pub(crate) fn weight_upload_units(
+    g: &Gguf,
+    cfg: &Config,
+    ec: &EngineConfig,
+    combined_gu: bool,
+) -> Vec<u64> {
+    let fuse_qkv = runner::fuse_qkv_decision(combined_gu, g, cfg, ec);
+    let fuse_gu = runner::fuse_gu_decision(combined_gu, g, cfg);
+    // The fused unit a tensor belongs to, keyed by its layer and which concatenation it joins.
+    let fused_unit = |name: &str| -> Option<(usize, bool)> {
+        let (layer, tensor) = name.strip_prefix("blk.")?.split_once('.')?;
+        let layer = layer.parse().ok()?;
+        match tensor {
+            "attn_q.weight" | "attn_k.weight" | "attn_v.weight" if fuse_qkv => Some((layer, false)),
+            "ffn_gate.weight" | "ffn_up.weight" if fuse_gu => Some((layer, true)),
+            _ => None,
+        }
+    };
+    let mut units = Vec::new();
+    let mut fused: std::collections::BTreeMap<(usize, bool), u64> = Default::default();
+    for t in g.tensors() {
+        let numel: usize = t.shape.iter().product();
+        let bytes = crate::weights::tensor_resident_bytes(t.dtype, numel, t.nbytes);
+        match fused_unit(&t.name) {
+            Some(key) => *fused.entry(key).or_default() += bytes,
+            None => units.push(bytes),
+        }
+    }
+    units.extend(fused.into_values());
+    units
+}
+
+/// The least device memory the resident-BDA arena can commit for upload units of `units` bytes,
+/// by the placement rule [`infr_vulkan::WeightLoadCost`] documents: every unit rounded up to the
+/// arena's alignment, a unit of at least a block taking a block of exactly its size, and the rest
+/// sharing blocks, of which there are never fewer than their rounded total fills. A LOWER bound
+/// on what the arena commits for the units it is given, whatever order they arrive in: first-fit
+/// can strand a block's tail and open more blocks, never fewer. The units themselves
+/// ([`weight_upload_units`]) can include tensors a run never uploads — `token_embd` when the GPU
+/// embedding gather is off on an untied model, gemma-4 E2B's `per_layer_token_embd` when its
+/// on-device gather is off — which over-counts those, the safe direction for a fit.
+pub(crate) fn weight_arena_floor(units: &[u64], cost: infr_vulkan::WeightLoadCost) -> u64 {
+    let (mut whole, mut shared) = (0u64, 0u64);
+    for &unit in units {
+        let rounded = unit.max(1).next_multiple_of(cost.align);
+        if rounded >= cost.block_min {
+            whole += rounded;
+        } else {
+            shared += rounded;
+        }
+    }
+    whole + shared.div_ceil(cost.block_min) * cost.block_min
+}
+
 /// Device memory a live session commits AFTER its KV cache is allocated, which therefore has to be
 /// held back from [`reclamp_ctx_to_live_room`]'s budget: the compute pipelines, descriptor pools
 /// and command buffers the driver builds while recording the first forwards. It is the driver's
@@ -2170,20 +2235,24 @@ pub(crate) const POST_KV_DEVICE_RESERVE: u64 = 256 * 1024 * 1024;
 /// resident — the runner's cold init calls this between the weight upload and the KV allocation.
 ///
 /// **Why this exists at all.** Every pre-load estimate of "will this fit?" has to model the weight
-/// bytes, and the model is wrong in a direction that hurts: `weight_footprint` sums tensor bytes,
-/// while the resident-BDA arena commits those tensors into ≥64 MiB blocks whose tails nobody
-/// counts (measured: **+2.20%** on gemma-4-31B UD-Q5_K_XL = 481 MiB, +2.43% on gemma-3-12b,
-/// +1.16% on Qwen3-14B Q4_K_M), and neither the retained upload staging nor the driver's own
-/// memory appears in any footprint. At THIS point none of that has to be modelled: the weights,
-/// the tails, the staging and the driver's memory so far are all allocated, so the live budget
-/// query prices them exactly. What remains predicted is the activation reserve
-/// ([`dense_act_reserve_at`]) and [`POST_KV_DEVICE_RESERVE`].
+/// bytes. The fit before the load prices the arena's block rounding as a lower bound
+/// ([`weight_arena_floor`]) and the upload staging, but not what first-fit strands beyond that
+/// bound nor the driver's own memory. The arena's tails were measured at **+2.20%** of the
+/// footprint on gemma-4-31B UD-Q5_K_XL (481 MiB), +2.43% on gemma-3-12b and +1.16% on Qwen3-14B
+/// Q4_K_M; how much of that the bound covers was not measured. At THIS point none of that has to
+/// be modelled: the weights, the tails, the staging and the driver's memory so far are all
+/// allocated, so the live budget query prices them exactly. What remains predicted is the
+/// activation reserve ([`dense_act_reserve_at`]) and [`POST_KV_DEVICE_RESERVE`].
 ///
-/// **Only ever shrinks**, and only a context the SESSION chose. A user-pinned `--ctx`/`INFR_CTX`
-/// is documented as taken verbatim (never clamped), so it is warned about and honored —
-/// [`refuse_unallocatable_kv`] refuses one whose KV cache alone cannot land, and the alloc-time
-/// VRAM guard stays the backstop for the rest. Returns `want_ctx` unchanged on a backend with no
-/// budget to report (`Backend::device_alloc_room` → `None`: CPU, Metal today).
+/// **Only ever shrinks**, only a context the SESSION chose, and never below the minimum
+/// ([`post_load_ctx`] has the rule): a window that would fall below it is served in q8_0 when the
+/// auto-q8 policy allows it, which re-pins the session's KV format before anything is allocated
+/// and is why the formats are returned, else spilled at the minimum under `kv.overflow`, else
+/// refused with the numbers. A user-pinned `--ctx`/`INFR_CTX` is documented as taken verbatim
+/// (never clamped), so it is warned about and honored — [`refuse_unallocatable_kv`] refuses one
+/// whose KV cache alone cannot land, and the alloc-time VRAM guard stays the backstop for the
+/// rest. Returns the window and formats unchanged on a backend with no budget to report
+/// (`Backend::device_alloc_room` → `None`: CPU, Metal today).
 ///
 /// May also LOWER the pinned prefill chunk ([`repin_ubatch_lower`]) when a shorter one serves more
 /// context — the same trade the pre-load sweep makes, retaken with the weight bytes known.
@@ -2194,41 +2263,57 @@ pub(crate) fn reclamp_ctx_to_live_room(
     want_ctx: usize,
     k_fmt: DType,
     v_fmt: DType,
-) -> AResult<usize> {
+) -> AResult<(usize, DType, DType)> {
     let Some(room) = be.device_alloc_room() else {
-        return Ok(want_ctx);
+        return Ok((want_ctx, k_fmt, v_fmt));
     };
     let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
     let budget = room.saturating_sub(POST_KV_DEVICE_RESERVE);
     let align = KvAlign::of(be);
     // Walk the chunk ladder HERE too, and price each rung on its own: a shorter chunk shrinks both
     // the activation reserve and the SWA ring, so it buys context, and the rung the pre-load sweep
-    // pinned was chosen against weight bytes that turned out to be ~2% light. Pricing only the
-    // pinned rung leaves that context on the floor (measured on gemma-4-31B: 10 440 tokens at the
-    // pinned 256-row chunk against 15 440 at 128). Tallest-first, so a rung is only lowered when
-    // the taller one genuinely cannot serve the window.
+    // pinned was chosen against an estimate of the weight bytes. Pricing only the pinned rung
+    // leaves that context on the floor (measured on gemma-4-31B: 10 440 tokens at the pinned
+    // 256-row chunk against 15 440 at 128). Tallest-first, so a rung is only lowered when the
+    // taller one genuinely cannot serve the window.
     let cands = ubatch_candidates(ec);
     // MoE: the pager's arenas are already allocated by the binder at this point, so the live room
     // has them netted out and the flat `total/12` stand-in would double-count. The dense reserve
     // is what an MoE forward's activations actually need beside them.
-    let at = |ub: usize| kv_fit_ctx_in_budget(cfg, ec, budget, None, &[ub], align, k_fmt, v_fmt);
-    let Some(_) = at(cands[0]) else {
-        return Ok(want_ctx); // pure recurrent-state arch: no per-token KV to size.
+    let at = |ub: usize, k: DType, v: DType| {
+        kv_fit_ctx_in_budget(cfg, ec, budget, None, &[ub], align, k, v)
     };
-    // The tallest rung that serves the whole window, else the rung that serves the most of it.
-    let (chunk, fit) = cands
-        .iter()
-        .map(|&ub| (ub, at(ub).unwrap_or(0)))
-        .find(|&(_, fit)| fit >= want_ctx)
-        .unwrap_or_else(|| {
-            cands
-                .iter()
-                .map(|&ub| (ub, at(ub).unwrap_or(0)))
+    // The tallest rung that serves the whole window, else the rung that serves the most of it:
+    // `(chunk, fit)` for one format pair, or `None` for a pure recurrent-state arch, which has no
+    // per-token KV to size.
+    let walk = |k: DType, v: DType| -> Option<(usize, usize)> {
+        at(cands[0], k, v)?;
+        let fits = || cands.iter().map(|&ub| (ub, at(ub, k, v).unwrap_or(0)));
+        Some(fits().find(|&(_, fit)| fit >= want_ctx).unwrap_or_else(|| {
+            fits()
                 .max_by_key(|&(ub, fit)| (fit, ub))
                 .expect("ubatch_candidates is never empty")
-        });
-    // Lower the pinned height BEFORE the KV buffers below are sized: the ring is `window + chunk`
-    // rows, and the reserve this fit was priced with is that height's.
+        }))
+    };
+    let Some((chunk, fit)) = walk(k_fmt, v_fmt) else {
+        return Ok((want_ctx, k_fmt, v_fmt));
+    };
+    let explicit = ec.device.ctx.is_some();
+    // q8_0 is tried only where the pre-load ladder may pick it on its own (`may_auto_q8`) and the
+    // runner reads a q8_0 pin (`parse_kv_fmt`'s placement arm is Vulkan-only).
+    let q8_allowed =
+        be.name() == "vulkan" && (k_fmt, v_fmt) == (DType::F16, DType::F16) && may_auto_q8(cfg, ec);
+    let mut q8_walk = None;
+    let decision = post_load_ctx(want_ctx, explicit, ec.kv.overflow, fit, || {
+        q8_walk = q8_allowed.then(|| walk(DType::Q8_0, DType::Q8_0)).flatten();
+        q8_walk.map(|(_, fit)| fit)
+    });
+    // The chunk the chosen cache was priced at. Lowered BEFORE the KV buffers are sized: the ring
+    // is `window + chunk` rows, and the reserve the fit was priced with is that height's.
+    let chunk = match (decision, q8_walk) {
+        (PostLoadCtx::ServeQ8(_), Some((q8_chunk, _))) => q8_chunk,
+        _ => chunk,
+    };
     if chunk < ubatch_rows(ec) {
         repin_ubatch_lower(chunk);
     }
@@ -2242,55 +2327,156 @@ pub(crate) fn reclamp_ctx_to_live_room(
         ubatch,
         want_ctx,
         fit,
+        ?decision,
         "ctx fit against the live device room"
     );
-    if fit >= want_ctx {
-        return Ok(want_ctx);
+    match decision {
+        PostLoadCtx::Serve(ctx) if ctx == want_ctx => {
+            if fit < want_ctx {
+                tracing::warn!(
+                    requested_ctx = want_ctx,
+                    fits_ctx = fit,
+                    "ctx: only {fit} tokens fit the {:.2} GiB the device reports free after the \
+                     weights, but the context was set explicitly — honoring it. The allocation \
+                     guard will fail this session if it really does not fit; lower INFR_CTX/--ctx \
+                     to pick a window that does.",
+                    gib(room),
+                );
+            }
+            Ok((want_ctx, k_fmt, v_fmt))
+        }
+        PostLoadCtx::Serve(ctx) => {
+            tracing::warn!(
+                requested_ctx = want_ctx,
+                fits_ctx = ctx,
+                "ctx clamp (measured): {want_ctx} -> {ctx} tokens against the {:.2} GiB the device \
+                 reports free after the weights are resident (KV {:.2} GiB + activation reserve \
+                 {:.2} GiB at a {ubatch}-row chunk, minus {:.2} GiB held for the driver's own \
+                 later allocations) — the pre-load estimate prices the weights' arena and staging \
+                 but not the driver's own memory; set INFR_CTX to override",
+                gib(room),
+                gib(kv_bytes_estimate_fmt(cfg, ctx, ring, ubatch, align, k_fmt, v_fmt)),
+                gib(dense_act_reserve_at(cfg, ctx, ubatch)),
+                gib(POST_KV_DEVICE_RESERVE),
+            );
+            Ok((ctx, k_fmt, v_fmt))
+        }
+        PostLoadCtx::ServeQ8(ctx) => {
+            // Under the session's placement scope, so every later call of this session reads q8_0
+            // too (`parse_kv_fmt`); nothing is allocated in either format yet.
+            pin_kv_auto_q8();
+            tracing::warn!(
+                requested_ctx = want_ctx,
+                f16_fit_ctx = fit,
+                q8_fit_ctx = ctx,
+                kv_dtype = "q8_0",
+                "kv auto-quant (measured): q8_0 KV cache — after the weights an f16 cache leaves \
+                 only {fit} tokens of context, below the usable minimum; serving {ctx} tokens in \
+                 q8_0 (decode is ~10-16% slower on q8). Set INFR_KV_TYPE_K/V=f16 to force f16."
+            );
+            Ok((ctx, DType::Q8_0, DType::Q8_0))
+        }
+        PostLoadCtx::Spill(ctx) => {
+            tracing::warn!(
+                requested_ctx = want_ctx,
+                fits_ctx = fit,
+                "ctx overflow (measured): only {fit} tokens fit the {:.2} GiB the device reports \
+                 free after the weights; keeping a {ctx}-token context, with the part of its KV \
+                 cache that does not fit in VRAM placed in system RAM (INFR_KV_OVERFLOW) and read \
+                 over PCIe",
+                gib(room),
+            );
+            Ok((ctx, k_fmt, v_fmt))
+        }
+        PostLoadCtx::Refuse => {
+            let floor = want_ctx.min(MIN_SESSION_CTX);
+            let kv = kv_bytes_estimate_fmt(cfg, floor, ring, ubatch, align, k_fmt, v_fmt);
+            let act = dense_act_reserve_at(cfg, floor, ubatch);
+            let need = kv + act + POST_KV_DEVICE_RESERVE;
+            Err(anyhow!(
+                "this model does not fit the device's free memory: after its weights are resident \
+                 the device reports {:.2} GiB allocatable, and the smallest usable context, \
+                 {floor} tokens, needs {:.2} GiB ({:.2} GiB of {k_fmt:?}/{v_fmt:?} KV cache, \
+                 {:.2} GiB of activations at a {ubatch}-row chunk, and {:.2} GiB held for the \
+                 driver's own later allocations), {:.2} GiB more than is left. What fits: {fit} \
+                 tokens in {k_fmt:?}/{v_fmt:?}{}. Free device memory held by other applications, \
+                 ask for a smaller window (--ctx N / INFR_CTX=N), {}use INFR_KV_OVERFLOW=1 to \
+                 place the cache in system RAM, cap the expert cache (INFR_CACHE / \
+                 paging.cache), or use a smaller quant of the model.",
+                gib(room),
+                gib(need),
+                gib(kv),
+                gib(act),
+                gib(POST_KV_DEVICE_RESERVE),
+                gib(need.saturating_sub(room)),
+                match q8_walk {
+                    Some((_, q8)) => format!(", {q8} in q8_0"),
+                    None => String::new(),
+                },
+                if q8_walk.is_none() && (k_fmt, v_fmt) != (DType::Q8_0, DType::Q8_0) {
+                    "try a q8_0 cache (INFR_KV_TYPE_K=q8_0 INFR_KV_TYPE_V=q8_0), "
+                } else {
+                    ""
+                },
+            ))
+        }
     }
-    if ec.device.ctx.is_some() {
-        tracing::warn!(
-            requested_ctx = want_ctx,
-            fits_ctx = fit,
-            "ctx: only {fit} tokens fit the {:.2} GiB the device reports free after the weights, \
-             but the context was set explicitly — honoring it. The allocation guard will fail \
-             this session if it really does not fit; lower INFR_CTX/--ctx to pick a window that \
-             does.",
-            gib(room),
-        );
-        return Ok(want_ctx);
+}
+
+/// What the post-load re-clamp ([`reclamp_ctx_to_live_room`]) does with a session's window, from
+/// the fits alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PostLoadCtx {
+    /// Serve this many tokens in the session's formats: the window asked for when it fits or was
+    /// set explicitly, else the largest that fits.
+    Serve(usize),
+    /// Serve this many tokens with a q8_0 cache, where the session's own formats leave less than
+    /// the minimum and q8_0 does not.
+    ServeQ8(usize),
+    /// Keep the minimum with the part of the cache that does not fit in system RAM
+    /// (`kv.overflow`).
+    Spill(usize),
+    /// Nothing at or above the minimum fits.
+    Refuse,
+}
+
+/// The rule [`reclamp_ctx_to_live_room`] applies once the weights are resident, given `fit`, the
+/// largest window the session's formats hold now, and `q8_fit`, asked only when needed: the q8_0
+/// cache's fit where the auto-q8 policy allows q8_0 for this session, else `None`.
+///
+/// A window that fits, or that the user set (`explicit`, taken verbatim), is served as asked. Else
+/// it is cut to the fit, but never below the minimum: `MIN_SESSION_CTX`, or the window itself when
+/// it asked for less. Below that, a q8_0 cache that holds the minimum is served at what it holds,
+/// up to the window, as the pre-load clamp's rung does; then `kv.overflow` keeps the minimum with
+/// the cache spilled (B62); then it is refused.
+pub(crate) fn post_load_ctx(
+    want: usize,
+    explicit: bool,
+    overflow: bool,
+    fit: usize,
+    q8_fit: impl FnOnce() -> Option<usize>,
+) -> PostLoadCtx {
+    if fit >= want || explicit {
+        return PostLoadCtx::Serve(want);
     }
-    if fit == 0 {
-        // Not one token of context fits: say so with the measured numbers, rather than let the
-        // request fail later as a context overflow against a capacity of 0.
-        let floor = dense_act_reserve_at(cfg, 1, ubatch)
-            + kv_bytes_estimate_fmt(cfg, 1, ring, ubatch, align, k_fmt, v_fmt);
-        return Err(anyhow!(
-            "this model does not fit the device's free memory: after its weights are resident the \
-             device reports {:.2} GiB allocatable, and even a one-token context needs {:.2} GiB \
-             ({:.2} GiB of KV and activation reserve at a {ubatch}-row chunk, plus {:.2} GiB held \
-             for the driver's own later allocations). Free device memory held by other \
-             applications, cap the expert cache (INFR_CACHE / paging.cache), or use a smaller \
-             quant of the model.",
-            gib(room),
-            gib(floor + POST_KV_DEVICE_RESERVE),
-            gib(floor),
-            gib(POST_KV_DEVICE_RESERVE),
-        ));
+    let floor = want.min(MIN_SESSION_CTX);
+    if fit >= floor {
+        return PostLoadCtx::Serve(fit);
     }
-    tracing::warn!(
-        requested_ctx = want_ctx,
-        fits_ctx = fit,
-        "ctx clamp (measured): {want_ctx} -> {fit} tokens against the {:.2} GiB the device reports \
-         free after the weights are resident (KV {:.2} GiB + activation reserve {:.2} GiB at a \
-         {ubatch}-row chunk, minus {:.2} GiB held for the driver's own later allocations) — the \
-         pre-load estimate does not price the weight arena's block tails or the driver's own \
-         memory; set INFR_CTX to override",
-        gib(room),
-        gib(kv_bytes_estimate_fmt(cfg, fit, ring, ubatch, align, k_fmt, v_fmt)),
-        gib(dense_act_reserve_at(cfg, fit, ubatch)),
-        gib(POST_KV_DEVICE_RESERVE),
-    );
-    Ok(fit)
+    if let Some(q8) = q8_fit().filter(|&q8| q8 >= floor) {
+        return PostLoadCtx::ServeQ8(q8.min(want));
+    }
+    if overflow {
+        return PostLoadCtx::Spill(floor);
+    }
+    PostLoadCtx::Refuse
+}
+
+/// Whether a fit may switch a session's KV cache to q8_0 on its own: the user set no KV format and
+/// no rung already pinned one, and the model is dense with a q8_0-compatible layout — the case the
+/// auto-q8 rungs were validated on (MoE placement budgets its pager arenas apart from the fit).
+pub(crate) fn may_auto_q8(cfg: &Config, ec: &EngineConfig) -> bool {
+    cfg.moe.is_none() && !kv_auto_q8() && kv_unset(cfg, ec) && kv_q8_layout_ok(cfg)
 }
 
 /// Bytes a recurrent layer's two state buffers allocate (`Config::recurrent_state_elems`, f32
@@ -6351,14 +6537,35 @@ mod seam_helper_tests {
         .is_none());
     }
 
-    /// A `Backend` that reports nothing but a live allocation budget — enough to drive
+    /// A `Backend` that reports nothing but a name and a live allocation budget — enough to drive
     /// [`super::reclamp_ctx_to_live_room`], which touches no other method. `room: None` stands in
     /// for the CPU/Metal backends, which have no budget to report.
-    struct RoomOnly(Option<u64>);
+    struct RoomOnly {
+        room: Option<u64>,
+        name: &'static str,
+    }
+
+    impl RoomOnly {
+        /// A backend no KV-format pin applies to.
+        fn new(room: Option<u64>) -> Self {
+            Self {
+                room,
+                name: "room-only",
+            }
+        }
+
+        /// A backend named as Vulkan, whose runner reads a q8_0 pin (`parse_kv_fmt`).
+        fn vulkan(room: u64) -> Self {
+            Self {
+                room: Some(room),
+                name: "vulkan",
+            }
+        }
+    }
 
     impl infr_core::backend::Backend for RoomOnly {
         fn name(&self) -> &str {
-            "room-only"
+            self.name
         }
         fn capabilities(&self) -> infr_core::backend::Capabilities {
             infr_core::backend::Capabilities::default()
@@ -6401,7 +6608,7 @@ mod seam_helper_tests {
             Ok(())
         }
         fn device_alloc_room(&self) -> Option<u64> {
-            self.0
+            self.room
         }
     }
 
@@ -6418,11 +6625,14 @@ mod seam_helper_tests {
         let (k, v) = (DType::F16, DType::F16);
         let want = 32768;
         let call = |be: &dyn infr_core::backend::Backend, ec: &EngineConfig| {
-            super::reclamp_ctx_to_live_room(be, &cfg, ec, want, k, v).expect("reclamp")
+            let (ctx, k_got, v_got) =
+                super::reclamp_ctx_to_live_room(be, &cfg, ec, want, k, v).expect("reclamp");
+            assert_eq!((k_got, v_got), (k, v), "no backend here takes a q8_0 pin");
+            ctx
         };
 
         // No budget to report: the caller's window survives untouched.
-        assert_eq!(call(&RoomOnly(None), &ec), want);
+        assert_eq!(call(&RoomOnly::new(None), &ec), want);
 
         // Roomy: the fit is past `want`, so the window is kept rather than raised.
         let roomy =
@@ -6430,11 +6640,11 @@ mod seam_helper_tests {
                 + super::dense_act_reserve_at(&cfg, want, 1024)
                 + super::POST_KV_DEVICE_RESERVE
                 + (1 << 30);
-        assert_eq!(call(&RoomOnly(Some(roomy)), &ec), want);
+        assert_eq!(call(&RoomOnly::new(Some(roomy)), &ec), want);
 
         // Tight: cut, and cut to a window that really fits the budget it was given.
         let tight = roomy / 3;
-        let got = call(&RoomOnly(Some(tight)), &ec);
+        let got = call(&RoomOnly::new(Some(tight)), &ec);
         assert!(got < want, "a tight device must shrink the window: {got}");
         let ub = super::ubatch_rows(&ec);
         let need = super::kv_bytes_estimate_fmt(&cfg, got, true, ub, super::KvAlign::NONE, k, v)
@@ -6452,12 +6662,12 @@ mod seam_helper_tests {
             },
             ..Default::default()
         };
-        assert_eq!(call(&RoomOnly(Some(tight)), &pinned), want);
+        assert_eq!(call(&RoomOnly::new(Some(tight)), &pinned), want);
 
         // Not one token fits: refused with the measured room, not handed on as a context of 0
         // for the request to overflow later ("exceeds the session KV capacity 0").
         let err = super::reclamp_ctx_to_live_room(
-            &RoomOnly(Some(super::POST_KV_DEVICE_RESERVE)),
+            &RoomOnly::new(Some(super::POST_KV_DEVICE_RESERVE)),
             &cfg,
             &ec,
             want,
@@ -6470,6 +6680,211 @@ mod seam_helper_tests {
             msg.contains("does not fit") && msg.contains("0.25 GiB allocatable"),
             "{msg}"
         );
+    }
+
+    /// The post-load rule, case by case: a window is never cut below the minimum —
+    /// `MIN_SESSION_CTX`, or the window itself when it asked for less — and below it the q8_0 cache
+    /// is tried (only then), then the spill, then the refusal. An explicit window is served as
+    /// asked whatever fits.
+    #[test]
+    fn post_load_ctx_never_serves_below_the_minimum() {
+        use super::PostLoadCtx::{Refuse, Serve, ServeQ8, Spill};
+        let min = super::MIN_SESSION_CTX;
+        let unasked = || -> Option<usize> { panic!("q8_0 is tried only below the minimum") };
+        let post = |want, explicit, overflow, fit, q8: Option<usize>| {
+            super::post_load_ctx(want, explicit, overflow, fit, || q8)
+        };
+        // Fits, or set explicitly: as asked.
+        assert_eq!(
+            super::post_load_ctx(8192, false, false, 8192, unasked),
+            Serve(8192)
+        );
+        assert_eq!(
+            super::post_load_ctx(8192, true, false, 0, unasked),
+            Serve(8192)
+        );
+        // Cut, down to the minimum and no further.
+        assert_eq!(
+            super::post_load_ctx(8192, false, false, 5000, unasked),
+            Serve(5000)
+        );
+        assert_eq!(
+            super::post_load_ctx(8192, false, false, min, unasked),
+            Serve(min)
+        );
+        assert_eq!(post(8192, false, false, min - 1, None), Refuse);
+        assert_eq!(post(8192, false, false, 64, None), Refuse);
+        // A window below the minimum is its own minimum.
+        assert_eq!(
+            super::post_load_ctx(500, false, false, 500, unasked),
+            Serve(500)
+        );
+        assert_eq!(post(500, false, false, 499, None), Refuse);
+        // q8_0 rescues the minimum: served at what it holds, never past the window.
+        assert_eq!(post(8192, false, false, 64, Some(min)), ServeQ8(min));
+        assert_eq!(post(8192, false, false, 64, Some(3000)), ServeQ8(3000));
+        assert_eq!(post(500, false, false, 64, Some(3000)), ServeQ8(500));
+        assert_eq!(post(8192, false, false, 64, Some(min - 1)), Refuse);
+        // The spill keeps the minimum, after q8_0 and before the refusal.
+        assert_eq!(post(8192, false, true, 64, None), Spill(min));
+        assert_eq!(post(8192, false, true, 64, Some(3000)), ServeQ8(3000));
+        assert_eq!(post(500, false, true, 64, None), Spill(500));
+    }
+
+    /// The q8_0 retry inside the re-clamp itself, on a room where an f16 cache leaves less than the
+    /// minimum and a q8_0 one does not: a Vulkan session whose user set no format is switched to
+    /// q8_0 (and pinned, so its later calls read it), one whose user set f16 is refused with q8_0
+    /// named as the thing to try, and a backend the pin does not reach is refused.
+    #[test]
+    fn reclamp_retries_q8_below_the_minimum_where_the_policy_allows() {
+        let cfg = gemma3_12b();
+        let (f16, q8) = ((DType::F16, DType::F16), (DType::Q8_0, DType::Q8_0));
+        let min = super::MIN_SESSION_CTX;
+        let ec = EngineConfig::default();
+        let cands = super::ubatch_candidates(&ec);
+        let need = |(k, v): (DType, DType), ctx: usize| {
+            cands
+                .iter()
+                .map(|&ub| {
+                    super::kv_bytes_estimate_fmt(&cfg, ctx, true, ub, super::KvAlign::NONE, k, v)
+                        + super::dense_act_reserve_at(&cfg, ctx, ub)
+                })
+                .min()
+                .expect("the ladder is not empty")
+        };
+        // Exactly the minimum in q8_0, which f16 cannot hold.
+        let room = super::POST_KV_DEVICE_RESERVE + need(q8, min);
+        assert!(
+            need(f16, min) > need(q8, min),
+            "f16 must miss where q8_0 holds"
+        );
+        let want = 32768;
+
+        let scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
+        let (ctx, k, v) =
+            super::reclamp_ctx_to_live_room(&RoomOnly::vulkan(room), &cfg, &ec, want, f16.0, f16.1)
+                .expect("q8_0 holds the minimum");
+        assert_eq!((k, v), q8);
+        assert!(
+            (min..want).contains(&ctx),
+            "q8_0 holds at least the minimum here and not the window: {ctx}"
+        );
+        assert!(
+            super::kv_auto_q8(),
+            "the session's later calls must read q8_0 too"
+        );
+        drop(scope);
+
+        let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
+        let mut user_f16 = EngineConfig::default();
+        user_f16.kv.type_k = Some(DType::F16);
+        user_f16.kv.type_k_specified = true;
+        user_f16.kv.type_v = Some(DType::F16);
+        user_f16.kv.type_v_specified = true;
+        let refused = |be: &RoomOnly, ec: &EngineConfig| {
+            super::reclamp_ctx_to_live_room(be, &cfg, ec, want, f16.0, f16.1)
+                .expect_err("f16 leaves less than the minimum")
+                .to_string()
+        };
+        let msg = refused(&RoomOnly::vulkan(room), &user_f16);
+        assert!(msg.contains("INFR_KV_TYPE_K=q8_0"), "{msg}");
+        assert!(
+            !super::kv_auto_q8(),
+            "a format the user set is not overridden"
+        );
+        let msg = refused(&RoomOnly::new(Some(room)), &ec);
+        assert!(msg.contains("INFR_KV_TYPE_K=q8_0"), "{msg}");
+    }
+
+    /// The arena floor's rounding goes the safe way: never above what the arena's first-fit
+    /// placement commits for the same units in any order (a fit priced with it never counts memory
+    /// the arena will not commit for them), never below the units' own rounded bytes, and equal to
+    /// the placement where the shared blocks pack whole — with the arena's blocks at their usual
+    /// floor and on a device whose `maxMemoryAllocationSize` caps them below it.
+    ///
+    /// `first_fit` is a hand copy of `VulkanBackend::bda_weight_alloc`'s placement, cap included,
+    /// so a change there is not seen here; the GPU test `arena_commits_its_floor_for_a_model`
+    /// compares the floor with the real arena's blocks.
+    #[test]
+    fn weight_arena_floor_is_a_lower_bound_on_first_fit() {
+        let mib = 1u64 << 20;
+        // The arena's block floor (`BDA_BLOCK_MIN`), and the device caps tried: none that binds,
+        // and one below the floor.
+        let block_floor = 64 * mib;
+        for max_alloc in [4096 * mib, 48 * mib] {
+            let cost = infr_vulkan::WeightLoadCost {
+                align: 256,
+                block_min: block_floor.min(max_alloc),
+                staging: 0,
+            };
+            let round = |u: u64| u.max(1).next_multiple_of(cost.align);
+            // First-fit over every open block; when none has room, a new block of
+            // `max(unit, block floor)` bytes capped at `max_alloc` (a unit past the cap is an
+            // error there, and none is generated here).
+            let first_fit = |units: &[u64]| -> u64 {
+                let mut blocks: Vec<(u64, u64)> = Vec::new(); // (size, cursor)
+                for &u in units {
+                    let want = round(u);
+                    let size = want.max(block_floor).min(max_alloc);
+                    assert!(want <= size, "a unit past the device's cap");
+                    match blocks
+                        .iter_mut()
+                        .find(|(size, cursor)| *cursor + want <= *size)
+                    {
+                        Some((_, cursor)) => *cursor += want,
+                        None => blocks.push((size, want)),
+                    }
+                }
+                blocks.iter().map(|&(size, _)| size).sum()
+            };
+            let packed = [16 * mib, 16 * mib, 100 * mib, 16 * mib, 16 * mib];
+            if max_alloc >= 100 * mib {
+                // Packs whole: four 16 MiB units share one block, a 100 MiB unit has its own.
+                assert_eq!(super::weight_arena_floor(&packed, cost), first_fit(&packed));
+                assert_eq!(super::weight_arena_floor(&packed, cost), 164 * mib);
+                // A unit of exactly one block is whole, one alignment step less is shared, and a
+                // unit is rounded up before it is classed.
+                assert_eq!(super::weight_arena_floor(&[64 * mib], cost), 64 * mib);
+                assert_eq!(
+                    super::weight_arena_floor(&[64 * mib - 256, 1], cost),
+                    64 * mib
+                );
+                assert_eq!(
+                    super::weight_arena_floor(&[64 * mib - 1, 1], cost),
+                    128 * mib
+                );
+                assert_eq!(super::weight_arena_floor(&[3], cost), 64 * mib);
+            } else {
+                // Capped: three 16 MiB units fill one 48 MiB block, the fourth opens another.
+                let capped = [16 * mib; 4];
+                assert_eq!(super::weight_arena_floor(&capped, cost), first_fit(&capped));
+                assert_eq!(super::weight_arena_floor(&capped, cost), 96 * mib);
+                assert_eq!(super::weight_arena_floor(&[3], cost), 48 * mib);
+            }
+            let big = (max_alloc - block_floor.min(max_alloc)).min(200 * mib) + 1;
+            for seed in 0..64u64 {
+                let units: Vec<u64> = (0..40)
+                    .map(|i| {
+                        let r = infr_testkit::gguf::splitmix64(seed * 1000 + i);
+                        match r % 4 {
+                            0 => cost.block_min + r % big,
+                            _ => 1 + r % (cost.block_min * 5 / 8),
+                        }
+                    })
+                    .collect();
+                let floor = super::weight_arena_floor(&units, cost);
+                assert!(
+                    floor <= first_fit(&units),
+                    "cap {max_alloc}, seed {seed}: floor {floor} above first-fit {}",
+                    first_fit(&units)
+                );
+                let rounded: u64 = units.iter().map(|&u| round(u)).sum();
+                assert!(
+                    floor >= rounded,
+                    "cap {max_alloc}, seed {seed}: floor {floor} below the units' {rounded}"
+                );
+            }
+        }
     }
 
     /// The KV refuse rung fires only when the buffers the guard checks provably cannot land: past

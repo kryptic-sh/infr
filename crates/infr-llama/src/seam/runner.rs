@@ -1386,10 +1386,17 @@ pub(crate) fn generate_dense_backend_bound(
 
         // ── re-decide the context against what the device says is LEFT ───────────────────────
         // Every weight this session will hold is resident by now — including the arena block tails
-        // and the driver's own memory that no pre-load footprint prices — so the budget query here
-        // is a MEASUREMENT where the clamp that sized `want_ctx` could only estimate. Shrinks only,
-        // and never a context the user pinned. See `reclamp_ctx_to_live_room`.
-        let want_ctx = crate::seam::reclamp_ctx_to_live_room(be, c, ec, want_ctx, k_fmt, v_fmt)?;
+        // past the floor the pre-load fit priced, and the driver's own memory — so the budget
+        // query here is a MEASUREMENT where the clamp that sized `want_ctx` could only estimate.
+        // Shrinks only, and never a context the user pinned. See `reclamp_ctx_to_live_room`. It
+        // may also switch an f16 cache that would leave less than a usable window to q8_0, which
+        // nothing has been sized in yet: both formats ring alike, so `kv_ring` above still holds.
+        let want_ctx = {
+            let (ctx, k, v) =
+                crate::seam::reclamp_ctx_to_live_room(be, c, ec, want_ctx, k_fmt, v_fmt)?;
+            (k_fmt, v_fmt) = (k, v);
+            ctx
+        };
         // A model infr only matches the reference over a bounded context gets no larger cache.
         // Sessions arrive already capped (`SeamModel::session_ctx`); this is the one-shot paths'
         // cap (they size `prompt + max_new + 1`). The load already warned.
@@ -1569,6 +1576,8 @@ pub(crate) fn generate_dense_backend_bound(
             max_ctx: want_ctx,
             #[cfg(test)]
             kv_committed,
+            #[cfg(test)]
+            room_after_weights: room,
             kv_ring,
             ubatch,
             cached: Vec::new(),
@@ -1600,6 +1609,8 @@ pub(crate) fn generate_dense_backend_bound(
         max_ctx,
         #[cfg(test)]
             kv_committed: _,
+        #[cfg(test)]
+            room_after_weights: _,
         cached,
         written_end,
         denoise_cache,
@@ -8150,6 +8161,93 @@ mod tests {
     /// `rope_freqs` when given. The llama4 variant routes four experts but interleaves them every
     /// second layer, so its only layer is a dense ROPE layer (`no_rope_layer_step` 4 makes layer 3
     /// the first NoPE one) and needs no expert banks.
+    /// `crate::seam::weight_upload_units` groups a layer's q/k/v projections, and its gate/up
+    /// projections, into one unit each exactly where the runner uploads them concatenated, and
+    /// leaves every tensor its own unit where it does not. The synthetic llama's q/k/v are made
+    /// q8_0 so the q/k/v concatenation applies at all (it needs a native quantized dtype); neither
+    /// cached GPU model takes either concatenation.
+    #[test]
+    fn weight_upload_units_follow_the_runner_concatenations() {
+        use infr_core::WeightSource;
+        let mut model = llama_gguf("llama", None);
+        for t in &mut model.tensors {
+            if ["attn_q", "attn_k", "attn_v"]
+                .iter()
+                .any(|p| t.name == format!("blk.0.{p}.weight"))
+            {
+                t.fill = Fill::Quant(infr_core::DType::Q8_0);
+            }
+        }
+        let (g, cfg) = open_synthetic("weight-upload-units", &model);
+        let ec = EngineConfig::default();
+        let bytes = |name: &str| {
+            let t = g
+                .tensors()
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("{name} is in the model"));
+            crate::weights::tensor_resident_bytes(t.dtype, t.shape.iter().product(), t.nbytes)
+        };
+        let mut every: Vec<u64> = g.tensors().iter().map(|t| bytes(&t.name)).collect();
+        every.sort_unstable();
+        let sorted = |mut v: Vec<u64>| {
+            v.sort_unstable();
+            v
+        };
+
+        // A backend without combined weights: no concatenation, one unit per tensor.
+        assert!(!super::fuse_qkv_decision(false, &g, &cfg, &ec));
+        assert_eq!(
+            sorted(crate::seam::weight_upload_units(&g, &cfg, &ec, false)),
+            every
+        );
+
+        // With them, both concatenations apply to this model.
+        assert!(super::fuse_qkv_decision(true, &g, &cfg, &ec));
+        assert!(super::fuse_gu_decision(true, &g, &cfg));
+        let qkv: u64 = ["attn_q", "attn_k", "attn_v"]
+            .iter()
+            .map(|p| bytes(&format!("blk.0.{p}.weight")))
+            .sum();
+        let gu = bytes("blk.0.ffn_gate.weight") + bytes("blk.0.ffn_up.weight");
+        let mut expect: Vec<u64> = g
+            .tensors()
+            .iter()
+            .filter(|t| {
+                !["attn_q", "attn_k", "attn_v", "ffn_gate", "ffn_up"]
+                    .iter()
+                    .any(|p| t.name == format!("blk.0.{p}.weight"))
+            })
+            .map(|t| bytes(&t.name))
+            .chain([qkv, gu])
+            .collect();
+        expect.sort_unstable();
+        assert_eq!(
+            sorted(crate::seam::weight_upload_units(&g, &cfg, &ec, true)),
+            expect
+        );
+
+        // `kernels.qkv_fuse` off keeps q/k/v apart and still joins gate/up.
+        let mut no_qkv = EngineConfig::default();
+        no_qkv.kernels.qkv_fuse = false;
+        let mut expect: Vec<u64> = g
+            .tensors()
+            .iter()
+            .filter(|t| {
+                !["ffn_gate", "ffn_up"]
+                    .iter()
+                    .any(|p| t.name == format!("blk.0.{p}.weight"))
+            })
+            .map(|t| bytes(&t.name))
+            .chain([gu])
+            .collect();
+        expect.sort_unstable();
+        assert_eq!(
+            sorted(crate::seam::weight_upload_units(&g, &cfg, &no_qkv, true)),
+            expect
+        );
+    }
+
     fn llama_gguf(arch: &str, rope_freqs: Option<Vec<f32>>) -> SyntheticModel {
         let hd = Q35_NE / 2;
         let t = |name: &str, shape: Vec<usize>, base: f32| (name.to_string(), shape, base);

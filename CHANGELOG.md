@@ -61,6 +61,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`infr_vulkan::VulkanBackend::weight_load_cost`** returns a `WeightLoadCost`:
+  the resident weight arena's upload alignment and block size, and the upload
+  staging ring's bytes where the device's budget counts them, which the context
+  fit prices before a load.
 - **`INFR_VRAM_LIMIT` (`kernels.vulkan.vram_limit`): run as if the GPU had less
   memory.** A size (`4g`, `1536m`, or a percentage) that caps the total and free
   memory a Vulkan device reports, so the context fit, the KV format rungs, the
@@ -1164,6 +1168,35 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **A Vulkan context is sized before the weights load as the load will leave it,
+  so a device too small for a usable window is refused before the weights load,
+  and no run keeps a context too small to use.** The fit before the load (the
+  default context's clamp and its q8_0 and refuse rungs, the explicit `--ctx`
+  q8_0 rung, `--ctx N%`, and `infr serve --parallel`'s per-slot window) held
+  back only the weights' file bytes, so it promised a window that the re-clamp
+  after the load then cut, or refused after a full weight load. It now also
+  holds back the weight arena's block rounding (at the least), the upload
+  staging ring and the reserve the re-clamp keeps for the driver's later
+  allocations. The re-clamp never keeps less than 1024 tokens, or the window
+  asked for when that is smaller: below it, a session whose cache format is
+  unset is served with a q8_0 cache if that holds the minimum,
+  `INFR_KV_OVERFLOW` keeps the minimum with the cache spilled, and otherwise the
+  run is refused naming what fits and what to try. On the integrated GPU under
+  `INFR_VRAM_LIMIT`, Qwen3-0.6B Q4_K_M was refused after a full load at 1000 MiB
+  above what was in use and ran with 524 and 980 tokens at 1100 and 1150 MiB; it
+  is now refused before the load at 1000 and 1100 MiB and runs with 1641 tokens
+  in q8_0 at 1150. Qwen3.5-0.8B Q4_K_M was refused after a full load at 1100 and
+  1200 MiB and is now refused before it. Where the clamp binds, the context is
+  now 108 tokens (Qwen3-0.6B) and 780 to 816 tokens (Qwen3.5-0.8B) smaller than
+  before, because that device charges about 12.4 MB less for the staging ring
+  than its size; on the RX 7900 XTX, which charges the ring in full, the sweep's
+  contexts end within 276 tokens of the old ones, above or below, varying
+  between runs. Two format choices move with the honest figure: a default
+  context whose q8_0 cache used to reach the trained window before the load (so
+  q8_0 was pinned, then cut after it) may now miss it, and then stays f16 at
+  fewer tokens; and an explicit `--ctx` close to the device's limit gets a q8_0
+  cache where it got f16, which would have used the driver's reserve. Without a
+  limit both models keep their trained window.
 - **Vulkan KV cache buffers each get their own device allocation, so a context
   the fit accepts is no longer refused, or over-committed, over a shared
   block.** A KV buffer below the 32 MiB dedicated threshold (every buffer of a

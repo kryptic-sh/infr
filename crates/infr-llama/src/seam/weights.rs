@@ -369,6 +369,11 @@ pub(crate) struct SeamKv {
     /// the tests that read it; a run sees the same figure on the `KV cache allocated` debug line.
     #[cfg(test)]
     pub(super) kv_committed: Option<u64>,
+    /// `Backend::device_alloc_room` once the weights were resident, the room the cold init's
+    /// re-clamp sized this slot against. `None` as for `kv_committed`. Kept for the tests that
+    /// compare it with what the fit before the load expected.
+    #[cfg(test)]
+    pub(super) room_after_weights: Option<u64>,
     /// Whether this session's SWA layers were allocated as window-sized RINGS (see
     /// `crate::seam::kv_rows_at`): fork must size its buffers identically, and seed must respect
     /// that a wrapped ring no longer retains the early prefix rows a seed would copy.
@@ -792,6 +797,8 @@ impl SeamKv {
             max_ctx: self.max_ctx,
             #[cfg(test)]
             kv_committed: None,
+            #[cfg(test)]
+            room_after_weights: None,
             kv_ring: self.kv_ring,
             ubatch: self.ubatch,
             cached: Vec::new(),

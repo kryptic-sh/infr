@@ -74,8 +74,16 @@ not foresee.
 
 - Delete the early return on `kv.overflow` in `SeamModel::clamp_default_ctx`;
   extract the rung choice into a pure function and test the order. The post-load
-  `reclamp_ctx_to_live_room` already ignores `kv.overflow` **[R]**, so this
-  makes the pre-load ladder agree with it.
+  `reclamp_ctx_to_live_room` reads `kv.overflow` only below the minimum window,
+  where it spills at the minimum after a q8_0 retry and before refusing
+  (`seam::post_load_ctx`, which is already the pure function for that side)
+  **[R]**, so this makes the pre-load ladder agree with it. Since
+  B-PRELOAD-CLAMP's slice the pre-load fit prices what the re-clamp measures, so
+  without `kv.overflow` the two see the same window, short of what backlog
+  B-PRELOAD-CLAMP says neither can price before the load. Under `kv.overflow`
+  they do not yet: the pre-load rung keeps the full window and the re-clamp cuts
+  it to what fits in VRAM, spilling only below the minimum. That is the
+  disagreement this slice removes.
 - Resolve the `INFR_CACHE` percentage against `alloc_room()` in the MoE and
   dense override arms; update the `SizeSpec` and manifest text.
 

@@ -17,7 +17,8 @@ mod tests {
 
     use super::super::{open_backend, DenseVulkanSession, SeamModel};
     use crate::seam::{
-        kv_bytes_estimate_fmt, kv_recurrent_alloc_bytes, KvAlign, SeamKv, MIN_SESSION_CTX,
+        dense_act_reserve_at, kv_bytes_estimate_fmt, kv_recurrent_alloc_bytes, KvAlign, SeamKv,
+        MIN_SESSION_CTX,
     };
     use crate::EngineConfig;
 
@@ -37,12 +38,21 @@ mod tests {
     /// Rooms drawn per sweep between its tightest and loosest, besides those two.
     const SEEDED_ROOMS: u64 = 3;
 
-    /// How far [`usable_room`] raises a room that left too small a context.
+    /// How far [`usable_room`] raises a room the session refused.
     const ROOM_STEP: u64 = 32;
 
     /// The test environment's configuration (the device it names and the GPU knobs every GPU test
     /// honours) with the device memory capped at `limit` bytes and, when given, an explicit context.
     fn limited_cfg(limit: u64, ctx: Option<usize>) -> Arc<EngineConfig> {
+        limited_cfg_with(limit, ctx, |_| {})
+    }
+
+    /// [`limited_cfg`] with `edit` applied last.
+    fn limited_cfg_with(
+        limit: u64,
+        ctx: Option<usize>,
+        edit: impl FnOnce(&mut EngineConfig),
+    ) -> Arc<EngineConfig> {
         let env = EngineConfig::load_from_layers(&[
             infr_core::config::ConfigLayer::env().expect("test environment config")
         ]);
@@ -51,6 +61,7 @@ mod tests {
         infr_testkit::honour_env(&mut cfg);
         cfg.kernels.vulkan.vram_limit = Some(SizeSpec::Bytes(limit));
         cfg.device.ctx = ctx.map(|c| SizeSpec::Bytes(c as u64));
+        edit(&mut cfg);
         Arc::new(cfg)
     }
 
@@ -119,15 +130,38 @@ mod tests {
         committed: Option<u64>,
     }
 
+    /// Why a clamped run did not run.
+    enum RunErr {
+        /// The session refused to open because no usable cache fits the room.
+        NoUsableCache(String),
+        /// Anything else.
+        Other(String),
+    }
+
+    impl std::fmt::Display for RunErr {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                RunErr::NoUsableCache(m) | RunErr::Other(m) => f.write_str(m),
+            }
+        }
+    }
+
     /// Open the default (auto-sized) session of the model at `path` with the device limited to
     /// `room_mib` above the `used` bytes in use, check that the context was clamped below the
     /// trained window, generate a few tokens, and report what the slot allocated — or why the
-    /// generation failed.
-    fn clamped_run(path: &std::path::Path, used: u64, room_mib: u64) -> Result<ClampedRun, String> {
+    /// session refused to open or the generation failed.
+    fn clamped_run(path: &std::path::Path, used: u64, room_mib: u64) -> Result<ClampedRun, RunErr> {
         let model = load(path, used + room_mib * MIB, None);
-        let mut sess = model.vulkan_session_default().unwrap_or_else(|e| {
-            panic!("{room_mib} MiB of room: the default session did not open: {e}")
-        });
+        let mut sess = model.vulkan_session_default().map_err(|e| {
+            let msg = format!("{room_mib} MiB of room: the default session did not open: {e}");
+            // The refuse rung's own wording (`SeamModel::clamp_default_ctx`): the one open failure
+            // that means the room is too small rather than that something else broke.
+            if e.to_string().contains("no usable KV cache fits") {
+                RunErr::NoUsableCache(msg)
+            } else {
+                RunErr::Other(msg)
+            }
+        })?;
         let opened_ctx = sess.max_ctx;
         assert!(
             opened_ctx < model.cfg.n_ctx_train,
@@ -139,7 +173,7 @@ mod tests {
             model.generate_vulkan_session(&mut sess, "The capital of France is", 4, None, |_| {})
         {
             eprintln!("{room_mib} MiB of room: ctx {opened_ctx}, the run failed: {e}");
-            return Err(format!("{room_mib} MiB of room: {e}"));
+            return Err(RunErr::Other(format!("{room_mib} MiB of room: {e}")));
         }
         let live = sess.vram().live;
         let (_, kv) = slot(&sess);
@@ -197,15 +231,18 @@ mod tests {
     }
 
     /// The smallest room, from `start` MiB up in [`ROOM_STEP`]s and below `hi`, where the model at
-    /// `path` runs with a clamped context of at least [`MIN_SESSION_CTX`]. Measured rather than
-    /// computed, because what the weights take beyond their footprint is only known once they are
-    /// resident; below it the clamp either refuses or keeps an unusable context
-    /// (docs/backlog.md B-PRELOAD-CLAMP).
+    /// `path` runs with a clamped context: below it the session refuses to open for want of a
+    /// usable cache, and a run never keeps less than [`MIN_SESSION_CTX`] (which
+    /// `clamped_default_ctx_allocates_its_estimate` asserts). Any other failure on the way up is a
+    /// failure, not a room to step past. Probed rather than computed: where the refusal falls moves
+    /// with what the device reports in use while the test runs.
     fn usable_room(path: &std::path::Path, used: u64, start: u64, hi: u64) -> u64 {
         let mut room = start;
         while room < hi {
-            if clamped_run(path, used, room).is_ok_and(|r| r.slot_ctx >= MIN_SESSION_CTX) {
-                return room;
+            match clamped_run(path, used, room) {
+                Ok(_) => return room,
+                Err(RunErr::NoUsableCache(_)) => {}
+                Err(e @ RunErr::Other(_)) => panic!("{e}"),
             }
             room += ROOM_STEP;
         }
@@ -217,7 +254,7 @@ mod tests {
     /// seeded rooms from its [`usable_room`] up. Qwen3-0.6B's loosest room is past the rooms where
     /// its KV buffers, when they were sub-allocated from shared blocks, outgrew the room and the
     /// guard refused one. `None` when no backend opens.
-    fn clamped_sweeps() -> Option<Vec<Result<ClampedRun, String>>> {
+    fn clamped_sweeps() -> Option<Vec<Result<ClampedRun, RunErr>>> {
         let used = in_use()?;
         let mut runs = Vec::new();
         for (name, path, start, hi, seed) in [
@@ -299,7 +336,7 @@ mod tests {
             let run = match run {
                 Ok(run) => run,
                 Err(e) => {
-                    failed.push(e);
+                    failed.push(e.to_string());
                     continue;
                 }
             };
@@ -316,10 +353,253 @@ mod tests {
             eprintln!("{first}; running it once more, in case another process moved the figure");
             match clamped_run(&run.path, run.used, run.room_mib) {
                 Ok(again) => failed.extend(past_bound(&again)),
-                Err(e) => failed.push(e),
+                Err(e) => failed.push(e.to_string()),
             }
         }
         assert!(failed.is_empty(), "{}", failed.join("\n"));
+    }
+
+    /// How far the context a session opens with may exceed the one it runs with, priced as the KV
+    /// cache and activation reserve the difference would have cost: what the device may lose to
+    /// another process, or to memory the pre-load fit cannot price, between the session opening and
+    /// the KV allocation. A whole arena block of weights the fit failed to price would be past it.
+    const AGREEMENT_SLACK: u64 = 16 * MIB;
+
+    /// How one auto-sized session on a limited device ended.
+    enum AutoEnd {
+        /// The session refused to open. Opening loads no weights, so none were.
+        RefusedBeforeLoad(String),
+        /// The session opened with `opened` tokens and its first generation failed once the
+        /// weights had taken `weights_took` bytes of the device's room.
+        RefusedAfterLoad {
+            opened: usize,
+            weights_took: u64,
+            err: String,
+        },
+        /// The session ran: it opened with `opened` tokens and its slot holds `ctx`, `excess` being
+        /// what the cache and activation reserve of the tokens it lost would have cost. `unused`
+        /// is the other direction: what the fit before the load priced the weights and their
+        /// upload staging at, less what the load took from the room — room the window was not
+        /// given (negative when the load took more than was priced). `staging` is the ring's
+        /// size as the backend reports it (`VulkanBackend::weight_load_cost`).
+        Ran {
+            opened: usize,
+            ctx: usize,
+            k_fmt: DType,
+            v_fmt: DType,
+            excess: u64,
+            unused: i64,
+            staging: u64,
+        },
+    }
+
+    /// Open the default session of the model at `path` with the device limited to `room_mib` above
+    /// the `used` bytes in use and generate a few tokens, reporting where it stopped.
+    fn auto_run(path: &std::path::Path, used: u64, room_mib: u64) -> AutoEnd {
+        let model = load(path, used + room_mib * MIB, None);
+        let mut sess = match model.vulkan_session_default() {
+            Ok(sess) => sess,
+            Err(e) => return AutoEnd::RefusedBeforeLoad(e.to_string()),
+        };
+        let opened = sess.max_ctx;
+        let before = sess.be.alloc_room();
+        let held = model.preload_held(&sess.be);
+        if let Err(e) =
+            model.generate_vulkan_session(&mut sess, "The capital of France is", 4, None, |_| {})
+        {
+            return AutoEnd::RefusedAfterLoad {
+                opened,
+                weights_took: before.saturating_sub(sess.be.alloc_room()),
+                err: e.to_string(),
+            };
+        }
+        let (_, kv) = slot(&sess);
+        let align = KvAlign::of(&sess.be);
+        let cost = |ctx: usize| {
+            kv_bytes_estimate_fmt(
+                &model.cfg, ctx, kv.kv_ring, kv.ubatch, align, kv.k_fmt, kv.v_fmt,
+            ) + dense_act_reserve_at(&model.cfg, ctx, kv.ubatch)
+        };
+        let took = before.saturating_sub(kv.room_after_weights.expect("a Vulkan room"));
+        AutoEnd::Ran {
+            opened,
+            ctx: kv.max_ctx,
+            k_fmt: kv.k_fmt,
+            v_fmt: kv.v_fmt,
+            excess: cost(opened).saturating_sub(cost(kv.max_ctx)),
+            unused: (held.weights + held.staging) as i64 - took as i64,
+            // From the backend, not from what the fit priced, so a fit that over-prices the ring
+            // cannot widen its own bound.
+            staging: sess.be.weight_load_cost().staging,
+        }
+    }
+
+    /// The context the default session opens with is the one it runs with, to within
+    /// [`AGREEMENT_SLACK`], across rooms from where nothing fits to where the clamp barely binds,
+    /// on both cached models — the rooms where the fit before the load, when it priced neither the
+    /// weights' memory past their footprint nor the driver's reserve, promised a context the
+    /// measurement after it refused or cut (measured with this test on 2026-11-24: Qwen3-0.6B
+    /// refused after a full load at 1000 MiB, run with 524 tokens at 1100 and 980 at 1150;
+    /// Qwen3.5-0.8B refused after a full load at 1100 and 1200 MiB; every run cut by about 395 MB
+    /// and 413 MB of context). A room that cannot hold a usable context is refused before the
+    /// weights load, and no run keeps less than [`MIN_SESSION_CTX`].
+    ///
+    /// The other direction is bounded too: the room the fit priced and the load did not take may
+    /// not exceed the staging ring's size as the backend reports it, the most the fit can
+    /// over-price on a device that charges the ring nothing (the integrated GPU charges about
+    /// 12.4 MB less than its size, the RX 7900 XTX all of it; see docs/backlog.md
+    /// B-PRELOAD-CLAMP). A fit that counted the ring twice is past it.
+    #[test]
+    #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+    fn auto_ctx_before_the_load_is_the_ctx_after_it() {
+        let Some(used) = in_use() else {
+            return;
+        };
+        let mut failed = Vec::new();
+        for (name, path, rooms) in [
+            (
+                "Qwen3-0.6B",
+                qwen3_06b(),
+                &[
+                    1000, 1100, 1150, 1200, 1300, 1400, 1536, 1600, 1800, 2000, 2300, 2600,
+                ][..],
+            ),
+            (
+                "Qwen3.5-0.8B",
+                qwen35_08b(),
+                &[
+                    1100, 1200, 1280, 1300, 1350, 1400, 1500, 1700, 2000, 2400, 2800, 3200,
+                ][..],
+            ),
+        ] {
+            let Some(path) = path else {
+                eprintln!("skip: {name} is not in the HF cache");
+                continue;
+            };
+            for &room in rooms {
+                let row = match auto_run(&path, used, room) {
+                    AutoEnd::RefusedBeforeLoad(e) => {
+                        format!(
+                            "refused before the load: {}",
+                            e.lines().next().unwrap_or("")
+                        )
+                    }
+                    AutoEnd::RefusedAfterLoad {
+                        opened,
+                        weights_took,
+                        err,
+                    } => {
+                        failed.push(format!(
+                            "{name} at {room} MiB: opened with {opened} tokens, refused after the \
+                             weights took {weights_took} bytes: {err}"
+                        ));
+                        format!("opened {opened}, refused after the load: {err}")
+                    }
+                    AutoEnd::Ran {
+                        opened,
+                        ctx,
+                        k_fmt,
+                        v_fmt,
+                        excess,
+                        unused,
+                        staging,
+                    } => {
+                        if ctx < MIN_SESSION_CTX {
+                            failed.push(format!("{name} at {room} MiB: ran with {ctx} tokens"));
+                        }
+                        if excess > AGREEMENT_SLACK {
+                            failed.push(format!(
+                                "{name} at {room} MiB: opened with {opened} tokens, ran with \
+                                 {ctx}: {excess} bytes promised and not held"
+                            ));
+                        }
+                        if unused > staging as i64 {
+                            failed.push(format!(
+                                "{name} at {room} MiB: the fit priced {unused} bytes the load did \
+                                 not take, past the staging ring's {staging}"
+                            ));
+                        }
+                        format!(
+                            "opened {opened}, ran {ctx} ({k_fmt:?}/{v_fmt:?}), excess {excess}, \
+                             unused {unused} of a {staging}-byte ring"
+                        )
+                    }
+                };
+                eprintln!("{name} at {room} MiB: {row}");
+            }
+        }
+        assert!(failed.is_empty(), "{}", failed.join("\n"));
+    }
+
+    /// What the resident weight arena really opens for a model's upload units, against the floor
+    /// the fit before the load prices it at (`crate::seam::weight_arena_floor`): every unit is
+    /// allocated as a weight on a fresh backend, in file order with the concatenated units last,
+    /// and the blocks are counted. A unit of at least a block gets a block of its own size and the
+    /// rest share blocks of `block_min`, so the count prices the commitment; it is never below
+    /// the floor, and above it by no more than first-fit can strand — less than the largest shared
+    /// unit in every shared block. The block sizes come from the placement rule, not a read of the
+    /// device, so this checks how many blocks the arena opens, not what the driver commits for
+    /// each.
+    #[test]
+    #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+    fn arena_commits_its_floor_for_a_model() {
+        use infr_core::backend::{Backend, BufferUsage};
+        for (name, path) in [("Qwen3-0.6B", qwen3_06b()), ("Qwen3.5-0.8B", qwen35_08b())] {
+            let Some(path) = path else {
+                eprintln!("skip: {name} is not in the HF cache");
+                continue;
+            };
+            let Some(vk) =
+                infr_testkit::gpu_or_skip_noted(open_backend(None, limited_cfg(u64::MAX, None)))
+            else {
+                return;
+            };
+            let model = load(&path, u64::MAX, None);
+            let units = crate::seam::weight_upload_units(
+                &model.gguf,
+                &model.cfg,
+                &model.ecfg,
+                vk.capabilities().combined_gu,
+            );
+            let cost = vk.weight_load_cost();
+            let floor = crate::seam::weight_arena_floor(&units, cost);
+            let round = |u: u64| u.max(1).next_multiple_of(cost.align);
+            let (whole, shared): (Vec<u64>, Vec<u64>) = units
+                .iter()
+                .map(|&u| round(u))
+                .partition(|&u| u >= cost.block_min);
+            let before = vk.device_memory_allocations();
+            let held: Vec<_> = units
+                .iter()
+                .map(|&u| {
+                    vk.alloc(u as usize, BufferUsage::Weights)
+                        .expect("a weight allocation")
+                })
+                .collect();
+            let opened = vk.device_memory_allocations() - before;
+            drop(held);
+            let shared_blocks = opened - whole.len() as u64;
+            let committed = whole.iter().sum::<u64>() + shared_blocks * cost.block_min;
+            let largest_shared = shared.iter().copied().max().unwrap_or(0);
+            let tail_bound = shared_blocks * largest_shared;
+            eprintln!(
+                "{name}: {} units ({} whole), {opened} blocks; floor {floor}, arena {committed} \
+                 ({:+}), bound {tail_bound}; {cost:?}",
+                units.len(),
+                whole.len(),
+                committed as i64 - floor as i64,
+            );
+            assert!(
+                committed >= floor,
+                "{name}: the arena committed {committed}, below the floor {floor}"
+            );
+            assert!(
+                committed - floor <= tail_bound,
+                "{name}: the arena committed {committed}, {} past the floor {floor}, more than \
+                 first-fit can strand ({tail_bound})",
+                committed - floor
+            );
+        }
     }
 
     /// The q8_0 rung for an explicit context (B12): on a limited device, a window between what f16 and
@@ -372,11 +652,15 @@ mod tests {
         assert_eq!((kv.k_fmt, kv.v_fmt), (DType::Q8_0, DType::Q8_0));
     }
 
-    /// The runner's refusal after the weights load (B12): the largest explicit f16 window the fit
-    /// accepts before the load is the one the weights' unpriced memory (arena block tails, staging,
-    /// the driver's own) pushes past what is left after it. Placement takes it as resident and the
-    /// refusal before the load lets it through, so it is refused between the weight upload and the KV
-    /// allocation, with the sizes — not by the allocation guard on one layer's buffer.
+    /// The runner's refusal after the weights load (B12), and the window that used to reach it.
+    /// The largest explicit f16 window the fit accepts before the load is now one the load leaves
+    /// room for, so it runs as asked: the fit prices what the weights commit, the upload staging
+    /// and the driver's reserve. What still reaches the refusal is a window the fit rejects and
+    /// placement still takes resident, because placement prices the weights at their bare
+    /// footprint: with the cache format set to f16, so neither q8_0 rung can take it, the largest
+    /// such window loads and is refused between the weight upload and the KV allocation, with the
+    /// sizes — not by the allocation guard on one layer's buffer (docs/backlog.md
+    /// B-PRELOAD-CLAMP).
     #[test]
     #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
     fn explicit_ctx_short_of_the_room_after_the_weights_is_refused() {
@@ -390,22 +674,54 @@ mod tests {
         let limit = used + B12_ROOM;
         let probe = load(&path, limit, None);
         let vk = open_backend(None, probe.ecfg.clone()).expect("backend");
-        let want = probe
+        let fits = probe
             .kv_fit_ctx_fmt(&vk, false)
             .expect("an attention model");
+        let placed = crate::seam::kv_fit_ctx_for(
+            &probe.cfg,
+            &probe.ecfg,
+            probe.footprint().total(),
+            &vk.vram(),
+            KvAlign::of(&vk),
+            DType::F16,
+            DType::F16,
+        )
+        .expect("an attention model");
         drop(vk);
+        assert!(
+            fits < placed,
+            "the fit ({fits}) must be below what the bare footprint leaves ({placed})"
+        );
 
-        let model = load(&path, limit, Some(want));
+        let model = load(&path, limit, Some(fits));
         let mut sess = model
-            .vulkan_session(want)
+            .vulkan_session(fits)
             .expect("the pre-load fit accepts its own largest window");
+        model
+            .generate_vulkan_session(&mut sess, "The capital of France is", 4, None, |_| {})
+            .expect("the largest window the fit accepts runs");
+        let (_, kv) = slot(&sess);
+        assert_eq!(kv.max_ctx, fits, "an explicit context is served as asked");
+        assert_eq!((kv.k_fmt, kv.v_fmt), (DType::F16, DType::F16));
+        drop(sess);
+
+        let f16 = limited_cfg_with(limit, Some(placed), |c| {
+            c.kv.type_k = Some(DType::F16);
+            c.kv.type_k_specified = true;
+            c.kv.type_v = Some(DType::F16);
+            c.kv.type_v_specified = true;
+        });
+        let model = SeamModel::load_with(&path, None, f16).expect("model load");
+        let mut sess = model
+            .vulkan_session(placed)
+            .expect("the refusal before the load counts the cache alone");
         let err = model
             .generate_vulkan_session(&mut sess, "The capital of France is", 4, None, |_| {})
             .expect_err("the window must not run once the weights' own memory is counted");
-        eprintln!("asked {want}: {err}");
+        eprintln!("fit {fits}; asked {placed} in f16: {err}");
         let msg = err.to_string();
         assert!(
-            msg.contains(&format!("context {want} cannot be served"))
+            msg.contains(&format!("context {placed} cannot be served"))
                 && msg.contains("after the weights"),
             "the refusal after the load, not another failure: {msg}"
         );

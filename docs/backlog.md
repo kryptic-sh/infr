@@ -391,19 +391,23 @@ refused in under a second with the sizes.
   them.
 - **Observed now, on the integrated GPU only, under `INFR_VRAM_LIMIT`**
   (`seam::model::vram_limit_tests`, Qwen3-0.6B with 1880 MiB of room above what
-  is in use): `explicit_ctx_f16_cannot_hold_is_served_in_q8` (f16 fit 11 104
-  tokens, q8_0 20 903, asked 16 003, served 16 003 in q8_0) and
-  `explicit_ctx_short_of_the_room_after_the_weights_is_refused` (asked 11 104,
-  the largest f16 window the pre-load fit accepts: refused after the weights,
-  1.19 GiB of KV against 1.10 GiB left). The q8 pin has a backstop the test had
-  to work around: dense placement's own auto-q8 rung in `vulkan_moe_binder` pins
-  q8_0 for the same window, so with `auto_q8_for_explicit_ctx` disabled the
-  window is still served in q8_0; the test reads the session's pins before any
-  weight loads to see which rung decided. The post-load refusal is reached only
-  through the weights' unpriced memory (arena tails, staging, driver), not
-  through a window the pre-load fit already rejects: one whose f16 cache cannot
-  sit beside the weights stops at dense placement's streaming-floor error first
-  (the gap above). Not run on the RX 7900 XTX.
+  is in use): `explicit_ctx_f16_cannot_hold_is_served_in_q8` (f16 fit 7 546
+  tokens, q8_0 14 204, asked 10 875, served 10 875 in q8_0) and
+  `explicit_ctx_short_of_the_room_after_the_weights_is_refused`. Since the fit
+  before the load prices the weights as the arena commits them, the upload
+  staging and `POST_KV_DEVICE_RESERVE` (B-PRELOAD-CLAMP), the largest f16 window
+  it accepts (7 546) runs as asked. The post-load refusal is reached by a window
+  the fit rejects and dense placement still takes resident, because
+  `vulkan_moe_binder`'s residency prices the weights at their bare footprint and
+  holds no reserve: asked 11 104 with `INFR_KV_TYPE_K/V=f16` (so neither q8_0
+  rung takes it), the largest window that footprint leaves, it is refused after
+  the weights (1.19 GiB of KV against 1.10 GiB left); a window whose f16 cache
+  cannot sit beside the footprint stops at dense placement's streaming-floor
+  error first (the gap above). The q8 pin has a backstop the q8 test had to work
+  around: dense placement's own auto-q8 rung in `vulkan_moe_binder` pins q8_0
+  for the same window, so with `auto_q8_for_explicit_ctx` disabled the window is
+  still served in q8_0; the test reads the session's pins before any weight
+  loads to see which rung decided. Not run on the RX 7900 XTX.
 - The DEFAULT-path refuse rung stays as narrow as it was: only "no usable
   context at all" may refuse, or every ordinary long-context model breaks on a
   24 GiB card.
@@ -608,53 +612,90 @@ the right memory type has a free range that large, and charge zero when it does
 whole `device_memblock_size` only when it would open a block, which needs the
 same knowledge as (b).
 
-### B-PRELOAD-CLAMP — the pre-load clamp over-promises on a small device (2026-11-24)
+### B-PRELOAD-CLAMP — what the pre-load fit still cannot price (2026-11-24)
 
-**Tag:** vram fit · predates the VRAM limit slice, which made it visible ·
-**Blocked on:** a decision
+**Tag:** vram fit · **Blocked on:** a decision (the staging term)
 
-`SeamModel::clamp_default_ctx` sizes the default context with `kv_fit_ctx_for`,
-which budgets `alloc_room - weight_footprint` and leaves out both
-`POST_KV_DEVICE_RESERVE` and the weights' unpriced memory (arena tails, staging,
-the driver's own). The runner's `reclamp_ctx_to_live_room` then re-fits against
-the measured room with the reserve. The gap between the two, measured without
-any limit on the integrated GPU (`alloc_room` and `weight_footprint` before the
-load, through a debug line added for the measurement and removed, against the
-re-clamp's `room_bytes`): Qwen3-0.6B Q4_K_M 127 120 384 bytes of unpriced weight
-memory, Qwen3.5-0.8B Q4_K_M 144 388 864; with the reserve, the pre-load fit
-over-promises by 395 555 840 and 412 824 320 bytes. On a device the trained
-window fits, nothing sees it. On one where the clamp binds:
+On Vulkan the fit before the load (`SeamModel::preload_held`) holds back what
+the post-load re-clamp (`seam::reclamp_ctx_to_live_room`) will measure: the
+weights as the resident arena commits them at the least
+(`seam::weight_arena_floor` over `seam::weight_upload_units`, the arena's
+geometry from `VulkanBackend::weight_load_cost`), the upload staging ring still
+allocated when the re-clamp reads the room, and `POST_KV_DEVICE_RESERVE`. The
+re-clamp never keeps less than `min(MIN_SESSION_CTX, window)`: below it, it
+retries q8_0 where the auto-q8 policy allows, spills at it under `kv.overflow`,
+and otherwise refuses (`seam::post_load_ctx`). Left:
 
-- Qwen3.5-0.8B Q4_K_M at 1280 MiB: the pre-load clamp picked 17 739 tokens, the
-  room after the weights was 230 793 216 bytes, less than the reserve, so the
-  run was refused after loading ("this model does not fit the device's free
-  memory"). At 1300 MiB it was refused the same way.
-- Qwen3.5-0.8B at 1400 MiB ran with a 64-token context, and Qwen3-0.6B at 1150
-  MiB of room above what was in use with 980: the post-load re-clamp has no
-  `MIN_SESSION_CTX` floor, which the pre-load refuse rung has.
-- Qwen3-0.6B at 1536 MiB: pre-load 6 416 tokens, after the load 2 967 (a room of
-  647 299 072 bytes after the weights).
-
-Options, none taken:
-
-- **Subtract `POST_KV_DEVICE_RESERVE` before the load too.** For an auto-sized
-  Vulkan context on a single device this costs no final context: the re-clamp
-  only shrinks, and its budget (room after the load, less the reserve) is never
-  above the pre-load one with the reserve taken off, so the context it settles
-  on is the same. What changes is what is decided before the load against the
-  pre-load figure: the auto-q8 rung (f16 misses sooner, so q8_0 is pinned for
-  some windows that f16 would have served after a shrink) and the refuse rung.
-  Where no re-clamp runs (the multi-device wrappers report no
-  `device_alloc_room`, B13), the pre-load context is final, and there it costs
-  the reserve's worth of context. Reasoned from the code, not run.
-- **Give the re-clamp a minimum:** refuse when its fit is below
-  `min(MIN_SESSION_CTX, want)`, so a small explicit or capped window is not
-  refused for being small.
-- **Re-try q8_0 after the load** when the f16 re-clamp falls below that minimum,
-  before refusing, as the pre-load ladder does.
-
-`clamped_default_ctx_allocates_its_estimate` starts each model's rooms at the
-smallest that leaves a context of at least `MIN_SESSION_CTX`, measured.
+- **The staging ring is priced at its size, and the integrated GPU charges less
+  of it.** Measured there without a limit: the weight load took 517 881 856
+  bytes for Qwen3-0.6B Q4_K_M and 665 952 256 for Qwen3.5-0.8B Q4_K_M, which is
+  the arena floor (396 061 696 and 544 133 120) plus 121 820 160 and 121
+  819 136. The arena opens exactly the blocks the floor counts on both models
+  and both GPUs (`arena_commits_its_floor_for_a_model`, which counts blocks;
+  their sizes follow from the placement rule, not a device read), so the rest is
+  the ring, charged about 12.4 MB below its 134 217 728 bytes. Why was not
+  found; the same device also charged a fresh 64 MiB weight block at 54 411 264
+  in a throwaway probe after the backend had freed memory, which suggests the
+  budget reuses freed pages, unverified. Since the re-clamp only shrinks, every
+  room where the clamp binds serves that much less context there than before:
+  108 tokens on Qwen3-0.6B and 780 to 816 on Qwen3.5-0.8B in
+  `auto_ctx_before_the_load_is_the_ctx_after_it`'s sweep. The RX 7900 XTX
+  charges the ring in full: its load took 300 032 (Qwen3-0.6B) and 299 008
+  (Qwen3.5-0.8B) bytes MORE than the floor and the ring, which the re-clamp
+  takes back as 0 to 24 tokens. Options: (a) keep it (safe, the loss above); (b)
+  allocate the ring when the backend opens, so both readings include it (128 MiB
+  held by sessions that never load, and an infr-vulkan change); (c) let the
+  re-clamp raise an auto-sized window back toward the window the pre-load clamp
+  cut from (the runner would need that bound, and placement and the chunk pin
+  were decided at the smaller window).
+- **Releasing the staging ring before the post-load check would return nothing
+  measurable.** The ring is drained when the weight-load scope ends, after the
+  KV allocation, so the re-clamp sees it allocated. Draining it first would help
+  only on a device that gives freed memory back to its budget at once. Measured
+  2026-11-24 with a throwaway probe (one weight block, one staged upload to
+  create the ring, then the drain): the ring took 134 463 488 bytes of
+  `alloc_room` on both the integrated GPU and the RX 7900 XTX, and the drain
+  returned 0 on both, read straight after it. Whether the room comes back later
+  was not measured.
+- **Not priced, and not knowable before the load:** tails first-fit strands past
+  the floor (none on the two cached models; gemma-4-31B's 2.20% tails were
+  measured before the floor existed, and how much of them it covers was not),
+  the driver's own memory during the load (the 0.3 MB above on the RX 7900 XTX,
+  none on the integrated GPU), and memory another process takes meanwhile. Each
+  makes the pre-load window larger than the re-clamp's, which cuts it as before.
+- **The overflow spill can spend the driver reserve.** `PostLoadCtx::Spill` and
+  the pre-load overflow rung in `SeamModel::clamp_default_ctx` keep a window
+  whose cache does not fit VRAM and rely on the backend's VRAM-first KV
+  placement (`kv_overflow_enabled`, `VulkanBackend::vram_budget_fits`), which
+  fills VRAM up to the allocation guard's own headroom, not up to
+  `POST_KV_DEVICE_RESERVE`. So a small spilled cache can take the memory the
+  re-clamp holds back for the driver's later allocations, and a forward can then
+  fail on an activation or pipeline allocation. Read in code, not run.
+- **More memory can give fewer tokens.** The default ladder's policy pins q8_0
+  only for a full rescue or for the minimum, so a room where f16 holds the
+  minimum gets f16 at fewer tokens than a slightly smaller room that fell to
+  q8_0: Qwen3-0.6B on the integrated GPU ran 1 641 tokens in q8_0 at 1150 MiB of
+  room and 1 330 in f16 at 1200. A visible consequence of the policy (f16's
+  faster decode over a larger window), not a defect in the fit.
+- **An explicit window can still load and be refused** (medium: the refusal is
+  clean and names the sizes, after a full weight load). `refuse_explicit_ctx`
+  checks the cache's floor against `alloc_room` alone, and `vulkan_moe_binder`'s
+  dense residency and streaming budgets price the weights at `weight_footprint`
+  and hold no reserve, so an explicit f16 window between the fit and what the
+  footprint leaves is placed resident and refused after the weights by
+  `refuse_unallocatable_kv` (B12's test). Options: the binder prices
+  `preload_held`'s weights and staging, so such a window streams or takes q8_0
+  instead; or `refuse_explicit_ctx` folds the weights in for a model placement
+  keeps resident. Not done: the same budgets size the streaming and MoE tiers.
+- **MoE: the minimum applies after the load, the pre-load fit is unchanged.**
+  The re-clamp's minimum and refusal reach an MoE session (its q8_0 retry does
+  not: `may_auto_q8` excludes MoE), but the MoE pre-load fit still prices the
+  bare footprint and holds back `max(total / 12, 1 GiB)` in place of the
+  reserve, staging and floor, which was not measured against them (no MoE run).
+- **Not verified:** Windows drivers, Metal (no `device_alloc_room`, unchanged),
+  the multi-device wrappers (they never call the pre-load fit, read in code),
+  and `infr serve --parallel N`, whose per-slot window is now divided from the
+  priced fit (not run).
 
 Also from the VRAM limit slice, not done: `infr serve`'s `/status` reports the
 limited `VramInfo` totals without saying they are limited
@@ -8621,14 +8662,34 @@ work on the compute-only family under RADV. `lockup_timeout` reads empty in
 ms with the format `[GFX,Compute,SDMA,Video]`: on this kernel one default covers
 every ring.
 
-**Still not measured on Linux:** the same loop inside a desktop session (the
-script and the pinned binary are in `~/.cache/infr-queue-ab` on the Linux
-machine, `run.sh desktop`), any measure of desktop responsiveness, and the work
-bound's tests on the compute-only family. llama.cpp makes the same default
-choice (`ggml-vulkan.cpp`, `ggml_vk_find_queue_family_index` avoiding the
-graphics bit) and has the same escape hatch, `GGML_VK_ALLOW_GRAPHICS_QUEUE`,
-commented "it can increase performance on RADV"; it does nothing else about the
-cost.
+**Measured on Linux, in a desktop session (2026-11-24).** The same pinned binary
+(`a66f3d06`) and script (`~/.cache/infr-queue-ab/run.sh desktop`), RADV (Mesa
+26.3.1, kernel 7.3.5), Hyprland running (Wayland, Xwayland beside it), DP-1
+connected on the RX 7900 XTX, Qwen3-1.7B Q4_K_M, 6 rounds with the first arm
+alternating, the CPU 99.4% to 99.7% idle in every reading before a sample.
+Medians, with the lowest and highest sample; the headless arm's medians beside
+them (a different window, so compare the changes, not the absolute figures):
+
+| Device                                    | What, t/s | `graphics`                      | `compute`                       | Change | Headless change (medians) |
+| ----------------------------------------- | --------- | ------------------------------- | ------------------------------- | ------ | ------------------------- |
+| RX 7900 XTX (RADV NAVI31)                 | tg128     | 476.02 (475.26 to 476.96)       | 466.11 (465.31 to 467.62)       | -2.1%  | 476.55 to 466.99, -2.0%   |
+| RX 7900 XTX (RADV NAVI31)                 | pp512     | 14805.47 (14611.26 to 14887.35) | 14718.94 (14636.36 to 14984.77) | -0.6%  | 15124.48 to 15134.65      |
+| Ryzen integrated (RADV RAPHAEL_MENDOCINO) | tg128     | 28.66 (28.64 to 28.68)          | 28.66 (28.65 to 28.69)          | 0      |                           |
+| Ryzen integrated (RADV RAPHAEL_MENDOCINO) | pp512     | 239.25 (239.04 to 239.31)       | 238.97 (238.83 to 239.13)       | -0.1%  |                           |
+
+So the compute-only family's decode cost on the RX 7900 XTX under RADV, about
+2%, is the same with and without a desktop session: it is not caused by the
+desktop sharing the GPU, and the hypothesis that it vanishes headless is
+refuted. Raw samples: `~/.cache/infr-queue-ab/headless.log` and `desktop.log`
+(the lines starting `sample dev=`).
+
+**Still not measured on Linux:** any measure of desktop responsiveness, and the
+work bound's tests on the compute-only family. The transfer-queue candidate
+(B230) and the Windows side (the display confound above) stay open. llama.cpp
+makes the same default choice (`ggml-vulkan.cpp`,
+`ggml_vk_find_queue_family_index` avoiding the graphics bit) and has the same
+escape hatch, `GGML_VK_ALLOW_GRAPHICS_QUEUE`, commented "it can increase
+performance on RADV"; it does nothing else about the cost.
 
 **Decided (owner, 2026-11-22): no display detection.** The compute-only queue is
 the default, and a user who wants the last of the throughput at the desktop's

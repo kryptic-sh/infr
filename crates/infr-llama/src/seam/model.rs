@@ -145,6 +145,24 @@ fn explicit_ctx_q8_fit(
     fit_q8().filter(|&f| f >= need)
 }
 
+/// What a Vulkan device will hold beside a session's KV cache and activation reserve once its
+/// weights are loaded, priced before the load (`SeamModel::preload_held`).
+#[derive(Clone, Copy, Debug)]
+struct PreloadHeld {
+    /// The weights as the resident arena commits them, at the least.
+    weights: u64,
+    /// The upload staging still allocated when the post-load re-clamp reads the room.
+    staging: u64,
+    /// What the re-clamp holds back for the driver's own later allocations.
+    reserve: u64,
+}
+
+impl PreloadHeld {
+    fn total(&self) -> u64 {
+        self.weights + self.staging + self.reserve
+    }
+}
+
 /// Open a Vulkan backend on physical device `dev`: `Some(idx)` pins `VulkanN`
 /// ([`infr_vulkan::VulkanBackend::new_on_with`], bypassing `device.dev`/the discrete-default rule
 /// for the multi-device path), `None` is the historical default
@@ -677,9 +695,10 @@ impl SeamModel {
         })
     }
 
-    /// Resolve a DEFAULT context length against the VRAM budget: the full weight footprint + one
-    /// KV cache (priced as the exact allocation, [`kv_fit_ctx`](Self::kv_fit_ctx)) + the dense
-    /// activation reserve must fit the live free bytes. The rung ladder, in order:
+    /// Resolve a DEFAULT context length against the VRAM budget: what the loaded weights will hold
+    /// ([`preload_held`](Self::preload_held)) + one KV cache (priced as the exact allocation,
+    /// [`kv_fit_ctx`](Self::kv_fit_ctx)) + the dense activation reserve must fit the allocatable
+    /// bytes. The rung ladder, in order:
     ///
     ///  1. **f16 fits `want`** → use it, say nothing. (The overwhelmingly common case, and — since
     ///     the fit now walks the same prefill-chunk ladder placement walks — the case gemma-3-12b
@@ -764,13 +783,15 @@ impl SeamModel {
             return Ok(f8);
         }
         let vram = vk.vram();
-        let fp = self.footprint();
+        let held = self.preload_held(vk);
+        let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
         // Refuse rung: the BEST cache this model may pick on its own (q8_0 when the user set no
-        // format, else the format they did set) cannot serve even a minimally-useful window.
+        // format, else the format they did set) cannot serve even a minimally-useful window. The
+        // fit prices what the post-load re-clamp will measure, so this is where a session the
+        // re-clamp would refuse is refused — before a single weight is loaded.
         let best = fit.max(fit_q8.unwrap_or(0));
         if best < crate::seam::MIN_SESSION_CTX {
-            let free = vram.available.saturating_sub(fp.total());
-            let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+            let free = vram.alloc_room().saturating_sub(held.total());
             let (k_fmt, v_fmt) = self.kv_fit_fmts(false);
             let need = crate::seam::kv_bytes_estimate_fmt(
                 &self.cfg,
@@ -787,7 +808,9 @@ impl SeamModel {
                  fits at {k_fmt:?}/{v_fmt:?} KV : {fit} tokens\n  \
                  fits at q8_0 KV     : {}\n  \
                  KV cache needed     : {:.2} GiB at {want} tokens in {k_fmt:?}/{v_fmt:?}\n  \
-                 free after weights  : {:.2} GiB ({:.2} GiB {}{} - {:.2} GiB weights)\n\
+                 free after weights  : {:.2} GiB ({:.2} GiB allocatable{}{} - {:.2} GiB \
+                 weights as loaded - {:.2} GiB upload staging - {:.2} GiB held for the driver's \
+                 own later allocations)\n\
                  Try a smaller window (--ctx N / INFR_CTX=N), an explicitly quantized cache \
                  (INFR_KV_TYPE_K=q8_0 INFR_KV_TYPE_V=q8_0), INFR_KV_OVERFLOW=1 to place the cache \
                  in system RAM, or a smaller quant of the model.",
@@ -797,32 +820,28 @@ impl SeamModel {
                 },
                 gib(need),
                 gib(free),
-                gib(vram.available),
-                if vram.live { "free, live" } else { "heap" },
+                gib(vram.alloc_room()),
+                if vram.live { ", live" } else { ", heap" },
                 vram.limit_note(),
-                gib(fp.total()),
+                gib(held.weights),
+                gib(held.staging),
+                gib(held.reserve),
             ));
         }
         tracing::warn!(
-            "ctx clamp: default context {want} -> {fit} to fit VRAM (weights {:.2} GiB vs \
-             {:.2} GiB available{}{}); set INFR_CTX to override",
-            fp.total() as f64 / (1u64 << 30) as f64,
-            vram.available as f64 / (1u64 << 30) as f64,
+            "ctx clamp: default context {want} -> {fit} to fit VRAM (weights {:.2} GiB as loaded \
+             vs {:.2} GiB available{}{}); set INFR_CTX to override",
+            gib(held.weights),
+            gib(vram.available),
             if vram.live { ", live" } else { ", total heap" },
             vram.limit_note(),
         );
         Ok(fit)
     }
 
-    /// Whether a fit may switch the KV cache to Q8_0 on its own: the user set no KV format and no
-    /// earlier rung already pinned one, and the model is dense (non-MoE) with a q8-compatible
-    /// layout — the placement rung this was validated on, since MoE placement budgets pager arenas
-    /// separately from this fit math.
+    /// Whether a fit may switch the KV cache to Q8_0 on its own ([`crate::seam::may_auto_q8`]).
     fn may_auto_q8(&self) -> bool {
-        self.cfg.moe.is_none()
-            && !crate::seam::kv_auto_q8()
-            && crate::seam::kv_unset(&self.cfg, &self.ecfg)
-            && crate::seam::kv_q8_layout_ok(&self.cfg)
+        crate::seam::may_auto_q8(&self.cfg, &self.ecfg)
     }
 
     /// The auto-q8 rung for a context the USER chose (`--ctx N` / `INFR_CTX=N`), which is never
@@ -892,7 +911,8 @@ impl SeamModel {
 
     /// The VRAM-fit KV capacity in tokens: the LARGEST context whose KV cache — priced as the
     /// exact allocation the runner will make — plus the dense activation reserve still fits the
-    /// device's AVAILABLE memory after the full weight footprint (live free bytes when
+    /// device's AVAILABLE memory after what the loaded weights will hold
+    /// ([`preload_held`](Self::preload_held)) (live free bytes when
     /// VK_EXT_memory_budget is present, so call this BEFORE the weights upload while `available`
     /// still includes their space). Honors the per-layer KV geometry, the SWA ring, and the
     /// runner's KV-dtype env overrides (INFR_KV_TYPE_K/V, INFR_KV_Q8).
@@ -914,10 +934,9 @@ impl SeamModel {
     /// BEFORE pinning that choice process-wide.
     ///
     /// All the arithmetic lives in [`crate::seam::kv_fit_ctx_for`] (GPU-free, unit-tested); this
-    /// only collects the device's VRAM figures and this model's weight footprint and dtypes.
+    /// only collects the device's VRAM figures, what the loaded weights will hold and the dtypes.
     fn kv_fit_ctx_fmt(&self, vk: &infr_vulkan::VulkanBackend, auto_q8: bool) -> Option<usize> {
         let vram = vk.vram();
-        let fp = self.footprint();
         let (k_fmt, v_fmt) = self.kv_fit_fmts(auto_q8);
         // The snapshot goes in whole: `kv_fit_ctx_for` derives its budget from the allocator's OWN
         // ceiling (`VramInfo::alloc_room`), not from the raw free figure — the VRAM guard reserves
@@ -929,12 +948,46 @@ impl SeamModel {
         crate::seam::kv_fit_ctx_for(
             &self.cfg,
             &self.ecfg,
-            fp.total(),
+            self.preload_held(vk).total(),
             &vram,
             crate::seam::KvAlign::of(vk),
             k_fmt,
             v_fmt,
         )
+    }
+
+    /// What the device will hold beside the KV cache and the activation reserve once the weights
+    /// are loaded, priced before the load as the post-load re-clamp
+    /// (`crate::seam::reclamp_ctx_to_live_room`) will measure it: the weights as the resident
+    /// arena commits them at the least ([`crate::seam::weight_arena_floor`]), the upload staging
+    /// still live when the re-clamp reads the room, and the reserve the re-clamp holds back for
+    /// the driver's later allocations. So the context sized here is one the re-clamp keeps, short
+    /// only of what neither can know before the load: arena tails first-fit strands past the
+    /// bound, and memory the driver takes during the load.
+    ///
+    /// An MoE model keeps its bare footprint: its fit holds back a flat share of the device
+    /// (`kv_fit_ctx_for`'s MoE arm) where the re-clamp holds the dense activation reserve and this
+    /// reserve, a share meant to cover them both (not measured against them).
+    fn preload_held(&self, vk: &infr_vulkan::VulkanBackend) -> PreloadHeld {
+        if self.cfg.moe.is_some() {
+            return PreloadHeld {
+                weights: self.footprint().total(),
+                staging: 0,
+                reserve: 0,
+            };
+        }
+        let cost = vk.weight_load_cost();
+        let units = crate::seam::weight_upload_units(
+            &self.gguf,
+            &self.cfg,
+            &self.ecfg,
+            vk.capabilities().combined_gu,
+        );
+        PreloadHeld {
+            weights: crate::seam::weight_arena_floor(&units, cost),
+            staging: cost.staging,
+            reserve: crate::seam::POST_KV_DEVICE_RESERVE,
+        }
     }
 
     /// The per-side KV dtypes a fit/footprint estimate must price: the user's explicit

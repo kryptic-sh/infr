@@ -8669,3 +8669,26 @@ fail: two caches built with different fingerprints see the same token chain as
 a miss, and one built with the same fingerprint still hits. Until then a
 file-backed tier is only as trustworthy as the assumption that one model ever
 writes it.
+
+### B242 — a block is only reusable at the position it was captured (2026-11-24)
+
+**Tag:** kv · store · reuse · **Plan:** none yet, follows `docs/plan/20-kv-cold-format.md`
+
+Block ids are chained from token 0 (`block_id(prev, tokens)`), so a block is found only when
+everything before it matches too. That is what makes dedup work across sessions — a shared system
+prompt has the same ids everywhere — and it is also the limit: a document quoted in the middle of a
+prompt, or an agent that puts a fresh instruction above a long transcript, gets no reuse at all and
+recomputes the whole thing.
+
+Two pieces would lift it. **Chunked hashing**: hash a 128-token chunk on its content and the hash of
+the chunk before it, so an index can find the chunk at any offset instead of only on a chain. **A
+position fix at the seam**: the rows are baked with RoPE at the position they were captured, so a
+chunk moved to a different offset needs de-rotating and re-rotating (the backward de-rope already
+exists for DeepSeek, plan 09), and rows are also conditional on the preceding context through the
+residual stream, so a chunk reused out of context is approximate. CacheBlend's answer is to recompute
+the most influential tokens at the seam; the exact case, a chunk whose prefix is unchanged and whose
+suffix is new, needs no correction at all. LFM3's short-conv layers carry state from the tokens just
+before the chunk, which the block-boundary recurrent snapshot already captures.
+
+Scope: single node. No RDMA, no cluster, no second GPU — those stay out until there is hardware to
+measure them on.

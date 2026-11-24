@@ -743,6 +743,35 @@ impl SeamKv {
         crate::seam::window_ring_rows(cfg, self.max_ctx, self.ubatch, be.kv_row_align())
     }
 
+    /// Where layer `l`'s logical rows sit: the slot's pages, a sliding-window ring, or linear.
+    pub(crate) fn row_layout(
+        &self,
+        be: &dyn Backend,
+        cfg: &Config,
+        l: usize,
+    ) -> Box<dyn crate::seam::rows::RowLayout + '_> {
+        if let Some(p) = self
+            .paged
+            .as_ref()
+            .filter(|_| crate::seam::paged_layer(cfg, l))
+        {
+            return Box::new(&p.map);
+        }
+        if self.kv_ring && cfg.is_swa_layer(l) {
+            return Box::new(crate::seam::rows::Ring {
+                rows: crate::seam::kv_rows_at(
+                    cfg,
+                    l,
+                    self.max_ctx,
+                    true,
+                    self.ubatch,
+                    be.kv_row_align(),
+                ),
+            });
+        }
+        Box::new(crate::seam::rows::Linear)
+    }
+
     /// Number of token ids materialized in this slot's KV cache.
     pub(crate) fn cached_len(&self) -> usize {
         self.cached.len()

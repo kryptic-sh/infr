@@ -534,13 +534,7 @@ impl ParallelSeam {
                 .store
                 .lock()
                 .map_err(|_| anyhow!("kv store lock poisoned"))?
-                .restore(
-                    &self.vk,
-                    self.model.config(),
-                    self.model.engine_cfg(),
-                    kv,
-                    &prompt_tokens,
-                )?;
+                .restore(&self.vk, self.model.config(), kv, &prompt_tokens)?;
             if restored > 0 {
                 tracing::debug!(tokens = restored, "kv store: restored a stored prefix");
             }
@@ -584,14 +578,8 @@ impl ParallelSeam {
         // cache miss on the next request, never a failed request.
         if let Some(kv) = guard.kv.as_ref() {
             match self.store.lock().map(|mut s| {
-                s.capture(
-                    &self.vk,
-                    self.model.config(),
-                    self.model.engine_cfg(),
-                    kv,
-                    prompt_tokens.len(),
-                )
-                .map(|kept| (kept, s.stats()))
+                s.capture(&self.vk, self.model.config(), kv, prompt_tokens.len())
+                    .map(|kept| (kept, s.stats()))
             }) {
                 Ok(Ok((kept, (blocks, bytes)))) if kept > 0 => {
                     tracing::debug!(tokens = kept, blocks, bytes, "kv store: captured a prefix");

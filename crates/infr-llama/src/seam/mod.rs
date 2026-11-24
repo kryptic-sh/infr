@@ -23,6 +23,7 @@ mod kv_store;
 pub mod model;
 mod pool;
 mod routing;
+mod rows;
 mod runner;
 mod sc;
 mod weights;

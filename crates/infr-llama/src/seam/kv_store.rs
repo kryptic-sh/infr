@@ -14,16 +14,16 @@
 //! re-prefilling the same tokens costs tens of seconds.
 
 use crate::Config;
-use crate::EngineConfig;
 use anyhow::Result;
-use infr_core::backend::{Backend, Buffer};
+use infr_core::backend::Backend;
 use infr_core::budget::kv_fmt_bytes;
 use infr_core::DType;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
 
 use super::{
-    kv_row_elems, kv_rows_at, ubatch_rows,
+    kv_row_elems,
+    rows::{read_rows, write_rows},
     weights::{RecurrentSnap, SeamKv},
 };
 
@@ -223,34 +223,6 @@ fn write_block(w: &mut impl Write, h: &mut Fnv, b: &Block) -> std::io::Result<()
         }
     }
     put_u64(w, h, b.used)
-}
-
-/// Write one stored block's rows into a sliding-window ring at the block's own position, wrapping
-/// at `rcap` so the newest rows end up where the window reads them.
-#[allow(clippy::too_many_arguments)]
-fn write_ring_block(
-    be: &dyn Backend,
-    dst: &dyn Buffer,
-    fmt: DType,
-    row: usize,
-    rcap: usize,
-    start: usize,
-    len: usize,
-    bytes: &[u8],
-) -> Result<()> {
-    if len == 0 || rcap == 0 {
-        return Ok(());
-    }
-    let first = start % rcap;
-    let head = len.min(rcap - first);
-    let hb = kv_fmt_bytes(fmt, head * row);
-    be.upload_at(dst, kv_fmt_bytes(fmt, first * row), &bytes[..hb])?;
-    if head < len {
-        let tail = len - head;
-        let tb = kv_fmt_bytes(fmt, tail * row);
-        be.upload_at(dst, 0, &bytes[hb..hb + tb])?;
-    }
-    Ok(())
 }
 
 fn read_block(r: &mut impl Read, h: &mut Fnv) -> Result<Block> {
@@ -891,7 +863,6 @@ impl KvPrefixStore {
         &mut self,
         be: &dyn Backend,
         cfg: &Config,
-        ec: &EngineConfig,
         kv: &mut SeamKv,
         prompt: &[u32],
     ) -> Result<usize> {
@@ -903,16 +874,11 @@ impl KvPrefixStore {
             return Ok(0);
         }
         p = p.min(kv.max_ctx);
-        if kv.kv_ring {
-            for l in 0..cfg.n_layer {
-                if cfg.is_swa_layer(l) {
-                    let rows =
-                        kv_rows_at(cfg, l, kv.max_ctx, true, ubatch_rows(ec), be.kv_row_align());
-                    if kv.cached.len() > rows {
-                        return Ok(0);
-                    }
-                }
-            }
+        if kv
+            .window_ring_rows(be, cfg)
+            .is_some_and(|rows| kv.cached.len() > rows)
+        {
+            return Ok(0);
         }
         let mut keep = Vec::new();
         let mut n = 0usize;
@@ -944,76 +910,36 @@ impl KvPrefixStore {
                 continue;
             }
             let (k_row, v_row) = kv_row_elems(cfg, l);
-            if kv.kv_ring && cfg.is_swa_layer(l) {
-                let rcap = kv_rows_at(cfg, l, kv.max_ctx, true, ubatch_rows(ec), be.kv_row_align());
-                let mut start = 0usize;
-                for i in &keep {
-                    let b = &self.blocks[*i];
-                    // A block captured before the ring's window was recycled has no rows.
-                    if !b.k[l].is_empty() {
-                        write_ring_block(
-                            be,
-                            kv.kbufs[l].as_ref(),
-                            kv.k_fmt,
-                            k_row,
-                            rcap,
-                            start,
-                            b.len,
-                            &b.k[l],
-                        )?;
-                        if v_row > 0 && !b.v[l].is_empty() {
-                            write_ring_block(
-                                be,
-                                kv.vbufs[l].as_ref(),
-                                kv.v_fmt,
-                                v_row,
-                                rcap,
-                                start,
-                                b.len,
-                                &b.v[l],
-                            )?;
-                        }
-                    }
-                    start += b.len;
+            let layout = kv.row_layout(be, cfg, l);
+            let flush = |rows: std::ops::Range<usize>, k: &[u8], v: &[u8]| -> Result<()> {
+                if rows.is_empty() {
+                    return Ok(());
                 }
-                continue;
-            }
-            let kb = kv_fmt_bytes(kv.k_fmt, n * k_row);
-            let mut buf = Vec::with_capacity(kb);
+                let kbuf = kv.kbufs[l].as_ref();
+                write_rows(be, kbuf, kv.k_fmt, k_row, &*layout, rows.clone(), k)?;
+                if v_row > 0 {
+                    let vbuf = kv.vbufs[l].as_ref();
+                    write_rows(be, vbuf, kv.v_fmt, v_row, &*layout, rows, v)?;
+                }
+                Ok(())
+            };
+            // A block captured after the ring's window was recycled has no rows: it ends a run.
+            let (mut run, mut start) = (0usize, 0usize);
+            let (mut kbuf, mut vbuf) = (Vec::new(), Vec::new());
             for i in &keep {
-                buf.extend_from_slice(&self.blocks[*i].k[l]);
-            }
-            debug_assert_eq!(buf.len(), kb);
-            Self::write_rows(
-                be,
-                cfg,
-                kv,
-                l,
-                kv.k_fmt,
-                k_row,
-                n,
-                kv.kbufs[l].as_ref(),
-                &buf,
-            )?;
-            if v_row > 0 {
-                let vb = kv_fmt_bytes(kv.v_fmt, n * v_row);
-                let mut buf = Vec::with_capacity(vb);
-                for i in &keep {
-                    buf.extend_from_slice(&self.blocks[*i].v[l]);
+                let b = &self.blocks[*i];
+                if b.k[l].is_empty() || (v_row > 0 && b.v[l].is_empty()) {
+                    flush(run..start, &kbuf, &vbuf)?;
+                    kbuf.clear();
+                    vbuf.clear();
+                    run = start + b.len;
+                } else {
+                    kbuf.extend_from_slice(&b.k[l]);
+                    vbuf.extend_from_slice(&b.v[l]);
                 }
-                debug_assert_eq!(buf.len(), vb);
-                Self::write_rows(
-                    be,
-                    cfg,
-                    kv,
-                    l,
-                    kv.v_fmt,
-                    v_row,
-                    n,
-                    kv.vbufs[l].as_ref(),
-                    &buf,
-                )?;
+                start += b.len;
             }
+            flush(run..start, &kbuf, &vbuf)?;
         }
         if cfg.has_recurrent_state() {
             let snap = self.blocks[*keep.last().expect("the snapshot block")]
@@ -1043,7 +969,6 @@ impl KvPrefixStore {
         &mut self,
         be: &dyn Backend,
         cfg: &Config,
-        ec: &EngineConfig,
         kv: &SeamKv,
         upto: usize,
     ) -> Result<usize> {
@@ -1065,26 +990,6 @@ impl KvPrefixStore {
             self.blocks.clear();
             self.k_fmt = kv.k_fmt;
             self.v_fmt = kv.v_fmt;
-        }
-        // A wrapped SWA ring has recycled every row below the window it still holds.
-        let mut safe_start = 0usize;
-        if kv.kv_ring {
-            let mut min_rows = usize::MAX;
-            for l in 0..cfg.n_layer {
-                if cfg.is_swa_layer(l) {
-                    min_rows = min_rows.min(kv_rows_at(
-                        cfg,
-                        l,
-                        kv.max_ctx,
-                        true,
-                        ubatch_rows(ec),
-                        be.kv_row_align(),
-                    ));
-                }
-            }
-            if min_rows != usize::MAX {
-                safe_start = kv.cached.len().saturating_sub(min_rows);
-            }
         }
         let tokens = &kv.cached[..p];
         let mut id = 0u64;
@@ -1122,7 +1027,7 @@ impl KvPrefixStore {
                 dirty: true,
             });
         }
-        let filled = self.fill_from_device(be, cfg, kv, p, safe_start, &missing, base);
+        let filled = self.fill_from_device(be, cfg, kv, p, &missing, base);
         if let Err(e) = filled {
             self.blocks.truncate(base);
             return Err(e);
@@ -1192,7 +1097,6 @@ impl KvPrefixStore {
         cfg: &Config,
         kv: &SeamKv,
         p: usize,
-        safe_start: usize,
         missing: &[(usize, usize, u64)],
         base: usize,
     ) -> Result<()> {
@@ -1201,90 +1105,32 @@ impl KvPrefixStore {
                 continue;
             }
             let (k_row, v_row) = kv_row_elems(cfg, l);
-            // A sliding-window ring holds only its last `rows` positions, at `pos % rows`; the
-            // bulk read below would run past its buffer once the conversation is longer than the
-            // window.
-            if kv.kv_ring && cfg.is_swa_layer(l) {
-                let rcap = kv_rows_at(cfg, l, kv.max_ctx, true, kv.ubatch, be.kv_row_align());
-                for (j, (start, len, _)) in missing.iter().enumerate() {
-                    if *start < safe_start {
-                        continue;
-                    }
-                    let first = start % rcap;
-                    let n1 = (*len).min(rcap - first);
-                    let mut kslice = vec![0u8; kv_fmt_bytes(kv.k_fmt, *len * k_row)];
-                    be.download_at(
-                        kv.kbufs[l].as_ref(),
-                        kv_fmt_bytes(kv.k_fmt, first * k_row),
-                        &mut kslice[..kv_fmt_bytes(kv.k_fmt, n1 * k_row)],
-                    )?;
-                    if n1 < *len {
-                        be.download_at(
-                            kv.kbufs[l].as_ref(),
-                            0,
-                            &mut kslice[kv_fmt_bytes(kv.k_fmt, n1 * k_row)..],
-                        )?;
-                    }
-                    let vslice = if v_row > 0 {
-                        let mut buf = vec![0u8; kv_fmt_bytes(kv.v_fmt, *len * v_row)];
-                        be.download_at(
-                            kv.vbufs[l].as_ref(),
-                            kv_fmt_bytes(kv.v_fmt, first * v_row),
-                            &mut buf[..kv_fmt_bytes(kv.v_fmt, n1 * v_row)],
-                        )?;
-                        if n1 < *len {
-                            be.download_at(
-                                kv.vbufs[l].as_ref(),
-                                0,
-                                &mut buf[kv_fmt_bytes(kv.v_fmt, n1 * v_row)..],
-                            )?;
-                        }
-                        buf
-                    } else {
-                        Vec::new()
-                    };
-                    let b = &mut self.blocks[base + j];
-                    b.bytes += kslice.len() + vslice.len();
-                    b.k[l] = kslice;
-                    b.v[l] = vslice;
-                }
+            let layout = kv.row_layout(be, cfg, l);
+            // Blocks below the oldest resident row stay empty here but stay in the chain.
+            let oldest = layout.oldest_resident(kv.cached.len());
+            let Some(from) = missing.iter().map(|m| m.0).find(|&s| s >= oldest) else {
                 continue;
-            }
-            let mut kbuf = vec![0u8; kv_fmt_bytes(kv.k_fmt, p * k_row)];
-            Self::read_rows(
-                be,
-                cfg,
-                kv,
-                l,
-                kv.k_fmt,
-                k_row,
-                p,
-                kv.kbufs[l].as_ref(),
-                &mut kbuf,
-            )?;
+            };
+            let mut kbuf = vec![0u8; kv_fmt_bytes(kv.k_fmt, (p - from) * k_row)];
+            let kdev = kv.kbufs[l].as_ref();
+            read_rows(be, kdev, kv.k_fmt, k_row, &*layout, from..p, &mut kbuf)?;
             let vbuf = if v_row > 0 {
-                let mut buf = vec![0u8; kv_fmt_bytes(kv.v_fmt, p * v_row)];
-                Self::read_rows(
-                    be,
-                    cfg,
-                    kv,
-                    l,
-                    kv.v_fmt,
-                    v_row,
-                    p,
-                    kv.vbufs[l].as_ref(),
-                    &mut buf,
-                )?;
+                let mut buf = vec![0u8; kv_fmt_bytes(kv.v_fmt, (p - from) * v_row)];
+                let vdev = kv.vbufs[l].as_ref();
+                read_rows(be, vdev, kv.v_fmt, v_row, &*layout, from..p, &mut buf)?;
                 buf
             } else {
                 Vec::new()
             };
             for (j, (start, len, _)) in missing.iter().enumerate() {
-                let ks = kv_fmt_bytes(kv.k_fmt, *start * k_row);
+                if *start < from {
+                    continue;
+                }
+                let ks = kv_fmt_bytes(kv.k_fmt, (*start - from) * k_row);
                 let ke = ks + kv_fmt_bytes(kv.k_fmt, *len * k_row);
                 let kslice = kbuf[ks..ke].to_vec();
                 let vslice = if v_row > 0 {
-                    let vs = kv_fmt_bytes(kv.v_fmt, *start * v_row);
+                    let vs = kv_fmt_bytes(kv.v_fmt, (*start - from) * v_row);
                     let ve = vs + kv_fmt_bytes(kv.v_fmt, *len * v_row);
                     vbuf[vs..ve].to_vec()
                 } else {
@@ -1295,79 +1141,6 @@ impl KvPrefixStore {
                 b.k[l] = kslice;
                 b.v[l] = vslice;
             }
-        }
-        Ok(())
-    }
-
-    /// Download `rows` rows of one side into `buf`, walking the slot's page table when the layer
-    /// is pooled (a paged layer has no single row base to read from).
-    #[allow(clippy::too_many_arguments)]
-    fn read_rows(
-        be: &dyn Backend,
-        cfg: &Config,
-        kv: &SeamKv,
-        l: usize,
-        fmt: DType,
-        row: usize,
-        rows: usize,
-        src: &dyn Buffer,
-        buf: &mut [u8],
-    ) -> Result<()> {
-        let Some(paged) = kv
-            .paged
-            .as_ref()
-            .filter(|_| crate::seam::paged_layer(cfg, l))
-        else {
-            be.download_at(src, 0, buf)?;
-            return Ok(());
-        };
-        for page in 0..rows.div_ceil(infr_vulkan::paged::PAGE_ROWS) {
-            let first = page * infr_vulkan::paged::PAGE_ROWS;
-            let n = infr_vulkan::paged::PAGE_ROWS.min(rows - first);
-            let phys = paged.map.page(page) as usize;
-            let at = kv_fmt_bytes(fmt, first * row);
-            let bytes = kv_fmt_bytes(fmt, n * row);
-            be.download_at(
-                src,
-                kv_fmt_bytes(fmt, phys * infr_vulkan::paged::PAGE_ROWS * row),
-                &mut buf[at..at + bytes],
-            )?;
-        }
-        Ok(())
-    }
-
-    /// Upload `rows` rows of one side from `buf`, page by page when the layer is pooled.
-    #[allow(clippy::too_many_arguments)]
-    fn write_rows(
-        be: &dyn Backend,
-        cfg: &Config,
-        kv: &SeamKv,
-        l: usize,
-        fmt: DType,
-        row: usize,
-        rows: usize,
-        dst: &dyn Buffer,
-        buf: &[u8],
-    ) -> Result<()> {
-        let Some(paged) = kv
-            .paged
-            .as_ref()
-            .filter(|_| crate::seam::paged_layer(cfg, l))
-        else {
-            be.upload_at(dst, 0, buf)?;
-            return Ok(());
-        };
-        for page in 0..rows.div_ceil(infr_vulkan::paged::PAGE_ROWS) {
-            let first = page * infr_vulkan::paged::PAGE_ROWS;
-            let n = infr_vulkan::paged::PAGE_ROWS.min(rows - first);
-            let phys = paged.map.page(page) as usize;
-            let at = kv_fmt_bytes(fmt, first * row);
-            let bytes = kv_fmt_bytes(fmt, n * row);
-            be.upload_at(
-                dst,
-                kv_fmt_bytes(fmt, phys * infr_vulkan::paged::PAGE_ROWS * row),
-                &buf[at..at + bytes],
-            )?;
         }
         Ok(())
     }
@@ -1564,28 +1337,6 @@ mod tests {
         tier.rewrite(key, DType::F16, DType::F16, &[])
             .expect("clear");
         assert!(tier.load(key).expect("load").is_none(), "nothing left");
-    }
-
-    /// A stored block lands at its own ring position and wraps at the capacity, so a prefix
-    /// longer than the ring still leaves the newest rows where attention reads them.
-    #[test]
-    fn a_ring_block_wraps_at_its_capacity() {
-        use infr_core::backend::BufferUsage;
-        let be = infr_cpu::CpuBackend::new();
-        let buf = be.alloc(4 * 512, BufferUsage::KvCache).expect("buffer");
-        let mut rows = Vec::with_capacity(300 * 4);
-        for i in 0..300u32 {
-            rows.extend_from_slice(&i.to_le_bytes());
-        }
-        write_ring_block(&be, buf.as_ref(), DType::F32, 1, 512, 400, 300, &rows).expect("write");
-        let mut out = vec![0u8; 4 * 512];
-        be.download(buf.as_ref(), &mut out).expect("read");
-        let at = |row: usize| u32::from_le_bytes(out[row * 4..row * 4 + 4].try_into().unwrap());
-        assert_eq!(at(400), 0);
-        assert_eq!(at(511), 111);
-        assert_eq!(at(0), 112);
-        assert_eq!(at(187), 299);
-        assert_eq!(at(188), 0, "nothing past the block");
     }
 
     fn temp_path(name: &str) -> std::path::PathBuf {

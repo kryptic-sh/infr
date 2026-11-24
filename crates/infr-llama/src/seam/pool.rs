@@ -21,6 +21,7 @@ use infr_core::budget::kv_fmt_bytes;
 use infr_core::paging::KvPagesExhausted;
 use infr_core::DType;
 
+use crate::seam::rows::{copy_rows, Linear};
 use crate::seam::{kv_row_elems, kv_side_bytes};
 use crate::Config;
 use infr_vulkan::paged::{PagePool, PAGE_ROWS};
@@ -212,29 +213,27 @@ impl KvPool {
             let Some(k) = self.k[l].as_ref() else {
                 continue;
             };
-            let (k_row, v_row) = (self.k_row[l], self.v_row[l]);
             let v = self.v[l].as_ref().expect("pooled layer has both sides");
-            for page in 0..rows.div_ceil(PAGE_ROWS) {
-                let first = page * PAGE_ROWS;
-                let n = PAGE_ROWS.min(rows - first);
-                let phys = map.page(page);
-                be.copy_buffer_at(
-                    src_k[l].as_ref(),
-                    kv_fmt_bytes(self.k_fmt, first * k_row),
-                    k.as_ref(),
-                    kv_fmt_bytes(self.k_fmt, phys as usize * PAGE_ROWS * k_row),
-                    kv_fmt_bytes(self.k_fmt, n * k_row),
-                )
-                .map_err(|e| anyhow!("{e}"))?;
-                be.copy_buffer_at(
-                    src_v[l].as_ref(),
-                    kv_fmt_bytes(self.v_fmt, first * v_row),
-                    v.as_ref(),
-                    kv_fmt_bytes(self.v_fmt, phys as usize * PAGE_ROWS * v_row),
-                    kv_fmt_bytes(self.v_fmt, n * v_row),
-                )
-                .map_err(|e| anyhow!("{e}"))?;
-            }
+            copy_rows(
+                be,
+                src_k[l].as_ref(),
+                &Linear,
+                k.as_ref(),
+                map,
+                self.k_fmt,
+                self.k_row[l],
+                0..rows,
+            )?;
+            copy_rows(
+                be,
+                src_v[l].as_ref(),
+                &Linear,
+                v.as_ref(),
+                map,
+                self.v_fmt,
+                self.v_row[l],
+                0..rows,
+            )?;
         }
         Ok(())
     }
@@ -397,25 +396,6 @@ fn copy_page(be: &dyn Backend, buf: &dyn Buffer, src: u32, dst: u32, bytes: usiz
         .map_err(|e| anyhow!("{e}"))
 }
 
-/// Copy `bytes` from physical page `src` of `buf` into page `dst`; `page_bytes` is that page's
-/// size, so page `p` starts at `p * page_bytes` and only the first `bytes` of it move.
-fn copy_page_rows(
-    be: &dyn Backend,
-    buf: &dyn Buffer,
-    src: u32,
-    dst: u32,
-    bytes: usize,
-    page_bytes: usize,
-) -> AResult<()> {
-    if bytes == 0 || src == dst {
-        return Ok(());
-    }
-    let from = src as usize * page_bytes;
-    let to = dst as usize * page_bytes;
-    be.copy_buffer_at(buf, from, buf, to, bytes.min(page_bytes))
-        .map_err(|e| anyhow!("{e}"))
-}
-
 impl Drop for SlotMap {
     fn drop(&mut self) {
         self.unshare_all();
@@ -503,19 +483,16 @@ impl PagedSlot {
         }
         self.map.grow(page + 1)?;
         let pool = self.map.pool();
-        let from = src.page(page);
-        let to = self.map.page(page);
+        let span = page * PAGE_ROWS..page * PAGE_ROWS + rows;
         for l in 0..pool.k.len() {
             let Some(k) = pool.k[l].as_ref() else {
                 continue;
             };
-            let kb = kv_fmt_bytes(pool.k_fmt, PAGE_ROWS * pool.k_row[l]);
-            let n = kv_fmt_bytes(pool.k_fmt, rows * pool.k_row[l]);
-            copy_page_rows(be, k.as_ref(), from, to, n, kb)?;
             let v = pool.v[l].as_ref().expect("pooled layer has both sides");
-            let vb = kv_fmt_bytes(pool.v_fmt, PAGE_ROWS * pool.v_row[l]);
-            let n = kv_fmt_bytes(pool.v_fmt, rows * pool.v_row[l]);
-            copy_page_rows(be, v.as_ref(), from, to, n, vb)?;
+            let (k, v) = (k.as_ref(), v.as_ref());
+            let (fk, fv) = (pool.k_fmt, pool.v_fmt);
+            copy_rows(be, k, src, k, &self.map, fk, pool.k_row[l], span.clone())?;
+            copy_rows(be, v, src, v, &self.map, fv, pool.v_row[l], span.clone())?;
         }
         self.upload_table(be)?;
         Ok(())

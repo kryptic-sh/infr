@@ -148,6 +148,50 @@ mod tests {
         Some(settled_use(reader()?))
     }
 
+    /// How far the device's memory in use may move across a failed run before
+    /// [`retry_if_moved`] runs it again. A test's limit is the memory in use plus its room, so
+    /// memory another process takes after the reading comes out of the room; the tightest rooms
+    /// here sit within a few MiB of where a session is refused, by construction
+    /// ([`usable_room`] stops at the first room that runs). Observed on the RX 7900 XTX on
+    /// 2026-11-25 with the desktop in use: the readings move in 4 MiB steps, and one such step
+    /// across a run at the tightest Qwen3-0.6B room turned its 1080-token q8_0 window into a
+    /// refusal; consecutive settled readings that did not step differed by under 100 KB.
+    const IN_USE_MOVED: u64 = MIB;
+
+    /// Run `run`, which opens a session on a limited device, between two [`in_use`] readings, and
+    /// once more when it failed while the reading moved by more than [`IN_USE_MOVED`] across it,
+    /// saying so; the second result is the one returned. A failure on a device that did not move,
+    /// or a second failure, is returned as it is.
+    fn retry_if_moved<T, E>(
+        what: impl std::fmt::Display,
+        mut run: impl FnMut() -> Result<T, E>,
+    ) -> Result<T, E> {
+        let before = in_use().expect("a backend opened for the test");
+        let first = run();
+        if first.is_ok() {
+            return first;
+        }
+        let moved = in_use().expect("a backend").abs_diff(before);
+        if moved <= IN_USE_MOVED {
+            return first;
+        }
+        eprintln!(
+            "re-run: {what}: the device's memory in use moved {moved} bytes across a failed run, \
+             so it runs once more"
+        );
+        run()
+    }
+
+    /// `Ok` when `holds`, else `Err` with `msg`: an assertion a [`retry_if_moved`] run reports
+    /// instead of panicking, so that a run the device's movement failed can run again.
+    fn ensure(holds: bool, msg: impl FnOnce() -> String) -> Result<(), String> {
+        if holds {
+            Ok(())
+        } else {
+            Err(msg())
+        }
+    }
+
     fn qwen3_06b() -> Option<std::path::PathBuf> {
         crate::util::test_qwen3_06b()
     }
@@ -219,8 +263,16 @@ mod tests {
     /// `room_mib` above the bytes in use as [`in_use`] reads them just before, check that the
     /// context was clamped below the
     /// trained window, generate a few tokens, and report what the slot allocated — or why the
-    /// session refused to open or the generation failed.
+    /// session refused to open or the generation failed. Run again when it failed while the
+    /// device's memory in use moved ([`retry_if_moved`]).
     fn clamped_run(path: &std::path::Path, room_mib: u64) -> Result<ClampedRun, RunErr> {
+        retry_if_moved(format!("{room_mib} MiB of room"), || {
+            clamped_run_once(path, room_mib)
+        })
+    }
+
+    /// One [`clamped_run`].
+    fn clamped_run_once(path: &std::path::Path, room_mib: u64) -> Result<ClampedRun, RunErr> {
         let used = in_use().expect("a backend opened for the sweep");
         let model = load(path, used + room_mib * MIB, None);
         let mut sess = model.vulkan_session_default().map_err(|e| {
@@ -522,9 +574,9 @@ mod tests {
     /// 12.4 MB less than its size, the RX 7900 XTX all of it; see docs/backlog.md
     /// B-PRELOAD-CLAMP). A fit that counted the ring twice is past it.
     ///
-    /// A room that fails while the device's memory in use moved by more than [`IN_USE_SLACK`]
-    /// across its run (another process on the GPU: observed once on the RX 7900 XTX, 77 MB taken
-    /// during one run and kept) is run once more, and fails the test only if it fails again.
+    /// A room that fails while the device's memory in use moved across its run (another process
+    /// on the GPU: observed once on the RX 7900 XTX, 77 MB taken during one run and kept) is run
+    /// once more ([`retry_if_moved`]), and fails the test only if it fails again.
     #[test]
     #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
     fn auto_ctx_before_the_load_is_the_ctx_after_it() {
@@ -606,20 +658,16 @@ mod tests {
                 (row, fails)
             };
             for &room in rooms {
-                let before = in_use().expect("a backend opened for the sweep");
-                let (mut row, mut fails) = judge(room, auto_run(&path, room));
-                if !fails.is_empty() {
-                    let moved = in_use().expect("a backend").abs_diff(before);
-                    if moved > IN_USE_SLACK {
-                        eprintln!(
-                            "{name} at {room} MiB: {row}; the device's memory in use moved {moved} \
-                             bytes across the run, so it runs once more"
-                        );
-                        (row, fails) = judge(room, auto_run(&path, room));
+                let ran = retry_if_moved(format!("{name} at {room} MiB"), || {
+                    let (row, fails) = judge(room, auto_run(&path, room));
+                    eprintln!("{name} at {room} MiB: {row}");
+                    if fails.is_empty() {
+                        Ok(())
+                    } else {
+                        Err(fails)
                     }
-                }
-                failed.extend(fails);
-                eprintln!("{name} at {room} MiB: {row}");
+                });
+                failed.extend(ran.err().unwrap_or_default());
             }
         }
         assert!(failed.is_empty(), "{}", failed.join("\n"));
@@ -708,45 +756,56 @@ mod tests {
         let Some(reader) = reader() else {
             return;
         };
-        let used = settled_use(reader);
-        let limit = used + B12_ROOM;
-        let probe = load(&path, limit, None);
-        let vk = open_backend(None, probe.ecfg.clone()).expect("backend");
-        let f16 = probe
-            .kv_fit_ctx_fmt(&vk, false)
-            .expect("an attention model");
-        let q8 = probe.kv_fit_ctx_fmt(&vk, true).expect("an attention model");
-        drop(vk);
-        // What the probe backend freed lands before the session's own backend measures the room.
-        settled_use(reader);
-        let want = (f16 + q8) / 2;
-        assert!(
-            f16 < want && want < q8,
-            "f16 {f16}, q8_0 {q8}: no window between them"
-        );
+        let run = || -> Result<(), String> {
+            let used = settled_use(reader);
+            let limit = used + B12_ROOM;
+            let probe = load(&path, limit, None);
+            let vk = open_backend(None, probe.ecfg.clone()).expect("backend");
+            let f16 = probe
+                .kv_fit_ctx_fmt(&vk, false)
+                .expect("an attention model");
+            let q8 = probe.kv_fit_ctx_fmt(&vk, true).expect("an attention model");
+            drop(vk);
+            // What the probe backend freed lands before the session's own backend measures the
+            // room.
+            settled_use(reader);
+            let want = (f16 + q8) / 2;
+            ensure(f16 < want && want < q8, || {
+                format!("f16 {f16}, q8_0 {q8}: no window between them")
+            })?;
 
-        let model = load(&path, limit, Some(want));
-        let mut sess = model.vulkan_session(want).expect("session");
-        // The explicit-context rung pins q8_0 when the session opens, before any weight loads; the
-        // dense placement's own q8_0 rung would also catch this window later, so the served format
-        // alone cannot say which rung decided.
-        let scope = crate::seam::PlacementScope::enter(sess.pins().clone());
-        let pinned = crate::seam::kv_auto_q8();
-        drop(scope);
-        assert!(
-            pinned,
-            "the session opened without the explicit-context q8_0 pin"
-        );
-        model
-            .generate_vulkan_session(&mut sess, "The capital of France is", 4, None, |_| {})
-            .expect("the q8_0 window runs");
-        let (_, kv) = slot(&sess);
-        eprintln!(
-            "f16 fits {f16}, q8_0 fits {q8}; asked {want}, served {} at {:?}/{:?}",
-            kv.max_ctx, kv.k_fmt, kv.v_fmt
-        );
-        assert_eq!(kv.max_ctx, want, "an explicit context is served as asked");
-        assert_eq!((kv.k_fmt, kv.v_fmt), (DType::Q8_0, DType::Q8_0));
+            let model = load(&path, limit, Some(want));
+            let mut sess = model
+                .vulkan_session(want)
+                .map_err(|e| format!("session: {e}"))?;
+            // The explicit-context rung pins q8_0 when the session opens, before any weight loads;
+            // the dense placement's own q8_0 rung would also catch this window later, so the
+            // served format alone cannot say which rung decided.
+            let scope = crate::seam::PlacementScope::enter(sess.pins().clone());
+            let pinned = crate::seam::kv_auto_q8();
+            drop(scope);
+            ensure(pinned, || {
+                "the session opened without the explicit-context q8_0 pin".to_string()
+            })?;
+            model
+                .generate_vulkan_session(&mut sess, "The capital of France is", 4, None, |_| {})
+                .map_err(|e| format!("the q8_0 window did not run: {e}"))?;
+            let (_, kv) = slot(&sess);
+            eprintln!(
+                "f16 fits {f16}, q8_0 fits {q8}; asked {want}, served {} at {:?}/{:?}",
+                kv.max_ctx, kv.k_fmt, kv.v_fmt
+            );
+            ensure(kv.max_ctx == want, || {
+                format!(
+                    "an explicit context is served as asked: asked {want}, served {}",
+                    kv.max_ctx
+                )
+            })?;
+            ensure((kv.k_fmt, kv.v_fmt) == (DType::Q8_0, DType::Q8_0), || {
+                format!("served in {:?}/{:?}, not q8_0", kv.k_fmt, kv.v_fmt)
+            })
+        };
+        retry_if_moved("the q8_0 window", run).unwrap_or_else(|e| panic!("{e}"));
     }
 
     /// The runner's refusal after the weights load (B12), and the window that used to reach it.
@@ -771,68 +830,159 @@ mod tests {
         let Some(reader) = reader() else {
             return;
         };
-        let used = settled_use(reader);
-        let limit = used + B12_ROOM;
-        let probe = load(&path, limit, None);
-        // Both windows are taken at the edge of a room `IN_USE_SLACK` smaller than the sessions
-        // get, so the desktop moving between this reading and theirs cannot push either one past
-        // its edge.
-        let vk = open_backend(None, limited_cfg(limit - IN_USE_SLACK, None)).expect("backend");
-        let fits = probe
-            .kv_fit_ctx_fmt(&vk, false)
+        let run = || -> Result<(), String> {
+            let used = settled_use(reader);
+            let limit = used + B12_ROOM;
+            let probe = load(&path, limit, None);
+            // Both windows are taken at the edge of a room `IN_USE_SLACK` smaller than the
+            // sessions get, so the desktop moving between this reading and theirs cannot push
+            // either one past its edge.
+            let vk = open_backend(None, limited_cfg(limit - IN_USE_SLACK, None)).expect("backend");
+            let fits = probe
+                .kv_fit_ctx_fmt(&vk, false)
+                .expect("an attention model");
+            let placed = crate::seam::kv_fit_ctx_for(
+                &probe.cfg,
+                &probe.ecfg,
+                probe.footprint().total(),
+                &vk.vram(),
+                KvAlign::of(&vk),
+                DType::F16,
+                DType::F16,
+            )
             .expect("an attention model");
-        let placed = crate::seam::kv_fit_ctx_for(
-            &probe.cfg,
-            &probe.ecfg,
-            probe.footprint().total(),
-            &vk.vram(),
-            KvAlign::of(&vk),
-            DType::F16,
-            DType::F16,
-        )
-        .expect("an attention model");
-        drop(vk);
-        // What the probe backend freed lands before the session's own backend measures the room.
-        settled_use(reader);
-        assert!(
-            fits < placed,
-            "the fit ({fits}) must be below what the bare footprint leaves ({placed})"
-        );
+            drop(vk);
+            // What the probe backend freed lands before the session's own backend measures the
+            // room.
+            settled_use(reader);
+            ensure(fits < placed, || {
+                format!("the fit ({fits}) must be below what the bare footprint leaves ({placed})")
+            })?;
 
-        let model = load(&path, limit, Some(fits));
-        let mut sess = model
-            .vulkan_session(fits)
-            .expect("the pre-load fit accepts its own largest window");
-        model
-            .generate_vulkan_session(&mut sess, "The capital of France is", 4, None, |_| {})
-            .expect("the largest window the fit accepts runs");
-        let (_, kv) = slot(&sess);
-        assert_eq!(kv.max_ctx, fits, "an explicit context is served as asked");
-        assert_eq!((kv.k_fmt, kv.v_fmt), (DType::F16, DType::F16));
-        drop(sess);
-        // What the first session freed lands before the second one's placement measures the room.
-        settled_use(reader);
+            let model = load(&path, limit, Some(fits));
+            let mut sess = model.vulkan_session(fits).map_err(|e| {
+                format!("the pre-load fit did not accept its own largest window {fits}: {e}")
+            })?;
+            model
+                .generate_vulkan_session(&mut sess, "The capital of France is", 4, None, |_| {})
+                .map_err(|e| format!("the largest window the fit accepts, {fits}, failed: {e}"))?;
+            let (_, kv) = slot(&sess);
+            ensure(kv.max_ctx == fits, || {
+                format!(
+                    "an explicit context is served as asked: asked {fits}, served {}",
+                    kv.max_ctx
+                )
+            })?;
+            ensure((kv.k_fmt, kv.v_fmt) == (DType::F16, DType::F16), || {
+                format!("served in {:?}/{:?}, not f16", kv.k_fmt, kv.v_fmt)
+            })?;
+            drop(sess);
+            // What the first session freed lands before the second one's placement measures the
+            // room.
+            settled_use(reader);
 
-        let f16 = limited_cfg_with(limit, Some(placed), |c| {
-            c.kv.type_k = Some(DType::F16);
-            c.kv.type_k_specified = true;
-            c.kv.type_v = Some(DType::F16);
-            c.kv.type_v_specified = true;
-        });
-        let model = SeamModel::load_with(&path, None, f16).expect("model load");
-        let mut sess = model
-            .vulkan_session(placed)
-            .expect("the refusal before the load counts the cache alone");
-        let err = model
-            .generate_vulkan_session(&mut sess, "The capital of France is", 4, None, |_| {})
-            .expect_err("the window must not run once the weights' own memory is counted");
-        eprintln!("fit {fits}; asked {placed} in f16: {err}");
-        let msg = err.to_string();
-        assert!(
-            msg.contains(&format!("context {placed} cannot be served"))
-                && msg.contains("after the weights"),
-            "the refusal after the load, not another failure: {msg}"
-        );
+            let f16 = limited_cfg_with(limit, Some(placed), |c| {
+                c.kv.type_k = Some(DType::F16);
+                c.kv.type_k_specified = true;
+                c.kv.type_v = Some(DType::F16);
+                c.kv.type_v_specified = true;
+            });
+            let model = SeamModel::load_with(&path, None, f16).expect("model load");
+            let mut sess = model.vulkan_session(placed).map_err(|e| {
+                format!("the refusal before the load counts the cache alone, yet {placed}: {e}")
+            })?;
+            let Err(err) = model.generate_vulkan_session(
+                &mut sess,
+                "The capital of France is",
+                4,
+                None,
+                |_| {},
+            ) else {
+                return Err(format!(
+                    "the window {placed} ran: it must not once the weights' own memory is counted"
+                ));
+            };
+            eprintln!("fit {fits}; asked {placed} in f16: {err}");
+            let msg = err.to_string();
+            ensure(
+                msg.contains(&format!("context {placed} cannot be served"))
+                    && msg.contains("after the weights"),
+                || format!("the refusal after the load, not another failure: {msg}"),
+            )
+        };
+        retry_if_moved("the windows beside the weights", run).unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    /// The ladder's order under `kv.overflow` (B62, plan 13 S3) on a device whose room holds
+    /// Qwen3-0.6B's trained window in neither cache format ([`B12_ROOM`]): the auto-sized window is
+    /// clamped to what fits in VRAM before the load and runs at that, with its cache allocated
+    /// whole in device memory. Before S3 the fit before the load kept the trained window under
+    /// `kv.overflow` (dense placement was then decided for it) and left the re-clamp after the
+    /// load to cut it.
+    ///
+    /// On a unified-memory device the system RAM a spilled buffer takes counts in the same budget
+    /// as device memory, so where the cache landed is not read off the budget there and only the
+    /// windows are checked. An explicit window that does not fit is not run here: on this tree it
+    /// does not reach a working spill (docs/backlog.md B62).
+    #[test]
+    #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+    fn overflow_clamps_an_auto_sized_ctx() {
+        let Some(path) = qwen3_06b() else {
+            eprintln!("skip: Qwen3-0.6B is not in the HF cache");
+            return;
+        };
+        let Some(reader) = reader() else {
+            return;
+        };
+        let run = || -> Result<(), String> {
+            let limit = settled_use(reader) + B12_ROOM;
+            let cfg = limited_cfg_with(limit, None, |c| c.kv.overflow = true);
+            let model = SeamModel::load_with(&path, None, cfg).expect("model load");
+            let trained = model.cfg.n_ctx_train;
+            let mut sess = model
+                .vulkan_session_default()
+                .map_err(|e| format!("the auto-sized session did not open: {e}"))?;
+            let opened = sess.max_ctx;
+            model
+                .generate_vulkan_session(&mut sess, "The capital of France is", 4, None, |_| {})
+                .map_err(|e| format!("the clamped window {opened} did not run: {e}"))?;
+            let vram = sess.vram();
+            let (_, kv) = slot(&sess);
+            let allocated: u64 = kv
+                .kbufs
+                .iter()
+                .chain(&kv.vbufs)
+                .map(|b| b.len_bytes() as u64)
+                .sum();
+            let committed = kv.kv_committed.filter(|_| vram.live && !vram.uma);
+            eprintln!(
+                "trained {trained}, opened {opened}, served {} ({:?}/{:?}); KV buffers holding \
+                 {allocated}, committed {:?}, unified memory {}",
+                kv.max_ctx, kv.k_fmt, kv.v_fmt, kv.kv_committed, vram.uma
+            );
+            ensure(opened < trained, || {
+                format!(
+                    "the auto-sized window opened at {opened} of the trained {trained}: kept \
+                     whole, not clamped, under kv.overflow"
+                )
+            })?;
+            ensure((MIN_SESSION_CTX..=opened).contains(&kv.max_ctx), || {
+                format!("opened with {opened} tokens, served {}", kv.max_ctx)
+            })?;
+            match committed {
+                Some(c) => ensure(c >= allocated, || {
+                    format!(
+                        "the clamped cache's allocation took {c} bytes of device memory for \
+                         {allocated} bytes of buffers: part of it spilled"
+                    )
+                }),
+                None => {
+                    eprintln!("skip: where the clamped cache landed is not read off this budget");
+                    Ok(())
+                }
+            }
+        };
+        retry_if_moved("the auto-sized window", run).unwrap_or_else(|e| panic!("{e}"));
     }
 
     /// gemma-4-12b-it Q4_K_M, the largest dense model the GPU tests use, or `None` (saying so)
@@ -911,52 +1061,65 @@ mod tests {
         let mut failed = Vec::new();
         for ubatch in [None, Some(1024)] {
             for room in [9800, 10500, 11500, 12800] {
-                let used = settled_use(reader);
-                let cfg = limited_cfg_with(used + room * MIB, None, |c| {
-                    c.device.ubatch = ubatch;
-                    c.device.ubatch_specified = ubatch.is_some();
-                });
-                let model = SeamModel::load_with(&path, None, cfg).expect("model load");
-                let mut sess = match model.vulkan_session_default() {
-                    Ok(sess) => sess,
-                    Err(e) if e.to_string().contains("no usable KV cache fits") => {
-                        eprintln!("{room} MiB, chunk {ubatch:?}: refused before the load");
-                        continue;
+                // `Ok(true)` when the room ran the prompt, `Ok(false)` when its window is shorter
+                // than the prompt (which is not run), `Err` when it failed.
+                let run = || -> Result<bool, String> {
+                    let used = settled_use(reader);
+                    let cfg = limited_cfg_with(used + room * MIB, None, |c| {
+                        c.device.ubatch = ubatch;
+                        c.device.ubatch_specified = ubatch.is_some();
+                    });
+                    let model = SeamModel::load_with(&path, None, cfg).expect("model load");
+                    let mut sess = match model.vulkan_session_default() {
+                        Ok(sess) => sess,
+                        Err(e) if e.to_string().contains("no usable KV cache fits") => {
+                            eprintln!("{room} MiB, chunk {ubatch:?}: refused before the load");
+                            return Ok(false);
+                        }
+                        Err(e) => {
+                            return Err(format!("{room} MiB, chunk {ubatch:?}: did not open: {e}"))
+                        }
+                    };
+                    if sess.max_ctx < PROMPT_TOKENS_MAX {
+                        eprintln!(
+                            "{room} MiB, chunk {ubatch:?}: a {}-token window, shorter than the \
+                             prompt",
+                            sess.max_ctx
+                        );
+                        return Ok(false);
                     }
-                    Err(e) => {
-                        failed.push(format!("{room} MiB, chunk {ubatch:?}: did not open: {e}"));
-                        continue;
+                    match model.generate_vulkan_session(&mut sess, &prompt, 8, None, |_| {}) {
+                        Ok(stats) => {
+                            let (_, kv) = slot(&sess);
+                            eprintln!(
+                                "{room} MiB, chunk {ubatch:?}: ctx {} at a {}-row chunk, \
+                                 prefilled {} tokens, decoded {}",
+                                kv.max_ctx, kv.ubatch, stats.n_prompt, stats.n_gen
+                            );
+                            if let Some(pinned) = ubatch {
+                                ensure(kv.ubatch == pinned, || {
+                                    format!(
+                                        "{room} MiB: the pinned chunk {pinned} did not take \
+                                         effect ({} rows)",
+                                        kv.ubatch
+                                    )
+                                })?;
+                            }
+                            Ok(true)
+                        }
+                        // The window the post-load re-clamp kept, shorter than the prompt: a
+                        // context the room cannot hold, not an allocation the guard refused.
+                        Err(e) if e.to_string().contains("exceeds the session KV capacity") => {
+                            eprintln!("{room} MiB, chunk {ubatch:?}: {e}");
+                            Ok(false)
+                        }
+                        Err(e) => Err(format!("{room} MiB, chunk {ubatch:?}: {e}")),
                     }
                 };
-                if sess.max_ctx < PROMPT_TOKENS_MAX {
-                    eprintln!(
-                        "{room} MiB, chunk {ubatch:?}: a {}-token window, shorter than the prompt",
-                        sess.max_ctx
-                    );
-                    continue;
-                }
-                match model.generate_vulkan_session(&mut sess, &prompt, 8, None, |_| {}) {
-                    Ok(stats) => {
-                        let (_, kv) = slot(&sess);
-                        eprintln!(
-                            "{room} MiB, chunk {ubatch:?}: ctx {} at a {}-row chunk, prefilled {} \
-                             tokens, decoded {}",
-                            kv.max_ctx, kv.ubatch, stats.n_prompt, stats.n_gen
-                        );
-                        if let Some(pinned) = ubatch {
-                            assert_eq!(
-                                kv.ubatch, pinned,
-                                "{room} MiB: the pinned chunk did not take effect"
-                            );
-                        }
-                        ran.push((room, ubatch));
-                    }
-                    // The window the post-load re-clamp kept, shorter than the prompt: a context
-                    // the room cannot hold, not an allocation the guard refused.
-                    Err(e) if e.to_string().contains("exceeds the session KV capacity") => {
-                        eprintln!("{room} MiB, chunk {ubatch:?}: {e}");
-                    }
-                    Err(e) => failed.push(format!("{room} MiB, chunk {ubatch:?}: {e}")),
+                match retry_if_moved(format!("{room} MiB, chunk {ubatch:?}"), run) {
+                    Ok(true) => ran.push((room, ubatch)),
+                    Ok(false) => {}
+                    Err(e) => failed.push(e),
                 }
             }
         }

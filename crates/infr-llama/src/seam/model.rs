@@ -126,23 +126,24 @@ fn pick_continuation(
         .map(|(idx, _, _)| idx)
 }
 
-/// The q8_0 KV capacity that serves an explicit `want`-token context across `n_slots` caches,
-/// when f16 cannot: `Some` only if the `fit` f16 tokens fall short, q8 is allowed at all, and
-/// `fit_q8` (asked lazily, since it re-runs the fit math) reaches the whole demand.
+/// The fit before the load ([`crate::seam::preload_ctx`]) for an explicit `want`-token context
+/// across `n_slots` caches, each of which owns a full cache: `fit` is the tokens the session's own
+/// formats hold in total, and `fit_q8` (asked lazily, since it re-runs the fit math, and only when
+/// `may_auto_q8`) the tokens a q8_0 cache holds in total.
 ///
 /// Split out as a pure fn so the rung is unit-testable without a live backend.
-fn explicit_ctx_q8_fit(
+fn explicit_ctx_rung(
     want: usize,
     n_slots: usize,
+    overflow: bool,
     fit: usize,
     may_auto_q8: bool,
     fit_q8: impl FnOnce() -> Option<usize>,
-) -> Option<usize> {
-    let need = want.saturating_mul(n_slots);
-    if fit >= need || !may_auto_q8 {
-        return None;
-    }
-    fit_q8().filter(|&f| f >= need)
+) -> crate::seam::CtxRung {
+    let n_slots = n_slots.max(1);
+    crate::seam::preload_ctx(want, true, overflow, fit / n_slots, || {
+        may_auto_q8.then(fit_q8).flatten().map(|f| f / n_slots)
+    })
 }
 
 /// What a Vulkan device will hold beside a session's KV cache and activation reserve once its
@@ -615,7 +616,7 @@ impl SeamModel {
         // placement scope, as in `vulkan_session_default_on`.
         let pins = std::sync::Arc::new(crate::seam::PlacementPins::default());
         let scope = crate::seam::PlacementScope::enter(pins.clone());
-        self.auto_q8_for_explicit_ctx(&vk, max_ctx, 1);
+        self.fit_explicit_ctx(&vk, max_ctx, 1);
         let refused = self.refuse_explicit_ctx(&vk, max_ctx, 1);
         drop(scope);
         refused?;
@@ -633,7 +634,7 @@ impl SeamModel {
     /// the VRAM budget — a long-context model's trained window (128k+) would otherwise allocate
     /// a KV cache that blows VRAM at startup or on the first request. Explicit contexts
     /// (INFR_CTX → `vulkan_session(ctx)`) are NEVER clamped: they get a q8_0 cache when only
-    /// that fits (`auto_q8_for_explicit_ctx`), and one whose KV cache cannot fit at all is
+    /// that fits (`fit_explicit_ctx`), and one whose KV cache cannot fit at all is
     /// refused before it is allocated (`refuse_unallocatable_kv`).
     pub fn vulkan_session_default(&self) -> Result<DenseVulkanSession> {
         self.vulkan_session_default_on(None)
@@ -698,145 +699,147 @@ impl SeamModel {
     /// Resolve a DEFAULT context length against the VRAM budget: what the loaded weights will hold
     /// ([`preload_held`](Self::preload_held)) + one KV cache (priced as the exact allocation,
     /// [`kv_fit_ctx`](Self::kv_fit_ctx)) + the dense activation reserve must fit the allocatable
-    /// bytes. The rung ladder, in order:
+    /// bytes. The rung ladder is [`crate::seam::preload_ctx`]'s, in order:
     ///
     ///  1. **f16 fits `want`** → use it, say nothing. (The overwhelmingly common case, and — since
     ///     the fit now walks the same prefill-chunk ladder placement walks — the case gemma-3-12b
     ///     at ctx 131072 belongs in and used to miss.)
     ///  2. **f16 misses, q8_0 reaches `want`** → pin auto-q8 and `tracing::warn!`. Only a FULL
-    ///     rescue pins q8; a partial one keeps the predictable f16 cache, because auto-q8 exists
-    ///     to avoid losing capability, not to trade decode speed for a still-clamped window.
-    ///  3. **`INFR_KV_OVERFLOW`** → keep `want` with the cache in system RAM.
-    ///  4. **Nothing serves even [`MIN_SESSION_CTX`](crate::seam::MIN_SESSION_CTX)** → `Err`. The
-    ///     weights leave no room for a usable cache on this device, so refusing with the numbers
-    ///     beats a session that errors at its first activation alloc.
-    ///  5. Otherwise **clamp and log**, exactly as before.
+    ///     rescue pins q8 here; a partial one keeps the predictable f16 cache, because auto-q8
+    ///     exists to avoid losing capability, not to trade decode speed for a still-clamped window.
+    ///  3. **f16 serves at least [`MIN_SESSION_CTX`](crate::seam::MIN_SESSION_CTX)** → clamp and
+    ///     log, whether or not `kv.overflow` is on: the clamp comes before the spill (B62).
+    ///  4. **q8_0 serves the minimum where f16 does not** → pin auto-q8 and clamp to what q8_0
+    ///     holds: the choice is "slower cache vs no session at all".
+    ///  5. **`kv.overflow`** → keep the minimum with the part of the cache that does not fit VRAM
+    ///     in system RAM.
+    ///  6. **Nothing else** → `Err`. The weights leave no room for a usable cache on this device,
+    ///     so refusing with the numbers beats a session that errors at its first activation alloc.
     ///
-    /// Rung 4 is deliberately narrow. It fires on "no usable context at all", NOT on "the trained
+    /// Rung 6 is deliberately narrow. It fires on "no usable context at all", NOT on "the trained
     /// window is bigger than this card" — a 262144-token trained window on a 24 GiB card is
     /// completely ordinary (Qwen3-30B-A3B) and must keep clamping to a working ~50k, not refuse.
     /// A context the USER asked for explicitly (`--ctx N` / `INFR_CTX=N`) never reaches this
-    /// function at all: those are taken verbatim, given q8_0 by
-    /// [`auto_q8_for_explicit_ctx`](Self::auto_q8_for_explicit_ctx) when only that fits, and
-    /// refused by `refuse_unallocatable_kv` when their KV cache cannot fit at all.
+    /// function at all: those are taken verbatim by [`fit_explicit_ctx`](Self::fit_explicit_ctx),
+    /// which gives them q8_0 when only that fits, and refused by `refuse_unallocatable_kv` when
+    /// their KV cache cannot fit at all.
     ///
     /// Extra KV slots (INFR_KV_SLOTS forks) and MoE expert host-offload aren't modeled — the
     /// alloc-time budget guard remains the backstop for those.
     fn clamp_default_ctx(&self, vk: &infr_vulkan::VulkanBackend, want: usize) -> Result<usize> {
+        use crate::seam::CtxRung;
         let Some(fit) = self.kv_fit_ctx(vk) else {
             return Ok(want); // pure recurrent-state arch: no per-token KV to size.
         };
-        if fit >= want {
-            return Ok(want);
-        }
-        // Auto-q8 KV rung, clamp flavor (see `crate::seam::PlacementPins` for the policy): before
-        // shrinking the DEFAULT context below the trained window, try a Q8_0 KV cache — roughly
-        // half the bytes per token.
-        let fit_q8 = self
-            .may_auto_q8()
-            .then(|| self.kv_fit_ctx_fmt(vk, true))
-            .flatten();
-        if fit_q8.is_some_and(|f| f >= want) {
-            crate::seam::pin_kv_auto_q8();
-            tracing::warn!(
-                requested_ctx = want,
-                f16_fit_ctx = fit,
-                kv_dtype = "q8_0",
-                "kv auto-quant: q8_0 KV cache — an f16 cache would clamp the default context \
-                 {want} -> {fit}; set INFR_KV_TYPE_K/V=f16 to force f16 (decode is ~10-16% \
-                 slower on q8), or --ctx to pick the window yourself"
-            );
-            return Ok(want);
-        }
-        // Placement ladder's LAST rung (SWA ring → auto-q8 → THIS): if the context still does
-        // not fit VRAM and the user opted into KV overflow, keep the requested window and let
-        // the KV cache live in system RAM (`INFR_KV_OVERFLOW`, honored by the Vulkan backend's
-        // `BufferUsage::KvCache` alloc). Read over PCIe by attention — slower, but the big
-        // context actually runs instead of clamping. Flag off ⇒ today's clamp/error unchanged.
-        // The SAME flag the backend's own KV placement reads (`kv.overflow`, off the
-        // `Config` the backend was built with) — one value, so the clamp ladder and the
-        // allocator cannot disagree about whether the spill is armed.
-        if vk.cfg().kv.overflow {
-            tracing::warn!(
-                "ctx overflow: keeping default context {want} (would clamp to {fit} in VRAM); \
-                 INFR_KV_OVERFLOW=1 places the KV cache in system RAM, read over PCIe"
-            );
-            return Ok(want);
-        }
-        // f16 cannot reach even the floor but q8 can: pin q8 and clamp to THAT. A partial rescue
-        // normally keeps f16 (see the ladder doc), but the choice here is not "slower cache vs
-        // smaller window" — it is "slower cache vs no session at all".
-        let q8_rescues_the_floor = fit < crate::seam::MIN_SESSION_CTX
-            && fit_q8.is_some_and(|f| f >= crate::seam::MIN_SESSION_CTX);
-        if q8_rescues_the_floor {
-            let f8 = fit_q8.expect("guarded by q8_rescues_the_floor");
-            crate::seam::pin_kv_auto_q8();
-            tracing::warn!(
-                requested_ctx = want,
-                f16_fit_ctx = fit,
-                q8_fit_ctx = f8,
-                kv_dtype = "q8_0",
-                "kv auto-quant: q8_0 KV cache — an f16 cache leaves only {fit} tokens of context, \
-                 below the {} usable minimum; clamping the default context {want} -> {f8}",
-                crate::seam::MIN_SESSION_CTX
-            );
-            return Ok(f8);
-        }
+        // The q8_0 fit, priced only when f16 falls short of `want` and kept for the messages.
+        let mut fit_q8 = None;
+        // The SAME flag the backend's own KV placement reads (`kv.overflow`, off the `Config` the
+        // backend was built with), so the ladder and the allocator agree on whether the spill is
+        // armed.
+        let rung = crate::seam::preload_ctx(want, false, vk.cfg().kv.overflow, fit, || {
+            fit_q8 = self
+                .may_auto_q8()
+                .then(|| self.kv_fit_ctx_fmt(vk, true))
+                .flatten();
+            fit_q8
+        });
+        let min = crate::seam::MIN_SESSION_CTX;
         let vram = vk.vram();
         let held = self.preload_held(vk);
         let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
-        // Refuse rung: the BEST cache this model may pick on its own (q8_0 when the user set no
-        // format, else the format they did set) cannot serve even a minimally-useful window. The
-        // fit prices what the post-load re-clamp will measure, so this is where a session the
-        // re-clamp would refuse is refused — before a single weight is loaded.
-        let best = fit.max(fit_q8.unwrap_or(0));
-        if best < crate::seam::MIN_SESSION_CTX {
-            let free = vram.alloc_room().saturating_sub(held.total());
-            let (k_fmt, v_fmt) = self.kv_fit_fmts(false);
-            let need = crate::seam::kv_bytes_estimate_fmt(
-                &self.cfg,
-                want,
-                crate::seam::kv_ring_wanted(&self.cfg, &self.ecfg),
-                crate::seam::ubatch_rows(&self.ecfg),
-                crate::seam::KvAlign::of(vk),
-                k_fmt,
-                v_fmt,
-            );
-            return Err(anyhow!(
-                "this model cannot be served on this device: no usable KV cache fits.\n  \
-                 requested context   : {want} tokens\n  \
-                 fits at {k_fmt:?}/{v_fmt:?} KV : {fit} tokens\n  \
-                 fits at q8_0 KV     : {}\n  \
-                 KV cache needed     : {:.2} GiB at {want} tokens in {k_fmt:?}/{v_fmt:?}\n  \
-                 free after weights  : {:.2} GiB ({:.2} GiB allocatable{}{} - {:.2} GiB \
-                 weights as loaded - {:.2} GiB upload staging - {:.2} GiB held for the driver's \
-                 own later allocations)\n\
-                 Try a smaller window (--ctx N / INFR_CTX=N), an explicitly quantized cache \
-                 (INFR_KV_TYPE_K=q8_0 INFR_KV_TYPE_V=q8_0), INFR_KV_OVERFLOW=1 to place the cache \
-                 in system RAM, or a smaller quant of the model.",
-                match fit_q8 {
-                    Some(f) => format!("{f} tokens"),
-                    None => "not available (an explicit INFR_KV_TYPE_K/V wins)".to_string(),
-                },
-                gib(need),
-                gib(free),
-                gib(vram.alloc_room()),
-                if vram.live { ", live" } else { ", heap" },
-                vram.limit_note(),
-                gib(held.weights),
-                gib(held.staging),
-                gib(held.reserve),
-            ));
+        match rung {
+            CtxRung::Serve(ctx) if ctx == want => Ok(want),
+            CtxRung::ServeQ8(ctx) if ctx == want => {
+                crate::seam::pin_kv_auto_q8();
+                tracing::warn!(
+                    requested_ctx = want,
+                    f16_fit_ctx = fit,
+                    kv_dtype = "q8_0",
+                    "kv auto-quant: q8_0 KV cache — an f16 cache would clamp the default context \
+                     {want} -> {fit}; set INFR_KV_TYPE_K/V=f16 to force f16 (decode is ~10-16% \
+                     slower on q8), or --ctx to pick the window yourself"
+                );
+                Ok(want)
+            }
+            CtxRung::ServeQ8(ctx) => {
+                crate::seam::pin_kv_auto_q8();
+                tracing::warn!(
+                    requested_ctx = want,
+                    f16_fit_ctx = fit,
+                    q8_fit_ctx = ctx,
+                    kv_dtype = "q8_0",
+                    "kv auto-quant: q8_0 KV cache — an f16 cache leaves only {fit} tokens of \
+                     context, below the {min} usable minimum; clamping the default context {want} \
+                     -> {ctx}"
+                );
+                Ok(ctx)
+            }
+            CtxRung::Spill(ctx) => {
+                let (k_fmt, v_fmt) = self.kv_fit_fmts(crate::seam::kv_auto_q8());
+                tracing::warn!(
+                    requested_ctx = want,
+                    fit_ctx = fit,
+                    "ctx overflow: no usable context fits VRAM (a {k_fmt:?}/{v_fmt:?} cache holds \
+                     {fit} tokens, below the {min} minimum); keeping a {ctx}-token default context \
+                     with the part of its KV cache that does not fit placed in system RAM \
+                     (INFR_KV_OVERFLOW), read over PCIe"
+                );
+                Ok(ctx)
+            }
+            CtxRung::Serve(ctx) => {
+                tracing::warn!(
+                    "ctx clamp: default context {want} -> {ctx} to fit VRAM (weights {:.2} GiB as \
+                     loaded vs {:.2} GiB available{}{}); set INFR_CTX to override",
+                    gib(held.weights),
+                    gib(vram.available),
+                    if vram.live { ", live" } else { ", total heap" },
+                    vram.limit_note(),
+                );
+                Ok(ctx)
+            }
+            // The BEST cache this model may pick on its own (q8_0 when the user set no format,
+            // else the format they did set) cannot serve even a minimally-useful window. The fit
+            // prices what the post-load re-clamp will measure, so this is where a session the
+            // re-clamp would refuse is refused — before a single weight is loaded.
+            CtxRung::Refuse => {
+                let free = vram.alloc_room().saturating_sub(held.total());
+                let (k_fmt, v_fmt) = self.kv_fit_fmts(false);
+                let need = crate::seam::kv_bytes_estimate_fmt(
+                    &self.cfg,
+                    want,
+                    crate::seam::kv_ring_wanted(&self.cfg, &self.ecfg),
+                    crate::seam::ubatch_rows(&self.ecfg),
+                    crate::seam::KvAlign::of(vk),
+                    k_fmt,
+                    v_fmt,
+                );
+                Err(anyhow!(
+                    "this model cannot be served on this device: no usable KV cache fits.\n  \
+                     requested context   : {want} tokens\n  \
+                     fits at {k_fmt:?}/{v_fmt:?} KV : {fit} tokens\n  \
+                     fits at q8_0 KV     : {}\n  \
+                     KV cache needed     : {:.2} GiB at {want} tokens in {k_fmt:?}/{v_fmt:?}\n  \
+                     free after weights  : {:.2} GiB ({:.2} GiB allocatable{}{} - {:.2} GiB \
+                     weights as loaded - {:.2} GiB upload staging - {:.2} GiB held for the \
+                     driver's own later allocations)\n\
+                     Try a smaller window (--ctx N / INFR_CTX=N), an explicitly quantized cache \
+                     (INFR_KV_TYPE_K=q8_0 INFR_KV_TYPE_V=q8_0), INFR_KV_OVERFLOW=1 to place the \
+                     cache in system RAM, or a smaller quant of the model.",
+                    match fit_q8 {
+                        Some(f) => format!("{f} tokens"),
+                        None => "not available (an explicit INFR_KV_TYPE_K/V wins)".to_string(),
+                    },
+                    gib(need),
+                    gib(free),
+                    gib(vram.alloc_room()),
+                    if vram.live { ", live" } else { ", heap" },
+                    vram.limit_note(),
+                    gib(held.weights),
+                    gib(held.staging),
+                    gib(held.reserve),
+                ))
+            }
         }
-        tracing::warn!(
-            "ctx clamp: default context {want} -> {fit} to fit VRAM (weights {:.2} GiB as loaded \
-             vs {:.2} GiB available{}{}); set INFR_CTX to override",
-            gib(held.weights),
-            gib(vram.available),
-            if vram.live { ", live" } else { ", total heap" },
-            vram.limit_note(),
-        );
-        Ok(fit)
     }
 
     /// Whether a fit may switch the KV cache to Q8_0 on its own ([`crate::seam::may_auto_q8`]).
@@ -844,43 +847,50 @@ impl SeamModel {
         crate::seam::may_auto_q8(&self.cfg, &self.ecfg)
     }
 
-    /// The auto-q8 rung for a context the USER chose (`--ctx N` / `INFR_CTX=N`), which is never
-    /// clamped: when `n_slots` f16 caches of `want` tokens do not fit but q8_0 ones do, pin q8_0
-    /// for the current placement scope so the window that was asked for is served. Otherwise
-    /// nothing changes, and a window that fits in neither format is refused by
-    /// `crate::seam::refuse_unallocatable_kv` once the weights are resident.
-    fn auto_q8_for_explicit_ctx(
-        &self,
-        vk: &infr_vulkan::VulkanBackend,
-        want: usize,
-        n_slots: usize,
-    ) {
+    /// The fit before the load for a context the USER chose (`--ctx N` / `INFR_CTX=N`), which is
+    /// never clamped ([`explicit_ctx_rung`]): when `n_slots` caches of `want` tokens do not fit in
+    /// the session's formats but q8_0 ones do, pin q8_0 for the current placement scope so the
+    /// window that was asked for is served. Under `kv.overflow` a window that fits in neither
+    /// format is kept as asked with its cache to be spilled; without it, one whose cache cannot
+    /// land at all is refused by `crate::seam::refuse_unallocatable_kv` (here, by
+    /// [`refuse_explicit_ctx`](Self::refuse_explicit_ctx), and again once the weights are
+    /// resident). The window itself is never changed, so the caller opens `want`.
+    fn fit_explicit_ctx(&self, vk: &infr_vulkan::VulkanBackend, want: usize, n_slots: usize) {
         let Some(fit) = self.kv_fit_ctx(vk) else {
             return; // pure recurrent-state arch: no per-token KV to size.
         };
-        let Some(fit_q8) = explicit_ctx_q8_fit(want, n_slots, fit, self.may_auto_q8(), || {
-            self.kv_fit_ctx_fmt(vk, true)
-        }) else {
-            return;
-        };
-        crate::seam::pin_kv_auto_q8();
-        tracing::warn!(
-            requested_ctx = want,
-            slots = n_slots,
-            f16_fit_ctx = fit,
-            q8_fit_ctx = fit_q8,
-            kv_dtype = "q8_0",
-            "kv auto-quant: q8_0 KV cache — an f16 cache cannot hold the requested context {want} \
-             (fits {fit} tokens in total); set INFR_KV_TYPE_K/V=f16 to force f16 (decode is ~10-16% \
-             slower on q8)"
+        let mut fit_q8 = None;
+        let rung = explicit_ctx_rung(
+            want,
+            n_slots,
+            vk.cfg().kv.overflow,
+            fit,
+            self.may_auto_q8(),
+            || {
+                fit_q8 = self.kv_fit_ctx_fmt(vk, true);
+                fit_q8
+            },
         );
+        if let crate::seam::CtxRung::ServeQ8(_) = rung {
+            crate::seam::pin_kv_auto_q8();
+            tracing::warn!(
+                requested_ctx = want,
+                slots = n_slots,
+                f16_fit_ctx = fit,
+                q8_fit_ctx = fit_q8,
+                kv_dtype = "q8_0",
+                "kv auto-quant: q8_0 KV cache — an f16 cache cannot hold the requested context \
+                 {want} (fits {fit} tokens in total); set INFR_KV_TYPE_K/V=f16 to force f16 \
+                 (decode is ~10-16% slower on q8)"
+            );
+        }
     }
 
     /// The refuse rung for a context the USER chose, taken before any weight is loaded: `Err` when
     /// even the smallest KV cache `n_slots` windows of `want` tokens could still allocate
     /// (`crate::seam::kv_floor_alloc_bytes`) cannot fit the device at all. Runs after
-    /// [`auto_q8_for_explicit_ctx`](Self::auto_q8_for_explicit_ctx), under the same placement
-    /// scope, so a q8_0 pin it just made is what gets priced.
+    /// [`fit_explicit_ctx`](Self::fit_explicit_ctx), under the same placement scope, so a q8_0 pin
+    /// it just made is what gets priced.
     fn refuse_explicit_ctx(
         &self,
         vk: &infr_vulkan::VulkanBackend,
@@ -1164,7 +1174,7 @@ impl SeamModel {
         // the cache to q8_0 when that is what it takes to fit.
         if let Some(infr_core::SizeSpec::Bytes(c)) = want {
             let ctx = self.session_ctx((c as usize).max(1));
-            self.auto_q8_for_explicit_ctx(vk, ctx, n_slots);
+            self.fit_explicit_ctx(vk, ctx, n_slots);
             self.refuse_explicit_ctx(vk, ctx, n_slots)?;
             return Ok(ctx);
         }
@@ -2968,14 +2978,15 @@ mod vram_limit_tests;
 
 #[cfg(test)]
 mod explicit_ctx_q8_tests {
-    use super::explicit_ctx_q8_fit;
+    use super::explicit_ctx_rung;
+    use crate::seam::CtxRung::{Serve, ServeQ8, Spill};
 
     /// The B12 rung: an explicit window f16 cannot hold gets q8_0 when q8_0 holds all of it.
     #[test]
     fn q8_serves_a_window_f16_cannot() {
         assert_eq!(
-            explicit_ctx_q8_fit(8000, 1, 5000, true, || Some(9000)),
-            Some(9000)
+            explicit_ctx_rung(8000, 1, false, 5000, true, || Some(9000)),
+            ServeQ8(8000)
         );
     }
 
@@ -2983,7 +2994,10 @@ mod explicit_ctx_q8_tests {
     #[test]
     fn a_fitting_window_stays_f16() {
         let probe = || panic!("the q8 fit must not be computed when f16 fits");
-        assert_eq!(explicit_ctx_q8_fit(5000, 1, 5000, true, probe), None);
+        assert_eq!(
+            explicit_ctx_rung(5000, 1, false, 5000, true, probe),
+            Serve(5000)
+        );
     }
 
     /// q8_0 that still falls short is not a rescue: the window stays as asked, f16, and meets the
@@ -2991,29 +3005,58 @@ mod explicit_ctx_q8_tests {
     #[test]
     fn no_partial_or_forbidden_rescue() {
         assert_eq!(
-            explicit_ctx_q8_fit(8000, 1, 5000, true, || Some(7999)),
-            None
+            explicit_ctx_rung(8000, 1, false, 5000, true, || Some(7999)),
+            Serve(8000)
         );
-        assert_eq!(explicit_ctx_q8_fit(8000, 1, 5000, true, || None), None);
+        assert_eq!(
+            explicit_ctx_rung(8000, 1, false, 5000, true, || None),
+            Serve(8000)
+        );
         let probe = || panic!("a forbidden q8 rung must not run the fit");
-        assert_eq!(explicit_ctx_q8_fit(8000, 1, 5000, false, probe), None);
+        assert_eq!(
+            explicit_ctx_rung(8000, 1, false, 5000, false, probe),
+            Serve(8000)
+        );
     }
 
     /// Each `--parallel` slot owns a full cache, so the demand is the window times the slots.
     #[test]
     fn every_slot_owns_a_cache() {
         assert_eq!(
-            explicit_ctx_q8_fit(4000, 2, 6000, true, || Some(9000)),
-            Some(9000)
+            explicit_ctx_rung(4000, 2, false, 6000, true, || Some(9000)),
+            ServeQ8(4000)
         );
         assert_eq!(
-            explicit_ctx_q8_fit(4000, 3, 6000, true, || Some(9000)),
-            None
+            explicit_ctx_rung(4000, 3, false, 6000, true, || Some(9000)),
+            Serve(4000)
         );
         assert_eq!(
-            explicit_ctx_q8_fit(4000, 1, 6000, true, || Some(9000)),
-            None,
+            explicit_ctx_rung(4000, 1, false, 6000, true, || Some(9000)),
+            Serve(4000),
             "f16 fits one"
+        );
+    }
+
+    /// Under `kv.overflow` a window neither format holds is kept, spilled, never cut; q8_0 still
+    /// comes first, and a window that fits does not spill.
+    #[test]
+    fn overflow_spills_only_what_neither_format_holds() {
+        assert_eq!(
+            explicit_ctx_rung(8000, 1, true, 5000, true, || Some(7999)),
+            Spill(8000)
+        );
+        assert_eq!(
+            explicit_ctx_rung(8000, 1, true, 5000, true, || Some(9000)),
+            ServeQ8(8000)
+        );
+        assert_eq!(
+            explicit_ctx_rung(4000, 2, true, 6000, true, || Some(7000)),
+            Spill(4000)
+        );
+        let probe = || panic!("the q8 fit must not be computed when f16 fits");
+        assert_eq!(
+            explicit_ctx_rung(5000, 1, true, 5000, true, probe),
+            Serve(5000)
         );
     }
 }

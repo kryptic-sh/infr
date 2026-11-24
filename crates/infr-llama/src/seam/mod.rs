@@ -2032,6 +2032,14 @@ pub(crate) fn moe_expert_budget(vram: &infr_vulkan::VramInfo, dense: u64, kv: u6
     (base <= room).then(|| room.saturating_sub(base.saturating_add(MOE_ACT_HEADROOM)))
 }
 
+/// The pager budget an explicit `paging.cache` (`INFR_CACHE`) sets: an absolute size as given, and
+/// a percentage of the allocator's ceiling ([`VramInfo::alloc_room`](infr_vulkan::VramInfo::alloc_room)),
+/// the room every other budget here is held to, so `100%` is a budget the guard can admit (plan 13
+/// S3).
+pub(crate) fn paging_cache_budget(spec: infr_core::SizeSpec, vram: &infr_vulkan::VramInfo) -> u64 {
+    spec.resolve(vram.alloc_room())
+}
+
 /// Hard ceiling on [`kv_fit_ctx_for`]'s search. Reached only by a model whose KV bytes AND
 /// activation reserve both PLATEAU with context — every attention layer sliding-window (so the
 /// ring caps its rows) and head_dim 128 with no score tile. There the fit is bounded by nothing
@@ -2311,7 +2319,7 @@ pub(crate) fn reclamp_ctx_to_live_room(
     // The chunk the chosen cache was priced at. Lowered BEFORE the KV buffers are sized: the ring
     // is `window + chunk` rows, and the reserve the fit was priced with is that height's.
     let chunk = match (decision, q8_walk) {
-        (PostLoadCtx::ServeQ8(_), Some((q8_chunk, _))) => q8_chunk,
+        (CtxRung::ServeQ8(_), Some((q8_chunk, _))) => q8_chunk,
         _ => chunk,
     };
     if chunk < ubatch_rows(ec) {
@@ -2331,7 +2339,7 @@ pub(crate) fn reclamp_ctx_to_live_room(
         "ctx fit against the live device room"
     );
     match decision {
-        PostLoadCtx::Serve(ctx) if ctx == want_ctx => {
+        CtxRung::Serve(ctx) if ctx == want_ctx => {
             if fit < want_ctx {
                 tracing::warn!(
                     requested_ctx = want_ctx,
@@ -2345,7 +2353,7 @@ pub(crate) fn reclamp_ctx_to_live_room(
             }
             Ok((want_ctx, k_fmt, v_fmt))
         }
-        PostLoadCtx::Serve(ctx) => {
+        CtxRung::Serve(ctx) => {
             tracing::warn!(
                 requested_ctx = want_ctx,
                 fits_ctx = ctx,
@@ -2361,7 +2369,7 @@ pub(crate) fn reclamp_ctx_to_live_room(
             );
             Ok((ctx, k_fmt, v_fmt))
         }
-        PostLoadCtx::ServeQ8(ctx) => {
+        CtxRung::ServeQ8(ctx) => {
             // Under the session's placement scope, so every later call of this session reads q8_0
             // too (`parse_kv_fmt`); nothing is allocated in either format yet.
             pin_kv_auto_q8();
@@ -2376,7 +2384,7 @@ pub(crate) fn reclamp_ctx_to_live_room(
             );
             Ok((ctx, DType::Q8_0, DType::Q8_0))
         }
-        PostLoadCtx::Spill(ctx) => {
+        CtxRung::Spill(ctx) => {
             tracing::warn!(
                 requested_ctx = want_ctx,
                 fits_ctx = fit,
@@ -2388,7 +2396,7 @@ pub(crate) fn reclamp_ctx_to_live_room(
             );
             Ok((ctx, k_fmt, v_fmt))
         }
-        PostLoadCtx::Refuse => {
+        CtxRung::Refuse => {
             let floor = want_ctx.min(MIN_SESSION_CTX);
             let kv = kv_bytes_estimate_fmt(cfg, floor, ring, ubatch, align, k_fmt, v_fmt);
             let act = dense_act_reserve_at(cfg, floor, ubatch);
@@ -2423,21 +2431,59 @@ pub(crate) fn reclamp_ctx_to_live_room(
     }
 }
 
-/// What the post-load re-clamp ([`reclamp_ctx_to_live_room`]) does with a session's window, from
-/// the fits alone.
+/// What a session's window becomes against the room it is fitted to, from the fits alone: the
+/// answer of the fit before the load ([`preload_ctx`]) and of the post-load re-clamp
+/// ([`post_load_ctx`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PostLoadCtx {
+pub(crate) enum CtxRung {
     /// Serve this many tokens in the session's formats: the window asked for when it fits or was
     /// set explicitly, else the largest that fits.
     Serve(usize),
-    /// Serve this many tokens with a q8_0 cache, where the session's own formats leave less than
-    /// the minimum and q8_0 does not.
+    /// Serve this many tokens with a q8_0 cache, where the session's own formats cannot hold the
+    /// window and q8_0 can, or leave less than the minimum and q8_0 does not.
     ServeQ8(usize),
-    /// Keep the minimum with the part of the cache that does not fit in system RAM
-    /// (`kv.overflow`).
+    /// Keep this many tokens with the part of the cache that does not fit placed in system RAM
+    /// (`kv.overflow`): the window a user set, or the minimum of one the session chose.
     Spill(usize),
     /// Nothing at or above the minimum fits.
     Refuse,
+}
+
+/// The rule the fit before the load applies to a session's window, given `fit`, the largest window
+/// the session's formats hold per cache, and `q8_fit`, asked only when `fit` falls short: the q8_0
+/// cache's fit where the auto-q8 policy allows q8_0 for this session, else `None`. It is the
+/// ladder plan 13 decided for B62, in order:
+///
+/// 1. A window that fits is served as asked.
+/// 2. One a q8_0 cache holds whole is served as asked, in q8_0.
+/// 3. One the user set (`explicit`) is never cut: under `kv.overflow` it is kept with the cache
+///    spilled, else served as asked, where `refuse_unallocatable_kv` refuses one whose cache cannot
+///    land at all.
+/// 4. One the session chose is cut to the fit, never below the minimum; below it a q8_0 cache that
+///    holds the minimum is served at what it holds, then `kv.overflow` keeps the minimum with the
+///    cache spilled, then it is refused ([`post_load_ctx`]'s own rule, shared with it).
+///
+/// So turning `kv.overflow` on spills a session-chosen window only when nothing usable fits VRAM:
+/// the clamp comes first. Whatever this serves, [`post_load_ctx`] keeps for the same room.
+pub(crate) fn preload_ctx(
+    want: usize,
+    explicit: bool,
+    overflow: bool,
+    fit: usize,
+    q8_fit: impl FnOnce() -> Option<usize>,
+) -> CtxRung {
+    if fit >= want {
+        return CtxRung::Serve(want);
+    }
+    let q8 = q8_fit();
+    if q8.is_some_and(|q8| q8 >= want) {
+        return CtxRung::ServeQ8(want);
+    }
+    match (explicit, overflow) {
+        (true, true) => CtxRung::Spill(want),
+        (true, false) => CtxRung::Serve(want),
+        (false, _) => clamp_rung(want, overflow, fit, || q8),
+    }
 }
 
 /// The rule [`reclamp_ctx_to_live_room`] applies once the weights are resident, given `fit`, the
@@ -2455,21 +2501,33 @@ pub(crate) fn post_load_ctx(
     overflow: bool,
     fit: usize,
     q8_fit: impl FnOnce() -> Option<usize>,
-) -> PostLoadCtx {
+) -> CtxRung {
     if fit >= want || explicit {
-        return PostLoadCtx::Serve(want);
+        return CtxRung::Serve(want);
     }
+    clamp_rung(want, overflow, fit, q8_fit)
+}
+
+/// The clamp both sides apply to a session-chosen window that `fit` does not hold whole: cut to the
+/// fit, never below the minimum (`MIN_SESSION_CTX`, or the window when it asked for less); below
+/// it the q8_0 cache that holds the minimum, then the spill at the minimum, then the refusal.
+fn clamp_rung(
+    want: usize,
+    overflow: bool,
+    fit: usize,
+    q8_fit: impl FnOnce() -> Option<usize>,
+) -> CtxRung {
     let floor = want.min(MIN_SESSION_CTX);
     if fit >= floor {
-        return PostLoadCtx::Serve(fit);
+        return CtxRung::Serve(fit);
     }
     if let Some(q8) = q8_fit().filter(|&q8| q8 >= floor) {
-        return PostLoadCtx::ServeQ8(q8.min(want));
+        return CtxRung::ServeQ8(q8.min(want));
     }
     if overflow {
-        return PostLoadCtx::Spill(floor);
+        return CtxRung::Spill(floor);
     }
-    PostLoadCtx::Refuse
+    CtxRung::Refuse
 }
 
 /// Whether a fit may switch a session's KV cache to q8_0 on its own: the user set no KV format and
@@ -2720,8 +2778,8 @@ pub(crate) fn vulkan_moe_binder<'a>(
     //      caller (or a test) force the paged path deterministically instead of depending on
     //      this box's free VRAM — see the `gpu_seam_paged_moe_matches_*` tests. The value is the
     //      shared size grammar (`infr_core::parse_size`): plain bytes, `k/m/g/t` 1024-suffixes
-    //      (`INFR_CACHE=19g`), or a percentage of the device's AVAILABLE VRAM at first load
-    //      (`INFR_CACHE=80%` — device-appropriate base: the cache lives in VRAM).
+    //      (`INFR_CACHE=19g`), or a percentage of the allocatable room at first load
+    //      (`INFR_CACHE=80%`; [`paging_cache_budget`]: free VRAM less the guard's headroom).
     //   2. Auto (unset): fully resident (the fast path, zero change) when the banks fit VRAM;
     //      otherwise the pager with budget = remaining VRAM after dense+KV+headroom.
     // Paging rides the adapter's paged executor split (`infr_vulkan::adapter::execute_static`'s
@@ -2756,9 +2814,9 @@ pub(crate) fn vulkan_moe_binder<'a>(
         match cache_override {
             Some(spec) => {
                 n_paged = cfg.n_layer;
-                // Percent resolves against AVAILABLE VRAM at this (first-load, pre-upload)
-                // moment — the same consistent snapshot the auto tier uses below.
-                pager_budget_bytes = spec.resolve(vk.vram().available);
+                // A percentage resolves against the allocatable room at this (first-load,
+                // pre-upload) moment — the same consistent snapshot the auto tier uses below.
+                pager_budget_bytes = paging_cache_budget(spec, &vk.vram());
             }
             None => {
                 let fp = crate::weights::weight_footprint(g);
@@ -3161,7 +3219,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
         // strides the pools use.
         let stride_of = infr_vulkan::linear::dense_stream_slot_stride;
         let budget = match cache_override {
-            Some(spec) => Some(spec.resolve(vram.available)),
+            Some(spec) => Some(paging_cache_budget(spec, &vram)),
             None if resident => None,
             None => {
                 // Streaming is inevitable. Edge-aware chunk sweep — the STREAMING twin of the
@@ -6148,7 +6206,7 @@ mod seam_helper_tests {
         assert_eq!(super::ubatch_candidates(&pinned(2048)), vec![2048]);
     }
 
-    /// **Drift guard (backlog B11).** Every VRAM budget in this file — the residency predicate, the
+    /// **Drift guard.** Every VRAM budget in this file — the residency predicate, the
     /// streaming budget, the MoE expert budget — must be taken against the ALLOCATOR's ceiling
     /// (`VramInfo::alloc_room` = free minus the guard's 256 MiB headroom), never the raw free
     /// figure. The placement sweeps used to compare against `vram.available`, so they could declare
@@ -6382,7 +6440,7 @@ mod seam_helper_tests {
         ));
     }
 
-    /// **Drift guard (backlog B11), the rung half.** The shared `ubatch_candidates` ladder exists so
+    /// **Drift guard, the rung half.** The shared `ubatch_candidates` ladder exists so
     /// the context-fit math and the placement sweep settle on the SAME prefill chunk. They only do
     /// while both budget against the same ceiling: with the sweep on `vram.available` and the fit
     /// math on `alloc_room()`, gemma-3-12b @131072 was validated at one rung and placed at a taller
@@ -6688,7 +6746,7 @@ mod seam_helper_tests {
     /// asked whatever fits.
     #[test]
     fn post_load_ctx_never_serves_below_the_minimum() {
-        use super::PostLoadCtx::{Refuse, Serve, ServeQ8, Spill};
+        use super::CtxRung::{Refuse, Serve, ServeQ8, Spill};
         let min = super::MIN_SESSION_CTX;
         let unasked = || -> Option<usize> { panic!("q8_0 is tried only below the minimum") };
         let post = |want, explicit, overflow, fit, q8: Option<usize>| {
@@ -6729,6 +6787,177 @@ mod seam_helper_tests {
         assert_eq!(post(8192, false, true, 64, None), Spill(min));
         assert_eq!(post(8192, false, true, 64, Some(3000)), ServeQ8(3000));
         assert_eq!(post(500, false, true, 64, None), Spill(500));
+    }
+
+    /// The pre-load ladder's order (B62): q8_0 first, then the clamp, then the spill, then the
+    /// refusal, for a window the session chose and one the user set, with `kv.overflow` off and
+    /// on, in every room shape: the window fits, fits only in q8_0, fits only cut, fits only below
+    /// the minimum where q8_0 still holds the minimum, and fits nowhere.
+    #[test]
+    fn preload_ctx_clamps_before_it_spills() {
+        use super::CtxRung::{Refuse, Serve, ServeQ8, Spill};
+        let min = super::MIN_SESSION_CTX;
+        let want = 8 * min;
+        let pre = |explicit, overflow, fit, q8: Option<usize>| {
+            super::preload_ctx(want, explicit, overflow, fit, || q8)
+        };
+        // (room, f16 fit, q8_0 fit, [auto off, auto overflow, explicit off, explicit overflow]).
+        let rooms = [
+            ("fits", want, None, [Serve(want); 4]),
+            (
+                "fits only in q8_0",
+                5 * min,
+                Some(9 * min),
+                [ServeQ8(want); 4],
+            ),
+            (
+                "fits only cut",
+                5 * min,
+                Some(7 * min),
+                [Serve(5 * min), Serve(5 * min), Serve(want), Spill(want)],
+            ),
+            (
+                "fits only cut, no q8_0",
+                5 * min,
+                None,
+                [Serve(5 * min), Serve(5 * min), Serve(want), Spill(want)],
+            ),
+            (
+                "f16 below the minimum, q8_0 holds it",
+                min / 2,
+                Some(3 * min),
+                [ServeQ8(3 * min), ServeQ8(3 * min), Serve(want), Spill(want)],
+            ),
+            (
+                "below the minimum in both",
+                min / 2,
+                Some(min - 1),
+                [Refuse, Spill(min), Serve(want), Spill(want)],
+            ),
+            (
+                "nothing fits",
+                0,
+                None,
+                [Refuse, Spill(min), Serve(want), Spill(want)],
+            ),
+        ];
+        for (room, fit, q8, expect) in rooms {
+            let got = [
+                pre(false, false, fit, q8),
+                pre(false, true, fit, q8),
+                pre(true, false, fit, q8),
+                pre(true, true, fit, q8),
+            ];
+            assert_eq!(
+                got, expect,
+                "{room}: [auto, auto + overflow, explicit, explicit + overflow]"
+            );
+        }
+        // The q8_0 fit is priced only when f16 falls short.
+        let unasked = || -> Option<usize> { panic!("q8_0 is priced only when f16 falls short") };
+        for (explicit, overflow) in [(false, false), (false, true), (true, false), (true, true)] {
+            assert_eq!(
+                super::preload_ctx(want, explicit, overflow, want, unasked),
+                Serve(want)
+            );
+        }
+    }
+
+    /// The fit before the load and the re-clamp after it give the same answer for the same room:
+    /// whatever the pre-load ladder opens a session with, the re-clamp keeps — the same window,
+    /// with no switch to q8_0 — and a room the pre-load side refuses the re-clamp refuses too. For
+    /// an auto-sized window the re-clamp also spills exactly when the pre-load side did; an
+    /// explicit one it serves as asked by design (`post_load_ctx`), so only its window is
+    /// compared. Over a grid of windows, fits and q8_0 fits at and around every boundary the rules
+    /// compare against, for both kinds of window and both `kv.overflow` settings, with the same
+    /// kind of window on both sides (`ec.device.ctx` against the entry point is backlog B62's).
+    /// The re-clamp is fed what the session carries into it: the window it opened with, the fit
+    /// of the format it pinned, and no q8_0 retry once q8_0 is pinned (the re-clamp tries q8_0
+    /// only on an f16 cache). Agreement cannot see a pre-load side that cuts too much, since the
+    /// re-clamp keeps any smaller window: `preload_ctx_clamps_before_it_spills` pins that.
+    #[test]
+    fn preload_and_post_load_agree_for_the_same_room() {
+        use super::CtxRung::{Refuse, Serve, ServeQ8, Spill};
+        let min = super::MIN_SESSION_CTX;
+        let wants = [min / 2, min - 1, min, min + 1, 4 * min, 40 * min];
+        let mut points: Vec<usize> = vec![0, 1];
+        for &w in &wants {
+            points.extend([w.saturating_sub(1), w, w + 1]);
+        }
+        points.extend([min / 3, 3 * min, 20 * min, 50 * min]);
+        points.sort_unstable();
+        points.dedup();
+        let mut checked = 0usize;
+        for &want in &wants {
+            for &fit in &points {
+                let q8s = std::iter::once(None)
+                    .chain(points.iter().filter(|&&q8| q8 >= fit).map(|&q8| Some(q8)));
+                for q8 in q8s {
+                    for explicit in [false, true] {
+                        for overflow in [false, true] {
+                            let case = format!(
+                                "want {want}, f16 fit {fit}, q8_0 fit {q8:?}, explicit {explicit}, \
+                                 overflow {overflow}"
+                            );
+                            let pre = super::preload_ctx(want, explicit, overflow, fit, || q8);
+                            let (ctx, q8_pinned) = match pre {
+                                Serve(ctx) | Spill(ctx) => (ctx, false),
+                                ServeQ8(ctx) => (ctx, true),
+                                Refuse => {
+                                    assert_eq!(
+                                        super::post_load_ctx(want, explicit, overflow, fit, || q8),
+                                        Refuse,
+                                        "{case}: refused before the load only"
+                                    );
+                                    checked += 1;
+                                    continue;
+                                }
+                            };
+                            let (post_fit, post_q8) = if q8_pinned {
+                                (q8.expect("q8_0 was served"), None)
+                            } else {
+                                (fit, q8)
+                            };
+                            let post =
+                                super::post_load_ctx(ctx, explicit, overflow, post_fit, || post_q8);
+                            let kept = match post {
+                                Serve(c) | Spill(c) => c,
+                                ServeQ8(_) | Refuse => {
+                                    panic!("{case}: opened {pre:?}, the re-clamp gave {post:?}")
+                                }
+                            };
+                            assert_eq!(kept, ctx, "{case}: opened {pre:?}, re-clamped {post:?}");
+                            if !explicit {
+                                assert_eq!(
+                                    matches!(pre, Spill(_)),
+                                    matches!(post, Spill(_)),
+                                    "{case}: opened {pre:?}, re-clamped {post:?}"
+                                );
+                            }
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+        // The grid ran: every window against every fit pair, both window kinds and settings.
+        assert!(checked > 1000, "only {checked} rooms checked");
+    }
+
+    /// An `INFR_CACHE` percentage is of the allocatable room (plan 13 S3), not of the free figure the
+    /// guard keeps its headroom inside, nor of the device's total: on the reference box `100%` is
+    /// exactly the bytes the allocator can still hand out. An absolute size is taken as given.
+    #[test]
+    fn paging_cache_percentage_is_of_the_allocatable_room() {
+        use infr_core::SizeSpec::{Bytes, Percent};
+        let vram = xtx(XTX_FREE);
+        assert!(vram.alloc_room() < vram.available && vram.available < vram.total);
+        assert_eq!(super::paging_cache_budget(Percent(1.0), &vram), XTX_ROOM);
+        assert_eq!(
+            super::paging_cache_budget(Percent(0.5), &vram),
+            (XTX_ROOM as f64 * 0.5) as u64
+        );
+        assert_eq!(super::paging_cache_budget(Bytes(19 << 30), &vram), 19 << 30);
     }
 
     /// The q8_0 retry inside the re-clamp itself, on a room where an f16 cache leaves less than the

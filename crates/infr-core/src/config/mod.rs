@@ -153,7 +153,8 @@ cfg_struct! {
 cfg_struct! {
     /// Weight/expert paging and the VRAM-first spill budgets.
     PagingCfg / PartialPagingCfg {
-        /// `INFR_CACHE`: paged expert-cache budget.
+        /// `INFR_CACHE`: paged expert-cache budget. A percentage is of the allocatable room (free
+        /// VRAM less the allocation guard's headroom) when placement runs.
         cache: Option<SizeSpec> = None,
         /// `INFR_PAGER_RING`: upload staging ring. `None` = the budget-fraction policy.
         ring: Option<SizeSpec> = None,

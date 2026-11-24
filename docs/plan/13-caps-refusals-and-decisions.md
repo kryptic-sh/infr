@@ -70,22 +70,22 @@ say so. The estimate also prices each buffer at what the backend says a KV
 allocation of that size commits (`Backend::kv_alloc_cost`), which the plan did
 not foresee.
 
-### S3 — ladder order and the cache percentage (S)
+### S3 — ladder order and the cache percentage — done 2026-11-25
 
-- Delete the early return on `kv.overflow` in `SeamModel::clamp_default_ctx`;
-  extract the rung choice into a pure function and test the order. The post-load
-  `reclamp_ctx_to_live_room` reads `kv.overflow` only below the minimum window,
-  where it spills at the minimum after a q8_0 retry and before refusing
-  (`seam::post_load_ctx`, which is already the pure function for that side)
-  **[R]**, so this makes the pre-load ladder agree with it. Since
-  B-PRELOAD-CLAMP's slice the pre-load fit prices what the re-clamp measures, so
-  without `kv.overflow` the two see the same window, short of what backlog
-  B-PRELOAD-CLAMP says neither can price before the load. Under `kv.overflow`
-  they do not yet: the pre-load rung keeps the full window and the re-clamp cuts
-  it to what fits in VRAM, spilling only below the minimum. That is the
-  disagreement this slice removes.
-- Resolve the `INFR_CACHE` percentage against `alloc_room()` in the MoE and
-  dense override arms; update the `SizeSpec` and manifest text.
+Shipped; what it left is backlog B62: the two places the ladder spills (an
+explicit window that does not fit, and the minimum when nothing fits) do not
+reach a working run on a dense model, because dense placement prices the whole
+cache in VRAM and the spill leaves later allocations no room.
+
+Departs from the slice as planned in two places. The pre-load rule
+(`seam::preload_ctx`) covers the explicit window too, so
+`SeamModel::fit_explicit_ctx` replaced `auto_q8_for_explicit_ctx` and the pure
+`explicit_ctx_rung` replaced `explicit_ctx_q8_fit`; and it shares its clamp with
+`seam::post_load_ctx` (`clamp_rung`), whose result enum is now `CtxRung`. The
+plan's account of the old behaviour was short of what a run showed: under
+`kv.overflow` the kept trained window was not cut after the load, it failed at
+dense placement's streaming floor first (Qwen3-0.6B, 1880 MiB of room, both
+GPUs).
 
 ### S4 — the device class into the pins (S–M)
 

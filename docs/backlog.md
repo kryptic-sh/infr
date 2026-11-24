@@ -340,28 +340,6 @@ window between the weight upload and the KV allocation, against
    the interaction between a shrunk window and `vulkan_slot_ctx`'s divide-by-N
    is reasoned, not measured.
 
-### B11 — an explicit `INFR_CACHE=<pct>` still resolves against raw free VRAM
-
-**Tag:** narrowed 2026-08-02 · **Blocked on:** a decision about what the
-percentage should MEAN
-
-The placement budgets that infr derives for itself — `vulkan_moe_binder`'s dense
-residency predicate, its streaming budget and its MoE expert budget — now take
-the allocator's ceiling (`VramInfo::alloc_room`, free minus the VRAM guard's 256
-MiB headroom), the same function the context-fit math uses, guarded by
-`budgets_agree_with_the_allocator_ceiling` and
-`fit_math_and_placement_pick_the_same_rung`.
-
-Both `INFR_CACHE` tiers still resolve a percentage spec against `vram.available`
-(`spec.resolve(..)` in the MoE and dense override arms). Left alone
-deliberately: that value is the CALLER's budget, the grammar is documented as "a
-percentage of the device's AVAILABLE VRAM", and the override exists to force a
-placement the auto tiers would not choose — so failing loudly at the alloc guard
-is defensible where silently handing back less than asked is not.
-`INFR_CACHE=100%` is the case that would trip it. Decide whether the percentage
-means "of free VRAM" (today) or "of what can actually be allocated" before
-changing it; either way it is one `spec.resolve` argument per arm.
-
 ### B12 — what the explicit `--ctx N` fit ladder still does not cover
 
 **Tag:** raised 2026-08-02 · **Blocked on:** nothing; the ladder shipped (q8
@@ -370,13 +348,13 @@ changing it; either way it is one `spec.resolve` argument per arm.
 **DECIDED 2026-08-12 (user):** an explicit `--ctx N` that does not fit must try
 q8_0 KV first, then refuse — f16, then q8_0, then refuse.
 
-**Shipped:** `SeamModel::auto_q8_for_explicit_ctx` pins q8_0 when f16 misses and
-q8_0 holds `want * n_slots`. `SeamModel::refuse_explicit_ctx` then refuses,
-before any weight loads, when `seam::kv_floor_alloc_bytes` (each side at the
-cheapest of the requested format, f16 and q8_0, the ring wherever possible, the
-shortest prefill chunk) exceeds `alloc_room()`. The runner repeats the check
-with the exact buffers against the measured room between the weight upload and
-the KV allocation. Both count only buffers of at least
+**Shipped:** `SeamModel::fit_explicit_ctx` pins q8_0 when f16 misses and q8_0
+holds `want * n_slots`. `SeamModel::refuse_explicit_ctx` then refuses, before
+any weight loads, when `seam::kv_floor_alloc_bytes` (each side at the cheapest
+of the requested format, f16 and q8_0, the ring wherever possible, the shortest
+prefill chunk) exceeds `alloc_room()`. The runner repeats the check with the
+exact buffers against the measured room between the weight upload and the KV
+allocation. Both count only buffers of at least
 `infr_vulkan::VRAM_GUARD_MIN_ALLOC`, and both skip under `INFR_KV_OVERFLOW` and
 `INFR_NO_VRAM_GUARD`. Observed on the iGPU: Qwen3-0.6B at `INFR_CTX=1000000` is
 refused in under a second with the sizes.
@@ -405,9 +383,9 @@ refused in under a second with the sizes.
   cannot sit beside the footprint stops at dense placement's streaming-floor
   error first (the gap above). The q8 pin has a backstop the q8 test had to work
   around: dense placement's own auto-q8 rung in `vulkan_moe_binder` pins q8_0
-  for the same window, so with `auto_q8_for_explicit_ctx` disabled the window is
-  still served in q8_0; the test reads the session's pins before any weight
-  loads to see which rung decided. Not run on the RX 7900 XTX.
+  for the same window, so with `fit_explicit_ctx` disabled the window is still
+  served in q8_0; the test reads the session's pins before any weight loads to
+  see which rung decided. Not run on the RX 7900 XTX.
 - The DEFAULT-path refuse rung stays as narrow as it was: only "no usable
   context at all" may refuse, or every ordinary long-context model breaks on a
   24 GiB card.
@@ -734,14 +712,8 @@ and otherwise refuses (`seam::post_load_ctx`). Left:
   the driver's own memory during the load (the 0.3 MB above on the RX 7900 XTX,
   none on the integrated GPU), and memory another process takes meanwhile. Each
   makes the pre-load window larger than the re-clamp's, which cuts it as before.
-- **The overflow spill can spend the driver reserve.** `PostLoadCtx::Spill` and
-  the pre-load overflow rung in `SeamModel::clamp_default_ctx` keep a window
-  whose cache does not fit VRAM and rely on the backend's VRAM-first KV
-  placement (`kv_overflow_enabled`, `VulkanBackend::vram_budget_fits`), which
-  fills VRAM up to the allocation guard's own headroom, not up to
-  `POST_KV_DEVICE_RESERVE`. So a small spilled cache can take the memory the
-  re-clamp holds back for the driver's later allocations, and a forward can then
-  fail on an activation or pipeline allocation. Read in code, not run.
+- **The overflow spill spends the driver reserve.** Observed 2026-11-25 on both
+  GPUs; B62 has the runs and the options.
 - **More memory can give fewer tokens.** The default ladder's policy pins q8_0
   only for a full rescue or for the minimum, so a room where f16 holds the
   minimum gets f16 at fewer tokens than a slightly smaller room that fell to
@@ -808,7 +780,7 @@ time or hardware, not difficulty.
   re-clamp) refuses to RAISE a height for the same reason, and is equally
   unmeasured there.
 - **The tightened placement budgets were only exercised on their RESIDENT
-  branch** (the 2026-08-02 B11 slice). gemma-4-31B, gemma-3-12b and
+  branch** (the 2026-08-02 placement-budget slice). gemma-4-31B, gemma-3-12b and
   Qwen3-30B-A3B all stay resident on this box, so `dense_stream_budget_at` and
   `moe_expert_budget`'s `None` arm (dense weights + KV past the ceiling — the
   hard error) were verified only by unit test, never by a run that actually
@@ -3072,20 +3044,75 @@ milliseconds against seconds of load. Four more `tensors().iter().find` scans in
 infr-llama mean indexing `resolve` alone would not remove the cost. Worth doing
 only after measuring total name-lookup time on a model with about 2000 tensors.
 
-### B62 — KV spill comes before the context clamp when overflow is on (2026-08-12, traced 2026-11-12)
+### B62 — the overflow spill does not yet give a working run on a dense model (2026-11-25)
 
-**Tag:** vram · kv · **Needs:** a decision
+**Tag:** vram · kv · **Blocked on:** a decision, and an infr-vulkan change
 
-User, 2026-08-12: _"Only spill K/V cache to system ram when absolutely
-necessary."_ The intended ladder is SWA → q8 → clamp → stream → KV-overflow
-last. Traced in `SeamModel::clamp_default_ctx`: auto-q8 is tried before the
-spill, as intended, but with `kv.overflow` on the default window is KEPT and
-spilled instead of clamped — so the clamp does not come before the spill.
-Options: (a) clamp the auto-sized window and spill only for an explicit `--ctx`,
-which matches the instruction; (b) keep today's spill-instead-of-clamp, on the
-reading that turning overflow on is asking for the full window; (c) a separate
-knob. Whichever is chosen wants a test of the order: spilling is invisible in
-output and only shows as throughput.
+Plan 13 S3 made the ladder SWA → q8 → clamp → stream → spill (decided
+2026-11-13): `seam::preload_ctx` is the rule before the load and agrees with
+`seam::post_load_ctx` for the same room
+(`preload_and_post_load_agree_for_the_same_room`), and under `kv.overflow` an
+auto-sized window is now clamped, not kept whole
+(`overflow_clamps_an_auto_sized_ctx`, both GPUs). The two places the ladder
+SPILLS still do not reach a working run. Both observed 2026-11-25 with
+Qwen3-0.6B Q4_K_M under `INFR_VRAM_LIMIT`, on the integrated GPU and the RX 7900
+XTX, with throwaway tests that were not kept:
+
+- **Dense placement ignores `kv.overflow`.** `vulkan_moe_binder` prices the KV
+  cache wholly in VRAM, so a window whose cache does not fit beside the weights
+  is streamed, and one whose cache alone leaves less than the streaming floor is
+  refused with "below the streaming floor" instead of spilled. Seen for an
+  explicit `--ctx 40960` at 1880 MiB of room (integrated GPU) and for the
+  auto-sized minimum (`CtxRung::Spill`, 1024 tokens) at 700 MiB (both) and 800
+  MiB (integrated GPU). Before S3 the auto-sized window under `kv.overflow`
+  failed the same way at 1880 MiB on both GPUs (it kept the trained window).
+- **The spilled cache takes the memory later allocations need.** Where placement
+  keeps the weights resident, the VRAM-first KV placement
+  (`VulkanBackend::make_alloc`'s `KvCache` arm, `vram_budget_fits`) fills VRAM
+  up to the allocation guard's headroom, so the first forward's next allocation
+  is refused: the explicit window dense placement still takes resident
+  (`explicit_ctx_short_of_the_room_after_the_weights_is_refused`'s, in f16) at
+  1880 MiB, and the minimum at 900 and 1000 MiB (and 800 on the RX 7900 XTX),
+  each refused "256 MiB requested (the new shared block a 16 KiB buffer opens)",
+  or a 121.7 MiB request, past the budget.
+- **`kv.overflow_reserve_mb` (`INFR_KV_OVERFLOW_RESERVE_MB`) is read by
+  nothing.** `infr_core::budget::reserve_bytes` computes the "headroom left for
+  everything else" that `infr.example.toml` documents (default max(12% of VRAM,
+  2 GiB)), and has no caller outside its tests; it is what the spill above
+  lacks.
+- **On a unified-memory device the spill moves nothing.** The integrated GPU's
+  budget counts every heap, so system RAM taken by a spilled buffer is charged
+  to the same budget the device memory is.
+- **The two sides read "explicit" from different places** (read in code, not
+  run). Before the load it is which entry point was called:
+  `SeamModel::vulkan_session_on` and the token-count arm of
+  `SeamModel::vulkan_slot_ctx` go through `fit_explicit_ctx`. After it,
+  `seam::reclamp_ctx_to_live_room` reads `ec.device.ctx.is_some()`. So
+  `vulkan_session(N)` on a model whose config sets no `device.ctx` (tests can do
+  this) is explicit before the load and auto-sized after it: the pre-load side
+  keeps N (`Spill(N)` under `kv.overflow`, `Serve(N)` without it) and the
+  re-clamp cuts it to the fit. That second case predates S3. A percentage
+  context goes through `vulkan_session_frac` (or `vulkan_slot_ctx`'s percentage
+  arm), which has no pre-load ladder, yet the re-clamp takes it as explicit
+  because `device.ctx` is set. The product path (`chat::vulkan`'s
+  `ensure_session`) sets `device.ctx` exactly when it calls the explicit entry
+  point, so it is consistent there.
+  `preload_and_post_load_agree_for_the_same_room` passes the same flag to both
+  sides, so it cannot see this.
+- **The ladder covers single-slot, auto-sized sessions only** (read in code, not
+  run). `vulkan_slot_ctx` with more than one slot, or with a percentage, divides
+  the fit by the slot count and floors it at `MIN_SESSION_CTX` without
+  `preload_ctx`: no q8_0 rung, no refusal, and `kv.overflow` is not read, so a
+  slot opens at the minimum whether or not it fits.
+
+Options: (a) hold a reserve in the KV spill (the activation reserve plus
+`POST_KV_DEVICE_RESERVE`, or wire `reserve_bytes`), an infr-vulkan change; (b)
+under `kv.overflow`, let dense placement keep the weights resident when they fit
+without the cache and price only what of the cache fits, so the rest spills
+(faster than streaming weights at the floor, which re-reads them every token,
+but against the stream-before-spill order); (c) refuse before the load under
+`kv.overflow` too when (a) and (b) are not done, since the run fails anyway. Not
+covered by a test: no GPU test runs a spill, because none passes today.
 
 ### B63 — deep-context performance is unmeasured across the whole model matrix (2026-08-12)
 

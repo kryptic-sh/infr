@@ -47,8 +47,12 @@ pub use pager::{BlockId, Pager, PagerStats, Resolution, NOT_RESIDENT};
 pub use tensor::{DType, Shape, TensorDesc, TensorId};
 
 /// A parsed human size/count value: an absolute amount, or a percentage the CALLER resolves
-/// against the device-appropriate base (available VRAM for GPU-resident structures like the
-/// paged expert cache and the Vulkan KV budget; available system RAM on the CPU backend).
+/// against the base that knob documents: for the Vulkan paged-weight cache (`paging.cache`) the
+/// room the allocator can still hand out (free VRAM less the allocation guard's headroom), for a
+/// Vulkan context (`device.ctx`) the KV capacity that room fits, for a context on a path with no
+/// VRAM fit the model's trained window, and for the Vulkan memory limit
+/// (`kernels.vulkan.vram_limit`, `INFR_VRAM_LIMIT`) the device's total memory as its guard counts
+/// it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SizeSpec {
     /// Absolute amount in the knob's base unit (bytes for sizes, tokens for counts).
@@ -58,8 +62,8 @@ pub enum SizeSpec {
 }
 
 impl SizeSpec {
-    /// Resolve against `base` (the device-appropriate total — see the enum doc). Absolute values
-    /// pass through untouched; percentages scale `base`.
+    /// Resolve against `base` (the knob's own base — see the enum doc). Absolute values pass
+    /// through untouched; percentages scale `base`.
     pub fn resolve(self, base: u64) -> u64 {
         match self {
             SizeSpec::Bytes(b) => b,
@@ -72,7 +76,7 @@ impl SizeSpec {
 /// counts); an optional case-insensitive suffix scales by 1024-powers — `k`, `m`, `g`, `t` (a
 /// trailing `b` is tolerated: `256mb` == `256m`; a bare `b` is the base unit, so
 /// `INFR_CACHE=256b` == `256`); a `%` suffix yields [`SizeSpec::Percent`], which the caller
-/// resolves against the device-appropriate base ([`SizeSpec::resolve`]). Fractional mantissas
+/// resolves against the knob's own base ([`SizeSpec`], [`SizeSpec::resolve`]). Fractional mantissas
 /// work (`1.5g`, `12.5%`). `None` on anything else — callers treat unparseable values as unset
 /// rather than guessing.
 ///

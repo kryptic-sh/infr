@@ -112,10 +112,10 @@ model whose DENSE part also doesn't fit is out of scope and errors clearly.
 `--ctx` share one value grammar (`infr_core::parse_size`): a plain number is the
 base unit (bytes for `INFR_CACHE`, tokens for `INFR_CTX`), `k`/`m`/`g`/`t`
 suffixes scale by 1024 (`INFR_CACHE=19g`, `INFR_CTX=256k`), and `%` resolves
-against the device-appropriate base — available VRAM for the expert cache, the
-free-VRAM KV capacity for the Vulkan context (`INFR_CACHE=80%`, `INFR_CTX=50%`;
-on the CPU/Metal chat paths a ctx-`%` resolves against the model's trained
-context).
+against the device-appropriate base — allocatable VRAM (what the allocation
+guard would admit) for the expert cache, the free-VRAM KV capacity for the
+Vulkan context (`INFR_CACHE=80%`, `INFR_CTX=50%`; on the CPU/Metal chat paths a
+ctx-`%` resolves against the model's trained context).
 
 **Resident-BDA weight arena** — always on; it is the only weight path. Routes
 every weight allocation into one `bufferDeviceAddress` arena and has the kernels

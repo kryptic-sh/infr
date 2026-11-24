@@ -522,6 +522,29 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **`INFR_KV_OVERFLOW` no longer keeps a default context that does not fit
+  VRAM.** On Vulkan, with `kv.overflow` on, a context infr sizes itself (no
+  `--ctx` / `INFR_CTX`) is now clamped to what fits in VRAM, exactly as without
+  the flag. It used to keep the model's whole trained window and decide weight
+  placement for it, which on a device too small for that window's cache failed
+  at load with a "below the streaming floor" error (seen with Qwen3-0.6B Q4_K_M
+  under `INFR_VRAM_LIMIT` with 1880 MiB of room, on both GPUs here); that run
+  now opens at 6 174 tokens on the integrated GPU and 6 956 on the RX 7900 XTX.
+  Below that, a q8_0 cache that holds the 1024-token minimum is tried first, and
+  only when neither does the session open at the minimum with its cache to be
+  spilled to system RAM; on a dense model such a run still fails at load, at
+  weight placement or at the first allocation after the spilled cache, as it did
+  before. A context you set is still never cut: q8_0 is tried first, then it is
+  kept as asked; but under `kv.overflow` a set context that neither format fits
+  also still fails on a dense model, the same way, instead of spilling. Without
+  `kv.overflow` nothing changes.
+- **An `INFR_CACHE` (`paging.cache`) percentage is of the allocatable VRAM.**
+  `INFR_CACHE=80%` now means 80% of what the Vulkan allocator can still hand out
+  when placement runs (free VRAM less the allocation guard's 256 MiB headroom),
+  the same room every other placement budget uses, where it used to be 80% of
+  the free figure, so `INFR_CACHE=100%` no longer asks for memory the guard
+  refuses. Each percentage now yields 256 MiB times the percentage less than
+  before. An absolute size (`INFR_CACHE=8g`) is unchanged.
 - **`strftime_now` in chat templates is formatted by the C library, and accepts
   fewer conversions.** The date a template stamps (Llama 3.x and SmolLM3 write
   `Today Date:` with it) now comes from the C library's local-time conversion

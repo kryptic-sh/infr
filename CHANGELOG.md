@@ -1023,20 +1023,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   sweeps and the MoE expert budget used to price a model of the cache: every
   layer as per-token K and V rows, plus 64 spare rows per layer. They now sum
   the buffers a session allocates, through the functions that allocate them, at
-  the backend's own row alignment, each buffer rounded up to the alignment the
-  device's allocator gives it (the new `Backend::kv_alloc_align`, which Vulkan
-  reads from the driver's memory requirements for a KV buffer). A qwen35
-  DeltaNet layer (and an LFM3 short-convolution layer) is priced at its
-  fixed-size state, twice over: the live state and the one snapshot of it a slot
-  keeps for MTP rollback and for resuming at a prefill boundary, so a context
-  fitted to fill the device leaves room for the snapshot. Where the default
-  context is clamped to VRAM it grows: computed from the files' own geometry,
-  Qwen3.5-0.8B Q4_K_M with 4 GiB free fits 221 497 tokens where the old pricing
-  gave 65 860, and Qwen3.5-4B UD-Q4_K_XL with 8 GiB free fits 131 265 where it
-  gave 37 924 (the old figures are the old KV pricing under today's activation
-  reserve). A device with room for the trained context is unchanged, and a
-  qwen35moe model keeps more experts resident. Every other model's fit moves by
-  the 64 rows per layer it no longer reserves.
+  the backend's own row alignment, each buffer priced at what the device commits
+  for it (the new `Backend::kv_alloc_cost`, which Vulkan measures; see the
+  dedicated KV allocations under Fixed). A qwen35 DeltaNet layer (and an LFM3
+  short-convolution layer) is priced at its fixed-size state, twice over: the
+  live state and the one snapshot of it a slot keeps for MTP rollback and for
+  resuming at a prefill boundary, so a context fitted to fill the device leaves
+  room for the snapshot. Where the default context is clamped to VRAM it grows:
+  computed from the files' own geometry, Qwen3.5-0.8B Q4_K_M with 4 GiB free
+  fits 221 497 tokens where the old pricing gave 65 860, and Qwen3.5-4B
+  UD-Q4_K_XL with 8 GiB free fits 131 265 where it gave 37 924 (the old figures
+  are the old KV pricing under today's activation reserve). A device with room
+  for the trained context is unchanged, and a qwen35moe model keeps more experts
+  resident. Every other model's fit moves by the 64 rows per layer it no longer
+  reserves.
 - **Paged MoE decode on Vulkan reaches its no-readback path from a short prompt
   when the expert cache can hold the whole model.** A MoE layer decodes without
   reading its router ids back only once every one of its experts is in VRAM, and
@@ -1164,6 +1164,26 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Vulkan KV cache buffers each get their own device allocation, so a context
+  the fit accepts is no longer refused, or over-committed, over a shared
+  block.** A KV buffer below the 32 MiB dedicated threshold (every buffer of a
+  context clamped small, recurrent states, snapshots) was sub-allocated from
+  gpu-allocator's shared 256 MiB blocks, and a buffer that opened a new block
+  committed all of it, which neither the context fit nor the VRAM guard priced.
+  Every `BufferUsage::KvCache` buffer is now its own `vkAllocateMemory`, and
+  `Backend::kv_alloc_cost` (an `infr_core::KvAllocCost`) prices one: its size
+  rounded up by a step for small buffers and one for buffers of 2 MiB and more,
+  plus a fixed cost per allocation, all measured when the backend is built off
+  the process heap usage of a few probe allocations. On the integrated GPU
+  (RADV, RAPHAEL_MENDOCINO) that is a 4096-byte step in both classes and no
+  overhead; the RX 7900 XTX and other drivers were not probed, and a device that
+  cannot report its heap usage is priced by a guess (a 64 KiB and a 2 MiB step).
+  On the integrated GPU with Qwen3-0.6B Q4_K_M, `INFR_VRAM_LIMIT` from 2660 to
+  2730 MiB used to refuse the run at the guard and now runs (2640 to 2740 MiB,
+  contexts 13 060 to 13 974); what the KV allocation took from the device beyond
+  the estimate fell from 112 779 264 and 276 389 888 bytes (at 2640 and 2740
+  MiB) to 335 872 at every limit. A KV allocation that would pass the device's
+  `maxMemoryAllocationCount` is refused with the count and the limit.
 - **The production CPU's int8 activations keep the rest of a block that holds an
   outlier.** The int8 activation quantizer for K-quant, IQ, TQ and 256-wide Q8_0
   weights (`quantize_q8`) took one scale per 256 activations from the block's

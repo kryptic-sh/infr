@@ -11,7 +11,7 @@
 
 use crate::{dequant_block, Config, EngineConfig, GenStats, PerLayerEmbd};
 use anyhow::{anyhow, Result as AResult};
-use infr_core::backend::{Backend, Buffer, BufferUsage};
+use infr_core::backend::{Backend, Buffer, BufferUsage, KvAllocCost};
 use infr_core::tensor::DType;
 use infr_core::WeightSource;
 use infr_cpu::CpuBackend;
@@ -1739,25 +1739,28 @@ pub fn window_ring_rows(
         .min()
 }
 
-/// How the backend a session runs on rounds its KV cache: every layer's row capacity up to `rows`
-/// (`Backend::kv_row_align`, see [`kv_rows_at`]) and every buffer's committed memory up to `bytes`
-/// (`Backend::kv_alloc_align`). The footprint estimates take both; the allocation itself asks for
-/// the padded rows and leaves the byte rounding to the allocator.
+/// How the backend a session runs on sizes its KV cache: every layer's row capacity rounded up to
+/// `rows` (`Backend::kv_row_align`, see [`kv_rows_at`]), and what the device commits for each
+/// buffer, `commit` (`Backend::kv_alloc_cost`). The footprint estimates take both; the allocation
+/// itself asks for the padded rows and leaves the rest to the allocator.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct KvAlign {
     pub(crate) rows: usize,
-    pub(crate) bytes: usize,
+    pub(crate) commit: KvAllocCost,
 }
 
 impl KvAlign {
     /// No rounding at all: the CPU backend's, and what a sizing decision without a backend prices.
-    pub(crate) const NONE: KvAlign = KvAlign { rows: 1, bytes: 1 };
+    pub(crate) const NONE: KvAlign = KvAlign {
+        rows: 1,
+        commit: KvAllocCost::IDENTITY,
+    };
 
-    /// The rounding `be` applies.
+    /// How `be` sizes a KV cache.
     pub(crate) fn of(be: &(impl Backend + ?Sized)) -> KvAlign {
         KvAlign {
             rows: be.kv_row_align(),
-            bytes: be.kv_alloc_align(),
+            commit: be.kv_alloc_cost(),
         }
     }
 }
@@ -1778,18 +1781,19 @@ pub(crate) fn kv_bytes_estimate(
 }
 
 /// Bytes of device memory one session slot's KV cache takes: every buffer of [`kv_slot_allocs`],
-/// each rounded up to the allocator's `align.bytes`, so the figure every fit and placement decision
-/// compares against a budget is the allocation itself and not a model of it. `align` is the
-/// [`KvAlign`] of the backend the session will run on.
+/// each priced at what the device commits for it (`align.commit`), so the figure every fit and
+/// placement decision compares against a budget is the allocation itself and not a model of it.
+/// `align` is the [`KvAlign`] of the backend the session will run on.
 ///
 /// The recurrent-state snapshot is in it although a slot allocates that on first use: a context
 /// sized to fill the device has to leave room for it. That is where this differs from the refuse
 /// rung's floor ([`kv_floor_alloc_bytes`]), which lists only what the runner's init allocates.
 ///
-/// What the device commits beyond the rounded buffers is not here: on Vulkan a buffer below
-/// `make_buf_ex`'s dedicated threshold is sub-allocated from gpu-allocator's shared blocks and can
-/// open a whole new one, and the driver may round a dedicated allocation further
-/// (docs/backlog.md B13).
+/// On Vulkan every KV buffer has its own allocation, and `align.commit` is the driver's rounding
+/// and per-allocation cost as the backend measured them off its own heap usage. Measured on the
+/// integrated GPU only, where they match each buffer exactly; the device's free memory still drops
+/// by a few KB a buffer more than that, unexplained and unpriced (docs/backlog.md B13), and a
+/// driver the probe cannot measure is priced by a guess.
 pub(crate) fn kv_bytes_estimate_fmt(
     cfg: &Config,
     want_ctx: usize,
@@ -1799,7 +1803,7 @@ pub(crate) fn kv_bytes_estimate_fmt(
     k_fmt: DType,
     v_fmt: DType,
 ) -> u64 {
-    let committed = |bytes: usize| bytes.next_multiple_of(align.bytes) as u64;
+    let committed = |bytes: usize| align.commit.committed(bytes as u64);
     kv_slot_allocs(cfg, want_ctx, ring, ubatch, align.rows, k_fmt, v_fmt)
         .map(|(a, b)| committed(a) + committed(b))
         .sum()
@@ -6658,6 +6662,14 @@ mod seam_helper_tests {
             DType::Q4_0,
             DType::Turbo3,
         ];
+        // No rounding; a word; the integrated GPU's 4 KiB pages; 2 MiB pages from 2 MiB with 4
+        // KiB below and a cost per allocation.
+        let costs = [
+            super::KvAllocCost::IDENTITY,
+            super::KvAllocCost::new(16, 16, u64::MAX, 0),
+            super::KvAllocCost::new(4096, 4096, 2 << 20, 0),
+            super::KvAllocCost::new(4096, 2 << 20, 2 << 20, 512),
+        ];
         let mut rng = infr_core::pager::shapes::XorShift64::new(0x5eed_4b56);
         let (mut recurrent, mut ringed, mut compressed, mut mixed, mut rounded) = (0, 0, 0, 0, 0);
         for (name, cfg) in &kv_families() {
@@ -6671,11 +6683,11 @@ mod seam_helper_tests {
                 let ubatch = [8, 128, 512, 1024][rng.below(4)];
                 let align = super::KvAlign {
                     rows: [1, 16, 64][rng.below(3)],
-                    bytes: [1, 16, 4096][rng.below(3)],
+                    commit: costs[rng.below(costs.len())],
                 };
                 let k_fmt = formats[rng.below(formats.len())];
                 let v_fmt = formats[rng.below(formats.len())];
-                let committed = |b: usize| b.next_multiple_of(align.bytes);
+                let committed = |b: usize| align.commit.committed(b as u64) as usize;
                 let mut want = 0usize;
                 let mut pairs = Vec::new();
                 for l in 0..cfg.n_layer {
@@ -6747,11 +6759,22 @@ mod seam_helper_tests {
         );
         let page = super::KvAlign {
             rows: 1,
-            bytes: 4096,
+            commit: super::KvAllocCost::new(4096, 4096, u64::MAX, 0),
         };
         assert_eq!(
             super::kv_bytes_estimate_fmt(&plain, 1000, false, 512, page, k8, v16),
             139_264 + 258_048
+        );
+        // Classes and a cost per allocation: K (136 000 B) is below a 200 000-byte boundary and
+        // rounds to 4 KiB, V (256 000 B) is above it and rounds to 64 KiB (262 144), and each
+        // buffer adds 100 bytes.
+        let classes = super::KvAlign {
+            rows: 1,
+            commit: super::KvAllocCost::new(4096, 65_536, 200_000, 100),
+        };
+        assert_eq!(
+            super::kv_bytes_estimate_fmt(&plain, 1000, false, 512, classes, k8, v16),
+            139_264 + 100 + 262_144 + 100
         );
         assert_eq!(
             super::kv_layer_alloc_bytes(&plain, 0, 1000, false, 512, 16, k8, v16),
@@ -6762,7 +6785,10 @@ mod seam_helper_tests {
             indexer_head_size: 128,
             ..deepseek_v2_lite_kv()
         };
-        let rows16 = super::KvAlign { rows: 16, bytes: 1 };
+        let rows16 = super::KvAlign {
+            rows: 16,
+            commit: super::KvAllocCost::IDENTITY,
+        };
         // Per layer: 1008 x 576 q8_0 = 616 896 bytes of K, 1008 x 128 f16 = 258 048 of V.
         assert_eq!(
             super::kv_bytes_estimate_fmt(&mla, 1000, false, 512, rows16, k8, v16),

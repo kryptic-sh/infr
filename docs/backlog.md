@@ -412,24 +412,11 @@ refused in under a second with the sizes.
 
 **Tag:** vram fit · kv · qwen35
 
-`seam::kv_bytes_estimate_fmt` is now the sum of `seam::kv_slot_allocs`, each
-buffer rounded up to the backend's `Backend::kv_alloc_align` (carried with
-`kv_row_align` in `seam::KvAlign`): each layer's two buffers from
-`kv_layer_alloc_bytes` (which the runner's cold init and `SeamKv::fork` allocate
-through), a DeepSeek V4 layer's compressed buffers, and the recurrent-state
-snapshot (`kv_recurrent_alloc_bytes`, which `snapshot_delta` allocates through).
-The refuse rung's floor, `kv_floor_alloc_bytes`, lists `kv_init_allocs`: the
-same without the snapshot. The 64 rows per layer every estimate used to add are
-gone. Held by `kv_estimate_is_the_sum_of_the_slot_allocations` (seeded draws
-over the arch families, row and byte alignments, per-side formats),
-`kv_sizes_price_each_side_in_its_own_format` (hand-computed sizes, the one that
-catches a K/V format swap),
-`kv_floor_is_the_cold_init_and_the_estimate_adds_the_snapshot`,
-`kv_floor_never_exceeds_a_cache_the_runner_could_allocate` (every family), and
-two tests that count `KvCache` bytes through a wrapper backend under CPU runs of
-the synthetic qwen35, LFM3, llama and gemma3 models:
-`cpu_kv_alloc_is_the_estimate_without_the_snapshot` and
-`kv_snapshot_and_fork_allocate_what_the_estimate_counts`. Left:
+`seam::kv_bytes_estimate_fmt` sums `seam::kv_slot_allocs`, each buffer priced by
+`Backend::kv_alloc_cost` (`infr_core::KvAllocCost`), and on Vulkan every
+`BufferUsage::KvCache` buffer is its own `vkAllocateMemory` (`make_alloc`), so
+the estimate is what the device commits for the buffers as far as the backend
+measured it. Left:
 
 - **The refuse rung leaves the snapshot out, against plan 13 S2's text.** The
   plan had `kv_floor_alloc_bytes` gain the snapshot term. It did not: the floor
@@ -441,7 +428,7 @@ the synthetic qwen35, LFM3, llama and gemma3 models:
   of at least `infr_vulkan::VRAM_GUARD_MIN_ALLOC`: on Qwen3.5-0.8B each DeltaNet
   layer's S state is exactly 1 MiB and counts, and only its 73 728-byte
   convolution state is skipped (18 layers x (73 728 + 1 048 576) = 20 201 472
-  bytes, the `kv_snapshot_bytes` below).
+  bytes, the snapshot the estimate adds).
 - **Callers can still pass the estimate something the runner will not
   allocate.** The function is exact for the ring flag, chunk height and formats
   it is given; three callers derive those apart from the runner. The MoE arm of
@@ -463,94 +450,104 @@ the synthetic qwen35, LFM3, llama and gemma3 models:
     KV head x 256 x 2 bytes = 1024, so 22 x 1536 x 1024 = 34 603 008 bytes (33.0
     MiB) per extra slot.
   - A V4 layer's compressor rings.
-- **What the device commits beyond the estimate.** Read in
-  `infr_vulkan::VulkanBackend::make_buf_ex` and gpu-allocator 0.27's
-  `MemoryType::allocate`. A KV buffer is created at `fill_span(bytes)` and the
-  guard (`check_vram_budget`) checks its `requirements.size`. The backend reads
-  the alignment at init off two probe buffers with the KV usage, one tiny and
-  one of `DEDICATED_MIN` bytes, and takes the larger. RADV (Mesa 26.3.1, read on
-  the Raphael iGPU; the RX 7900 XTX was not probed) reports alignment 16 and a
-  size rounded up to it, which the estimate now prices. A buffer of at least
-  `DEDICATED_MIN` (32 MiB) gets a dedicated `vkAllocateMemory` of exactly
-  `requirements.size`. A smaller one is sub-allocated from gpu-allocator's
-  shared device-local blocks (`AllocationSizes::default`, which infr passes:
-  `device_memblock_size` 256 MiB): when no open block has room, the allocator
-  commits a whole new block, which the guard did not check and the live budget
-  then shows. Small KV buffers are common: recurrent states, snapshots, short
-  window rings, and — where the fit actually binds — a clamped context. On
-  Qwen3.5-0.8B each attention side is ctx x 2 KV heads x 256 x 2 bytes = ctx x
-  1024 bytes, so below a 32 768-token context every attention buffer is pooled,
-  and a clamped run on a small device can put its whole cache in shared blocks.
-  Worst case: about one `device_memblock_size` block beyond the estimate (the
-  last block's unused tail), plus per extra block the tail a buffer that did not
-  fit left behind. What covers it today: `check_vram_budget`'s doc says
-  `GUARD_HEADROOM` (256 MiB) "absorbs allocation slop (alignment, gpu-allocator
-  block rounding)", but the fit budgets against `alloc_room`, the same ceiling
-  the guard enforces, so that headroom keeps the device from over-committing
-  without stopping the guard refusing a later allocation the fit counted on.
-  Against that, the cover is the slack `POST_KV_DEVICE_RESERVE` (256 MiB) keeps
-  over the 181 MiB of driver growth it was sized on, 75 MiB on that one device.
-  **Recommended, as its own slice (not done here):** give every `KvCache` buffer
-  its own dedicated allocation. That makes the commitment exact up to page
-  rounding, and KV buffers are allocated only at init, at a fork and at the
-  first snapshot, never per token. Costs to check: the allocation count per slot
-  against `maxMemoryAllocationCount` (RADV reports 4 294 967 295 on both GPUs
-  here; Vulkan only guarantees 4096), where V4 is the case to check — the
-  V4-Flash geometry is 2 x 43 + 20 x 3 + 21 x 6 = 272 KV allocations per slot,
-  multiplied by the slot count; and each tiny buffer (the 4-byte placeholders,
-  small states) would take at least a page, so the alignment priced would have
-  to become the page size. The alternatives are pricing one device block in the
-  reserve whenever a KV buffer falls under `DEDICATED_MIN`, or leaving it.
-  Whether the kernel rounds a dedicated allocation further (to its page size)
-  was not read or measured.
-- **The pooled-block exposure, observed.** Measured 2026-11-24 on the integrated
-  GPU (RADV Raphael, unified memory) under `INFR_VRAM_LIMIT`, reading what the
-  KV allocation took from the device's live budget (`Backend::device_alloc_room`
-  before less after; the runner's `kv_committed_bytes`). Committed minus the
-  estimate, where runs succeeded: Qwen3-0.6B with every buffer pooled, +21 762
-  048 to +292 282 368 (the commitment moves about one 268 435 456-byte block at
-  a time, and passes the estimate by more than a whole block when the tails of
-  the earlier blocks add up); Qwen3-0.6B with every buffer dedicated (ctx 17 266
-  and up), +335 872 to +450 560; Qwen3.5-0.8B, +228 110 336 to +228 220 928 at
-  every room whose attention buffers are dedicated, because its 36 small
-  recurrent-state buffers open a block of their own. A deep prefill did not
-  fail: Qwen3.5-0.8B at a 2 GiB limit, `infr bench -p 512 -n 4 -d 40000`
-  (context 40 532, committed 248 385 536 past the allocation) ran to completion.
-- **And a clamped run refused at the guard on a context the fit said fits.**
-  Qwen3-0.6B Q4_K_M, every K and V buffer pooled (56 of them, 9 to a block):
-  - absolute limits (`infr run`, 20 MiB steps): refused from 2660 to 2720 MiB,
-    and at 2730 in a separate run; 2640 and 2740 ran. Clamped to 13 244 to 13
-    792 tokens; the refused buffers measured 26.6 MiB (2700), 26.8 (2714) and
-    27.1 (2730). Rooms after the weights 1 825 898 496 (2660) to 1 888 813 056
-    (2720), 1 882 521 600 at 2714 and 1 899 298 816 at 2730. The 7 blocks the
-    cache needs measured 1 879 154 688 bytes committed at 2740 (7 x 268 435 456
-    - 106 496).
-  - rooms above what was in use
-    (`clamped_run_is_not_refused_over_pooled_kv_blocks` as first written):
-    refused from 2480 to 2560 MiB of room, buffers 25.7 to 27.1 MiB; 2460 and
-    2580 ran. Where that band falls moves with the weights' own memory, the
-    driver and the device, which is why the test was replaced.
-
-  Two causes. Below the commitment (2660 to 2700 MiB) the seventh block does not
-  fit the room: this entry's exposure. Above it (2714, 2720, 2730) the room
-  holds all 7 blocks and the guard still refuses: that is a guard defect,
-  B-GUARD-POOLED. `clamped_kv_opens_no_pooled_block` now asserts what the
-  dedicated-KV fix must produce at any room (no more than a page per buffer past
-  the buffers) and is red today, `#[ignore]`d with this entry as the reason and
-  left out of the GPU gate filter (`docs/gpu-tolerance.md`). The dedicated-KV
-  slice recommended above is the fix; it was not made in the slice that measured
-  this.
-
+  - Since each KV buffer is now its own allocation, also its step's rounding and
+    the per-allocation overhead per buffer per extra slot (up to a page per
+    buffer on the integrated GPU).
+- **What the device reports taken beyond the estimate, unexplained.** Measured
+  2026-11-24 on the integrated GPU (RADV, RAPHAEL_MENDOCINO) through the
+  runner's `kv_committed_bytes` (the live `device_alloc_room` before the KV
+  allocation less after): Qwen3-0.6B Q4_K_M under `INFR_VRAM_LIMIT` 2640 to 2740
+  MiB, 335 872 bytes past the estimate at every limit (56 buffers, about 6.0 KB
+  each); `vram_limit_tests` rooms, Qwen3-0.6B 323 584 to 335 872 (56 buffers)
+  and Qwen3.5-0.8B 163 840 to 188 416 (48 buffers). The allocations themselves
+  commit exactly their price: infr-vulkan's
+  `kv_buffers_commit_no_more_than_their_price` reads the process heap usage
+  (`VK_EXT_memory_budget`'s `heapUsage`) and finds each dedicated KV buffer, 16
+  bytes to 48 MiB + 8, at its size rounded up to 4096, nothing past. So the
+  remainder is memory the device's budget loses outside this process's heap
+  usage while the KV cache is allocated and zero-filled; kernel page tables for
+  each new mapping are a guess, not verified. A one-off throwaway read of the
+  room around plain allocations, without the runner, was not usable: on the iGPU
+  it fell 12 464 128 bytes less than the heap usage rose for 56 buffers of 23
+  MiB, and not at all for the same allocated again (`vram_info` clamps each
+  heap's free figure to the heap's size, a likely cause, not checked). Not
+  priced; `clamped_kv_opens_no_pooled_block` allows 16 KiB a buffer for it. At
+  about 6 KB a buffer, a 15-slot V4 serve (15 x 272 buffers) would lose about 24
+  MB, under `POST_KV_DEVICE_RESERVE` (256 MiB), which covers it here. Pricing it
+  would mean measuring it somewhere other than the UMA budget (the probe's
+  per-allocation overhead reads the process heap usage, which does not show it);
+  decide once it is measured on the RX 7900 XTX, where the budget is plain VRAM.
+- **`kv_alloc_cost`'s measurement, where it was not made.** The backend measures
+  it once at construction (`probe_kv_alloc_cost`): the median of three dedicated
+  allocations of each of `KV_COST_PROBES` (4 bytes, 64 KiB, 64 KiB + 4, 2 MiB +
+  4), read off the process heap usage, giving a step for buffers below
+  `KV_LARGE_FROM` (2 MiB), one for buffers from it up, and the overhead the
+  exact 64 KiB probe commits past its size (`kv_alloc_cost_from`). Read on the
+  integrated GPU only: 4096 in both classes, no overhead; every dedicated
+  allocation from 4 bytes to 100 MiB + 4 committed its size rounded up to 4096
+  (a throwaway measurement, four allocations per size, and the test above at
+  eight per size). Not probed on the RX 7900 XTX, Windows drivers, NVIDIA, Intel
+  or any other driver, so the step and overhead are unverified on all of them. A
+  device without `VK_EXT_memory_budget`, or whose heap usage does not move, gets
+  a guess: a 64 KiB small step and a 2 MiB large one, no overhead. Blind spots:
+  a driver that rounds only allocations larger than 2 MiB + 4 further (a probe a
+  word past `DEDICATED_MIN` would see more, but on the integrated GPU the pages
+  a probe frees stayed counted as in use by the live budget, about 80 MiB of
+  reported room for that one, so it was dropped); a class whose step changes
+  between probes; and the host-visible memory type the UMA spill and
+  `INFR_KV_OVERFLOW`'s host KV allocate in. Its cost: about 0.1 ms in-process on
+  the integrated GPU (a throwaway timing of an earlier, larger probe set, ten
+  runs, median 115 us), and backend open (`infr tune show`, ten runs alternated
+  with HEAD's build) 24.7 ms median against 23.8, inside a 20 to 26 ms spread,
+  load average 1.2. Run at construction rather than on first use: run lazily,
+  between two budget reads of one sizing decision, its freed pages moved
+  Qwen3-0.6B at `INFR_VRAM_LIMIT=2640m` from an f16 cache of 13 060 tokens to a
+  q8_0 cache of 16 510.
+- **The allocation count.** Each KV buffer counts against
+  `maxMemoryAllocationCount` (RADV reports 4 294 967 295 on both GPUs here;
+  Vulkan guarantees only 4096, and a driver may report just that; none here
+  does). Per slot, read in code (`kv_slot_allocs`): two per layer, plus three
+  per V4 HCA layer and six per CSA layer, plus two per recurrent layer's
+  snapshot. DeepSeek V4-Flash (43 layers: 2 ratio-0, 21 CSA, 20 HCA) is the
+  largest in the codebase: 2 x 43 + 20 x 3 + 21 x 6 = 272.
+  `infr serve --parallel N` has no upper bound and allocates every slot at
+  startup (`ParallelSeam::init_slots` forks them). 15 x 272 = 4 080, so against
+  a limit of 4096 a V4 serve has room for 15 slots at most, fewer once the
+  weights' own allocations are counted (one per arena block, a block being at
+  most `maxMemoryAllocationSize`). Qwen3-0.6B's run holds 64 device memory
+  allocations in all with its 56 KV buffers, and Qwen3.5-0.8B 57 with 48 (the
+  `vram_limit_tests` lines), so the rest of a run is a handful. `make_alloc`
+  refuses a KV allocation that would pass the limit, naming the count and the
+  limit (`admit_memory_allocation`, tested without a GPU). It reads counters
+  kept where allocations are made and freed
+  (`VulkanBackend::memory_allocations_bound`): exact for the backend's own
+  allocations and gpu-allocator's dedicated ones, an upper bound for its shared
+  blocks (one per live pooled allocation, plus one emptied block per memory
+  type); only when that bound reaches the limit does it walk gpu-allocator's
+  report for the exact count. P2P exports and imports (`p2p.rs`) are not
+  counted. Best-effort near the limit: the check and the allocation are not
+  atomic, and only KV allocations are admitted this way, so any other class past
+  the limit fails inside the driver. Where it fires: at serve startup for
+  `--parallel`; on a request for a session-pool fork (`SlotPool::pick`, which
+  then recycles the LRU slot) and for a slot's first recurrent snapshot (the
+  decode loop carries on, the MTP path fails the request, as for any refused
+  snapshot). No up-front check that a configuration fits the count before the
+  weights load; never exercised against a real 4096 limit.
+- **To measure on Windows:** a session-pool fork during a request
+  (`SlotPool::pick`) now makes one `vkAllocateMemory` per KV buffer of the new
+  slot (bounded by `INFR_KV_SLOTS`; each already did a one-shot submit for its
+  zero-fill). Not timed anywhere; the cost of an allocation on a WDDM driver is
+  the question.
 - **Wrappers that report no rounding make no budget decision with it.** The
   multi-device wrappers (`PipelineBackend`, `TensorParallelBackend`,
-  `ExpertParallelBackend`) forward neither `kv_row_align` nor `kv_alloc_align`.
+  `ExpertParallelBackend`) forward neither `kv_row_align` nor `kv_alloc_cost`.
   None of them implements `Backend::device_alloc_room` either, whose default is
   `None`: `reclamp_ctx_to_live_room` then returns the context at once, and the
   runner's post-load `refuse_unallocatable_kv` returns `Ok` without calling its
   fit closure (`kv_guarded_bytes` is `None` without a room). So through those
-  wrappers only the `KV cache allocated` debug line uses the default alignment;
-  no budget decision does. Read in code. Metal keeps the default 1 byte; what a
-  Metal shared buffer commits was not checked.
+  wrappers only the `KV cache allocated` debug line uses the default cost; no
+  budget decision does. Read in code. Metal keeps the default
+  (`KvAllocCost::IDENTITY`); what a Metal shared buffer commits was not checked.
 - **A split model and KV allocations past two per layer.**
   `PipelineBackend::next_kv_device` places `KvCache` allocations by pair index
   and, on more than one device, refuses any past `2 x n_layer`
@@ -562,23 +559,12 @@ the synthetic qwen35, LFM3, llama and gemma3 models:
   (`alloc_dsv4_comp_bufs` runs after the pair loop), and a snapshot would be
   refused on first use: the decode loop carries on without it, MTP fails the
   request. Read in code, not run.
-- **A clamped auto-sized context now runs under `INFR_VRAM_LIMIT`**
-  (`clamped_default_ctx_allocates_its_estimate`, integrated GPU only):
-  Qwen3-0.6B and Qwen3.5-0.8B at seeded rooms, from the smallest that leaves a
-  context of at least `MIN_SESSION_CTX`, allocate exactly the estimate (snapshot
-  included). No qwen35moe file is cached, so its expert budget was not run.
-  gemma-4-31B's documented context (B8) was measured with the 64 rows and not
-  re-measured.
+- **Coverage of the clamped runs.** `clamped_default_ctx_allocates_its_estimate`
+  and `clamped_kv_opens_no_pooled_block` run Qwen3-0.6B and Qwen3.5-0.8B on the
+  integrated GPU only. No qwen35moe file is cached, so its expert budget was not
+  run. gemma-4-31B's documented context (B8) was measured with the 64 rows and
+  not re-measured.
 - The MTP head's own K and V cache stays outside the fit (B191).
-
-A cold init logs `KV cache allocated` at debug level with the bytes its buffers
-hold, the snapshot's bytes and the estimate. On the integrated GPU (whose
-`kv_alloc_align` reads 16), Qwen3.5-0.8B Q4_K_M at its default context, the same
-figures before and after the byte rounding, so every one of its KV buffers is a
-multiple of 16 bytes: `want_ctx=262144`, `kv_alloc_bytes=3241426944`,
-`kv_snapshot_bytes=20201472`, `kv_estimate_bytes=3261628416`; with
-`INFR_KV_OVERFLOW=1` the backend's own tally read "all 48 KV buffers (3.02 GiB)
-fit in VRAM".
 
 ### B-GUARD-POOLED — the VRAM guard charges a pooled buffer for a block already committed (2026-11-24)
 
@@ -591,23 +577,27 @@ pooled. With `VK_EXT_memory_budget`, `vram_budget_fits` takes `used` as total
 less live free, and the live figure counts every gpu-allocator block whole from
 the moment it is opened. A buffer that gpu-allocator will place in the free tail
 of a block already open is charged again, for memory already counted, so the
-guard can refuse an allocation that needs no new memory at all. Read in code and
-confirmed by arithmetic on a refused run: Qwen3-0.6B Q4_K_M under
-`INFR_VRAM_LIMIT=2714m` on the integrated GPU clamps to a context whose 56 KV
-buffers (26.8 MiB, 9 to a 256 MiB block) need 7 blocks, 1 879 154 688 bytes
-committed (measured at 2740m). The room after the weights was 1 882 521 600.
-Buffer 55 opens block 7 with about 271 MB of room left; buffer 56 lands in that
-block, but the guard sees 3 366 912 bytes left against 28 MB asked and refuses
-(which buffer was refused is inferred from this arithmetic, not logged). At
-2720m (room 1 888 813 056) and 2730m (1 899 298 816) the same. The B13 entry has
-the runs.
+guard can refuse an allocation that needs no new memory at all. Found on the KV
+cache, when its buffers were still pooled, and confirmed by arithmetic on a
+refused run: Qwen3-0.6B Q4_K_M under `INFR_VRAM_LIMIT=2714m` on the integrated
+GPU clamped to a context whose 56 KV buffers (26.8 MiB, 9 to a 256 MiB block)
+needed 7 blocks, 1 879 154 688 bytes committed (measured at 2740m). The room
+after the weights was 1 882 521 600. Buffer 55 opened block 7 with about 271 MB
+of room left; buffer 56 fit that block, but the guard saw 3 366 912 bytes left
+against 28 MB asked and refused (which buffer was refused is inferred from this
+arithmetic, not logged). At 2720m (room 1 888 813 056) and 2730m (1 899 298 816)
+the same.
 
-Not KV-specific: any pooled allocation (activations, small states, staging the
-guard checks) near the budget can be refused falsely, with or without the limit.
-Dedicated KV allocations (B13's fix) would hide it for the KV cache only.
-Without `VK_EXT_memory_budget` the fallback charges `device_used`, which counts
-each sub-allocation's own size, so there the guard under-counts blocks instead
-of double-counting them.
+KV buffers no longer hit it: since 2026-11-24 each has its own allocation, so
+the guard charges what the allocation commits, short only of the driver's page
+rounding. The same limits (2640 to 2740 MiB) now run, and no measured case
+reproduces the defect. What remains exposed is every other device-local pooled
+allocation of at least `VRAM_GUARD_MIN_ALLOC` and below `DEDICATED_MIN`:
+`BufferUsage::Activations` buffers (the graph's scratch and pooled attention/MoE
+tiers), with or without the limit. Host-visible classes (staging, readback, host
+weights) are not guarded. Without `VK_EXT_memory_budget` the fallback charges
+`device_used`, which counts each sub-allocation's own size, so there the guard
+under-counts blocks instead of double-counting them.
 
 Fix options, none made: (a) check after allocating: allocate, read the live
 budget, and free and refuse if it is now over, so a placement inside an open

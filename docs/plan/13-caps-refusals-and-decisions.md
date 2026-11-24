@@ -66,8 +66,9 @@ slot allocates it on first use, the decode loop carries on when it is refused,
 and a slot that never snapshots never allocates it. So the floor is what the
 runner's cold init must allocate (`kv_init_allocs`) and the estimate that sizes
 a context is that plus the snapshot (`kv_slot_allocs`); the two functions' docs
-say so. The estimate also rounds each buffer up to the allocator's byte
-alignment (`Backend::kv_alloc_align`), which the plan did not foresee.
+say so. The estimate also prices each buffer at what the backend says a KV
+allocation of that size commits (`Backend::kv_alloc_cost`), which the plan did
+not foresee.
 
 ### S3 — ladder order and the cache percentage (S)
 

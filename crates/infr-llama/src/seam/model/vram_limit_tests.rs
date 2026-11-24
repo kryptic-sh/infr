@@ -23,10 +23,12 @@ mod tests {
 
     const MIB: u64 = 1 << 20;
 
-    /// What a KV buffer with its own allocation may commit beyond its size: the driver rounding
-    /// the allocation up to a large page. The bound [`clamped_kv_opens_no_pooled_block`] holds
-    /// each buffer to; a buffer placed in a shared block opens a whole block instead.
-    const PAGE_SLACK: u64 = 64 * 1024;
+    /// What the device's free memory may drop per KV buffer beyond the buffer's price
+    /// (`Backend::kv_alloc_cost`): the residual measured on the integrated GPU, about 6 KB a
+    /// buffer, which nothing prices (docs/backlog.md B13), with room to spare. The bound
+    /// [`clamped_kv_opens_no_pooled_block`] holds each buffer to; a buffer placed in a shared
+    /// block would open a whole block instead.
+    const RESIDUAL_SLACK: u64 = 16 * 1024;
 
     /// The room the B12 tests leave Qwen3-0.6B: its trained window fits in neither cache format
     /// beside its weights there, and part of it fits in each.
@@ -96,6 +98,9 @@ mod tests {
 
     /// What one clamped run allocated and committed for its KV cache.
     struct ClampedRun {
+        /// The model and the bytes in use the run's limit was set above, to run it again.
+        path: std::path::PathBuf,
+        used: u64,
         /// The room above what was in use that the limit left, in MiB.
         room_mib: u64,
         /// The context the slot was allocated for.
@@ -103,6 +108,9 @@ mod tests {
         /// The bytes the slot's KV buffers hold, and how many buffers.
         allocated: u64,
         buffers: u64,
+        /// The same buffers each priced at what the backend says the device commits for it
+        /// (`Backend::kv_alloc_cost`), as the estimate prices them.
+        priced: u64,
         /// The recurrent-state snapshot's bytes: in the estimate, allocated only on first use.
         snapshot: u64,
         estimate: u64,
@@ -142,44 +150,48 @@ mod tests {
             .chain(kv.cbufs.iter().flatten())
             .map(|b| b.len_bytes() as u64)
             .collect();
+        let align = KvAlign::of(&sess.be);
+        let rounded = |b: usize| align.commit.committed(b as u64);
         let snapshot: u64 = (0..model.cfg.n_layer)
             .filter_map(|l| kv_recurrent_alloc_bytes(&model.cfg, l))
-            .map(|(k, v)| (k + v) as u64)
+            .map(|(k, v)| rounded(k) + rounded(v))
             .sum();
         let estimate = kv_bytes_estimate_fmt(
-            &model.cfg,
-            kv.max_ctx,
-            kv.kv_ring,
-            kv.ubatch,
-            KvAlign::of(&sess.be),
-            kv.k_fmt,
-            kv.v_fmt,
+            &model.cfg, kv.max_ctx, kv.kv_ring, kv.ubatch, align, kv.k_fmt, kv.v_fmt,
         );
         let run = ClampedRun {
+            path: path.to_path_buf(),
+            used,
             room_mib,
             slot_ctx: kv.max_ctx,
             allocated: sizes.iter().sum(),
             buffers: sizes.len() as u64,
+            priced: sizes.iter().map(|&b| rounded(b as usize)).sum(),
             snapshot,
             estimate,
             committed: if live { kv.kv_committed } else { None },
         };
         eprintln!(
             "{room_mib} MiB of room: ctx {opened_ctx} -> {} ({:?}/{:?}), {} KV buffers holding {} \
-             + snapshot {snapshot}, estimate {}, committed {}",
+             (priced {}) + snapshot {snapshot}, estimate {}, committed {}; {} device memory \
+             allocations live of {}",
             run.slot_ctx,
             kv.k_fmt,
             kv.v_fmt,
             run.buffers,
             run.allocated,
+            run.priced,
             run.estimate,
             match run.committed {
                 Some(c) => format!(
-                    "{c} ({:+} against the buffers)",
-                    c as i64 - run.allocated as i64
+                    "{c} ({:+} against the buffers, {:+} against their price)",
+                    c as i64 - run.allocated as i64,
+                    c as i64 - run.priced as i64
                 ),
                 None => "unmeasured (no live budget)".to_string(),
             },
+            sess.be.device_memory_allocations(),
+            sess.be.max_device_memory_allocations(),
         );
         Ok(run)
     }
@@ -202,14 +214,14 @@ mod tests {
 
     /// Every clamped run both clamped-context tests check: Qwen3-0.6B (attention only) and
     /// Qwen3.5-0.8B (recurrent layers beside attention, so a snapshot in the estimate), each over
-    /// seeded rooms from its [`usable_room`] up. Qwen3-0.6B's loosest room stays below the band
-    /// where its pooled KV blocks outgrow the room and the guard refuses a buffer
-    /// (docs/backlog.md B13 and B-GUARD-POOLED). `None` when no backend opens.
+    /// seeded rooms from its [`usable_room`] up. Qwen3-0.6B's loosest room is past the rooms where
+    /// its KV buffers, when they were sub-allocated from shared blocks, outgrew the room and the
+    /// guard refused one. `None` when no backend opens.
     fn clamped_sweeps() -> Option<Vec<Result<ClampedRun, String>>> {
         let used = in_use()?;
         let mut runs = Vec::new();
         for (name, path, start, hi, seed) in [
-            ("Qwen3-0.6B", qwen3_06b(), 1150, 2300, 0x5134),
+            ("Qwen3-0.6B", qwen3_06b(), 1150, 2600, 0x5134),
             ("Qwen3.5-0.8B", qwen35_08b(), 1350, 3200, 0x5135),
         ] {
             let Some(path) = path else {
@@ -227,8 +239,9 @@ mod tests {
     }
 
     /// A default context clamped to a limited device loads, generates, keeps a usable context and
-    /// allocates exactly the KV bytes the fit priced it at (plan 13 S2's estimate, whose clamp
-    /// could only be checked as arithmetic on a device the cached models fit whole).
+    /// allocates exactly the KV bytes the fit priced it at, each buffer at what the backend's
+    /// `kv_alloc_cost` says it commits (plan 13 S2's estimate, whose clamp could only be checked
+    /// as arithmetic on a device the cached models fit whole).
     #[test]
     #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
     fn clamped_default_ctx_allocates_its_estimate() {
@@ -241,7 +254,7 @@ mod tests {
                 run.slot_ctx
             );
             assert_eq!(
-                run.allocated + run.snapshot,
+                run.priced + run.snapshot,
                 run.estimate,
                 "{} MiB of room: the clamped slot's KV bytes against the estimate it was fitted with",
                 run.room_mib
@@ -249,17 +262,38 @@ mod tests {
         }
     }
 
-    /// What dedicated KV allocations must produce: a clamped run's KV allocation commits no more
-    /// than its buffers plus [`PAGE_SLACK`] each, at any room on any device, so no shared block is
-    /// opened for the cache. Today a buffer below the backend's dedicated threshold is placed in a
-    /// shared block, a new block is committed whole, and neither the fit nor the guard prices it
-    /// (docs/backlog.md B13), so this fails wherever a KV buffer is pooled — every Qwen3.5-0.8B
-    /// run (its recurrent states) and every Qwen3-0.6B room here. Skips the check, saying so, on a
-    /// device without a live budget, where the commitment cannot be measured.
+    /// What dedicated KV allocations produce: a clamped run's KV allocation takes from the device
+    /// no more than its buffers' price (each buffer at what `Backend::kv_alloc_cost` says it
+    /// commits, as the estimate prices it) plus [`RESIDUAL_SLACK`] each, at any room, so no shared
+    /// block is opened for the cache. A KV buffer placed in one of gpu-allocator's shared blocks
+    /// (as every buffer below the backend's dedicated threshold was, before KV buffers got their
+    /// own allocations) commits the whole block when it opens one, which neither the fit nor the
+    /// guard prices — every Qwen3.5-0.8B run (its recurrent states) and every Qwen3-0.6B room here
+    /// did.
+    ///
+    /// The commitment is the device's free memory before the KV allocation less after it, a
+    /// device-wide figure: on a unified-memory device, memory another process takes meanwhile
+    /// lands in it. A run past the bound is run once more, saying so, and fails only if the
+    /// second run is past it too. Skips the check, saying so, on a device without a live budget,
+    /// where the commitment cannot be measured.
     #[test]
-    #[ignore = "expected to fail until KV buffers get their own allocations (docs/backlog.md \
-                B13): the pooled KV buffers open shared blocks"]
+    #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
     fn clamped_kv_opens_no_pooled_block() {
+        let past_bound = |run: &ClampedRun| -> Option<String> {
+            let committed = run.committed?;
+            let bound = run.priced + RESIDUAL_SLACK * run.buffers;
+            (committed > bound).then(|| {
+                format!(
+                    "{} MiB of room: the KV allocation committed {committed} bytes for {} in {} \
+                     buffers priced {}, {} past the bound",
+                    run.room_mib,
+                    run.allocated,
+                    run.buffers,
+                    run.priced,
+                    committed - bound
+                )
+            })
+        };
         let mut failed = Vec::new();
         for run in clamped_sweeps().unwrap_or_default() {
             let run = match run {
@@ -269,23 +303,20 @@ mod tests {
                     continue;
                 }
             };
-            let Some(committed) = run.committed else {
+            if run.committed.is_none() {
                 eprintln!(
                     "skip: {} MiB of room: no live budget, so the KV commitment is unmeasured",
                     run.room_mib
                 );
                 continue;
+            }
+            let Some(first) = past_bound(&run) else {
+                continue;
             };
-            let bound = run.allocated + PAGE_SLACK * run.buffers;
-            if committed > bound {
-                failed.push(format!(
-                    "{} MiB of room: the KV allocation committed {committed} bytes for {} in {} \
-                     buffers, {} past the page-level bound",
-                    run.room_mib,
-                    run.allocated,
-                    run.buffers,
-                    committed - bound
-                ));
+            eprintln!("{first}; running it once more, in case another process moved the figure");
+            match clamped_run(&run.path, run.used, run.room_mib) {
+                Ok(again) => failed.extend(past_bound(&again)),
+                Err(e) => failed.push(e),
             }
         }
         assert!(failed.is_empty(), "{}", failed.join("\n"));

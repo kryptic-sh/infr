@@ -361,6 +361,60 @@ impl Capabilities {
     }
 }
 
+/// What a backend's device commits for one `BufferUsage::KvCache` buffer, as a function of the
+/// bytes it was asked for ([`committed`](Self::committed)): the size rounded up to the step of its
+/// size class, plus a fixed cost per allocation. Two classes, because a driver may map small and
+/// large allocations with pages of different sizes. Built by a backend from what it measured
+/// ([`Backend::kv_alloc_cost`]); the parts are private so a caller cannot combine them any other
+/// way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KvAllocCost {
+    small_step: u64,
+    large_step: u64,
+    large_from: u64,
+    overhead: u64,
+}
+
+impl KvAllocCost {
+    /// Commits exactly what is asked: no rounding, no overhead.
+    pub const IDENTITY: KvAllocCost = KvAllocCost {
+        small_step: 1,
+        large_step: 1,
+        large_from: u64::MAX,
+        overhead: 0,
+    };
+
+    /// A buffer below `large_from` bytes rounded up to a multiple of `small_step`, one of at
+    /// least `large_from` to a multiple of `large_step`, and `overhead` bytes added to either.
+    /// Panics on a zero step, which no allocator has.
+    pub fn new(small_step: u64, large_step: u64, large_from: u64, overhead: u64) -> KvAllocCost {
+        assert!(
+            small_step > 0 && large_step > 0,
+            "a KV allocation step of zero bytes: {small_step}, {large_step}"
+        );
+        KvAllocCost {
+            small_step,
+            large_step,
+            large_from,
+            overhead,
+        }
+    }
+
+    /// Bytes the device commits for a KV buffer of `bytes` bytes. Zero bytes is no buffer and
+    /// commits nothing: the KV allocation lists pair a buffer with a 0 where a slot has only one.
+    pub fn committed(&self, bytes: u64) -> u64 {
+        if bytes == 0 {
+            return 0;
+        }
+        let step = if bytes >= self.large_from {
+            self.large_step
+        } else {
+            self.small_step
+        };
+        bytes.next_multiple_of(step) + self.overhead
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BufferUsage {
     Weights,
@@ -710,15 +764,16 @@ pub trait Backend: Send + Sync {
         1
     }
 
-    /// The byte multiple the backend's allocator rounds one `BufferUsage::KvCache` buffer up to: a
-    /// buffer of `n` bytes takes at least `n.next_multiple_of(kv_alloc_align())` of the device. KV
-    /// footprint estimates round every buffer up to it, so a context fitted to fill the device
-    /// leaves room for that rounding. It is a lower bound on what the device commits, not the
-    /// commitment itself: a pooled buffer can open a whole new memory block, and the driver may
-    /// round a dedicated allocation further (see the infr-llama KV estimate's own caveat). `1`
-    /// unless a backend says otherwise.
-    fn kv_alloc_align(&self) -> usize {
-        1
+    /// What one `BufferUsage::KvCache` buffer commits on this backend's device, as a function of
+    /// its size ([`KvAllocCost::committed`]). KV footprint estimates price every buffer through
+    /// it, so a context fitted to fill the device leaves room for the device's rounding and
+    /// per-allocation cost. Vulkan gives every KV buffer its own allocation and measures both
+    /// (see the backend's own caveats on where it could not). The default,
+    /// [`KvAllocCost::IDENTITY`], prices neither and so makes no such promise: what a KV buffer
+    /// commits on a backend that keeps it (Metal, the CPU, the multi-device wrappers) was not
+    /// checked.
+    fn kv_alloc_cost(&self) -> KvAllocCost {
+        KvAllocCost::IDENTITY
     }
 
     /// Perf (DiffusionGemma denoise, perf slice 3 — docs/diffusion-gemma.md): fused per-canvas-row
@@ -776,6 +831,26 @@ pub fn kv_overflow_report_each<B: Backend>(backends: &[B]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Hand-computed pins: a 4 KiB small step, a 2 MiB large step from 2 MiB on, and 512 bytes a
+    /// buffer. Each class rounds by its own step, an exact multiple is not rounded, the overhead
+    /// lands on every buffer but an empty one, and the identity commits what it is asked.
+    #[test]
+    fn kv_alloc_cost_rounds_by_class_and_adds_the_overhead() {
+        const MIB: u64 = 1 << 20;
+        let cost = KvAllocCost::new(4096, 2 * MIB, 2 * MIB, 512);
+        assert_eq!(cost.committed(0), 0);
+        assert_eq!(cost.committed(4), 4096 + 512);
+        assert_eq!(cost.committed(4096), 4096 + 512);
+        assert_eq!(cost.committed(73_728), 73_728 + 512);
+        assert_eq!(cost.committed(2 * MIB - 4), 2 * MIB + 512);
+        assert_eq!(cost.committed(2 * MIB), 2 * MIB + 512);
+        assert_eq!(cost.committed(2 * MIB + 4), 4 * MIB + 512);
+        assert_eq!(cost.committed(5 * MIB), 6 * MIB + 512);
+        for b in [0, 1, 4097, 3 * MIB + 1] {
+            assert_eq!(KvAllocCost::IDENTITY.committed(b), b);
+        }
+    }
 
     /// The integrated chunk policy. The load-bearing property is the CEILING: this may only ever
     /// SHRINK the discrete default (1024), never grow it — it is a watchdog guard, not a tuning

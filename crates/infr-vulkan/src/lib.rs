@@ -66,7 +66,7 @@ use gpu_allocator::vulkan::{
 use gpu_allocator::MemoryLocation;
 
 use infr_core::{
-    backend::{Bindings, Buffer, BufferUsage, Capabilities, Plan},
+    backend::{Bindings, Buffer, BufferUsage, Capabilities, KvAllocCost, Plan},
     budget::{spill_report_line, SpillNouns, SpillTally},
     config::Config,
     error::Result,
@@ -470,9 +470,24 @@ struct VulkanShared {
     /// single alloc of a whole multi-GiB model is impossible. Falls back to a conservative 1 GiB
     /// (the Vulkan-guaranteed floor) if the device reports 0.
     max_mem_alloc_size: u64,
-    /// [`Backend::kv_alloc_align`]: the memory-requirements alignment of a KV cache buffer, never
-    /// below the rounding `fill_span` applies to every created buffer.
-    kv_alloc_align: usize,
+    /// [`Backend::kv_alloc_cost`], with whether any of it was measured: probed when the backend is
+    /// built ([`probe_kv_alloc_cost`]), which needs the rest of this struct to exist first.
+    kv_alloc_cost: OnceLock<(KvAllocCost, bool)>,
+    /// `maxMemoryAllocationCount`: how many `VkDeviceMemory` objects may exist at once. Every KV
+    /// cache buffer is one, so a KV allocation that would pass it is refused by name
+    /// ([`admit_memory_allocation`]) instead of failing inside the driver.
+    max_memory_allocations: u64,
+    /// The device's memory type count: gpu-allocator keeps at most one emptied shared block per
+    /// memory type, which [`VulkanBackend::memory_allocations_bound`] has to count.
+    memory_type_count: u64,
+    /// Live `VkDeviceMemory` objects this backend allocated itself rather than through
+    /// gpu-allocator (`alloc_vram_mapped`: the UMA spill and `INFR_KV_OVERFLOW`'s host KV).
+    raw_memory_allocations: AtomicU64,
+    /// Live gpu-allocator allocations with a dedicated block of their own (`make_buf_ex`).
+    dedicated_allocations: AtomicU64,
+    /// Live gpu-allocator allocations placed in a shared block (`make_buf_ex`): each lies in one
+    /// block, so there are no more non-empty shared blocks than these.
+    pooled_allocations: AtomicU64,
     /// `maxPushConstantsSize` and the compute workgroup limits — every kernel's push block and
     /// `LocalSize` are checked against THESE rather than against the floors Vulkan merely
     /// guarantees (see `ops::try_make_compute_kernel`, which refuses an oversize kernel by name
@@ -695,6 +710,12 @@ impl VulkanShared {
             pc.maybe_save(&self.device, self.pipeline_cache);
         }
     }
+
+    /// [`Backend::kv_alloc_cost`] and whether any of it was measured, probing if it has not been
+    /// yet ([`probe_kv_alloc_cost`]; the backend's construction does it first).
+    fn kv_alloc_cost(&self) -> (KvAllocCost, bool) {
+        *self.kv_alloc_cost.get_or_init(|| probe_kv_alloc_cost(self))
+    }
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -878,6 +899,12 @@ impl Drop for VkBuffer {
             match &mut self.backing {
                 Backing::Pooled(alloc) => {
                     let alloc = ManuallyDrop::take(alloc);
+                    if alloc.is_dedicated() {
+                        &self.shared.dedicated_allocations
+                    } else {
+                        &self.shared.pooled_allocations
+                    }
+                    .fetch_sub(1, Ordering::Relaxed);
                     // Keep the budget guard's fallback accounting balanced.
                     if self.location == MemoryLocation::GpuOnly {
                         self.shared
@@ -900,6 +927,9 @@ impl Drop for VkBuffer {
                     }
                     self.shared.device.unmap_memory(*memory);
                     self.shared.device.free_memory(*memory, None);
+                    self.shared
+                        .raw_memory_allocations
+                        .fetch_sub(1, Ordering::Relaxed);
                 }
                 // Shares the block's `vk::Buffer` handle byte-for-byte with every other sub-tensor
                 // and the block's own keepalive copy — this handle owns NEITHER the buffer object
@@ -1056,8 +1086,227 @@ fn kv_overflow_vram_cap(cfg: &infr_core::config::Config) -> Option<u64> {
 const GUARD_HEADROOM: u64 = 256 * 1024 * 1024;
 
 /// Smallest buffer [`VulkanBackend::make_buf_ex`] gives its own dedicated `VkDeviceMemory`; a
-/// smaller one is sub-allocated from one of gpu-allocator's shared blocks.
+/// smaller one is sub-allocated from one of gpu-allocator's shared blocks. KV cache buffers are
+/// dedicated whatever their size (see `make_alloc`).
 const DEDICATED_MIN: u64 = 32 * 1024 * 1024;
+
+/// The size from which a KV buffer is in the large class of [`KvAllocCost`]: 2 MiB, the large
+/// page GPU MMUs map big allocations with. The probes measure each class separately
+/// ([`KV_COST_PROBES`]), so a driver that maps large allocations with large pages does not have
+/// that step charged to every small buffer.
+const KV_LARGE_FROM: u64 = 2 * 1024 * 1024;
+
+/// The probe whose size is an exact multiple of every page up to its own size, so what it commits
+/// past its size is a cost per allocation rather than rounding ([`kv_alloc_cost_from`]).
+const KV_PROBE_EXACT: u64 = 64 * 1024;
+
+/// The dedicated allocations [`probe_kv_alloc_cost`] measures, chosen so each size class has a
+/// one-word buffer past a page boundary and the small class an exact page multiple: a word (the
+/// placeholder's size), [`KV_PROBE_EXACT`] and a word past it, and a word past [`KV_LARGE_FROM`].
+/// Kept small on purpose: on a unified-memory device the pages a probe frees stay counted as in
+/// use by the live budget for a while, so every probed byte is room the context fit does not see
+/// (a probe a word past `DEDICATED_MIN` cost about 80 MiB of reported room on the integrated GPU
+/// here). A driver that rounds only allocations larger than the largest probe further is not
+/// seen; sizes between probes are priced by the step their class measured.
+const KV_COST_PROBES: [u64; 4] = [4, KV_PROBE_EXACT, KV_PROBE_EXACT + 4, KV_LARGE_FROM + 4];
+
+/// Allocations [`dedicated_commit`] makes per probe size; odd, so the median is one of them.
+const KV_COST_PROBE_ROUNDS: usize = 3;
+
+/// The small-class step [`kv_alloc_cost_from`] assumes where it measured none (no
+/// `VK_EXT_memory_budget`, a heap usage that does not move, or probes the device refused):
+/// D3D12's default resource placement alignment, taken as a plausible driver granule. A guess, not
+/// a figure measured on any device here.
+const KV_SMALL_STEP_UNMEASURED: u64 = 64 * 1024;
+
+/// The large-class step [`kv_alloc_cost_from`] assumes where it measured none: the large page
+/// itself ([`KV_LARGE_FROM`]), the most a driver mapping large allocations with large pages
+/// would round one up by. A guess, not a figure measured on any device here.
+const KV_LARGE_STEP_UNMEASURED: u64 = KV_LARGE_FROM;
+
+/// What this process has allocated on every heap, as `VK_EXT_memory_budget` reports it, or `None`
+/// on a device without the extension (`has_mem_budget`), whose usage figures are not filled in.
+fn process_heap_usage(s: &VulkanShared) -> Option<u64> {
+    if !s.has_mem_budget {
+        return None;
+    }
+    let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+    let mut props2 = vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
+    unsafe {
+        s.instance
+            .get_physical_device_memory_properties2(s.physical_device, &mut props2)
+    };
+    let heaps = props2.memory_properties.memory_heap_count as usize;
+    Some(budget.heap_usage[..heaps].iter().sum())
+}
+
+/// What the driver commits for a dedicated allocation of `buffer`'s memory requirements `req`,
+/// measured as the process heap usage it adds: the median of [`KV_COST_PROBE_ROUNDS`] allocations
+/// made one after the other, each freed before the next, so neither memory the driver sets up on
+/// its first allocation nor another thread allocating or freeing meanwhile (the usage is the whole
+/// process's) decides it alone. Made in the first device-local type the buffer accepts, the one
+/// gpu-allocator picks for `MemoryLocation::GpuOnly`, with the flags a KV buffer's memory carries.
+/// `None` without a heap usage to read, when the usage does not move, or when the device refuses
+/// the allocation.
+fn dedicated_commit(
+    s: &VulkanShared,
+    buffer: vk::Buffer,
+    req: &vk::MemoryRequirements,
+) -> Option<u64> {
+    let mp = unsafe {
+        s.instance
+            .get_physical_device_memory_properties(s.physical_device)
+    };
+    let ty = (0..mp.memory_type_count).find(|&i| {
+        req.memory_type_bits & (1 << i) != 0
+            && mp.memory_types[i as usize]
+                .property_flags
+                .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+    })?;
+    let mut added = Vec::with_capacity(KV_COST_PROBE_ROUNDS);
+    for _ in 0..KV_COST_PROBE_ROUNDS {
+        let mut flags =
+            vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
+        let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().buffer(buffer);
+        let info = vk::MemoryAllocateInfo::default()
+            .allocation_size(req.size)
+            .memory_type_index(ty)
+            .push_next(&mut flags)
+            .push_next(&mut dedicated);
+        let before = process_heap_usage(s)?;
+        let memory = unsafe { s.device.allocate_memory(&info, None) }.ok()?;
+        let after = process_heap_usage(s);
+        unsafe { s.device.free_memory(memory, None) };
+        added.push(after?.saturating_sub(before));
+    }
+    added.sort_unstable();
+    Some(added[KV_COST_PROBE_ROUNDS / 2]).filter(|&c| c > 0)
+}
+
+/// The smallest power of two, at least `floor`, that rounds `size` up to at least `committed`
+/// bytes: the step an estimate must round `size` by so that it is never below what a dedicated
+/// allocation of it was measured to commit.
+fn rounding_that_covers(size: u64, floor: u64, committed: u64) -> u64 {
+    let mut step = floor.max(1).next_power_of_two();
+    while size.next_multiple_of(step) < committed {
+        step *= 2;
+    }
+    step
+}
+
+/// One measured probe of [`KV_COST_PROBES`]: its size, its memory-requirements alignment, and
+/// what a dedicated allocation of it committed (`None` when that could not be measured).
+#[derive(Clone, Copy, Debug)]
+struct KvProbe {
+    size: u64,
+    alignment: u64,
+    committed: Option<u64>,
+}
+
+/// The [`KvAllocCost`] the probes support. The per-allocation overhead is what the exact-multiple
+/// probe ([`KV_PROBE_EXACT`]) committed past its size (0 if it was not measured). Each class's
+/// step is the smallest power of two, at least the class's memory-requirements alignment, that
+/// prices every measured probe of the class, overhead added, at no less than it committed; a class
+/// with no measured probe takes its unmeasured guess. Returns whether anything was measured.
+fn kv_alloc_cost_from(probes: &[KvProbe]) -> (KvAllocCost, bool) {
+    let overhead = probes
+        .iter()
+        .find(|p| p.size == KV_PROBE_EXACT)
+        .and_then(|p| p.committed)
+        .map_or(0, |c| c.saturating_sub(KV_PROBE_EXACT));
+    let step = |large: bool, unmeasured: u64| {
+        let class = || {
+            probes
+                .iter()
+                .filter(move |p| (p.size >= KV_LARGE_FROM) == large)
+        };
+        let floor = class()
+            .map(|p| p.alignment)
+            .fold(fill_span(1), u64::max)
+            .next_power_of_two();
+        let measured = class()
+            .filter_map(|p| {
+                let c = p.committed?;
+                Some(rounding_that_covers(
+                    p.size,
+                    floor,
+                    c.saturating_sub(overhead),
+                ))
+            })
+            .max();
+        (
+            measured.unwrap_or(unmeasured).max(floor),
+            measured.is_some(),
+        )
+    };
+    let (small, small_measured) = step(false, KV_SMALL_STEP_UNMEASURED);
+    let (large, large_measured) = step(true, KV_LARGE_STEP_UNMEASURED);
+    (
+        KvAllocCost::new(small, large, KV_LARGE_FROM, overhead),
+        small_measured || large_measured,
+    )
+}
+
+/// [`Backend::kv_alloc_cost`] for this device, measured off dedicated allocations of
+/// [`KV_COST_PROBES`] with the KV usage ([`dedicated_commit`], [`kv_alloc_cost_from`]). Every KV
+/// buffer has its own `VkDeviceMemory` (`make_alloc`), and Vulkan reports neither the driver's
+/// rounding of one nor any cost per allocation, so they are measured. Run once, when the backend
+/// is built and before anything reads its memory budget: on a unified-memory device the probes'
+/// freed pages lower the live budget for a while, and a probe run between two budget reads of one
+/// sizing decision (as running it on first use did) moved a run on the integrated GPU from an
+/// f16 to a q8_0 cache at the same limit. About 0.1 ms there. Logged at debug level.
+fn probe_kv_alloc_cost(s: &VulkanShared) -> (KvAllocCost, bool) {
+    let probes: Vec<KvProbe> = KV_COST_PROBES
+        .iter()
+        .filter_map(|&size| {
+            let ci = vk::BufferCreateInfo::default()
+                .size(size)
+                .usage(BUFFER_USAGE | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE);
+            let buffer = match unsafe { s.device.create_buffer(&ci, None) } {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!("KV allocation probe of {size} B: create_buffer: {e}");
+                    return None;
+                }
+            };
+            let req = unsafe { s.device.get_buffer_memory_requirements(buffer) };
+            let committed = dedicated_commit(s, buffer, &req);
+            unsafe { s.device.destroy_buffer(buffer, None) };
+            Some(KvProbe {
+                size,
+                alignment: req.alignment,
+                committed,
+            })
+        })
+        .collect();
+    let (cost, measured) = kv_alloc_cost_from(&probes);
+    tracing::debug!(?probes, ?cost, measured, "KV allocation cost");
+    (cost, measured)
+}
+
+/// `Ok` when one more `VkDeviceMemory` fits under the device's `limit`
+/// (`maxMemoryAllocationCount`), else the error a KV allocation is refused with: every KV cache
+/// buffer is its own allocation, so the count grows with layers times slots. `bound` is an upper
+/// bound on the live count kept by counters (`VulkanBackend::memory_allocations_bound`); only when
+/// it reaches the limit is the exact count (`exact`, a walk of the allocator) taken, so the check
+/// costs a few atomic loads everywhere but near the limit.
+fn admit_memory_allocation(bound: u64, exact: impl FnOnce() -> u64, limit: u64) -> Result<()> {
+    if bound < limit {
+        return Ok(());
+    }
+    let live = exact();
+    if live < limit {
+        return Ok(());
+    }
+    Err(be(format!(
+        "KV cache allocation refused: it would be device memory allocation {} of the {limit} this \
+         device allows at once (maxMemoryAllocationCount), and every KV cache buffer takes its \
+         own. Lower --parallel or INFR_KV_SLOTS (each slot allocates its own KV buffers), or run \
+         a model with fewer layers.",
+        live + 1,
+    )))
+}
 
 /// Smallest device-local allocation the VRAM budget guard checks: anything below it
 /// is let through unasked. Public so a caller proving that an allocation set MUST be refused (the
@@ -3072,25 +3321,6 @@ impl VulkanBackend {
             );
         }
 
-        // A KV buffer's memory requirements, read off probes created with the KV usage
-        // (`make_buf_ex(.., device_address = true)`): one pooled-size and one at the dedicated
-        // threshold, since Vulkan lets the alignment depend on the size. A buffer object binds no
-        // memory, so the probes cost nothing on the device. gpu-allocator commits
-        // `requirements.size` for a dedicated buffer and places a pooled one at an
-        // `alignment`-aligned offset.
-        let mut kv_alloc_align = fill_span(1) as usize;
-        for size in [fill_span(1), DEDICATED_MIN] {
-            let ci = vk::BufferCreateInfo::default()
-                .size(size)
-                .usage(BUFFER_USAGE | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS)
-                .sharing_mode(vk::SharingMode::EXCLUSIVE);
-            let probe = unsafe { device.create_buffer(&ci, None) }
-                .map_err(|e| be(format!("create_buffer(KV alignment probe, {size} B): {e}")))?;
-            let req = unsafe { device.get_buffer_memory_requirements(probe) };
-            unsafe { device.destroy_buffer(probe, None) };
-            kv_alloc_align = kv_alloc_align.max(req.alignment as usize);
-        }
-
         // ── gpu-allocator ──────────────────────────────────────────────────────
         let allocator = Allocator::new(&AllocatorCreateDesc {
             instance: instance.clone(),
@@ -3175,7 +3405,12 @@ impl VulkanBackend {
                 has_mem_budget,
                 vram_limit,
                 max_mem_alloc_size,
-                kv_alloc_align,
+                kv_alloc_cost: OnceLock::new(),
+                max_memory_allocations: u64::from(props.limits.max_memory_allocation_count),
+                memory_type_count: u64::from(mem_props.memory_type_count),
+                raw_memory_allocations: AtomicU64::new(0),
+                dedicated_allocations: AtomicU64::new(0),
+                pooled_allocations: AtomicU64::new(0),
                 kernel_limits: crate::caps::KernelLimits::of(&props.limits),
                 rte_f16: AtomicBool::new(false),
                 wave64,
@@ -3222,6 +3457,9 @@ impl VulkanBackend {
                 gpu_wait,
             }),
         };
+
+        // Before anything reads the memory budget: see `probe_kv_alloc_cost`.
+        backend.shared.kv_alloc_cost();
 
         // `kernels.vulkan.vram_limit`: say what every budget on this device will be measured
         // against, beside the device's own figure, so a limited run's numbers are not read as the
@@ -3875,6 +4113,42 @@ impl VulkanBackend {
         self.vram().alloc_room()
     }
 
+    /// Live `VkDeviceMemory` objects this backend holds, exactly: every gpu-allocator block
+    /// (shared and dedicated) plus those it allocated itself. A P2P export or import (`p2p.rs`)
+    /// is not counted. Built off gpu-allocator's report, which clones a name per live allocation
+    /// under the allocator lock: for a test or the near-limit path of the KV allocation-count
+    /// check (`admit_memory_allocation`), never per allocation.
+    pub fn device_memory_allocations(&self) -> u64 {
+        let blocks = self
+            .shared
+            .allocator
+            .lock()
+            .unwrap()
+            .generate_report()
+            .blocks
+            .len() as u64;
+        blocks + self.shared.raw_memory_allocations.load(Ordering::Relaxed)
+    }
+
+    /// An upper bound on [`device_memory_allocations`](Self::device_memory_allocations), from
+    /// counters kept where allocations are made and freed: exact for this backend's own
+    /// allocations and gpu-allocator's dedicated ones, and for its shared blocks the number of
+    /// live allocations in them (each lies in one block) plus one emptied block per memory type,
+    /// which gpu-allocator may keep. A few atomic loads.
+    fn memory_allocations_bound(&self) -> u64 {
+        let s = &self.shared;
+        s.raw_memory_allocations.load(Ordering::Relaxed)
+            + s.dedicated_allocations.load(Ordering::Relaxed)
+            + s.pooled_allocations.load(Ordering::Relaxed)
+            + s.memory_type_count
+    }
+
+    /// `maxMemoryAllocationCount`, read at construction: how many `VkDeviceMemory` objects this
+    /// device allows at once.
+    pub fn max_device_memory_allocations(&self) -> u64 {
+        self.shared.max_memory_allocations
+    }
+
     /// Device-memory budget guard: hard-error BEFORE a device-local allocation of `want` bytes
     /// that would exceed the budget. Over-committing does not fail cleanly on GPUs — the driver
     /// accepts the allocation and then evicts, which on a discrete card means reading weights back
@@ -4032,6 +4306,11 @@ impl VulkanBackend {
             return Err(be(format!("rebar bind_buffer_memory: {e}")));
         }
 
+        // Count the `VkDeviceMemory` this owns outside gpu-allocator (balanced in
+        // `VkBuffer::drop`).
+        self.shared
+            .raw_memory_allocations
+            .fetch_add(1, Ordering::Relaxed);
         // Charge the device-local budget tally — UNLESS this is a UMA/host spill, which lives off
         // the device-local heap and must not count against it (balanced in `VkBuffer::drop`).
         if !spilled {
@@ -4258,8 +4537,9 @@ impl VulkanBackend {
     /// block exists in the same memory type (`active_general_blocks > 1` in its `free()`), and
     /// exposes no purge/trim API — so the last 64 MiB host-visible block (and a 256 MiB
     /// device-local one) would sit empty in the ReBAR heap for the whole session. Used by the
-    /// weight-upload staging path below; never on a per-token path (a dedicated allocation costs
-    /// a `vkAllocateMemory`, fine once per tensor at load, wrong per token).
+    /// weight-upload staging path below and by every KV cache buffer (`make_alloc`); never on a
+    /// per-token path (a dedicated allocation costs a `vkAllocateMemory`, fine once per tensor at
+    /// load or per KV buffer at a slot's allocation, wrong per token).
     fn make_buf_ex(
         &self,
         size: usize,
@@ -4399,6 +4679,14 @@ impl VulkanBackend {
             }));
         }
 
+        // Count the allocation for `memory_allocations_bound` (balanced by `VkBuffer::drop`).
+        if allocation.is_dedicated() {
+            &self.shared.dedicated_allocations
+        } else {
+            &self.shared.pooled_allocations
+        }
+        .fetch_add(1, Ordering::Relaxed);
+
         // Charge the budget guard's fallback accounting (balanced by `VkBuffer::drop`).
         if location == MemoryLocation::GpuOnly {
             self.shared
@@ -4516,11 +4804,26 @@ impl VulkanBackend {
         // kernel reads this address yet (every attention/store/dequant dispatch still binds these
         // buffers exactly as before `vkb`). Unlike `Weights`, this is deliberately NOT an arena
         // sub-allocation: each `kbufs[l]`/`vbufs[l]` (and its fork/checkpoint/MTP-draft twins)
-        // stays its OWN dedicated-or-pooled buffer object via the ordinary `make_buf_ex` path — the
-        // per-layer/per-side structure is unchanged, it just gains `SHADER_DEVICE_ADDRESS` usage +
-        // an `own_addr`. Smallest blast radius: only KV buffers get an address, not every
-        // `Activations` scratch/partial/logits allocation in the engine.
+        // stays its OWN buffer object via the ordinary `make_buf_ex` path — the per-layer/per-side
+        // structure is unchanged, it just gains `SHADER_DEVICE_ADDRESS` usage + an `own_addr`.
+        // Smallest blast radius: only KV buffers get an address, not every `Activations`
+        // scratch/partial/logits allocation in the engine.
+        //
+        // Every KV buffer also gets its own DEDICATED `VkDeviceMemory`, whatever its size. A pooled
+        // one could open a whole gpu-allocator block that neither the context fit nor the VRAM
+        // guard prices; dedicated, the device commits what `Backend::kv_alloc_cost` prices, as far
+        // as it was measured. KV buffers are allocated at a slot's cold init, at a fork and at its
+        // first recurrent-state snapshot, never per token, so the `vkAllocateMemory` each costs
+        // stays off the decode path. Each one counts against `maxMemoryAllocationCount`, checked
+        // here first. Best-effort near the limit: the check and the allocation are not atomic
+        // (another thread may allocate between them), and only KV allocations are admitted this
+        // way — any other class past the limit still fails inside the driver.
         if usage == BufferUsage::KvCache {
+            admit_memory_allocation(
+                self.memory_allocations_bound(),
+                || self.device_memory_allocations(),
+                self.shared.max_memory_allocations,
+            )?;
             // Opt-in overflow (issue: KV-in-system-RAM), VRAM-FIRST: keep this KV buffer resident in
             // device-local VRAM while it fits the guard's budget; once VRAM is full, place it — and,
             // since the budget only shrinks as later buffers land, every subsequent one — in host RAM,
@@ -4547,7 +4850,7 @@ impl VulkanBackend {
                     .admits(kv_overflow_vram_cap(&self.cfg), bytes as u64);
                 if cap_ok && self.vram_budget_fits(bytes as u64) {
                     if let Ok(buf) =
-                        self.make_buf_ex(bytes, MemoryLocation::GpuOnly, "kv-cache", false, true)
+                        self.make_buf_ex(bytes, MemoryLocation::GpuOnly, "kv-cache", true, true)
                     {
                         self.shared.kv_spill.record_vram(bytes as u64);
                         return Ok(buf);
@@ -4557,7 +4860,7 @@ impl VulkanBackend {
                 self.shared.kv_spill.record_host(bytes as u64);
                 return Ok(buf);
             }
-            return self.make_buf_ex(bytes, MemoryLocation::GpuOnly, "kv-cache", false, true);
+            return self.make_buf_ex(bytes, MemoryLocation::GpuOnly, "kv-cache", true, true);
         }
         let (location, label) = match usage {
             BufferUsage::Weights => unreachable!("Weights routed to bda_weight_alloc above"),
@@ -4847,8 +5150,8 @@ impl Backend for VulkanBackend {
         self.shared.caps.clone()
     }
 
-    fn kv_alloc_align(&self) -> usize {
-        self.shared.kv_alloc_align
+    fn kv_alloc_cost(&self) -> KvAllocCost {
+        self.shared.kv_alloc_cost().0
     }
 
     fn weight_progress(
@@ -6702,6 +7005,220 @@ mod tests {
         );
     }
 
+    /// The rounding an estimate needs to cover a measured commitment, on the figures RADV gave on
+    /// the integrated GPU here (each dedicated allocation rounded up to a 4 KiB page) and on a
+    /// driver that would round a large allocation to a 2 MiB page.
+    #[test]
+    fn rounding_covers_what_was_committed() {
+        const PAGE: u64 = 4096;
+        const LARGE_PAGE: u64 = 2 << 20;
+        // Already covered by the alignment: no page rounding measured.
+        assert_eq!(rounding_that_covers(PAGE, 16, PAGE), 16);
+        // A 4-byte buffer committing a page needs the page.
+        assert_eq!(rounding_that_covers(4, 16, PAGE), PAGE);
+        // One word past 2 MiB committing a page more: a page.
+        assert_eq!(
+            rounding_that_covers(LARGE_PAGE + 4, 16, LARGE_PAGE + PAGE),
+            PAGE
+        );
+        // The same buffer committing two large pages: a large page.
+        assert_eq!(
+            rounding_that_covers(LARGE_PAGE + 4, 16, 2 * LARGE_PAGE),
+            LARGE_PAGE
+        );
+        // A floor that is not a power of two is raised to one.
+        assert_eq!(rounding_that_covers(4, 12, 4), 16);
+    }
+
+    /// The cost the probes support, on hand-made drivers, each probe at memory-requirements
+    /// alignment 16. Every measured probe is priced at no less than it committed, and:
+    /// - the figures RADV gave on the integrated GPU (every allocation rounded up to 4 KiB) price
+    ///   both classes at 4 KiB with no overhead;
+    /// - a driver mapping large allocations with 2 MiB pages charges that step to the large class
+    ///   only, so a placeholder still costs a page, not 2 MiB;
+    /// - a driver using 64 KiB pages past 64 KiB charges that step to the whole small class, a
+    ///   placeholder included: the classes are no finer than the probes;
+    /// - a fixed cost per allocation is read off the exact-multiple probe and added to every
+    ///   buffer, an exact page multiple included;
+    /// - nothing measured takes the guesses.
+    #[test]
+    fn kv_alloc_cost_prices_every_probe_by_its_class() {
+        const KIB: u64 = 1 << 10;
+        const MIB: u64 = 1 << 20;
+        let probes = |committed: [Option<u64>; 4]| -> Vec<KvProbe> {
+            KV_COST_PROBES
+                .iter()
+                .zip(committed)
+                .map(|(&size, committed)| KvProbe {
+                    size,
+                    alignment: 16,
+                    committed,
+                })
+                .collect()
+        };
+        // In `KV_COST_PROBES` order: 4 B, 64 KiB, 64 KiB + 4, 2 MiB + 4.
+        let cases = [
+            (
+                "4 KiB pages",
+                [4 * KIB, 64 * KIB, 68 * KIB, 2 * MIB + 4 * KIB],
+                KvAllocCost::new(4 * KIB, 4 * KIB, 2 * MIB, 0),
+            ),
+            (
+                "2 MiB pages from 2 MiB",
+                [4 * KIB, 64 * KIB, 68 * KIB, 4 * MIB],
+                KvAllocCost::new(4 * KIB, 2 * MIB, 2 * MIB, 0),
+            ),
+            (
+                "64 KiB pages past 64 KiB",
+                [4 * KIB, 64 * KIB, 128 * KIB, 2 * MIB + 64 * KIB],
+                KvAllocCost::new(64 * KIB, 64 * KIB, 2 * MIB, 0),
+            ),
+            (
+                "512 B per allocation",
+                [
+                    4 * KIB + 512,
+                    64 * KIB + 512,
+                    68 * KIB + 512,
+                    2 * MIB + 4 * KIB + 512,
+                ],
+                KvAllocCost::new(4 * KIB, 4 * KIB, 2 * MIB, 512),
+            ),
+        ];
+        for (name, committed, want) in cases {
+            let (cost, measured) = kv_alloc_cost_from(&probes(committed.map(Some)));
+            assert!(measured, "{name}");
+            assert_eq!(cost, want, "{name}");
+            for (&size, c) in KV_COST_PROBES.iter().zip(committed) {
+                assert!(
+                    cost.committed(size) >= c,
+                    "{name}: {size} B priced {} under the {c} committed",
+                    cost.committed(size)
+                );
+            }
+        }
+        assert_eq!(
+            KvAllocCost::new(4 * KIB, 4 * KIB, 2 * MIB, 512).committed(64 * KIB),
+            64 * KIB + 512
+        );
+        assert_eq!(
+            kv_alloc_cost_from(&probes([None; 4])),
+            (
+                KvAllocCost::new(
+                    KV_SMALL_STEP_UNMEASURED,
+                    KV_LARGE_STEP_UNMEASURED,
+                    KV_LARGE_FROM,
+                    0
+                ),
+                false
+            )
+        );
+    }
+
+    /// A KV allocation is refused by name, with the count and the limit, at the device's
+    /// `maxMemoryAllocationCount` (4096 is the minimum Vulkan guarantees), and admitted below it.
+    /// The exact count is taken only once the counters' bound reaches the limit.
+    #[test]
+    fn kv_allocation_past_the_allocation_count_is_refused() {
+        const LIMIT: u64 = 4096;
+        assert!(admit_memory_allocation(
+            LIMIT - 1,
+            || panic!("the exact count is not taken below the limit"),
+            LIMIT
+        )
+        .is_ok());
+        assert!(admit_memory_allocation(LIMIT + 7, || LIMIT - 1, LIMIT).is_ok());
+        for live in [LIMIT, LIMIT + 1] {
+            let msg = admit_memory_allocation(live + 7, || live, LIMIT)
+                .expect_err("an allocation past the limit must be refused")
+                .to_string();
+            assert!(
+                msg.contains(&format!("allocation {} of the {LIMIT}", live + 1))
+                    && msg.contains("maxMemoryAllocationCount"),
+                "{msg}"
+            );
+        }
+    }
+
+    /// Every KV buffer has its own allocation, and what the device commits for it is never above
+    /// what `Backend::kv_alloc_cost` prices it at — at sizes the probes do not use, in both
+    /// classes: a short word, an exact page multiple, an exact multiple the size of a small
+    /// recurrent state, a size off any page boundary, an exact 3 MiB, one off a boundary above
+    /// 2 MiB, and one past the largest probe. Measured off the process heap usage
+    /// (`VK_EXT_memory_budget`), so skipped, saying so, on a device where the cost could not be
+    /// measured; where it was, a buffer must move the usage. Before KV buffers were dedicated, the
+    /// first small one opened a shared block of gpu-allocator's, far past its price, and several
+    /// shared one allocation.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn kv_buffers_commit_no_more_than_their_price() {
+        let Some(be) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
+            return;
+        };
+        let (cost, measured) = be.shared.kv_alloc_cost();
+        if !measured {
+            eprintln!(
+                "skip: this device reports no usable heap usage, so the KV commitment is \
+                 unmeasured (priced by the guess {cost:?})"
+            );
+            return;
+        }
+        const N: u64 = 8;
+        const ROUNDS: usize = 5;
+        let usage = || process_heap_usage(&be.shared).expect("measured, so the usage is read");
+        // Memory the driver sets up on a first allocation is not this test's subject.
+        drop(
+            be.make_alloc(16, BufferUsage::KvCache)
+                .expect("KvCache alloc"),
+        );
+        for size in [
+            16usize,
+            4096,
+            73_728,
+            100_000,
+            3 << 20,
+            (5 << 20) + 12,
+            (48 << 20) + 8,
+        ] {
+            // The heap usage is the whole process's: under nextest (the gate's runner) that is
+            // this test alone, but a test thread allocating or freeing beside it under
+            // `cargo test` lands in the figure, so the median of a few rounds is taken.
+            let mut rounds = Vec::with_capacity(ROUNDS);
+            let mut allocs = 0;
+            for _ in 0..ROUNDS {
+                let (before, allocs_before) = (usage(), be.device_memory_allocations());
+                let bufs: Vec<VkBuffer> = (0..N)
+                    .map(|_| {
+                        be.make_alloc(size, BufferUsage::KvCache)
+                            .expect("KvCache alloc")
+                    })
+                    .collect();
+                rounds.push(usage().saturating_sub(before));
+                allocs = be.device_memory_allocations() - allocs_before;
+                drop(bufs);
+            }
+            rounds.sort_unstable();
+            let committed = rounds[ROUNDS / 2];
+            let priced = N * cost.committed(size as u64);
+            eprintln!(
+                "{N} KV buffers of {size} B: {allocs} allocations, committed {committed} B \
+                 ({} B per buffer past its size), priced {priced} B by {cost:?}",
+                (committed / N).saturating_sub(size as u64)
+            );
+            assert_eq!(
+                allocs, N,
+                "{size} B: every KV buffer must be its own allocation"
+            );
+            assert!(
+                committed >= N * size as u64,
+                "{size} B: {N} KV buffers moved the heap usage by only {committed} B"
+            );
+            assert!(
+                committed <= priced,
+                "{size} B: {N} KV buffers committed {committed} B, past the {priced} B priced"
+            );
+        }
+    }
+
     /// Slice 0 of the KV-cache u64/BDA migration (issue #74): pure allocator-seam enablement — a
     /// `BufferUsage::KvCache` allocation (the exact usage class `infr-llama`'s `kbufs[l]`/
     /// `vbufs[l]`, their `fork()`/MTP-checkpoint/MTP-draft twins all route through as of this
@@ -6716,9 +7233,9 @@ mod tests {
             return;
         };
         // Two independent buffers, mirroring a K/V pair for one layer. UNLIKE the resident-weight
-        // BDA arena, KV buffers are deliberately NOT consolidated into one shared block in this
-        // slice (see `make_alloc`'s `KvCache` arm) — each stays its own dedicated-or-pooled
-        // object, so their addresses must be distinct, non-null VkDeviceAddress values.
+        // BDA arena, KV buffers are deliberately NOT consolidated into one shared block (see
+        // `make_alloc`'s `KvCache` arm) — each is its own object with its own dedicated
+        // allocation, so their addresses must be distinct, non-null VkDeviceAddress values.
         let kbuf = be.alloc(4096, BufferUsage::KvCache).expect("KvCache alloc");
         let vbuf = be.alloc(4096, BufferUsage::KvCache).expect("KvCache alloc");
         let kaddr = kbuf

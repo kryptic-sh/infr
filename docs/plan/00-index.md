@@ -43,6 +43,12 @@ The standing goal: any model size on any hardware, disk to DRAM to VRAM.
 | 19    | [KV cache as a store, anywhere](19-kv-anywhere.md)                                 | P1 done; P2–P4 scoped                                                    |
 | 20    | [Cold KV in a compressed format](20-kv-cold-format.md)                             | scoped                                                                   |
 
+## Sampling and reasoning
+
+| Phase | What                                                                               | Status                                                                  |
+| ----- | ---------------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
+| 21    | [A reasoning budget the engine enforces](21-reasoning-budget.md)                   | scoped                                                                   |
+
 ## Numerics
 
 Priority: phase 11 goes ahead of the rest of phase 10, which needs the fixed CPU

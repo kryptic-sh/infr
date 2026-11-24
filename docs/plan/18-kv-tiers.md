@@ -1,6 +1,6 @@
 # Plan 18: KV tiers behind traits
 
-Status: proposed.
+Status: P1 shipped (`959b0864`); P2–P5 proposed.
 
 ## Problem
 
@@ -66,27 +66,26 @@ implements the trait too. Attention never goes through the trait: kernels keep b
 device buffers and page table directly, so the trait costs nothing per token.
 
 **Parked slots.** When the pool runs out of pages, the least-recently-used idle slot captures
-   all of its rows, prompt and reply, into the store and releases its pages. Its conversation
-   resumes through the ordinary prefix restore. This replaces the `kv_pool_exhausted` 400 for
-   every case except a single request larger than the pool.
+all of its rows, prompt and reply, into the store and releases its pages. Its conversation
+resumes through the ordinary prefix restore. This replaces the `kv_pool_exhausted` 400 for
+every case except a single request larger than the pool.
 
 ## Phases
 
-- **P1** `RowLayout` and the generic row copies; rewrite the store and pool callers. No
-  behavior change. Test: ring and page span splits, a CPU round trip through a wrapped ring, a
+- **P1** (done) `RowLayout` and the generic row copies; rewrite the store and pool callers. No
+  behavior change. Row ops refuse a format whose rows do not pack back to back (`row_bytes`). Test: ring and page span splits, a CPU round trip through a wrapped ring, a
   linear-to-pages copy.
 - **P2** `KvStore`, `KvRows`, `DeviceStore`, `copy`, `DeviceKv` and `RamKv`; `BlockCache`
   replaces `KvPrefixStore` over `RamKv`. No behavior change.
 - **P3** `BudgetedStore`, `Tiered`, `DiskKv` and `RedisKv` replace `KvColdTier` and the
-  journal file. Redis
-  gets a per-block meta key (tokens, length, snapshot flag) so the index loads without the
-  bytes. Test: demote and promote through two stores; a block evicted from RAM restores from
+  journal file. Redis gets a per-block meta key (tokens, length, snapshot flag) so the index
+  loads without the bytes. Test: demote and promote through two stores; a block evicted from RAM restores from
   the disk store.
 - **P4** capture the whole slot after a generation, not only the prompt.
-- **P5** `Paged<S>` replaces `KvPool`/`PagedSlot`, then parked slots on pool exhaustion. Test: two conversations in a one-conversation pool
-  both resume with `cached_tokens > 0`.
+- **P5** `Paged<S>` replaces `KvPool`/`PagedSlot`, then parked slots on pool exhaustion.
+  Test: two conversations in a one-conversation pool both resume with `cached_tokens > 0`.
 
 ## Measures
 
-- Restore latency per 512-token block from RAM, file and local Valkey on the RX 580 host.
+- Restore latency per 512-token block from RAM, redb and local Valkey on the RX 580 host.
 - TTFT of a resumed parked conversation versus a cold prefill, at 4k and 32k tokens.

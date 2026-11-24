@@ -900,6 +900,11 @@ impl SeamKv {
         self.paged.as_ref().map(|p| p.map.pool())
     }
 
+    /// Logical pages this slot owns, when `kv.paged` built a page table for it.
+    pub(crate) fn paged_pages(&self) -> Option<usize> {
+        self.paged.as_ref().map(|p| p.map.len())
+    }
+
     /// Turn this slot's pooled layers into blocks of `pool`: move the rows it already holds into
     /// its block, point the layer buffers at the pool, and materialize the table. Linear layers
     /// keep their private buffers.

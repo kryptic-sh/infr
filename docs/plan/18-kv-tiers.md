@@ -1,6 +1,7 @@
 # Plan 18: KV tiers behind traits
 
-Status: P1 shipped (`959b0864`); P2–P5 proposed.
+Status: P1–P4 shipped; P5 shipped except the `Paged<S>` rewrite, which is dropped with a reason
+in its phase.
 
 ## Problem
 
@@ -53,15 +54,22 @@ extent.
 
 **Combinators** wrap stores and implement `KvStore` themselves:
 
-- `Tiered<Fast, Slow>`: reads fall through and promote, evictions from `Fast` demote to `Slow`,
-  so `Tiered<RamKv, Tiered<DiskKv, RedisKv>>` is a single store;
-- `Paged<S: DeviceStore>`: a page pool and page tables over a device store; spilling a page is
-  a `copy` into a lower store and a release;
+- `Tiered<Fast, Slow>`: reads fall through and promote, evictions from `Fast` demote to `Slow`
+  with their index entry, so `Tiered<RamKv, Tiered<DiskKv, RedisKv>>` is a single store;
+- `Bounded<S: BudgetedStore>`: the last tier, which drops its own LRU instead of demoting, so a
+  RAM-only cache stays inside `kv.store_mb`;
 - `BlockCache<S: KvStore>`: the prefix cache, a token index over content-addressed extents
-  (FNV chain id) in any store. Startup loads the index only, never the bytes.
+  (FNV chain id) in any store. The index entry (tokens, snapshot flag, bytes) is side metadata on
+  the store itself (`KvStore::meta`), so startup lists extent ids and reads metas only.
 
-Blocks stay 128 rows and pages 512. Extent length is per store, so neither unit changes.
-Config picks the tiers at runtime, so they sit behind `Box<dyn KvStore>`, and the box
+`Paged<S>` was proposed here and is not built: its only possible `S` is the one page pool, whose
+buffers the attention kernels bind directly, so the wrapper would have a single implementor and no
+second consumer. `DeviceKv` already resolves a paged slot's rows through its page map, which is all
+the store side needs of it.
+
+Blocks stay 128 rows and pages 512. Extent length is per store, so neither unit changes. A block and
+the recurrent snapshot at its end are one extent, so a tier evicts the rows and their state
+together. Config picks the tiers at runtime, so they sit behind `Box<dyn KvStore>`, and the box
 implements the trait too. Attention never goes through the trait: kernels keep binding the
 device buffers and page table directly, so the trait costs nothing per token.
 
@@ -70,22 +78,38 @@ all of its rows, prompt and reply, into the store and releases its pages. Its co
 resumes through the ordinary prefix restore. This replaces the `kv_pool_exhausted` 400 for
 every case except a single request larger than the pool.
 
+**Ring windows.** A prefix longer than a sliding-window ring is captured per block, and the block
+that straddles the window's start keeps the rows that are still resident. A restore refuses when
+the blocks cannot fill the destination's window, so a ring never claims rows attention would read
+from a hole.
+
 ## Phases
 
-- **P1** (done) `RowLayout` and the generic row copies; rewrite the store and pool callers. No
+- **P1** (done, `959b0864`) `RowLayout` and the generic row copies; rewrite the store and pool callers. No
   behavior change. Row ops refuse a format whose rows do not pack back to back (`row_bytes`). Test: ring and page span splits, a CPU round trip through a wrapped ring, a
   linear-to-pages copy.
-- **P2** `KvStore`, `KvRows`, `DeviceStore`, `copy`, `DeviceKv` and `RamKv`; `BlockCache`
-  replaces `KvPrefixStore` over `RamKv`. No behavior change.
-- **P3** `BudgetedStore`, `Tiered`, `DiskKv` and `RedisKv` replace `KvColdTier` and the
-  journal file. Redis gets a per-block meta key (tokens, length, snapshot flag) so the index
-  loads without the bytes. Test: demote and promote through two stores; a block evicted from RAM restores from
-  the disk store.
-- **P4** capture the whole slot after a generation, not only the prompt.
-- **P5** `Paged<S>` replaces `KvPool`/`PagedSlot`, then parked slots on pool exhaustion.
-  Test: two conversations in a one-conversation pool both resume with `cached_tokens > 0`.
+- **P2** (done, `f7ef217a`) `KvStore`, `KvRows`, `DeviceStore`, `copy`, `DeviceKv` and `RamKv`;
+  `BlockCache` replaces `KvPrefixStore`. Fixed with it: a wrapped ring kept no rows for the block
+  straddling its window, so a restore left the rows attention reads unwritten, and residency came
+  from `cached.len()` rather than the rows a chain wrote past it.
+- **P3** (done, `7d471b44`) `BudgetedStore`, `Tiered`, `Bounded`, `DiskKv` (redb, `Durability::None`
+  plus one flush on drop) and `RedisKv` replace `KvColdTier` and the journal file; the index moves
+  into per-extent metas. Test: demote and promote through two stores; a block evicted from RAM
+  restores from the disk store, also across a restart; a damaged extent is a miss, not a failed
+  request.
+- **P4** (done, `39d89c19`) capture the whole slot after a generation, not only the prompt. A
+  recurrent model keeps its prompt only: it resumes from a snapshot, and prefill takes those at
+  prompt boundaries.
+- **P5** `Paged<S>` is dropped (see above). Parked slots ship as they are: the retry loop around
+  restore and the runner, and `park_idle` capturing the victim before `reset`. Test: two
+  conversations in a one-conversation pool both resume with `cached_tokens > 0`, plus the
+  panic-safety of the park reservation.
 
 ## Measures
 
-- Restore latency per 512-token block from RAM, redb and local Valkey on the RX 580 host.
-- TTFT of a resumed parked conversation versus a cold prefill, at 4k and 32k tokens.
+- Restore cost per tier, on the RX 580 with Qwen2.5-0.5B: 2k tokens take 21 ms from host RAM, 20 ms
+  from redb and 92 ms from loopback Valkey, against 864-906 ms to prefill them. The table lives in
+  `docs/perf/kv-prefix.md`, and `crates/infr-llama/tests/kv_tier_latency.rs` regenerates it.
+- The same comparison at long context: 4k 2138 → 34 ms, 31561 tokens 44.7 s → 272 ms. A parked
+  conversation resumes through that restore; the parking test asserts both conversations come back
+  with `cached_tokens > 0`.

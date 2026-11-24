@@ -5058,6 +5058,11 @@ impl Backend for VulkanBackend {
             .wait_queue_idle(&|| "the backend's outstanding work (`sync`)".to_string())
     }
 
+    /// A Q8_0 KV side here is planar (`store_q8.comp`): the codes, then every block's scale.
+    fn kv_q8_planar(&self) -> bool {
+        true
+    }
+
     fn moe_paged(&self) -> bool {
         self.moe_pager.lock().unwrap().is_some()
     }

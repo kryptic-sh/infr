@@ -107,6 +107,31 @@ table scan for redb), never the rows, so the index comes back in milliseconds
 whatever the cache holds. Block ids are chained FNV hashes, not `DefaultHasher`,
 because a toolchain upgrade must not silently rename every stored block.
 
+## What a restore costs, per tier
+
+Measured on the RX 580 with Qwen2.5-0.5B-Instruct q4_k_m, one slot, 4k ctx, a 2k-token prompt and
+one generated token (the clock covers the whole call, so the restore is inside it), after a 512-token
+run built the pipelines the prompt's chunk heights use:
+
+| Tier | Prompt tokens | First call | Same prompt again | Speedup |
+| --- | ---: | ---: | ---: | ---: |
+| host RAM | 1999 | 864 ms | 21 ms | 40× |
+| redb, with a 1 MiB RAM tier so every block demoted | 2000 | 894 ms | 20 ms | 45× |
+| Valkey on loopback, same 1 MiB RAM tier | 2000 | 906 ms | 92 ms | 10× |
+
+The disk tier is within noise of RAM at this size: 24 MB of rows crosses the page cache faster
+than the 1.1-1.3 ms per 128-token block a RAM restore already costs, and the upload is the floor.
+Loopback Valkey costs about 90 ms for the same rows, which is the socket, not the server.
+
+At long context the gap is the prefill being avoided, so it grows with the prompt, and a parked
+conversation resumes through the same path (`kv_paged_session`'s parking test asserts
+`cached_tokens > 0` for both conversations in a one-conversation pool):
+
+| Prompt tokens | First call | Same prompt again | Speedup |
+| ---: | ---: | ---: | ---: |
+| 4096 | 2138 ms | 34 ms | 63× |
+| 31561 | 44.7 s | 272 ms | 165× |
+
 ## What the inversion costs
 
 - The read side is one table read per chunk and one compare per key in

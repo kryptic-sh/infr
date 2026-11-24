@@ -776,6 +776,13 @@ pub trait Backend: Send + Sync {
         1
     }
 
+    /// Whether a Q8_0 KV side is laid out planar — every int8 code, then every block's f16 scale in
+    /// a second region — instead of packed in GGUF blocks. A planar side has no byte-packed rows,
+    /// so row-addressed transfers cannot address it. `false` unless a backend says otherwise.
+    fn kv_q8_planar(&self) -> bool {
+        false
+    }
+
     /// Perf (DiffusionGemma denoise, perf slice 3 — docs/diffusion-gemma.md): fused per-canvas-row
     /// entropy-bound sampler reduction over raw `[rows, dim]` logits, avoiding a full `[rows,
     /// dim]` host download. `u` is `rows` host-drawn uniform `[0,1)` floats (the seeded

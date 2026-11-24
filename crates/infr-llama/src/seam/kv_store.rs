@@ -46,6 +46,11 @@ pub(crate) fn capture_upto(cfg: &Config, kv: &SeamKv, prompt_len: usize) -> usiz
     }
 }
 
+/// Whether a Q8_0 KV side here has no packed rows to address (see [`Backend::kv_q8_planar`]).
+fn planar_q8(be: &dyn Backend, k_fmt: DType, v_fmt: DType) -> bool {
+    (k_fmt == DType::Q8_0 || v_fmt == DType::Q8_0) && be.kv_q8_planar()
+}
+
 /// Chain id of a block: the previous block's id mixed with this block's tokens.
 ///
 /// FNV-1a, not `DefaultHasher`: the ids are written to a tier, so they must not change with the
@@ -371,6 +376,10 @@ impl<S: KvStore> BlockCache<S> {
         if !self.enabled() {
             return Ok(0);
         }
+        if planar_q8(be, kv.k_fmt, kv.v_fmt) {
+            tracing::debug!("kv store: a planar Q8_0 cache has no packed rows to restore");
+            return Ok(0);
+        }
         let (mut p, hits) = self.matched(prompt);
         if p < MIN_PREFIX_TOKENS || self.k_fmt != kv.k_fmt || self.v_fmt != kv.v_fmt {
             return Ok(0);
@@ -454,6 +463,10 @@ impl<S: KvStore> BlockCache<S> {
         upto: usize,
     ) -> Result<usize> {
         if !self.enabled() {
+            return Ok(0);
+        }
+        if planar_q8(be, kv.k_fmt, kv.v_fmt) {
+            tracing::debug!("kv store: a planar Q8_0 cache has no packed rows to capture");
             return Ok(0);
         }
         let p = upto.min(kv.cached.len()).min(kv.max_ctx);

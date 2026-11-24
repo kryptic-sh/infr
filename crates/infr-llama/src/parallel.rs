@@ -146,6 +146,42 @@ impl Drop for SeedReservation<'_> {
     }
 }
 
+/// The slot whose rows a park is capturing: its KV is out of the pool and it is marked busy, so no
+/// other request can take it. Dropped without `done` — an unwind out of the capture — it resets the
+/// KV, puts it back and frees the slot, or the slot would stay busy with its KV gone.
+struct ParkReservation<'a> {
+    pool: &'a Mutex<Pool>,
+    freed: &'a Condvar,
+    idx: usize,
+    kv: Option<SeamKv>,
+    done: bool,
+}
+
+impl Drop for ParkReservation<'_> {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        if let Some(kv) = self.kv.as_mut() {
+            kv.reset();
+        }
+        let mut p = self
+            .pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        p.slots[self.idx].kv = self.kv.take();
+        p.slots[self.idx].busy = false;
+        drop(p);
+        self.freed.notify_all();
+    }
+}
+
+/// Whether `e` is the page pool refusing a request more pages than are free.
+fn out_of_pages(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<infr_core::paging::KvPagesExhausted>()
+        .is_some()
+}
+
 /// Run `seed` on slot `target`'s KV from slot `best`'s with the pool lock released, as the module
 /// doc requires around a GPU submit. Both slots are reserved (busy, KV taken out) meanwhile so no
 /// concurrent checkout selects them. Returns the re-acquired lock with `best` released and
@@ -525,6 +561,78 @@ impl ParallelSeam {
         self.model.render_chat_messages(messages)
     }
 
+    /// Give one idle slot's pages back to the pool, capturing what it held first, so a request that
+    /// hit the page budget can retry. Picks the least recently used idle slot with pages and never
+    /// waits on a busy one: two requests that each hold pages would wait on each other forever.
+    /// `false` when no idle slot has pages left to give.
+    fn park_idle(&self, exclude: usize, req: &RequestCtx) -> Result<bool> {
+        let p = self.pool.lock().expect("pool poisoned");
+        let victim = (0..p.slots.len())
+            .filter(|&i| i != exclude && !p.slots[i].busy)
+            .filter(|&i| {
+                p.slots[i]
+                    .kv
+                    .as_ref()
+                    .and_then(SeamKv::paged_pages)
+                    .is_some_and(|pages| pages > 0)
+            })
+            .min_by_key(|&i| p.slots[i].tick);
+        let Some(victim) = victim else {
+            return Ok(false);
+        };
+        let mut p = p;
+        p.slots[victim].busy = true;
+        let mut res = ParkReservation {
+            pool: &self.pool,
+            freed: &self.freed,
+            idx: victim,
+            kv: p.slots[victim].kv.take(),
+            done: false,
+        };
+        drop(p);
+
+        // The capture outlives no lock but the store's, and it takes a turn on the baton like any
+        // other submit. A failed capture costs only the resume, so the pages go back either way.
+        let _gp = req.gate_pass();
+        let captured = res.kv.as_ref().map_or(Ok(0), |kv| {
+            let upto = crate::seam::capture_upto(self.model.config(), kv, kv.cached_len());
+            self.store
+                .lock()
+                .map_err(|_| anyhow!("kv store lock poisoned"))?
+                .capture(&self.vk, self.model.config(), kv, upto)
+        });
+        if let Err(e) = &captured {
+            tracing::warn!(error = %e, "kv slots: park capture failed; the slot re-prefills");
+        }
+        if let Some(kv) = res.kv.as_mut() {
+            kv.reset();
+        }
+        let mut p = self.pool.lock().expect("pool poisoned");
+        p.slots[victim].kv = res.kv.take();
+        p.slots[victim].busy = false;
+        res.done = true;
+        drop(p);
+        self.freed.notify_all();
+        Ok(true)
+    }
+
+    /// Park an idle slot so this request can retry, or report that nothing was left to give.
+    fn park_for_retry(
+        &self,
+        guard: &mut SlotGuard<'_>,
+        req: &RequestCtx,
+        parks: &mut usize,
+    ) -> Result<bool> {
+        if *parks >= self.n_slots() || !self.park_idle(guard.idx, req)? {
+            return Ok(false);
+        }
+        *parks += 1;
+        if let Some(kv) = guard.kv.as_mut() {
+            kv.reset();
+        }
+        Ok(true)
+    }
+
     /// Generate one sequence: check out a slot, run the ordinary seam decode on it (taking turns on
     /// the GPU baton at every step), and return the slot. `&self` — N of these run concurrently.
     pub fn generate(
@@ -539,18 +647,6 @@ impl ParallelSeam {
         // guard keeps that override published for exactly this generation.
         let (prompt_tokens, _media) = self.model.encode_prompt(prompt, self.max_ctx, Some(req))?;
         let mut guard = self.checkout(&prompt_tokens, req)?;
-        // A prefix this engine already materialized — possibly for another conversation — costs one
-        // upload here and is then skipped by the prefill, exactly like a seed from a sibling slot.
-        if let Some(kv) = guard.kv.as_mut() {
-            let restored = self
-                .store
-                .lock()
-                .map_err(|_| anyhow!("kv store lock poisoned"))?
-                .restore(&self.vk, self.model.config(), kv, &prompt_tokens)?;
-            if restored > 0 {
-                tracing::debug!(tokens = restored, "kv store: restored a stored prefix");
-            }
-        }
         // Cap the reply to the context actually left in THIS slot (a per-slot ctx is smaller than
         // the model's trained window under `-np N`), mirroring the sequential session path: a
         // generation ceiling is a default, not a demand. An over-long PROMPT still errors cleanly
@@ -561,31 +657,66 @@ impl ParallelSeam {
         // Resolve `ubatch_rows`/`kv_auto_q8` against THIS engine's pins for the decode (warm calls
         // must agree with the buffers placement sized). Concurrent requests share the one cell.
         let _scope = crate::seam::PlacementScope::enter(self.pins.clone());
-        let (_ids, mut stats) = crate::seam::generate_dense_vulkan_session(
-            &self.vk,
-            self.model.weights(),
-            self.model.config(),
-            self.model.engine_cfg(),
-            self.model.embd(),
-            self.model.per_layer_embd(),
-            &prompt_tokens,
-            budget,
-            |id| {
-                crate::stream_token(
-                    self.model.tokenizer(),
-                    &mut acc,
-                    &mut printed,
-                    id,
-                    &mut on_piece,
-                )
-            },
-            &mut guard.kv,
-            self.max_ctx,
-            constraint,
-            Some(req),
-            None, // paged_blocks
-            1,    // slot_copies
-        )?;
+        let mut constraint = constraint;
+        let mut parks = 0usize;
+        let mut stats = loop {
+            // A prefix this engine already materialized — possibly another conversation's — costs
+            // one upload here and is then skipped by the prefill, like a seed from a sibling slot.
+            if let Some(kv) = guard.kv.as_mut() {
+                let restored = self
+                    .store
+                    .lock()
+                    .map_err(|_| anyhow!("kv store lock poisoned"))?
+                    .restore(&self.vk, self.model.config(), kv, &prompt_tokens);
+                match restored {
+                    Ok(0) => {}
+                    Ok(n) => tracing::debug!(tokens = n, "kv store: restored a stored prefix"),
+                    Err(e) if out_of_pages(&e) => {
+                        if !self.park_for_retry(&mut guard, req, &mut parks)? {
+                            return Err(e);
+                        }
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            let run = crate::seam::generate_dense_vulkan_session(
+                &self.vk,
+                self.model.weights(),
+                self.model.config(),
+                self.model.engine_cfg(),
+                self.model.embd(),
+                self.model.per_layer_embd(),
+                &prompt_tokens,
+                budget,
+                |id| {
+                    crate::stream_token(
+                        self.model.tokenizer(),
+                        &mut acc,
+                        &mut printed,
+                        id,
+                        &mut on_piece,
+                    )
+                },
+                &mut guard.kv,
+                self.max_ctx,
+                constraint.as_deref_mut(),
+                Some(req),
+                None, // paged_blocks
+                1,    // slot_copies
+            );
+            match run {
+                Ok((_ids, stats)) => break stats,
+                // The pool ran out of pages before the first token: park an idle conversation and
+                // start again on what its pages freed.
+                Err(e) if out_of_pages(&e) && acc.is_empty() => {
+                    if !self.park_for_retry(&mut guard, req, &mut parks)? {
+                        return Err(e);
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        };
         // Keep this turn's rows — prompt and reply — for whoever asks the adjacent question next.
         // A failure here is a cache miss on the next request, never a failed request.
         if let Some(kv) = guard.kv.as_ref() {
@@ -608,8 +739,56 @@ impl ParallelSeam {
 
 #[cfg(test)]
 mod tests {
-    use super::{pick_continuation, seed_unlocked, Pool, Slot};
+    use super::{out_of_pages, pick_continuation, seed_unlocked, ParkReservation, Pool, Slot};
     use std::sync::{Condvar, Mutex};
+
+    /// A panic inside the capture that parks a slot must still free it, or the pool loses a slot to
+    /// a request that already failed.
+    #[test]
+    fn a_panicking_park_releases_the_victim() {
+        let slot = || Slot {
+            kv: None,
+            busy: false,
+            tick: 0,
+        };
+        let pool = Mutex::new(Pool {
+            slots: vec![slot(), slot()],
+            tick: 0,
+        });
+        let freed = Condvar::new();
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut p = pool.lock().unwrap();
+            p.slots[1].busy = true;
+            let _res = ParkReservation {
+                pool: &pool,
+                freed: &freed,
+                idx: 1,
+                kv: p.slots[1].kv.take(),
+                done: false,
+            };
+            drop(p);
+            panic!("the capture panicked");
+        }));
+        assert!(r.is_err(), "the injected panic did not happen");
+        let p = pool
+            .lock()
+            .expect("the pool lock was not held across the park");
+        assert!(!p.slots[1].busy, "the parked slot was released");
+    }
+
+    /// Only the typed page refusal may trigger a park: any other failure has to reach the caller.
+    #[test]
+    fn only_a_page_refusal_counts_as_exhaustion() {
+        let refusal = anyhow::Error::new(infr_core::paging::KvPagesExhausted {
+            need: 3,
+            allocated: 1,
+            free: 1,
+            total: 3,
+        });
+        assert!(out_of_pages(&refusal));
+        assert!(out_of_pages(&refusal.context("prefill")));
+        assert!(!out_of_pages(&anyhow::anyhow!("the model diverged")));
+    }
 
     /// A panic inside the unlocked prefix seed frees both reserved slots. It used to unwind past
     /// the re-lock, leaving them busy with their KV gone, so once every other slot was taken a

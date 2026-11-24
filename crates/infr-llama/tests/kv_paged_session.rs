@@ -170,3 +170,79 @@ fn paged_slots_answer_the_same_bytes_as_contiguous_ones() {
         want_prefill[1]
     );
 }
+
+/// Two conversations in a pool that holds one: the second parks the first, and the first resumes
+/// from the store with its prefix cached instead of re-prefilling it.
+///
+/// Run: `cargo test -p infr-llama --test kv_paged_session -- --ignored --nocapture`
+#[test]
+#[ignore = "requires a Vulkan GPU and a cached GGUF"]
+fn parked_slots_resume_two_conversations_in_a_one_conversation_pool() {
+    let Some(path) = model_path() else {
+        eprintln!("skip: no GGUF in the HF cache");
+        return;
+    };
+    let ctx: usize = 2048;
+    let cfg0 = infr_llama::SeamModel::load_with(&path, None, Arc::new(engine(true)))
+        .expect("load")
+        .config()
+        .clone();
+    if (0..cfg0.n_layer).any(|l| cfg0.is_swa_layer(l)) {
+        eprintln!("skip: sliding-window layers keep a private cache");
+        return;
+    }
+
+    // One conversation's pages, plus the zero page: a second one cannot fit beside it.
+    let row = infr_core::budget::kv_fmt_bytes(
+        infr_core::DType::F16,
+        infr_vulkan::paged::PAGE_ROWS * cfg0.n_kv * cfg0.head_dim,
+    );
+    let page_bytes = (row * 2 * cfg0.n_layer) as u64;
+    let pps = ctx.div_ceil(infr_vulkan::paged::PAGE_ROWS) as u64;
+    let mut c = engine(true);
+    c.kv.pool_mb = Some((page_bytes * (pps + 1)).div_ceil(1 << 20));
+    c.kv.store_mb = Some(256);
+    let model = infr_llama::SeamModel::load_with(&path, None, Arc::new(c)).expect("load paged");
+    let seam = infr_llama::parallel::ParallelSeam::new(
+        model,
+        2,
+        Some(infr_core::SizeSpec::Bytes(ctx as u64)),
+    )
+    .expect("engine");
+    let pages = seam.kv_pages().expect("the pool was built");
+    assert!(
+        pages.0 + pages.1 <= pps as usize + 1,
+        "the pool holds {} pages, so both conversations fit and nothing would park",
+        pages.0 + pages.1
+    );
+
+    let greedy = infr_llama::sampling::RequestSampling {
+        temp: Some(0.0),
+        ..Default::default()
+    };
+    let sys = shared_prefix();
+    let run = |prompt: &str| {
+        let req = seam.request_ctx(greedy.clone());
+        let mut text = String::new();
+        let stats = seam
+            .generate(prompt, 8, None, &req, |p| text.push_str(p))
+            .expect("parked generation");
+        (text, stats)
+    };
+
+    let (a, _) = run(&format!("{sys}Name the three places the log is kept."));
+    let (b, _) = run(&format!("{sys}Which copy rides the train?"));
+    // Both conversations return: each one's rows were captured when the other took its pages.
+    let (_, again_a) = run(&format!(
+        "{sys}Name the three places the log is kept.{a} And the fourth?"
+    ));
+    let (_, again_b) = run(&format!(
+        "{sys}Which copy rides the train?{b} Who reads it?"
+    ));
+    assert!(
+        again_a.n_cached > 0 && again_b.n_cached > 0,
+        "a parked conversation re-prefilled instead of resuming (cached {} and {} tokens)",
+        again_a.n_cached,
+        again_b.n_cached
+    );
+}

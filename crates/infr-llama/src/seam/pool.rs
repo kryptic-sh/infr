@@ -104,6 +104,14 @@ impl KvPool {
                  dequant, so kv.paged stays off"
             ));
         }
+        // A fork's tail copy and a page's copy-on-write move byte runs, which only exist when a
+        // Q8_0 side packs rows.
+        if (k_fmt == DType::Q8_0 || v_fmt == DType::Q8_0) && be.kv_q8_planar() {
+            return Err(anyhow!(
+                "a planar Q8_0 KV cache ({k_fmt:?} K / {v_fmt:?} V) has no packed page rows, so \
+                 kv.paged stays off"
+            ));
+        }
         let pages = pages.max(2);
         let pps = max_ctx.div_ceil(PAGE_ROWS).max(1);
         let slot_rows = pps * PAGE_ROWS;
@@ -414,7 +422,7 @@ impl PagedSlot {
     fn with_table(map: SlotMap, be: &dyn Backend) -> AResult<Self> {
         let bytes = map.pool().table_len() * 4;
         let table = be.alloc(bytes, BufferUsage::KvCache)?;
-        let slot = Self {
+        let mut slot = Self {
             map,
             table,
             stale: false,
@@ -441,14 +449,16 @@ impl PagedSlot {
     }
 
     /// Push the current mapping to the device. Called after every change to `map`.
-    pub(crate) fn upload_table(&self, be: &dyn Backend) -> AResult<()> {
+    pub(crate) fn upload_table(&mut self, be: &dyn Backend) -> AResult<()> {
         let bytes = self.map.table_bytes();
         tracing::debug!(
             first = ?&bytes[..bytes.len().min(24)],
             "kv.paged: uploading a slot's page table"
         );
         be.upload(self.table.as_ref(), &bytes)
-            .map_err(|e| anyhow!("{e}"))
+            .map_err(|e| anyhow!("{e}"))?;
+        self.stale = false;
+        Ok(())
     }
 
     /// The linear fallback bias. A paged slot resolves every row through its table, so this is 0.
@@ -457,14 +467,16 @@ impl PagedSlot {
     }
 
     /// Allocate pages through `rows` and push the table if the map grew. Returns the page count
-    /// now allocated.
+    /// now allocated. A refusal partway through leaves the map ahead of the device table, which
+    /// `stale` records so the next forward uploads it.
     pub(crate) fn reserve_rows(&mut self, be: &dyn Backend, rows: usize) -> AResult<usize> {
         let need = rows.div_ceil(PAGE_ROWS).min(self.map.pool().pps);
-        let before = self.map.len();
-        self.map.grow(need)?;
-        if self.map.len() != before {
-            self.upload_table(be)?;
+        if self.map.len() >= need {
+            return Ok(self.map.len());
         }
+        self.stale = true;
+        self.map.grow(need)?;
+        self.upload_table(be)?;
         Ok(self.map.len())
     }
 
@@ -481,7 +493,10 @@ impl PagedSlot {
         if rows == 0 || page >= self.map.pool().pps {
             return Ok(());
         }
-        self.map.grow(page + 1)?;
+        if self.map.len() <= page {
+            self.stale = true;
+            self.map.grow(page + 1)?;
+        }
         let pool = self.map.pool();
         let span = page * PAGE_ROWS..page * PAGE_ROWS + rows;
         for l in 0..pool.k.len() {
@@ -508,7 +523,6 @@ impl PagedSlot {
     pub(crate) fn refresh(&mut self, be: &dyn Backend) -> AResult<()> {
         if self.stale {
             self.upload_table(be)?;
-            self.stale = false;
         }
         Ok(())
     }
@@ -685,6 +699,30 @@ mod tests {
         slot.release_pages();
         assert_eq!(pool.in_use_pages(), 1, "only the zero page is left");
         other.reserve_rows(&be, 600).unwrap();
+    }
+
+    /// A refusal partway through a reservation leaves the map ahead of the device table, and a
+    /// later request that fits the partial map must still see the table that map describes.
+    #[test]
+    fn a_partial_growth_leaves_the_table_stale() {
+        let be = cpu();
+        let c = cfg();
+        let pool = KvPool::new(&be, &c, 1024, DType::F16, DType::F16, 4).unwrap();
+        let mut first = PagedSlot::new(&pool, &be).unwrap();
+        first.reserve_rows(&be, 1024).unwrap();
+        assert!(!first.stale, "a whole reservation uploads its table");
+
+        let mut second = PagedSlot::new(&pool, &be).unwrap();
+        let err = second.reserve_rows(&be, 1024).unwrap_err();
+        assert!(err.downcast_ref::<KvPagesExhausted>().is_some());
+        assert_eq!(second.map.len(), 1, "one of the two pages was handed out");
+        assert!(second.stale, "the device table does not describe the map");
+
+        let mut got = vec![0u8; pool.table_len() * 4];
+        second.refresh(&be).unwrap();
+        assert!(!second.stale);
+        be.download(second.table.as_ref(), &mut got).unwrap();
+        assert_ne!(got[0..4], [0u8; 4], "the table now names the page");
     }
 
     /// A small and a large request share one budget: each holds only the pages it uses, the second

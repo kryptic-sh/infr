@@ -182,6 +182,14 @@ fn out_of_pages(e: &anyhow::Error) -> bool {
         .is_some()
 }
 
+/// Give back the pages a failed attempt took, so the slot a later request checks out holds neither
+/// a partly grown map nor a page table the device never saw.
+fn reset_slot(guard: &mut SlotGuard<'_>) {
+    if let Some(kv) = guard.kv.as_mut() {
+        kv.reset();
+    }
+}
+
 /// Run `seed` on slot `target`'s KV from slot `best`'s with the pool lock released, as the module
 /// doc requires around a GPU submit. Both slots are reserved (busy, KV taken out) meanwhile so no
 /// concurrent checkout selects them. Returns the re-acquired lock with `best` released and
@@ -673,6 +681,7 @@ impl ParallelSeam {
                     Ok(n) => tracing::debug!(tokens = n, "kv store: restored a stored prefix"),
                     Err(e) if out_of_pages(&e) => {
                         if !self.park_for_retry(&mut guard, req, &mut parks)? {
+                            reset_slot(&mut guard);
                             return Err(e);
                         }
                         continue;
@@ -711,6 +720,7 @@ impl ParallelSeam {
                 // start again on what its pages freed.
                 Err(e) if out_of_pages(&e) && acc.is_empty() => {
                     if !self.park_for_retry(&mut guard, req, &mut parks)? {
+                        reset_slot(&mut guard);
                         return Err(e);
                     }
                 }

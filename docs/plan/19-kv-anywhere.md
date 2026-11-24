@@ -37,9 +37,11 @@ be device-addressable: either device-local VRAM, or host memory the kernels can 
 ## Design
 
 **A tier names the memory.** Backends split into addressable (`vram`, `host`) and storage (`redb`,
-`redis`). The first entry of `[[kv.tiers]]` is where a live slot's rows sit; storage tiers receive
-what the addressable tier demotes. A storage backend in first position is refused at open, the same
-way a `redis` tier in a non-final position is refused today.
+`redis`). The first entry of `[[kv.tiers]]` is where a live slot's rows sit; storage tiers below it
+receive what the addressable tier demotes. A storage backend may also be named first, and then it is
+the slot's backing: the slot is host-resident and its window is synchronised with that store every
+step. That is the experiment P4 measures — technically the same code path as a `host` tier, with the
+store doing the reading and writing instead of a local buffer — not a configuration to recommend.
 
 **The default is one `vram` tier, and it is implicit.** No tier list means `backend = "vram"` sized
 from the device budget after weights and activations — exactly what a plain `infr run` allocates
@@ -93,14 +95,18 @@ tier, and keep working through a config migration.
   exclusive), and the legacy `overflow` keys migrating onto it. Gate: output bit-identical to a vram
   tier; a whole host tier stores and resumes without a device allocation for KV. Measure: decode
   tokens/s at 2k and 8k on the RX 580 and the integrated GPU, next to the table above.
-- **P4** (scoped) measure the remote case instead of building it: a window's bytes fetched from
-  loopback Redis and from host RAM per step, timed in `crates/infr-llama/tests/kv_tier_latency.rs`
-  and added as rows in `docs/perf/kv-prefix.md`. Expected to lose to the device floor; the number is
-  what closes the question for good.
+- **P4** (scoped) the remote-primary experiment: `[[kv.tiers]]` with `redis` (or `redb`) as the
+  first entry, host-resident slot buffers, and the live window synchronised with that store each
+  step — the configuration that proves placement is a property of the list rather than of the
+  engine. Gate: output bit-identical to a vram tier, bytes transferred per step recorded and equal
+  to the window, and the cost published. Expect it to be slow where the table above says it must be
+  (a 4k window at 128 KB/token is ~0.5 GB over loopback per step); the small-model short-context row
+  is the one that stays usable, and both numbers are what close the question for good.
 
 ## Non-goals
 
-- Serving full attention from a `redb` or `redis` tier, or naming one as the first tier.
+- Serving full attention from a `redb` or `redis` tier as a recommended configuration; P4's
+  remote-primary experiment exists to show the path works, not to make it the default.
 - Multi-device stores: a tier lives on one device, and the tensor-parallel wrappers stay as they are.
 - Changing what a plain `infr run` does: the implicit `vram` tier is the default, so the default
   stays device-local.

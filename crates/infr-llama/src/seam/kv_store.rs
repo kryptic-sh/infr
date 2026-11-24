@@ -495,13 +495,15 @@ impl<S: KvStore> BlockCache<S> {
             self.tick += 1;
             self.resident[i].tick = self.tick;
             // The tail's pages may be the ones another resident holds.
-            self.spill(page_deficit(p, n));
+            self.spill(page_deficit(p, first, n));
         }
         if n > first {
-            if let Some(p) = kv.paged.as_mut() {
-                p.make_private(be, first, n)?;
+            if let Err(e) = upload_prefix(be, cfg, kv, first, n, rows) {
+                // The map holds another conversation's rows now: give the pages back rather than
+                // leave the slot claiming a prefix it no longer has.
+                kv.reset();
+                return Err(e);
             }
-            DeviceKv::new(SLOT, be, cfg, kv).put(SLOT, first, rows)?;
             self.restores += 1;
             self.restored_tokens += (n - first) as u64;
         }
@@ -637,8 +639,8 @@ impl<S: KvStore> BlockCache<S> {
         spilled
     }
 
-    /// Spill residents until `kv` can hold `rows` rows: the pages it still has to allocate, plus
-    /// one for the copy-on-write of a shared page its prefill writes into. Returns how many
+    /// Spill residents until `kv` can hold `rows` rows: the pages its run still has to allocate
+    /// for rows past what it already cached, less the pages the pool has free. Returns how many
     /// residents went.
     pub(crate) fn make_room(&mut self, kv: &SeamKv, rows: usize) -> usize {
         let Some(p) = kv.paged.as_ref() else {
@@ -647,8 +649,7 @@ impl<S: KvStore> BlockCache<S> {
         if self.resident.is_empty() {
             return 0;
         }
-        let cow = usize::from((0..p.map.len()).any(|j| !p.map.is_private(j)));
-        self.spill(page_deficit(p, rows.min(kv.max_ctx)) + cow)
+        self.spill(page_deficit(p, kv.cached.len(), rows.min(kv.max_ctx)))
     }
 
     /// Capture `kv`'s first `upto` rows as reusable blocks. Returns the token count kept.
@@ -880,13 +881,31 @@ fn open_tier(tier: &infr_core::config::KvTier, key: u64) -> anyhow::Result<Opene
 /// The device slot's extent id inside [`DeviceKv`] while the cache reads or writes it.
 const SLOT: u64 = 0;
 
-/// Pages `p` still has to allocate to hold `rows` rows that the pool does not have free.
-fn page_deficit(p: &PagedSlot, rows: usize) -> usize {
+/// Pages `p` still has to allocate to hold rows `from..rows` that the pool does not have free.
+/// A page it shares counts once, since the first write splits it.
+fn page_deficit(p: &PagedSlot, from: usize, rows: usize) -> usize {
     let pool = p.map.pool();
-    rows.min(pool.slot_rows())
-        .div_ceil(PAGE_ROWS)
-        .saturating_sub(p.map.len())
-        .saturating_sub(pool.free_pages())
+    let rows = rows.min(pool.slot_rows());
+    let first = from.min(rows) / PAGE_ROWS;
+    let need = (first..rows.div_ceil(PAGE_ROWS))
+        .filter(|&j| !p.map.is_private(j))
+        .count();
+    need.saturating_sub(pool.free_pages())
+}
+
+/// Write restored rows `first..n` into `kv`, splitting any page they share first.
+fn upload_prefix(
+    be: &dyn Backend,
+    cfg: &Config,
+    kv: &mut SeamKv,
+    first: usize,
+    n: usize,
+    rows: KvRows,
+) -> Result<()> {
+    if let Some(p) = kv.paged.as_mut() {
+        p.make_private(be, first, n)?;
+    }
+    DeviceKv::new(SLOT, be, cfg, kv).put(SLOT, first, rows)
 }
 
 #[cfg(test)]
@@ -1625,6 +1644,32 @@ mod tests {
         );
         assert_eq!(pool.used_pages(), 0);
         assert_eq!(s.restore(&be, &cfg, &mut dst, &prompt).unwrap(), 0);
+    }
+
+    /// Free pages that cover the run's writes keep the residents: only a real shortfall spills.
+    #[test]
+    fn making_room_keeps_residents_the_free_pages_cover() {
+        let be = infr_cpu::CpuBackend::new();
+        let cfg = slot_cfg(0);
+        let pool = crate::seam::KvPool::new(&be, &cfg, 2048, DType::F16, DType::F16, 8).unwrap();
+        let mut s = cache();
+        let mut src = paged_slot(&be, &cfg, &pool, 600);
+        s.capture(&be, &cfg, &src, 600).unwrap();
+        assert!(s.retain(&cfg, &mut src), "a whole page is kept");
+        src.reset();
+
+        let mut dst = SeamKv::for_test(&be, &cfg, 2048, false, 56, DType::F16).unwrap();
+        dst.attach_paged(&be, &cfg, &pool).unwrap();
+        let prompt = tokens(3, 600);
+        assert_eq!(s.restore(&be, &cfg, &mut dst, &prompt).unwrap(), 600);
+        assert!(pool.free_pages() >= 3, "room for the tail");
+
+        assert_eq!(s.make_room(&dst, 1600), 0, "free pages cover the writes");
+        assert_eq!(s.resident.len(), 1, "the resident survived");
+        assert_eq!(s.resident_spills, 0);
+
+        assert_eq!(s.make_room(&dst, 1024), 0, "the tail page is already held");
+        assert_eq!(s.resident.len(), 1);
     }
 
     /// A restore whose blocks cannot fill the destination's window re-prefills instead of leaving

@@ -395,13 +395,18 @@ impl SlotMap {
                 total: pool.pages(),
             }));
         };
-        for l in 0..pool.k.len() {
+        let copied: AResult<()> = (0..pool.k.len()).try_for_each(|l| {
             let Some(k) = pool.k[l].as_ref() else {
-                continue;
+                return Ok(());
             };
             let v = pool.v[l].as_ref().expect("pooled layer has both sides");
             copy_page(be, k.as_ref(), pool.k_fmt, pool.k_row[l], src, own)?;
-            copy_page(be, v.as_ref(), pool.v_fmt, pool.v_row[l], src, own)?;
+            copy_page(be, v.as_ref(), pool.v_fmt, pool.v_row[l], src, own)
+        });
+        if let Err(e) = copied {
+            // Nothing names the new page yet, so a failed copy has to give it back itself.
+            pool.ledger().lock().expect("page-pool lock").release(own);
+            return Err(e);
         }
         if src != 0 {
             pool.ledger().lock().expect("page-pool lock").release(src);

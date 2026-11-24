@@ -442,8 +442,8 @@ pub(crate) struct SeamKv {
 pub(super) const RECURRENT_SNAP_CAP_BYTES: usize = 512 << 20;
 
 /// One host copy of every recurrent layer's state at token position `pos`.
-#[derive(Clone)]
-pub(super) struct RecurrentSnap {
+#[derive(Clone, Debug)]
+pub(crate) struct RecurrentSnap {
     pub(super) pos: usize,
     /// `(layer, bytes)` per recurrent layer, in `SeamKv::kbufs`/`vbufs` order.
     pub(super) k: Vec<(usize, Vec<u8>)>,
@@ -770,6 +770,79 @@ impl SeamKv {
             });
         }
         Box::new(crate::seam::rows::Linear)
+    }
+
+    /// A slot with only KV buffers, for tests of the row stores.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        be: &dyn Backend,
+        cfg: &Config,
+        max_ctx: usize,
+        kv_ring: bool,
+        ubatch: usize,
+        fmt: DType,
+    ) -> AResult<SeamKv> {
+        let alloc = |bytes: usize| -> AResult<std::sync::Arc<dyn Buffer>> {
+            let b = be
+                .alloc(bytes.max(4), BufferUsage::KvCache)
+                .map_err(|e| anyhow!("{e}"))?;
+            Ok(std::sync::Arc::from(b))
+        };
+        let (mut kbufs, mut vbufs) = (Vec::new(), Vec::new());
+        for l in 0..cfg.n_layer {
+            let rows = crate::seam::kv_rows_at(cfg, l, max_ctx, kv_ring, ubatch, be.kv_row_align());
+            let (k_row, v_row) = crate::seam::kv_row_elems(cfg, l);
+            kbufs.push(alloc(crate::seam::kv_fmt_bytes(fmt, rows * k_row))?);
+            vbufs.push(alloc(crate::seam::kv_fmt_bytes(fmt, rows * v_row))?);
+        }
+        let small = || {
+            be.alloc(4, BufferUsage::Staging)
+                .map_err(|e| anyhow!("{e}"))
+        };
+        Ok(SeamKv {
+            weights: std::sync::Arc::new(SeamWeights {
+                wbufs: Vec::new(),
+                wspecs: Vec::new(),
+                exl3_specs: Default::default(),
+                rf_buf: None,
+                yff_buf: None,
+                layer_has_epb: Vec::new(),
+            }),
+            stable: std::sync::Arc::new(SessionStable {
+                has_wv: Vec::new(),
+                out_scale: Vec::new(),
+                dec_out_scale: Vec::new(),
+                rope_freqs: None,
+                yarn_ff: None,
+                fuse_gu: false,
+                fuse_qkv: false,
+                moe_batched_ok: false,
+            }),
+            kbufs,
+            vbufs,
+            paged: None,
+            cbufs: (0..cfg.n_layer).map(|_| Vec::new()).collect(),
+            k_fmt: fmt,
+            v_fmt: fmt,
+            hidden_buf: small()?,
+            pos_buf: small()?,
+            ipl_buf: None,
+            logits_buf: small()?,
+            max_ctx,
+            kv_ring,
+            ubatch,
+            cached: Vec::new(),
+            written_end: 0,
+            denoise_cache: None,
+            self_cond_w: None,
+            sc_embt: None,
+            sc_ping: None,
+            sc_ping_write: 0,
+            sc_temp_inv_buf: None,
+            mtp_delta_ckpt: None,
+            delta_snapshot_refused: false,
+            recurrent_snaps: Vec::new(),
+        })
     }
 
     /// Number of token ids materialized in this slot's KV cache.

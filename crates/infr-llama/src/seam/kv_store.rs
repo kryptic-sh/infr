@@ -16,14 +16,14 @@
 use crate::Config;
 use anyhow::Result;
 use infr_core::backend::Backend;
-use infr_core::budget::kv_fmt_bytes;
 use infr_core::DType;
+use std::collections::HashMap;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use super::{
-    kv_row_elems,
-    rows::{read_rows, write_rows},
+    kv_tier::{DeviceKv, KvRows, KvStore},
     weights::{RecurrentSnap, SeamKv},
 };
 
@@ -37,8 +37,8 @@ pub(crate) const MIN_PREFIX_TOKENS: usize = 256;
 /// Chain id of a block: the previous block's id mixed with this block's tokens.
 ///
 /// FNV-1a, not `DefaultHasher`: the ids are written to a cold tier, so they must not change
-/// with the toolchain. A collision only costs a wasted comparison, since every lookup also
-/// compares the token ids.
+/// with the toolchain. Every lookup also compares the token ids, so a collision costs a miss, and
+/// a capture under a colliding id replaces the older block.
 fn block_id(prev: u64, tokens: &[u32]) -> u64 {
     let mut h = Fnv::new();
     h.bytes(&prev.to_le_bytes());
@@ -196,19 +196,24 @@ fn read_header(r: &mut impl Read) -> Result<(u64, DType, DType)> {
     Ok((key, k_fmt, v_fmt))
 }
 
-fn write_block(w: &mut impl Write, h: &mut Fnv, b: &Block) -> std::io::Result<()> {
+fn write_block(w: &mut impl Write, h: &mut Fnv, b: &BlockRef<'_>) -> std::io::Result<()> {
     put_u64(w, h, b.id)?;
-    put_u32(w, h, b.len as u32)?;
-    for &t in &b.tokens {
+    put_u32(w, h, b.tokens.len() as u32)?;
+    for &t in b.tokens {
         put_u32(w, h, t)?;
     }
-    for side in [&b.k, &b.v] {
-        put_u32(w, h, side.len() as u32)?;
-        for bytes in side {
+    for side in 0..2 {
+        put_u32(w, h, b.rows.layers.len() as u32)?;
+        for l in 0..b.rows.layers.len() {
+            // A layer holding only some of the block's rows is stored as absent.
+            let bytes = b
+                .rows
+                .whole_layer(l)
+                .map_or(&[][..], |(k, v)| if side == 0 { k } else { v });
             put_bytes(w, h, bytes)?;
         }
     }
-    match &b.snap {
+    match b.snap {
         None => w.write_all(&[0])?,
         Some(s) => {
             w.write_all(&[1])?;
@@ -242,13 +247,10 @@ fn read_block(r: &mut impl Read, h: &mut Fnv) -> Result<Block> {
             anyhow::bail!("kv-prefix block claims {layers} layers");
         }
         let mut side = Vec::with_capacity(layers);
-        let mut bytes = 0usize;
         for _ in 0..layers {
-            let b = get_bytes(r, h)?;
-            bytes += b.len();
-            side.push(b);
+            side.push(get_bytes(r, h)?);
         }
-        sides.push((side, bytes));
+        sides.push(side);
     }
     let mut present = [0u8; 1];
     r.read_exact(&mut present)?;
@@ -277,47 +279,80 @@ fn read_block(r: &mut impl Read, h: &mut Fnv) -> Result<Block> {
         None
     };
     let used = get_u64(r, h)?;
-    let (k, kb) = sides.remove(0);
-    let (v, vb) = sides.remove(0);
-    let snap_bytes = snap.as_ref().map_or(0, |s| s.bytes);
+    let v = sides.pop().expect("two sides");
+    let k = sides.pop().expect("two sides");
     Ok(Block {
         id,
-        len,
+        rows: KvRows::whole(len, k, v),
         tokens,
-        k,
-        v,
         snap,
-        bytes: kb + vb + snap_bytes,
         used,
-        dirty: false,
     })
 }
 
-/// One stored block: `len` token ids and the raw K/V rows for that token range.
-///
-/// `len` is `BLOCK_TOKENS` except for the tail of a captured prefix, which may be short; a short
-/// block only ever matches at the end of a prompt.
+/// A block as a cold tier hands it back: its token ids, rows and snapshot.
 pub(crate) struct Block {
     id: u64,
-    len: usize,
     tokens: Vec<u32>,
-    /// Per layer, in `SeamKv::kbufs` order. `v[l]` is empty for an MLA layer (no V side) and both
-    /// are empty for a recurrent layer, whose state a `snap` carries instead.
-    k: Vec<Vec<u8>>,
-    v: Vec<Vec<u8>>,
-    /// The recurrent state at this block's end, when one was captured there.
+    rows: KvRows,
     snap: Option<RecurrentSnap>,
+    used: u64,
+}
+
+impl Block {
+    #[cfg(test)]
+    fn as_ref(&self) -> BlockRef<'_> {
+        BlockRef {
+            id: self.id,
+            tokens: &self.tokens,
+            rows: &self.rows,
+            snap: self.snap.as_ref(),
+            used: self.used,
+        }
+    }
+}
+
+/// A block as a cold tier writes it, borrowed from the cache's index and store.
+pub(crate) struct BlockRef<'a> {
+    id: u64,
+    tokens: &'a [u32],
+    rows: &'a KvRows,
+    snap: Option<&'a RecurrentSnap>,
+    used: u64,
+}
+
+/// The index entry of one stored block: `tokens.len()` token ids whose rows are extent `id`.
+///
+/// The length is `BLOCK_TOKENS` except for the tail of a captured prefix, which may be short; a
+/// short block only ever matches at the end of a prompt.
+struct Entry {
+    tokens: Vec<u32>,
+    /// Rows plus snapshot, what the budget counts.
     bytes: usize,
     used: u64,
-    /// Changed since the last save/append.
+    /// A recurrent-state snapshot at the block's end sits in extent [`snap_id`].
+    snap: bool,
+    /// Changed since the last write to the cold tier.
     dirty: bool,
 }
 
-/// Host-RAM LRU store of captured prompt blocks.
-pub(crate) struct KvPrefixStore {
-    blocks: Vec<Block>,
+/// The extent holding the snapshot at the end of block `id`.
+fn snap_id(id: u64) -> u64 {
+    !id
+}
+
+/// The prefix cache: a token index over content-addressed block extents in `S`.
+///
+/// Rows are kept per 128-token block, chained: a block's id hashes its predecessor's id with its
+/// own tokens, so a block only matches at the position it was written at (rope makes rows
+/// position-bound) and ten conversations sharing a system prompt keep one copy of it. A block's
+/// rows are extent `id` (rows `0..len`); a recurrent snapshot at its end is extent `snap_id(id)`.
+/// The cold tier reads extents through [`KvStore::host`].
+pub(crate) struct BlockCache<S: KvStore> {
+    store: S,
+    index: HashMap<u64, Entry>,
     cap_bytes: usize,
-    /// Monotonic access counter (LRU order, not wall time — the store never sleeps).
+    /// Monotonic access counter (LRU order, not wall time — the cache never sleeps).
     clock: u64,
     /// The KV layouts the blocks were captured with; a dtype change invalidates every block.
     k_fmt: DType,
@@ -335,7 +370,7 @@ pub(crate) struct KvPrefixStore {
     tier_fmt: Option<(DType, DType)>,
 }
 
-impl Drop for KvPrefixStore {
+impl<S: KvStore> Drop for BlockCache<S> {
     fn drop(&mut self) {
         if self.dirty {
             if let Err(e) = self.rewrite_tier() {
@@ -362,9 +397,21 @@ pub(crate) trait KvColdTier: Send {
     /// The blocks stored under `key`, or `None` when the tier holds nothing for it.
     fn load(&mut self, key: u64) -> Result<Option<TierContents>>;
     /// Add `blocks` captured with `k_fmt`/`v_fmt`, which match what the tier already holds.
-    fn append(&mut self, key: u64, k_fmt: DType, v_fmt: DType, blocks: &[&Block]) -> Result<()>;
+    fn append(
+        &mut self,
+        key: u64,
+        k_fmt: DType,
+        v_fmt: DType,
+        blocks: &[BlockRef<'_>],
+    ) -> Result<()>;
     /// Replace everything stored under `key` with `blocks`.
-    fn rewrite(&mut self, key: u64, k_fmt: DType, v_fmt: DType, blocks: &[&Block]) -> Result<()>;
+    fn rewrite(
+        &mut self,
+        key: u64,
+        k_fmt: DType,
+        v_fmt: DType,
+        blocks: &[BlockRef<'_>],
+    ) -> Result<()>;
 }
 
 /// A [`KvColdTier`] in one local file: a header, then checksummed records appended as blocks are
@@ -378,7 +425,7 @@ impl FileTier {
         Self { path }
     }
 
-    fn write_record(w: &mut impl Write, blocks: &[&Block]) -> std::io::Result<()> {
+    fn write_record(w: &mut impl Write, blocks: &[BlockRef<'_>]) -> std::io::Result<()> {
         let mut h = Fnv::new();
         put_u32(w, &mut h, blocks.len().min(u32::MAX as usize) as u32)?;
         for b in blocks {
@@ -458,7 +505,13 @@ impl KvColdTier for FileTier {
         }))
     }
 
-    fn append(&mut self, key: u64, k_fmt: DType, v_fmt: DType, blocks: &[&Block]) -> Result<()> {
+    fn append(
+        &mut self,
+        key: u64,
+        k_fmt: DType,
+        v_fmt: DType,
+        blocks: &[BlockRef<'_>],
+    ) -> Result<()> {
         if let Some(dir) = self.path.parent() {
             std::fs::create_dir_all(dir)?;
         }
@@ -477,7 +530,13 @@ impl KvColdTier for FileTier {
         Ok(())
     }
 
-    fn rewrite(&mut self, key: u64, k_fmt: DType, v_fmt: DType, blocks: &[&Block]) -> Result<()> {
+    fn rewrite(
+        &mut self,
+        key: u64,
+        k_fmt: DType,
+        v_fmt: DType,
+        blocks: &[BlockRef<'_>],
+    ) -> Result<()> {
         if let Some(dir) = self.path.parent() {
             std::fs::create_dir_all(dir)?;
         }
@@ -531,8 +590,8 @@ impl RedisTier {
         format!("{}:meta", Self::prefix(key))
     }
 
-    fn encode(b: &Block) -> Vec<u8> {
-        let mut v = Vec::with_capacity(b.bytes + 16);
+    fn encode(b: &BlockRef<'_>) -> Vec<u8> {
+        let mut v = Vec::with_capacity(b.rows.bytes() + 16);
         let mut h = Fnv::new();
         write_block(&mut v, &mut h, b).expect("writing to a Vec cannot fail");
         v.extend_from_slice(&h.0.to_le_bytes());
@@ -620,7 +679,13 @@ impl KvColdTier for RedisTier {
         }))
     }
 
-    fn append(&mut self, key: u64, k_fmt: DType, v_fmt: DType, blocks: &[&Block]) -> Result<()> {
+    fn append(
+        &mut self,
+        key: u64,
+        k_fmt: DType,
+        v_fmt: DType,
+        blocks: &[BlockRef<'_>],
+    ) -> Result<()> {
         if blocks.is_empty() {
             return Ok(());
         }
@@ -642,7 +707,13 @@ impl KvColdTier for RedisTier {
         Ok(())
     }
 
-    fn rewrite(&mut self, key: u64, k_fmt: DType, v_fmt: DType, blocks: &[&Block]) -> Result<()> {
+    fn rewrite(
+        &mut self,
+        key: u64,
+        k_fmt: DType,
+        v_fmt: DType,
+        blocks: &[BlockRef<'_>],
+    ) -> Result<()> {
         let old: Vec<String> = redis::cmd("SMEMBERS")
             .arg(Self::key_index(key))
             .query(&mut self.conn)?;
@@ -713,20 +784,46 @@ pub(crate) fn cold_tier_for(kv: &crate::EngineConfig) -> Option<Box<dyn KvColdTi
         .map(|p| Box::new(FileTier::new(p.clone())) as Box<dyn KvColdTier>)
 }
 
-impl KvPrefixStore {
-    /// Build a store with `cap_bytes` of host memory. A zero cap is a disabled store: every call
-    /// returns immediately, so the engine pays nothing for a feature nobody asked for.
+/// Borrow block `id` for a tier write; `None` when the store keeps it outside host memory.
+fn block_ref<'a, S: KvStore>(store: &'a S, id: u64, e: &'a Entry) -> Option<BlockRef<'a>> {
+    let rows = store.host(id)?;
+    let snap = if e.snap {
+        store.host(snap_id(id)).and_then(|r| r.snap.as_deref())
+    } else {
+        None
+    };
+    Some(BlockRef {
+        id,
+        tokens: &e.tokens,
+        rows,
+        snap,
+        used: e.used,
+    })
+}
+
+/// The device slot's extent id inside [`DeviceKv`] while the cache reads or writes it.
+const SLOT: u64 = 0;
+
+impl<S: KvStore> BlockCache<S> {
+    /// Build a cache with `cap_bytes` of budget over `store`. A zero cap is a disabled cache:
+    /// every call returns immediately, so the engine pays nothing for a feature nobody asked for.
     #[cfg(test)]
-    pub(crate) fn new(cap_bytes: usize) -> Self {
-        Self::with_tier(cap_bytes, None, 0)
+    pub(crate) fn new(store: S, cap_bytes: usize) -> Self {
+        Self::with_tier(store, cap_bytes, None, 0)
     }
 
-    /// [`new`](Self::new), backed by a cold `tier`: the store loads what the tier holds for `key`
+    /// [`new`](Self::new), backed by a cold `tier`: the cache loads what the tier holds for `key`
     /// now, writes each capture through to it, and compacts it on drop. `key` identifies the
     /// model geometry the blocks belong to.
-    pub(crate) fn with_tier(cap_bytes: usize, tier: Option<Box<dyn KvColdTier>>, key: u64) -> Self {
-        let mut store = Self {
-            blocks: Vec::new(),
+    pub(crate) fn with_tier(
+        store: S,
+        cap_bytes: usize,
+        tier: Option<Box<dyn KvColdTier>>,
+        key: u64,
+    ) -> Self {
+        let mut cache = Self {
+            store,
+            index: HashMap::new(),
             cap_bytes,
             clock: 0,
             k_fmt: DType::F16,
@@ -739,37 +836,50 @@ impl KvPrefixStore {
             dirty: false,
             tier_fmt: None,
         };
-        store.load_tier();
-        store
+        cache.load_tier();
+        cache
     }
 
-    /// Fill the RAM index from the tier. A tier that fails or holds another model's blocks leaves
-    /// the store empty; it never fails startup.
+    /// Fill the index and store from the tier. A tier that fails or holds another model's blocks
+    /// leaves the cache empty; it never fails startup.
     fn load_tier(&mut self) {
         let Some(tier) = self.tier.as_mut() else {
             return;
         };
         let name = tier.describe();
-        match tier.load(self.key) {
-            Ok(Some(c)) => {
-                self.k_fmt = c.k_fmt;
-                self.v_fmt = c.v_fmt;
-                self.tier_fmt = Some((c.k_fmt, c.v_fmt));
-                self.clock = c.blocks.iter().map(|b| b.used).max().unwrap_or(0);
-                self.blocks = c.blocks;
+        let loaded = tier.load(self.key);
+        let loaded = loaded.and_then(|c| {
+            let Some(c) = c else { return Ok(false) };
+            self.k_fmt = c.k_fmt;
+            self.v_fmt = c.v_fmt;
+            self.tier_fmt = Some((c.k_fmt, c.v_fmt));
+            self.clock = c.blocks.iter().map(|b| b.used).max().unwrap_or(0);
+            for b in c.blocks {
+                self.insert(b.id, b.tokens, b.rows, b.used, false)?;
+                if let Some(snap) = b.snap {
+                    self.attach(b.id, Arc::new(snap), false)?;
+                }
+            }
+            Ok(true)
+        });
+        match loaded {
+            Ok(true) => {
                 self.trim();
                 tracing::info!(
                     tier = %name,
-                    blocks = self.blocks.len(),
+                    blocks = self.index.len(),
                     "kv store: loaded the saved prefixes"
                 );
             }
-            Ok(None) => {}
-            Err(e) => tracing::warn!(
-                tier = %name,
-                error = %e,
-                "kv store: the saved prefixes are unusable; starting empty"
-            ),
+            Ok(false) => {}
+            Err(e) => {
+                self.clear();
+                tracing::warn!(
+                    tier = %name,
+                    error = %e,
+                    "kv store: the saved prefixes are unusable; starting empty"
+                );
+            }
         }
     }
 
@@ -779,20 +889,82 @@ impl KvPrefixStore {
 
     /// `(blocks, bytes)` currently resident, for the capture log.
     pub(crate) fn stats(&self) -> (usize, usize) {
-        (self.blocks.len(), self.blocks.iter().map(|b| b.bytes).sum())
+        (self.index.len(), self.index.values().map(|e| e.bytes).sum())
     }
 
-    /// Replace the tier's contents with the store's current blocks, which drops what the LRU
+    /// Store block `id`'s rows and index it, replacing any block under the same id.
+    fn insert(
+        &mut self,
+        id: u64,
+        tokens: Vec<u32>,
+        rows: KvRows,
+        used: u64,
+        dirty: bool,
+    ) -> Result<()> {
+        self.drop_entry(id);
+        let bytes = rows.bytes();
+        self.store.put(id, 0, rows)?;
+        let entry = Entry {
+            tokens,
+            bytes,
+            used,
+            snap: false,
+            dirty,
+        };
+        self.index.insert(id, entry);
+        Ok(())
+    }
+
+    /// Store `snap` as the state at the end of indexed block `id`.
+    fn attach(&mut self, id: u64, snap: Arc<RecurrentSnap>, dirty: bool) -> Result<()> {
+        let bytes = snap.bytes;
+        let rows = KvRows {
+            snap: Some(snap),
+            ..KvRows::default()
+        };
+        self.store.put(snap_id(id), 0, rows)?;
+        let e = self.index.get_mut(&id).expect("attach to an indexed block");
+        e.snap = true;
+        e.bytes += bytes;
+        e.dirty |= dirty;
+        Ok(())
+    }
+
+    fn drop_entry(&mut self, id: u64) {
+        let Some(e) = self.index.remove(&id) else {
+            return;
+        };
+        let mut removed = self.store.remove(id);
+        if e.snap {
+            removed = removed.and(self.store.remove(snap_id(id)));
+        }
+        if let Err(e) = removed {
+            tracing::warn!(error = %e, "kv store: dropping a block's extents failed");
+        }
+    }
+
+    fn clear(&mut self) {
+        let ids: Vec<u64> = self.index.keys().copied().collect();
+        for id in ids {
+            self.drop_entry(id);
+        }
+    }
+
+    /// Replace the tier's contents with the cache's current blocks, which drops what the LRU
     /// evicted and any superseded copies.
     fn rewrite_tier(&mut self) -> Result<()> {
         let Some(tier) = self.tier.as_mut() else {
             self.dirty = false;
             return Ok(());
         };
-        let all: Vec<&Block> = self.blocks.iter().collect();
+        let all: Vec<BlockRef<'_>> = self
+            .index
+            .iter()
+            .filter_map(|(&id, e)| block_ref(&self.store, id, e))
+            .collect();
         tier.rewrite(self.key, self.k_fmt, self.v_fmt, &all)?;
-        for b in &mut self.blocks {
-            b.dirty = false;
+        for e in self.index.values_mut() {
+            e.dirty = false;
         }
         self.dirty = false;
         self.tier_fmt = Some((self.k_fmt, self.v_fmt));
@@ -808,31 +980,31 @@ impl KvPrefixStore {
         if self.tier_fmt != Some((self.k_fmt, self.v_fmt)) {
             return self.rewrite_tier();
         }
-        let dirty: Vec<usize> = (0..self.blocks.len())
-            .filter(|&i| self.blocks[i].dirty)
+        let batch: Vec<BlockRef<'_>> = self
+            .index
+            .iter()
+            .filter(|(_, e)| e.dirty)
+            .filter_map(|(&id, e)| block_ref(&self.store, id, e))
             .collect();
-        if dirty.is_empty() {
+        if batch.is_empty() {
             return Ok(());
         }
-        let batch: Vec<&Block> = dirty.iter().map(|&i| &self.blocks[i]).collect();
         let tier = self.tier.as_mut().expect("checked above");
         tier.append(self.key, self.k_fmt, self.v_fmt, &batch)?;
-        for i in dirty {
-            self.blocks[i].dirty = false;
+        for e in self.index.values_mut() {
+            e.dirty = false;
         }
         self.dirty = false;
         Ok(())
     }
 
-    fn find(&self, id: u64, tokens: &[u32]) -> Option<usize> {
-        self.blocks
-            .iter()
-            .position(|b| b.id == id && b.tokens == tokens)
+    fn find(&self, id: u64, tokens: &[u32]) -> bool {
+        self.index.get(&id).is_some_and(|e| e.tokens == tokens)
     }
 
     /// Walk `prompt` block by block; return the tokens covered by the leading stored run and the
-    /// blocks that cover them, with their use stamped.
-    fn matched(&mut self, prompt: &[u32]) -> (usize, Vec<usize>) {
+    /// ids of the blocks that cover them, with their use stamped.
+    fn matched(&mut self, prompt: &[u32]) -> (usize, Vec<u64>) {
         let mut id = 0u64;
         let mut n = 0usize;
         let mut hits = Vec::new();
@@ -840,10 +1012,12 @@ impl KvPrefixStore {
             let len = BLOCK_TOKENS.min(prompt.len() - n);
             let block = &prompt[n..n + len];
             id = block_id(id, block);
-            let Some(i) = self.find(id, block) else { break };
+            let Some(e) = self.index.get_mut(&id).filter(|e| e.tokens == block) else {
+                break;
+            };
             self.clock += 1;
-            self.blocks[i].used = self.clock;
-            hits.push(i);
+            e.used = self.clock;
+            hits.push(id);
             n += len;
             if len < BLOCK_TOKENS {
                 break;
@@ -852,8 +1026,8 @@ impl KvPrefixStore {
         (n, hits)
     }
 
-    /// Copy the longest stored run of blocks into `kv` (a device upload per layer) and mark those
-    /// tokens materialized. Returns the number of tokens restored.
+    /// Copy the longest stored run of blocks into `kv` (a device upload per layer per run of
+    /// present rows) and mark those tokens materialized. Returns the number of tokens restored.
     ///
     /// A sliding-window ring is written at each block's own ring position (`start % rows`), so a
     /// prefix longer than the ring still seeds it: the newest blocks overwrite the oldest, which
@@ -880,80 +1054,60 @@ impl KvPrefixStore {
         {
             return Ok(0);
         }
+        let len = |id: &u64| self.index[id].tokens.len();
         let mut keep = Vec::new();
         let mut n = 0usize;
-        for i in hits {
-            let len = self.blocks[i].len;
-            if n + len > p {
+        for id in hits {
+            if n + len(&id) > p {
                 break;
             }
-            n += len;
-            keep.push(i);
+            n += len(&id);
+            keep.push(id);
         }
         // A recurrent model's rows are useless without the state they were written beside: only a
         // block carrying a snapshot can seed it, and everything after that block must be prefilled.
         if cfg.has_recurrent_state() {
-            let Some(at) = keep.iter().rposition(|&i| self.blocks[i].snap.is_some()) else {
+            let Some(at) = keep.iter().rposition(|id| self.index[id].snap) else {
                 return Ok(0);
             };
             keep.truncate(at + 1);
-            n = keep.iter().map(|&i| self.blocks[i].len).sum();
+            n = keep.iter().map(len).sum();
         }
         if n < MIN_PREFIX_TOKENS {
             return Ok(0);
         }
+        let mut rows = KvRows::default();
+        for id in &keep {
+            let len = self.index[id].tokens.len();
+            anyhow::ensure!(
+                self.store.get(*id, 0..len, &mut rows)?,
+                "kv store: block {id:x} is indexed but not stored"
+            );
+        }
+        if cfg.has_recurrent_state() {
+            let last = snap_id(*keep.last().expect("the snapshot block"));
+            anyhow::ensure!(
+                self.store.get(last, 0..0, &mut rows)?,
+                "kv store: a snapshot is indexed but not stored"
+            );
+        }
         if let Some(p) = kv.paged.as_mut() {
             p.make_private(be, 0, n)?;
         }
+        // Every row attention will read must be there: a window layer keeps only the newest rows
+        // it has, and a restore that cannot fill that window must re-prefill instead.
         for l in 0..cfg.n_layer {
             if cfg.is_recurrent_layer(l) {
                 continue;
             }
-            let (k_row, v_row) = kv_row_elems(cfg, l);
-            let layout = kv.row_layout(be, cfg, l);
-            let flush = |rows: std::ops::Range<usize>, k: &[u8], v: &[u8]| -> Result<()> {
-                if rows.is_empty() {
-                    return Ok(());
-                }
-                let kbuf = kv.kbufs[l].as_ref();
-                write_rows(be, kbuf, kv.k_fmt, k_row, &*layout, rows.clone(), k)?;
-                if v_row > 0 {
-                    let vbuf = kv.vbufs[l].as_ref();
-                    write_rows(be, vbuf, kv.v_fmt, v_row, &*layout, rows, v)?;
-                }
-                Ok(())
-            };
-            // A block captured after the ring's window was recycled has no rows: it ends a run.
-            let (mut run, mut start) = (0usize, 0usize);
-            let (mut kbuf, mut vbuf) = (Vec::new(), Vec::new());
-            for i in &keep {
-                let b = &self.blocks[*i];
-                if b.k[l].is_empty() || (v_row > 0 && b.v[l].is_empty()) {
-                    flush(run..start, &kbuf, &vbuf)?;
-                    kbuf.clear();
-                    vbuf.clear();
-                    run = start + b.len;
-                } else {
-                    kbuf.extend_from_slice(&b.k[l]);
-                    vbuf.extend_from_slice(&b.v[l]);
-                }
-                start += b.len;
+            let need = kv.row_layout(be, cfg, l).oldest_resident(n)..n;
+            if !need.is_empty() && !rows.layers.get(l).is_some_and(|r| r.covers(need.clone())) {
+                tracing::debug!(layer = l, need = ?need, "kv store: the stored blocks miss the window");
+                return Ok(0);
             }
-            flush(run..start, &kbuf, &vbuf)?;
         }
-        if cfg.has_recurrent_state() {
-            let snap = self.blocks[*keep.last().expect("the snapshot block")]
-                .snap
-                .as_ref()
-                .expect("the truncation kept the snapshot block");
-            for (l, bytes) in &snap.k {
-                be.upload(kv.kbufs[*l].as_ref(), bytes)?;
-            }
-            for (l, bytes) in &snap.v {
-                be.upload(kv.vbufs[*l].as_ref(), bytes)?;
-            }
-            kv.written_end = n;
-        }
+        DeviceKv::new(SLOT, be, cfg, kv).put(SLOT, 0, rows)?;
+        kv.written_end = n;
         kv.cached = prompt[..n].to_vec();
         self.restores += 1;
         self.restored_tokens += n as u64;
@@ -987,7 +1141,7 @@ impl KvPrefixStore {
             return Ok(0);
         }
         if self.k_fmt != kv.k_fmt || self.v_fmt != kv.v_fmt {
-            self.blocks.clear();
+            self.clear();
             self.k_fmt = kv.k_fmt;
             self.v_fmt = kv.v_fmt;
         }
@@ -1001,45 +1155,38 @@ impl KvPrefixStore {
             // Keep the chain complete from token 0: a block whose ring rows were recycled is
             // still stored (with its tokens and any full-attention rows), so `matched` can walk
             // across it to the newest snapshot.
-            if self.find(id, &tokens[start..start + len]).is_none() {
+            if !self.find(id, &tokens[start..start + len]) {
                 missing.push((start, len, id));
             }
             start += len;
         }
         if missing.is_empty() {
-            self.attach_snapshots(&kv.recurrent_snaps, &kv.cached, p);
+            self.attach_snapshots(&kv.recurrent_snaps, &kv.cached, p, None)?;
             self.trim();
             self.persist();
             return Ok(0);
         }
-        let base = self.blocks.len();
+        // One download per layer from the first new block; blocks already stored in between are
+        // read and dropped, and rows a ring recycled come back absent.
+        let from = missing[0].0;
+        let mut all = KvRows::default();
+        DeviceKv::new(SLOT, be, cfg, kv).get(SLOT, from..p, &mut all)?;
         for (start, len, id) in &missing {
+            let mut rows = KvRows::default();
+            rows.append(&all, start - from..start - from + len)?;
+            rows.snap = None;
             self.clock += 1;
-            self.blocks.push(Block {
-                id: *id,
-                len: *len,
-                tokens: tokens[*start..*start + *len].to_vec(),
-                k: vec![Vec::new(); cfg.n_layer],
-                v: vec![Vec::new(); cfg.n_layer],
-                snap: None,
-                bytes: 0,
-                used: self.clock,
-                dirty: true,
-            });
+            let block = tokens[*start..*start + *len].to_vec();
+            self.insert(*id, block, rows, self.clock, true)?;
         }
-        let filled = self.fill_from_device(be, cfg, kv, p, &missing, base);
-        if let Err(e) = filled {
-            self.blocks.truncate(base);
-            return Err(e);
-        }
-        self.attach_snapshots(&kv.recurrent_snaps, &kv.cached, p);
+        self.attach_snapshots(&kv.recurrent_snaps, &kv.cached, p, all.snap.take())?;
         self.captures += 1;
         self.trim();
         self.persist();
         Ok(p)
     }
 
-    /// Append the changed blocks to the configured file; a failure keeps them dirty for the drop
+    /// Append the changed blocks to the configured tier; a failure keeps them dirty for the drop
     /// compaction and never fails the request.
     fn persist(&mut self) {
         if self.tier.is_none() {
@@ -1053,30 +1200,39 @@ impl KvPrefixStore {
 
     /// Attach the slot's recurrent-state snapshots to the blocks that end at their positions.
     /// Only snapshots whose whole chain is present can ever restore, and a block's state is the
-    /// same whichever turn wrote it, so an already-attached snapshot is kept.
-    fn attach_snapshots(&mut self, snaps: &[RecurrentSnap], tokens: &[u32], p: usize) {
+    /// same whichever turn wrote it, so an already-attached snapshot is kept. `at_p` is a copy of
+    /// the snapshot at `p` already taken, used instead of cloning it again.
+    fn attach_snapshots(
+        &mut self,
+        snaps: &[RecurrentSnap],
+        tokens: &[u32],
+        p: usize,
+        mut at_p: Option<Arc<RecurrentSnap>>,
+    ) -> Result<()> {
         for snap in snaps {
             if snap.pos == 0 || snap.pos > p {
                 continue;
             }
-            let Some(i) = self.block_at(tokens, snap.pos) else {
+            let Some(id) = self.block_at(tokens, snap.pos) else {
                 continue;
             };
-            if self.blocks[i].snap.is_none() {
-                self.blocks[i].bytes += snap.bytes;
-                self.blocks[i].snap = Some(snap.clone());
-                self.blocks[i].dirty = true;
-                tracing::debug!(
-                    pos = snap.pos,
-                    block = i,
-                    "kv store: attached a recurrent snapshot"
-                );
+            if !self.index[&id].snap {
+                let shared = match at_p.take() {
+                    Some(s) if s.pos == snap.pos => s,
+                    other => {
+                        at_p = other;
+                        Arc::new(snap.clone())
+                    }
+                };
+                self.attach(id, shared, true)?;
+                tracing::debug!(pos = snap.pos, "kv store: attached a recurrent snapshot");
             }
         }
+        Ok(())
     }
 
     /// The stored block ending at token `pos`, when the chain covers it exactly.
-    fn block_at(&self, tokens: &[u32], pos: usize) -> Option<usize> {
+    fn block_at(&self, tokens: &[u32], pos: usize) -> Option<u64> {
         if pos == 0 || !pos.is_multiple_of(BLOCK_TOKENS) || pos > tokens.len() {
             return None;
         }
@@ -1088,74 +1244,19 @@ impl KvPrefixStore {
             start += len;
         }
         self.find(id, &tokens[pos - BLOCK_TOKENS..pos])
+            .then_some(id)
     }
 
-    /// Download each new block's rows into the blocks pushed at `base .. base + missing.len()`.
-    fn fill_from_device(
-        &mut self,
-        be: &dyn Backend,
-        cfg: &Config,
-        kv: &SeamKv,
-        p: usize,
-        missing: &[(usize, usize, u64)],
-        base: usize,
-    ) -> Result<()> {
-        for l in 0..cfg.n_layer {
-            if cfg.is_recurrent_layer(l) {
-                continue;
-            }
-            let (k_row, v_row) = kv_row_elems(cfg, l);
-            let layout = kv.row_layout(be, cfg, l);
-            // Blocks below the oldest resident row stay empty here but stay in the chain.
-            let oldest = layout.oldest_resident(kv.cached.len());
-            let Some(from) = missing.iter().map(|m| m.0).find(|&s| s >= oldest) else {
-                continue;
-            };
-            let mut kbuf = vec![0u8; kv_fmt_bytes(kv.k_fmt, (p - from) * k_row)];
-            let kdev = kv.kbufs[l].as_ref();
-            read_rows(be, kdev, kv.k_fmt, k_row, &*layout, from..p, &mut kbuf)?;
-            let vbuf = if v_row > 0 {
-                let mut buf = vec![0u8; kv_fmt_bytes(kv.v_fmt, (p - from) * v_row)];
-                let vdev = kv.vbufs[l].as_ref();
-                read_rows(be, vdev, kv.v_fmt, v_row, &*layout, from..p, &mut buf)?;
-                buf
-            } else {
-                Vec::new()
-            };
-            for (j, (start, len, _)) in missing.iter().enumerate() {
-                if *start < from {
-                    continue;
-                }
-                let ks = kv_fmt_bytes(kv.k_fmt, (*start - from) * k_row);
-                let ke = ks + kv_fmt_bytes(kv.k_fmt, *len * k_row);
-                let kslice = kbuf[ks..ke].to_vec();
-                let vslice = if v_row > 0 {
-                    let vs = kv_fmt_bytes(kv.v_fmt, (*start - from) * v_row);
-                    let ve = vs + kv_fmt_bytes(kv.v_fmt, *len * v_row);
-                    vbuf[vs..ve].to_vec()
-                } else {
-                    Vec::new()
-                };
-                let b = &mut self.blocks[base + j];
-                b.bytes += kslice.len() + vslice.len();
-                b.k[l] = kslice;
-                b.v[l] = vslice;
-            }
-        }
-        Ok(())
-    }
-
-    /// Drop least-recently-used blocks until the store fits its budget.
+    /// Drop least-recently-used blocks until the cache fits its budget.
     fn trim(&mut self) {
-        let mut total: usize = self.blocks.iter().map(|b| b.bytes).sum();
-        while total > self.cap_bytes && !self.blocks.is_empty() {
-            let (i, _) = self
-                .blocks
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, b)| b.used)
-                .expect("non-empty");
-            total -= self.blocks.remove(i).bytes;
+        let mut total: usize = self.index.values().map(|e| e.bytes).sum();
+        while total > self.cap_bytes {
+            let lru = self.index.iter().min_by_key(|(_, e)| e.used);
+            let Some((id, bytes)) = lru.map(|(&id, e)| (id, e.bytes)) else {
+                break;
+            };
+            total -= bytes;
+            self.drop_entry(id);
         }
     }
 }
@@ -1163,39 +1264,49 @@ impl KvPrefixStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::seam::kv_tier::RamKv;
+    use crate::seam::rows::{read_rows, write_rows};
+
+    type Cache = BlockCache<RamKv>;
 
     fn tokens(seed: u32, n: usize) -> Vec<u32> {
         (0..n as u32).map(|i| seed * 1000 + i).collect()
     }
 
-    /// Push the chain for `tokens` as if it had just been captured.
-    fn seed(s: &mut KvPrefixStore, tokens: &[u32], bytes: usize) {
+    /// Index the chain for `tokens` as if it had just been captured, each block counted as
+    /// `bytes`. Returns the block ids.
+    fn seed(s: &mut Cache, tokens: &[u32], bytes: usize) -> Vec<u64> {
         let mut id = 0u64;
         let mut n = 0usize;
+        let mut ids = Vec::new();
         while n < tokens.len() {
             let len = BLOCK_TOKENS.min(tokens.len() - n);
             let block = &tokens[n..n + len];
             id = block_id(id, block);
             s.clock += 1;
-            s.blocks.push(Block {
-                id,
-                len,
-                tokens: block.to_vec(),
-                k: Vec::new(),
-                v: Vec::new(),
-                snap: None,
-                bytes,
-                used: s.clock,
-                dirty: false,
-            });
+            let rows = KvRows {
+                rows: len,
+                ..KvRows::default()
+            };
+            s.insert(id, block.to_vec(), rows, s.clock, false).unwrap();
+            s.index.get_mut(&id).unwrap().bytes = bytes;
+            ids.push(id);
             n += len;
         }
+        ids
+    }
+
+    fn entry<'a>(s: &'a Cache, tokens: &[u32]) -> &'a Entry {
+        s.index
+            .values()
+            .find(|e| e.tokens == tokens)
+            .expect("a block with these tokens")
     }
 
     #[test]
     fn matched_walks_the_chain_and_stops_at_a_gap() {
         let a = tokens(1, 300);
-        let mut s = KvPrefixStore::new(1 << 20);
+        let mut s = Cache::new(RamKv::default(), 1 << 20);
         seed(&mut s, &a, 1);
         assert_eq!(s.matched(&a).0, 300);
         let mut extended = a.clone();
@@ -1212,32 +1323,36 @@ mod tests {
         let a = tokens(1, 300);
         let mut b = a[..256].to_vec();
         b.extend(tokens(2, 200));
-        let mut s = KvPrefixStore::new(1 << 20);
+        let mut s = Cache::new(RamKv::default(), 1 << 20);
         seed(&mut s, &a, 1);
-        assert_eq!(s.blocks.len(), 3);
+        assert_eq!(s.index.len(), 3);
         // The second prompt shares two blocks and adds two of its own.
         assert_eq!(s.matched(&b).0, 256);
         seed(&mut s, &b[256..], 1);
-        assert_eq!(s.blocks.len(), 5);
-        assert_eq!(s.blocks[4].len, 72);
+        assert_eq!(s.index.len(), 5);
+        assert_eq!(entry(&s, &b[384..]).tokens.len(), 72);
     }
 
     #[test]
     fn trim_drops_the_least_recently_used() {
-        let mut s = KvPrefixStore::new(10);
-        seed(&mut s, &tokens(1, 300), 6);
+        let mut s = Cache::new(RamKv::default(), 10);
+        let first = seed(&mut s, &tokens(1, 300), 6);
         seed(&mut s, &tokens(2, 300), 6);
-        assert_eq!(s.blocks.len(), 6);
+        assert_eq!(s.index.len(), 6);
         s.trim();
         // One block fits; it is the most recently used, i.e. the second prompt's tail.
-        assert_eq!(s.blocks.len(), 1);
-        assert_eq!(s.blocks[0].tokens, tokens(2, 300)[256..]);
+        assert_eq!(s.index.len(), 1);
+        assert_eq!(entry(&s, &tokens(2, 300)[256..]).bytes, 6);
+        assert!(
+            !s.store.contains(first[0]),
+            "the store dropped the extent too"
+        );
     }
 
     #[test]
     fn block_at_names_only_a_complete_chain_position() {
         let a = tokens(1, 300);
-        let mut s = KvPrefixStore::new(1 << 20);
+        let mut s = Cache::new(RamKv::default(), 1 << 20);
         seed(&mut s, &a, 1);
         assert!(s.block_at(&a, 0).is_none());
         assert!(s.block_at(&a, 128).is_some());
@@ -1250,30 +1365,36 @@ mod tests {
         assert!(s.block_at(&b, 256).is_none());
     }
 
-    #[test]
-    fn a_snapshot_rides_the_block_that_ends_at_it() {
-        let a = tokens(1, 512);
-        let mut s = KvPrefixStore::new(1 << 20);
-        seed(&mut s, &a, 1);
-        let snap = RecurrentSnap {
-            pos: 512,
+    fn snap(pos: usize) -> RecurrentSnap {
+        RecurrentSnap {
+            pos,
             k: vec![(0, vec![7u8; 64])],
             v: vec![(0, vec![9u8; 32])],
             bytes: 96,
-        };
-        let kv_snaps = vec![snap];
-        s.attach_snapshots(&kv_snaps, &a, 512);
-        let i = s.block_at(&a, 512).expect("block at 512");
-        assert_eq!(s.blocks[i].bytes, 1 + 96);
-        assert!(s.blocks[i].snap.is_some());
-        assert_eq!(s.block_at(&a, 512), Some(i));
-        // A row-only budget fits the block; counting the snapshot pushes it over and drops it.
-        let snap_block = s.blocks.pop().expect("the block at 512");
-        assert_eq!(snap_block.bytes, 97);
-        let mut tight = KvPrefixStore::new(96);
-        tight.blocks.push(snap_block);
+        }
+    }
+
+    #[test]
+    fn a_snapshot_rides_the_block_that_ends_at_it() {
+        let a = tokens(1, 512);
+        let mut s = Cache::new(RamKv::default(), 1 << 20);
+        seed(&mut s, &a, 1);
+        s.attach_snapshots(&[snap(512)], &a, 512, None).unwrap();
+        let id = s.block_at(&a, 512).expect("block at 512");
+        assert_eq!(s.index[&id].bytes, 1 + 96);
+        assert!(s.index[&id].snap);
+        let held = s.store.host(snap_id(id)).and_then(|r| r.snap.clone());
+        assert_eq!(held.expect("the snapshot extent").pos, 512);
+
+        // A row-only budget fits the blocks; counting the snapshot pushes them over.
+        let mut tight = Cache::new(RamKv::default(), 96);
+        seed(&mut tight, &a, 1);
         tight.trim();
-        assert!(tight.blocks.is_empty());
+        assert_eq!(tight.index.len(), 4);
+        tight.attach_snapshots(&[snap(512)], &a, 512, None).unwrap();
+        tight.trim();
+        assert!(tight.index.is_empty());
+        assert!(!tight.store.contains(snap_id(id)));
     }
 
     /// The chain id must not move with the toolchain: it is the key of every block in a cold
@@ -1287,14 +1408,10 @@ mod tests {
         let len = tokens.len();
         Block {
             id,
-            len,
+            rows: KvRows::whole(len, vec![vec![1, 2, 3]], vec![vec![4, 5]]),
             tokens,
-            k: vec![vec![1, 2, 3]],
-            v: vec![vec![4, 5]],
             snap: None,
-            bytes: 5,
             used: 1,
-            dirty: false,
         }
     }
 
@@ -1314,7 +1431,7 @@ mod tests {
             v: vec![(1, vec![9; 4])],
             bytes: 12,
         });
-        tier.append(key, DType::F16, DType::F16, &[&a, &b])
+        tier.append(key, DType::F16, DType::F16, &[a.as_ref(), b.as_ref()])
             .expect("append");
         let loaded = tier.load(key).expect("load").expect("meta");
         assert_eq!((loaded.k_fmt, loaded.v_fmt), (DType::F16, DType::F16));
@@ -1328,7 +1445,7 @@ mod tests {
         assert_eq!(got.snap.as_ref().expect("snapshot").pos, 6);
 
         // A rewrite drops what the LRU no longer holds.
-        tier.rewrite(key, DType::F16, DType::F16, &[&a])
+        tier.rewrite(key, DType::F16, DType::F16, &[a.as_ref()])
             .expect("rewrite");
         let loaded = tier.load(key).expect("load").expect("meta");
         assert_eq!(loaded.blocks.len(), 1);
@@ -1351,17 +1468,13 @@ mod tests {
         let file = |p: &std::path::PathBuf| -> Option<Box<dyn KvColdTier>> {
             Some(Box::new(FileTier::new(p.clone())))
         };
+        let open = |p| Cache::with_tier(RamKv::default(), 1 << 20, file(p), key);
         {
-            let mut s = KvPrefixStore::with_tier(1 << 20, file(&path), key);
-            seed(&mut s, &tokens(1, 300), 7);
-            s.blocks[2].snap = Some(RecurrentSnap {
-                pos: 300,
-                k: vec![(0, vec![7u8; 64])],
-                v: vec![(0, vec![9u8; 32])],
-                bytes: 96,
-            });
-            for b in &mut s.blocks {
-                b.dirty = true;
+            let mut s = open(&path);
+            let ids = seed(&mut s, &tokens(1, 300), 7);
+            s.attach(ids[2], Arc::new(snap(300)), true).unwrap();
+            for e in s.index.values_mut() {
+                e.dirty = true;
             }
             s.tier_fmt = Some((s.k_fmt, s.v_fmt));
             s.persist();
@@ -1370,46 +1483,220 @@ mod tests {
         let journal_one = std::fs::metadata(&path).expect("journal").len();
         {
             // A second conversation appends a record of its own.
-            let mut s = KvPrefixStore::with_tier(1 << 20, file(&path), key);
-            seed(&mut s, &tokens(2, 128), 5);
-            s.blocks.last_mut().expect("seeded").dirty = true;
+            let mut s = open(&path);
+            let ids = seed(&mut s, &tokens(2, 128), 5);
+            s.index.get_mut(&ids[0]).expect("seeded").dirty = true;
             s.persist();
             s.dirty = false;
         }
-        let loaded = KvPrefixStore::with_tier(1 << 20, file(&path), key);
-        assert_eq!(loaded.blocks.len(), 4, "both records came back");
+        let loaded = open(&path);
+        assert_eq!(loaded.index.len(), 4, "both records came back");
         drop(loaded);
 
         // A torn second record keeps the first record whole.
         let bytes = std::fs::read(&path).expect("read");
         std::fs::write(&path, &bytes[..bytes.len() - 3]).expect("write torn");
         assert!(bytes.len() as u64 > journal_one);
-        let loaded = KvPrefixStore::with_tier(1 << 20, file(&path), key);
-        assert_eq!(loaded.blocks.len(), 3);
-        assert_eq!(loaded.blocks[2].tokens, tokens(1, 300)[256..]);
+        let loaded = open(&path);
+        assert_eq!(loaded.index.len(), 3);
+        let tail = &tokens(1, 300)[256..];
         assert_eq!(
-            loaded.blocks[2].bytes, 96,
+            entry(&loaded, tail).bytes,
+            96,
             "the snapshot's bytes, recomputed"
         );
-        let snap = loaded.blocks[2]
-            .snap
-            .as_ref()
+        let tail_id = *loaded
+            .index
+            .iter()
+            .find(|(_, e)| e.tokens == tail)
+            .expect("the tail")
+            .0;
+        let snap = loaded
+            .store
+            .host(snap_id(tail_id))
+            .and_then(|r| r.snap.clone())
             .expect("the snapshot survived");
         assert_eq!((snap.pos, snap.k[0].1.len()), (300, 64));
 
         drop(loaded);
 
         // Another model's key discards the file whole.
-        let wrong = KvPrefixStore::with_tier(1 << 20, file(&path), key + 1);
-        assert!(wrong.blocks.is_empty());
+        let wrong = Cache::with_tier(RamKv::default(), 1 << 20, file(&path), key + 1);
+        assert!(wrong.index.is_empty());
         drop(wrong);
 
         // A first record torn mid-way leaves nothing to load, and never a half-read block.
         let bytes = std::fs::read(&path).expect("read");
         std::fs::write(&path, &bytes[..journal_one as usize - 3]).expect("write torn");
-        let broken = KvPrefixStore::with_tier(1 << 20, file(&path), key);
-        assert!(broken.blocks.is_empty());
+        let broken = open(&path);
+        assert!(broken.index.is_empty());
         drop(broken);
         std::fs::remove_file(path).ok();
+    }
+
+    const ROW: usize = 32;
+
+    /// Two attention layers of 32-element f16 rows; with `window`, layer 0 is a sliding window.
+    fn slot_cfg(window: usize) -> Config {
+        Config {
+            n_layer: 2,
+            n_head: 4,
+            n_kv: 2,
+            n_embd: 64,
+            head_dim: 16,
+            rope_dim: 16,
+            head_dim_swa: 16,
+            n_kv_swa: 2,
+            swa_window: window,
+            swa_pattern: if window > 0 { 2 } else { 0 },
+            ..Default::default()
+        }
+    }
+
+    /// The bytes of logical row `r` of layer `l`'s side `side` in the test slots.
+    fn row_data(l: usize, side: u16, r: usize) -> Vec<u8> {
+        let v = (r as u16) ^ ((l as u16) << 12) ^ (side << 14);
+        (0..ROW).flat_map(|_| v.to_le_bytes()).collect()
+    }
+
+    /// A slot holding `n` tokens, every row written through its own layout.
+    fn filled_slot(be: &dyn Backend, cfg: &Config, ring: bool, n: usize) -> SeamKv {
+        let mut kv = SeamKv::for_test(be, cfg, 1024, ring, 56, DType::F16).unwrap();
+        for l in 0..cfg.n_layer {
+            let layout = kv.row_layout(be, cfg, l);
+            for (side, buf) in [(0, &kv.kbufs[l]), (1, &kv.vbufs[l])] {
+                let data: Vec<u8> = (0..n).flat_map(|r| row_data(l, side, r)).collect();
+                write_rows(be, buf.as_ref(), DType::F16, ROW, &*layout, 0..n, &data).unwrap();
+            }
+        }
+        kv.cached = tokens(3, n);
+        kv.written_end = n;
+        kv
+    }
+
+    fn read_side(
+        be: &dyn Backend,
+        cfg: &Config,
+        kv: &SeamKv,
+        l: usize,
+        side: u16,
+        rows: std::ops::Range<usize>,
+    ) -> Vec<u8> {
+        let layout = kv.row_layout(be, cfg, l);
+        let buf = if side == 0 {
+            &kv.kbufs[l]
+        } else {
+            &kv.vbufs[l]
+        };
+        let mut out = vec![0u8; rows.len() * ROW * 2];
+        read_rows(be, buf.as_ref(), DType::F16, ROW, &*layout, rows, &mut out).unwrap();
+        out
+    }
+
+    #[test]
+    fn a_linear_slot_round_trips_through_the_cache() {
+        let be = infr_cpu::CpuBackend::new();
+        let cfg = slot_cfg(0);
+        let src = filled_slot(&be, &cfg, false, 300);
+        let mut s = Cache::new(RamKv::default(), 1 << 20);
+        assert_eq!(s.capture(&be, &cfg, &src, 300).unwrap(), 300);
+        assert_eq!(s.index.len(), 3);
+        // Capturing the same prefix again stores nothing new.
+        assert_eq!(s.capture(&be, &cfg, &src, 300).unwrap(), 0);
+        assert_eq!(s.captures, 1);
+
+        let mut dst = SeamKv::for_test(&be, &cfg, 1024, false, 56, DType::F16).unwrap();
+        assert_eq!(s.restore(&be, &cfg, &mut dst, &src.cached).unwrap(), 300);
+        assert_eq!(dst.cached, src.cached);
+        assert_eq!((s.restores, s.restored_tokens), (1, 300));
+        for l in 0..2 {
+            for side in 0..2 {
+                let want: Vec<u8> = (0..300).flat_map(|r| row_data(l, side, r)).collect();
+                assert_eq!(
+                    read_side(&be, &cfg, &dst, l, side, 0..300),
+                    want,
+                    "layer {l} side {side}"
+                );
+            }
+        }
+    }
+
+    /// A wrapped ring keeps only its window: the block that straddles the window's start stores
+    /// the rows of it that are still resident, and the restore writes the window back in place.
+    #[test]
+    fn a_wrapped_ring_round_trips_its_window() {
+        let be = infr_cpu::CpuBackend::new();
+        let cfg = slot_cfg(200);
+        let n = 700;
+        let src = filled_slot(&be, &cfg, true, n);
+        let ring = src.window_ring_rows(&be, &cfg).expect("a ring");
+        assert_eq!(ring, 256);
+        let mut s = Cache::new(RamKv::default(), 1 << 20);
+        assert_eq!(s.capture(&be, &cfg, &src, n).unwrap(), n);
+        let ids = s.matched(&src.cached).1;
+        assert_eq!(ids.len(), 6);
+        // The window starts at row 444: blocks below it are empty, the one straddling it keeps
+        // the rows from 444 on, and the rest are whole.
+        for (j, id) in ids.iter().enumerate() {
+            let rows = s.store.host(*id).unwrap();
+            let runs = &rows.layers[0].runs;
+            let run = (runs.len() == 1).then(|| runs[0].clone());
+            match j {
+                0..=2 => assert!(runs.is_empty(), "block {j}"),
+                3 => assert_eq!(run, Some(60..128), "block {j}"),
+                4 => assert_eq!(run, Some(0..BLOCK_TOKENS), "block {j}"),
+                _ => assert_eq!(run, Some(0..60), "block {j}"),
+            }
+            assert!(!rows.layers[1].k.is_empty());
+        }
+
+        let mut dst = SeamKv::for_test(&be, &cfg, 1024, true, 56, DType::F16).unwrap();
+        assert_eq!(s.restore(&be, &cfg, &mut dst, &src.cached).unwrap(), n);
+        for side in 0..2 {
+            for l in 0..2 {
+                let from = dst.row_layout(&be, &cfg, l).oldest_resident(n);
+                let want: Vec<u8> = (from..n).flat_map(|r| row_data(l, side, r)).collect();
+                assert_eq!(
+                    read_side(&be, &cfg, &dst, l, side, from..n),
+                    want,
+                    "layer {l} side {side} from row {from}"
+                );
+            }
+        }
+    }
+
+    /// A restore whose blocks cannot fill the destination's window re-prefills instead of leaving
+    /// rows attention will read unwritten.
+    #[test]
+    fn a_restore_into_a_wider_ring_refuses() {
+        let be = infr_cpu::CpuBackend::new();
+        let src_cfg = slot_cfg(200);
+        let n = 700;
+        let src = filled_slot(&be, &src_cfg, true, n);
+        let mut s = Cache::new(RamKv::default(), 1 << 20);
+        s.capture(&be, &src_cfg, &src, n).unwrap();
+
+        let dst_cfg = slot_cfg(400);
+        let mut dst = SeamKv::for_test(&be, &dst_cfg, 1024, true, 56, DType::F16).unwrap();
+        assert_eq!(dst.window_ring_rows(&be, &dst_cfg), Some(512));
+        assert_eq!(s.restore(&be, &dst_cfg, &mut dst, &src.cached).unwrap(), 0);
+        assert!(dst.cached.is_empty());
+    }
+
+    /// Decode can write rows past the tokens it accepted, so the ring recycles from the row count
+    /// actually written, not from the cached prefix.
+    #[test]
+    fn a_capture_skips_rows_a_chain_wrote_past_the_prompt() {
+        let be = infr_cpu::CpuBackend::new();
+        let cfg = slot_cfg(200);
+        let mut src = filled_slot(&be, &cfg, true, 600);
+        src.written_end = 800;
+        let mut s = Cache::new(RamKv::default(), 1 << 20);
+        assert_eq!(s.capture(&be, &cfg, &src, 600).unwrap(), 600);
+        let ids = s.matched(&src.cached).1;
+        assert_eq!(ids.len(), 5);
+        // Rows below 544 are gone: the block over 512..640 keeps only 544..600.
+        let rows = s.store.host(ids[4]).unwrap();
+        assert_eq!(rows.layers[0].runs, vec![32..88]);
     }
 }

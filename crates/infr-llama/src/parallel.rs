@@ -187,8 +187,8 @@ pub struct ParallelSeam {
     /// token, and single-request decode speed is a hard non-regression requirement.
     gate: Option<Arc<StepGate>>,
     /// Host-RAM KV prefixes shared by every conversation on this engine (see
-    /// [`crate::seam::KvPrefixStore`]). Empty and inert unless `kv.store_mb` is set.
-    store: Mutex<crate::seam::KvPrefixStore>,
+    /// [`crate::seam::BlockCache`]). Empty and inert unless `kv.store_mb` is set.
+    store: Mutex<crate::seam::BlockCache<crate::seam::RamKv>>,
     max_ctx: usize,
     /// The session's page pool when `kv.paged` built one, kept here so `/status` can report its
     /// usage even while every slot's KV is checked out of the pool mutex.
@@ -256,7 +256,8 @@ impl ParallelSeam {
                 tick: 0,
             }),
             freed: Condvar::new(),
-            store: Mutex::new(crate::seam::KvPrefixStore::with_tier(
+            store: Mutex::new(crate::seam::BlockCache::with_tier(
+                crate::seam::RamKv::default(),
                 store_bytes,
                 store_tier,
                 store_key,

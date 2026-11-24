@@ -88,13 +88,17 @@ pub struct RequestSampling {
     pub top_p: Option<f32>,
     /// Per-request RNG seed. `None` = the usual `INFR_SEED`/wall-clock seed.
     pub seed: Option<u64>,
-    /// OpenAI `presence_penalty` (-2..2): flat subtraction for any token already generated.
+    /// OpenAI `presence_penalty` (-2..2): flat subtraction for any token in the last
+    /// [`repeat_last_n`](Self::repeat_last_n) generated tokens.
     pub presence_penalty: f32,
-    /// OpenAI `frequency_penalty` (-2..2): subtraction scaled by the token's generated count.
+    /// OpenAI `frequency_penalty` (-2..2): subtraction scaled by the token's count in the last
+    /// [`repeat_last_n`](Self::repeat_last_n) generated tokens.
     pub frequency_penalty: f32,
     /// llama.cpp `repeat_penalty` (1.0 = off): divides positive logits / multiplies negative ones
     /// for tokens seen in the last [`repeat_last_n`](Self::repeat_last_n) generated tokens.
     pub repeat_penalty: f32,
+    /// llama.cpp `penalty_last_n`: the window of generated tokens all three penalties read.
+    /// 0 disables the penalties entirely, as in llama.cpp.
     pub repeat_last_n: usize,
     /// llama.cpp `min_p` (see [`Sampler::min_p`]). `None` = inherit the process default (off).
     pub min_p: Option<f32>,
@@ -132,9 +136,10 @@ impl RequestSampling {
     /// Any penalty actually active? One half of [`patches_logits`](Self::patches_logits), which
     /// drives the decode loop's host-sampling fallback.
     pub fn penalties_active(&self) -> bool {
-        self.presence_penalty != 0.0
-            || self.frequency_penalty != 0.0
-            || (self.repeat_penalty != 1.0 && self.repeat_last_n > 0)
+        self.repeat_last_n > 0
+            && (self.presence_penalty != 0.0
+                || self.frequency_penalty != 0.0
+                || self.repeat_penalty != 1.0)
     }
 
     /// Does this request rewrite the logits row before sampling — a penalty or a `logit_bias`?
@@ -475,7 +480,7 @@ pub(crate) struct Penalties {
     frequency: f32,
     repeat: f32,
     last_n: usize,
-    /// token id -> times generated so far (presence/frequency).
+    /// token id -> occurrences in `recent` (presence/frequency), kept in step with the window.
     counts: std::collections::HashMap<u32, u32>,
     /// The last `last_n` generated ids, in order (llama.cpp's `repeat_penalty` window).
     recent: std::collections::VecDeque<u32>,
@@ -501,7 +506,7 @@ impl Penalties {
     /// Patch `logits` in place: the request's `logit_bias` first, then the penalties for the tokens
     /// generated so far. Order matches llama.cpp's chain, whose `logit_bias` sampler runs ahead of
     /// `penalties`, and within the penalties repeat (multiplicative, sign-aware) then
-    /// presence/frequency (additive).
+    /// presence/frequency (additive, from each id's count in the same `last_n` window).
     ///
     /// Every logits access is CHECKED (`get_mut`), and an id at or past `logits.len()` is skipped.
     /// The row is full-vocab on the trunk decode path, so today no id can be out of range — but the
@@ -573,11 +578,20 @@ impl Penalties {
 
     /// Record a token the loop just committed.
     pub(crate) fn observe(&mut self, t: u32) {
+        if self.last_n == 0 {
+            return;
+        }
+        self.recent.push_back(t);
         *self.counts.entry(t).or_insert(0) += 1;
-        if self.last_n > 0 {
-            self.recent.push_back(t);
-            while self.recent.len() > self.last_n {
-                self.recent.pop_front();
+        while self.recent.len() > self.last_n {
+            let Some(old) = self.recent.pop_front() else {
+                break;
+            };
+            if let std::collections::hash_map::Entry::Occupied(mut e) = self.counts.entry(old) {
+                *e.get_mut() -= 1;
+                if *e.get() == 0 {
+                    e.remove();
+                }
             }
         }
     }
@@ -1275,6 +1289,83 @@ mod tests {
         assert_eq!(logits[1], 2.5, "in-range id must still be penalized");
         assert_eq!(logits[0], 0.0, "untouched ids stay untouched");
         assert_eq!(logits.len(), 4, "the row is not resized");
+    }
+
+    /// Presence/frequency read the same `repeat_last_n` window as the repeat penalty, as in
+    /// llama.cpp: a token that has left the window carries no penalty.
+    #[test]
+    fn frequency_penalty_forgets_tokens_that_leave_the_window() {
+        let ctx = RequestCtx::new(RequestSampling {
+            repeat_last_n: 4,
+            frequency_penalty: 1.0,
+            ..Default::default()
+        });
+        let mut p = Penalties::resolve(Some(&ctx)).expect("penalty active");
+        for t in [0, 1, 2, 3, 4] {
+            p.observe(t);
+        }
+        let mut logits = vec![0.0f32; 5];
+        p.apply(&mut logits);
+        assert_eq!(logits[0], 0.0, "id 0 left the window");
+        assert_eq!(logits[4], -1.0, "id 4 is in the window once");
+    }
+
+    /// A token repeated past the window size is counted only for the occurrences still inside it.
+    #[test]
+    fn frequency_penalty_counts_only_the_window() {
+        let ctx = RequestCtx::new(RequestSampling {
+            repeat_last_n: 4,
+            frequency_penalty: 1.5,
+            ..Default::default()
+        });
+        let mut p = Penalties::resolve(Some(&ctx)).expect("penalty active");
+        for _ in 0..10 {
+            p.observe(2);
+        }
+        let mut logits = vec![0.0f32; 3];
+        p.apply(&mut logits);
+        assert_eq!(logits[2], -4.0 * 1.5, "4 in-window occurrences, not 10");
+    }
+
+    /// A zero window disables every penalty, as llama.cpp's `penalty_last_n = 0` does.
+    #[test]
+    fn zero_window_disables_all_penalties() {
+        let r = RequestSampling {
+            repeat_last_n: 0,
+            frequency_penalty: 1.1,
+            repeat_penalty: 1.2,
+            ..Default::default()
+        };
+        assert!(!r.penalties_active());
+        assert!(Penalties::resolve(Some(&RequestCtx::new(r))).is_none());
+    }
+
+    /// A zero window still honours `logit_bias`: the bias lands and nothing is recorded, so the
+    /// penalties cannot fire off history a longer window would have kept.
+    #[test]
+    fn zero_window_applies_only_the_logit_bias() {
+        let ctx = RequestCtx::new(RequestSampling {
+            repeat_last_n: 0,
+            presence_penalty: 1.0,
+            frequency_penalty: 1.1,
+            repeat_penalty: 1.2,
+            logit_bias: vec![(1, 2.0)],
+            ..Default::default()
+        });
+        let mut p = Penalties::resolve(Some(&ctx)).expect("a bias still takes the host path");
+        for t in [1, 1, 2, 2, 2] {
+            p.observe(t);
+        }
+        let mut logits = vec![0.0f32; 3];
+        p.apply(&mut logits);
+        assert_eq!(
+            logits[1], 2.0,
+            "the bias alone, with no repeat scale or shift"
+        );
+        assert_eq!(
+            logits[2], 0.0,
+            "an observed id carries nothing at a zero window"
+        );
     }
 
     /// A request's `logit_bias` alone, as `infr serve` builds it.

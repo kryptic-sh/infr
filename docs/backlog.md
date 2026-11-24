@@ -8634,3 +8634,38 @@ as long as `kv.tiers` is the only list, but a second one, or a typo that turns a
 scalar into a table, is reported as a set of unknown keys rather than as the
 wrong shape. The fix is a list of list-valued paths generated beside `all_paths`,
 so the walker can tell "this leaf is a list" from "this path is unknown".
+
+### B241 — the KV store's namespace names geometry, not the weights (2026-11-24)
+
+**Tag:** kv · store · correctness · **Plan:** `docs/plan/18-kv-tiers.md` (P6)
+
+`store_key` (`crates/infr-llama/src/seam/kv_store.rs`) hashes nine `Config`
+fields — layers, width, heads, KV heads, head dim, rope dim, trained context,
+vocabulary and FFN width — and that hash is the namespace every stored block
+lives under (`(key, id)` rows in redb, `infr:kv:{key:016x}` in Redis). Block ids
+hash only the token chain, and a block's meta carries its tokens, the snapshot
+flag and a byte count; the formats blob carries the two KV dtypes. Nothing in
+the store names the weights that produced the rows.
+
+Two GGUF files of one model share that namespace whenever they share the
+geometry — `q4_k_m` and `q8_0` of the same model is the everyday case. A prompt
+that hits a block stored by the other file then restores K/V rows computed by
+different weights, and nothing catches it: the upload lengths fit because the
+geometry matches, and the dtype tag describes the KV format, not the weight
+format. Attention runs one model's keys and values against the other's queries,
+so the output is wrong rather than refused. A persistent `path` makes it a
+restart away, and a multi-model `serve` over a shared Redis makes it immediate.
+
+The fix is to key the namespace on the file's identity: hash `general.name`,
+`general.quantization_version` (or `file_type`) and every tensor's name, dtype
+and shape out of the GGUF header — no tensor data, so it stays a header scan —
+and fold that into `store_key`. That separates quants and renamed fine-tunes,
+and the call site (`ParallelSeam::new` in `crates/infr-llama/src/parallel.rs`)
+already holds the model, so the function takes `&SeamModel` instead of `&Config`.
+Two files with the same name and the same quantizer still collide, so a
+`kv.store_namespace` string mixed into the key is the escape hatch for a Redis
+tier shared by hosts that keep the files at different paths. The test that can
+fail: two caches built with different fingerprints see the same token chain as
+a miss, and one built with the same fingerprint still hits. Until then a
+file-backed tier is only as trustworthy as the assumption that one model ever
+writes it.

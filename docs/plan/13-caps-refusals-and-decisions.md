@@ -53,21 +53,21 @@ Each is independently shippable. Sizes: S, M, L.
 
 Shipped; what it left is backlog B137.
 
-### S2 — KV estimate equals allocation (M)
+### S2 — KV estimate equals allocation — done 2026-11-24
 
-- `seam::kv_bytes_estimate_fmt` becomes the sum of `kv_layer_alloc_bytes` over
-  the layers plus a qwen35 snapshot term (twice the DeltaNet state), so the
-  estimate equals the allocation by construction; the runner already allocates
-  through the same function **[R]**.
-- `kv_row_elems` returns nothing for DeltaNet layers. `kv_floor_alloc_bytes`
-  gains the same snapshot term so the refuse rung agrees.
-- Remove `KV_SLOP_ROWS`; pass the backend's row alignment through the estimate.
-- User-visible: auto-sized qwen35 and qwen35moe contexts grow, roughly fourfold
-  **[I]**, and qwen35moe keeps more experts resident.
-- Tests: a property test over synthetic configs (qwen35, gemma SWA ring, MLA,
-  plain, mixed KV formats) that estimate == sum of allocations; a counting
-  `Backend` wrapper summing `BufferUsage::KvCache` bytes in a CPU run of a
-  synthetic qwen35 model.
+Shipped; what it left is backlog B13. The estimate's inputs still come from
+`ubatch_candidates`, `placement_ring` and `SeamModel::kv_fit_fmts`, which S3 and
+S4 touch: a change there must keep them the values the runner allocates with.
+
+Departs from the slice as planned in one place: `kv_floor_alloc_bytes` does NOT
+gain the snapshot term. The refuse rung's floor is documented, and tested, as
+never refusing a run that would have worked, and the snapshot breaks that: a
+slot allocates it on first use, the decode loop carries on when it is refused,
+and a slot that never snapshots never allocates it. So the floor is what the
+runner's cold init must allocate (`kv_init_allocs`) and the estimate that sizes
+a context is that plus the snapshot (`kv_slot_allocs`); the two functions' docs
+say so. The estimate also rounds each buffer up to the allocator's byte
+alignment (`Backend::kv_alloc_align`), which the plan did not foresee.
 
 ### S3 — ladder order and the cache percentage (S)
 
@@ -82,7 +82,10 @@ Shipped; what it left is backlog B137.
 
 - `INFR_VRAM_LIMIT` (`kernels.vulkan.vram_limit`, size grammar) caps what
   `vram_info` reports, which makes the q8 pin and the post-load refusal (B12)
-  testable here with Qwen3-0.6B.
+  testable here with Qwen3-0.6B. Its first use is S2's missing run: a clamped
+  auto-sized context allocates. Both cached Qwen3.5 files fit their trained
+  context on this machine, so the clamp S2 changed was checked only as
+  arithmetic.
 - Move the default prefill chunk into `PlacementPins::for_caps`; delete
   `DeviceClass`, `DEVICE_CLASS` and `device_class()`; add scopes at the entry
   points that relied on the global. A missed site runs an integrated GPU at the

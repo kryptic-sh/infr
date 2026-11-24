@@ -1406,30 +1406,21 @@ pub(crate) fn generate_dense_backend_bound(
         // DeepSeek2 MLA layers have ONE k_cache (key_length = kv_lora_rank + qk_rope_dim wide) per
         // token; V is an aliased prefix view — no separate v_cache.
         let ubatch = crate::seam::ubatch_rows(ec);
-        let kv_sizes: Vec<(usize, usize)> = (0..c.n_layer)
-            .map(|l| {
-                crate::seam::kv_layer_alloc_bytes(
-                    c,
-                    l,
-                    want_ctx,
-                    kv_ring,
-                    ubatch,
-                    be.kv_row_align(),
-                    k_fmt,
-                    v_fmt,
-                )
-            })
-            .collect();
+        // Every KV-class allocation this init makes, which the guard sees whole: the K/V pairs,
+        // which lead the list and are what the loop below allocates, then a V4 compressed layer's
+        // block caches and rings, one entry each.
+        let guarded: Vec<(usize, usize)> = crate::seam::kv_init_allocs(
+            c,
+            want_ctx,
+            kv_ring,
+            ubatch,
+            be.kv_row_align(),
+            k_fmt,
+            v_fmt,
+        )
+        .collect();
+        let kv_sizes = &guarded[..c.n_layer];
         let room = be.device_alloc_room();
-        // The guard sees every KV-class allocation this init makes: the K/V pairs, then a V4
-        // compressed layer's block caches and rings, one entry each.
-        let guarded: Vec<(usize, usize)> = kv_sizes
-            .iter()
-            .copied()
-            .chain(
-                (0..c.n_layer).flat_map(|l| crate::seam::dsv4_comp_allocs(c, l, want_ctx, k_fmt)),
-            )
-            .collect();
         crate::seam::refuse_unallocatable_kv(
             ec,
             &guarded,
@@ -1440,12 +1431,21 @@ pub(crate) fn generate_dense_backend_bound(
             "after the weights",
             || {
                 let budget = room?.saturating_sub(crate::seam::POST_KV_DEVICE_RESERVE);
-                crate::seam::kv_fit_ctx_in_budget(c, ec, budget, None, &[ubatch], k_fmt, v_fmt)
+                crate::seam::kv_fit_ctx_in_budget(
+                    c,
+                    ec,
+                    budget,
+                    None,
+                    &[ubatch],
+                    crate::seam::KvAlign::of(be),
+                    k_fmt,
+                    v_fmt,
+                )
             },
         )?;
         let mut kbufs: Vec<Box<dyn Buffer>> = Vec::new();
         let mut vbufs: Vec<Box<dyn Buffer>> = Vec::new();
-        for &(k_bytes, v_bytes) in &kv_sizes {
+        for &(k_bytes, v_bytes) in kv_sizes {
             kbufs.push(
                 be.alloc(k_bytes, BufferUsage::KvCache)
                     .map_err(|e| anyhow!("{e}"))?,
@@ -1456,6 +1456,33 @@ pub(crate) fn generate_dense_backend_bound(
             );
         }
         let cbufs = super::weights::alloc_dsv4_comp_bufs(be, c, want_ctx, k_fmt)?;
+        // What the buffers just allocated hold, beside the estimate the context was fitted with.
+        // The two differ by the recurrent-state snapshot, which a slot allocates on first use, and
+        // by the allocator's rounding of each buffer (`KvAlign::bytes`).
+        tracing::debug!(
+            want_ctx,
+            kv_alloc_align = be.kv_alloc_align(),
+            kv_alloc_bytes = kbufs
+                .iter()
+                .chain(&vbufs)
+                .chain(cbufs.iter().flatten())
+                .map(|b| b.len_bytes())
+                .sum::<usize>(),
+            kv_snapshot_bytes = (0..c.n_layer)
+                .filter_map(|l| crate::seam::kv_recurrent_alloc_bytes(c, l))
+                .map(|(k, v)| k + v)
+                .sum::<usize>(),
+            kv_estimate_bytes = crate::seam::kv_bytes_estimate_fmt(
+                c,
+                want_ctx,
+                kv_ring,
+                ubatch,
+                crate::seam::KvAlign::of(be),
+                k_fmt,
+                v_fmt
+            ),
+            "KV cache allocated"
+        );
         // VRAM-first KV overflow (`INFR_KV_OVERFLOW`): now that every per-layer/per-side KV buffer
         // is placed, let the backend log the resident-vs-spilled split once. No-op with the flag off.
         be.kv_overflow_report();
@@ -9438,5 +9465,233 @@ mod tests {
             after, fresh,
             "the turn after a cancelled prefill read ring rows that prefill had recycled"
         );
+    }
+
+    /// Delegates to the CPU backend, summing the bytes of every `KvCache` allocation it is asked
+    /// for.
+    struct CountKv<'a> {
+        cpu: &'a infr_cpu::CpuBackend,
+        kv_bytes: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountKv<'_> {
+        fn count(&self, bytes: usize, usage: infr_core::backend::BufferUsage) {
+            if usage == infr_core::backend::BufferUsage::KvCache {
+                self.kv_bytes
+                    .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
+    impl infr_core::backend::Backend for CountKv<'_> {
+        fn name(&self) -> &str {
+            self.cpu.name()
+        }
+        fn deltanet_strided(&self) -> bool {
+            self.cpu.deltanet_strided()
+        }
+        fn capabilities(&self) -> infr_core::backend::Capabilities {
+            self.cpu.capabilities()
+        }
+        fn kv_row_align(&self) -> usize {
+            self.cpu.kv_row_align()
+        }
+        fn kv_alloc_align(&self) -> usize {
+            self.cpu.kv_alloc_align()
+        }
+        fn alloc(
+            &self,
+            bytes: usize,
+            usage: infr_core::backend::BufferUsage,
+        ) -> infr_core::error::Result<Box<dyn infr_core::backend::Buffer>> {
+            self.count(bytes, usage);
+            self.cpu.alloc(bytes, usage)
+        }
+        fn alloc_uninit(
+            &self,
+            bytes: usize,
+            usage: infr_core::backend::BufferUsage,
+        ) -> infr_core::error::Result<Box<dyn infr_core::backend::Buffer>> {
+            self.count(bytes, usage);
+            self.cpu.alloc_uninit(bytes, usage)
+        }
+        fn upload(
+            &self,
+            dst: &dyn infr_core::backend::Buffer,
+            src: &[u8],
+        ) -> infr_core::error::Result<()> {
+            self.cpu.upload(dst, src)
+        }
+        fn download(
+            &self,
+            src: &dyn infr_core::backend::Buffer,
+            dst: &mut [u8],
+        ) -> infr_core::error::Result<()> {
+            self.cpu.download(src, dst)
+        }
+        fn compile(
+            &self,
+            graph: &infr_core::graph::Graph,
+        ) -> infr_core::error::Result<Box<dyn infr_core::backend::Plan>> {
+            self.cpu.compile(graph)
+        }
+        fn execute(
+            &self,
+            plan: &dyn infr_core::backend::Plan,
+            bindings: &infr_core::backend::Bindings,
+        ) -> infr_core::error::Result<()> {
+            self.cpu.execute(plan, bindings)
+        }
+        fn sync(&self) -> infr_core::error::Result<()> {
+            self.cpu.sync()
+        }
+        fn host_streams(
+            &self,
+            weights: &mut dyn Iterator<Item = &dyn infr_core::backend::Buffer>,
+        ) -> bool {
+            self.cpu.host_streams(weights)
+        }
+    }
+
+    /// Runs each synthetic model once on the CPU behind a [`CountKv`] and hands `check` the
+    /// counting backend, the real CPU backend, the slot the run left and the model's config. Covers
+    /// a model with recurrent and attention layers (qwen35), a short convolution beside a window
+    /// layer (LFM3), a plain attention model and a sliding-window cache ringed below its context
+    /// (gemma3).
+    fn for_each_counted_cpu_run(
+        mut check: impl FnMut(&str, &CountKv<'_>, &infr_cpu::CpuBackend, &mut SeamKv, &Config),
+    ) {
+        let ringed = {
+            let mut ec = EngineConfig::default();
+            ec.device.ubatch = Some(8);
+            ec
+        };
+        let cases: [(&str, SyntheticModel, EngineConfig, usize); 4] = [
+            ("qwen35", qwen35_gguf(true), EngineConfig::default(), 32),
+            ("lfm3", lfm3_gguf(), EngineConfig::default(), 32),
+            (
+                "llama",
+                llama_gguf("llama", None),
+                EngineConfig::default(),
+                64,
+            ),
+            ("gemma3", gemma3_gguf(), ringed, 256),
+        ];
+        for (name, model, ec, ctx) in cases {
+            let (g, cfg) = open_synthetic(&format!("kv-count-{name}"), &model);
+            let cpu = infr_cpu::CpuBackend::new();
+            let be = CountKv {
+                cpu: &cpu,
+                kv_bytes: 0.into(),
+            };
+            let embd = std::sync::OnceLock::new();
+            let mut slot = None;
+            super::generate_dense_backend(
+                &be,
+                &crate::seam::cpu_upload_bind(&cpu),
+                &g,
+                &cfg,
+                &ec,
+                TokenEmbd::new(&embd, &g),
+                None,
+                &Q35_FIRST,
+                1,
+                |_| {},
+                &mut slot,
+                ctx,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("synthetic generation");
+            let kv = slot.as_mut().expect("slot initialized");
+            assert_eq!(kv.max_ctx, ctx, "{name}: the slot holds the asked context");
+            // Only gemma3's chunk is short enough for its ring to hold fewer rows than the context.
+            assert_eq!(
+                kv.window_ring_rows(&be, &cfg)
+                    .is_some_and(|rows| rows < ctx),
+                name == "gemma3",
+                "{name}: a ring shorter than the context"
+            );
+            assert_eq!(
+                cfg.has_recurrent_state(),
+                matches!(name, "qwen35" | "lfm3"),
+                "{name}: recurrent layers"
+            );
+            check(name, &be, &cpu, kv, &cfg);
+        }
+    }
+
+    /// The bytes a slot's KV estimate prices, at the slot's own context, ring, chunk and formats,
+    /// rounded as `cpu` (the real CPU backend, not the wrapper) rounds.
+    fn slot_estimate(kv: &SeamKv, cfg: &Config, cpu: &infr_cpu::CpuBackend) -> usize {
+        crate::seam::kv_bytes_estimate_fmt(
+            cfg,
+            kv.max_ctx,
+            kv.kv_ring,
+            kv.ubatch,
+            crate::seam::KvAlign::of(cpu),
+            kv.k_fmt,
+            kv.v_fmt,
+        ) as usize
+    }
+
+    /// A CPU run's cold init asks its backend for exactly the KV estimate less the recurrent-state
+    /// snapshot, which a CPU decode never takes. The CPU backend rounds its cache neither way,
+    /// which is what lets `cpu_committed_bytes` price it with no backend at hand.
+    #[test]
+    fn cpu_kv_alloc_is_the_estimate_without_the_snapshot() {
+        assert_eq!(
+            crate::seam::KvAlign::of(&infr_cpu::CpuBackend::new()),
+            crate::seam::KvAlign::NONE,
+            "the CPU backend pads no row and rounds no buffer"
+        );
+        for_each_counted_cpu_run(|name, be, cpu, kv, cfg| {
+            let snapshot: usize = (0..cfg.n_layer)
+                .filter_map(|l| cfg.recurrent_state_elems(l))
+                .map(|(k, v)| (k + v) * 4)
+                .sum();
+            assert_eq!(
+                be.kv_bytes.load(std::sync::atomic::Ordering::Relaxed) + snapshot,
+                slot_estimate(kv, cfg, cpu),
+                "{name}: the cold init's KV bytes and the snapshot against the estimate"
+            );
+        });
+    }
+
+    /// The buffers a slot adds later are the ones the estimate already counts: its recurrent-state
+    /// snapshot (taken here by hand, as MTP rollback and the decode loop's prefill boundary do)
+    /// brings the slot's KV bytes to the estimate, and a fork of the slot, snapshot included,
+    /// allocates the estimate again.
+    #[test]
+    fn kv_snapshot_and_fork_allocate_what_the_estimate_counts() {
+        use std::sync::atomic::Ordering::Relaxed;
+        for_each_counted_cpu_run(|name, be, cpu, kv, cfg| {
+            let estimate = slot_estimate(kv, cfg, cpu);
+            let live = be.kv_bytes.load(Relaxed);
+            assert!(live > 0, "{name}: the run allocated no KV cache");
+            kv.mtp_snapshot_delta(be, cfg).expect("snapshot");
+            assert_eq!(
+                be.kv_bytes.load(Relaxed) > live,
+                cfg.has_recurrent_state(),
+                "{name}: the snapshot's own allocation"
+            );
+            assert_eq!(
+                be.kv_bytes.load(Relaxed),
+                estimate,
+                "{name}: the slot's KV bytes, snapshot included, against the estimate"
+            );
+            let mut fork = kv.fork(be, cfg).expect("fork");
+            fork.mtp_snapshot_delta(be, cfg).expect("fork snapshot");
+            assert_eq!(
+                be.kv_bytes.load(Relaxed),
+                2 * estimate,
+                "{name}: a forked slot allocates the estimate again"
+            );
+        });
     }
 }

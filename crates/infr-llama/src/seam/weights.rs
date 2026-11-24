@@ -458,21 +458,24 @@ pub(super) fn snapshot_delta(
     cached_len: usize,
 ) -> AResult<()> {
     if ckpt.is_none() {
-        let layers: Vec<usize> = (0..cfg.n_layer)
-            .filter(|&l| cfg.is_recurrent_layer(l))
+        // The sizes the fit already reserved for the snapshot (`kv_slot_allocs`).
+        let sizes: Vec<(usize, (usize, usize))> = (0..cfg.n_layer)
+            .filter_map(|l| Some((l, crate::seam::kv_recurrent_alloc_bytes(cfg, l)?)))
             .collect();
-        if layers.is_empty() {
+        if sizes.is_empty() {
             return Ok(());
         }
-        let mut ck_k = Vec::with_capacity(layers.len());
-        let mut ck_v = Vec::with_capacity(layers.len());
-        for &l in &layers {
+        let mut layers = Vec::with_capacity(sizes.len());
+        let mut ck_k = Vec::with_capacity(sizes.len());
+        let mut ck_v = Vec::with_capacity(sizes.len());
+        for (l, (k_bytes, v_bytes)) in sizes {
+            layers.push(l);
             ck_k.push(
-                be.alloc(kbufs[l].len_bytes().max(1), BufferUsage::KvCache)
+                be.alloc(k_bytes, BufferUsage::KvCache)
                     .map_err(|e| anyhow!("{e}"))?,
             );
             ck_v.push(
-                be.alloc(vbufs[l].len_bytes().max(1), BufferUsage::KvCache)
+                be.alloc(v_bytes, BufferUsage::KvCache)
                     .map_err(|e| anyhow!("{e}"))?,
             );
         }
@@ -703,46 +706,26 @@ impl SeamKv {
         let mut kbufs: Vec<Box<dyn Buffer>> = Vec::new();
         let mut vbufs: Vec<Box<dyn Buffer>> = Vec::new();
         for l in 0..cfg.n_layer {
-            // Recurrent layers (qwen35 DeltaNet, LFM short convolution): fixed-size state, NOT a
-            // `max_ctx`-scaled KV cache (see the matching alloc in `generate_dense_backend`'s state
-            // init and `Config::recurrent_state_elems`).
-            if let Some((k_elems, v_elems)) = cfg.recurrent_state_elems(l) {
-                kbufs.push(
-                    be.alloc(k_elems * 4, BufferUsage::KvCache)
-                        .map_err(|e| anyhow!("{e}"))?,
-                );
-                vbufs.push(
-                    be.alloc(v_elems * 4, BufferUsage::KvCache)
-                        .map_err(|e| anyhow!("{e}"))?,
-                );
-                continue;
-            }
-            // Same per-layer geometry as the original allocation — same widths from the same
-            // helper (`crate::seam::kv_row_elems`, MLA's compressed K row and placeholder V side
-            // included), and SWA layers ring at window+ubatch rows when this session was
-            // ring-sized (see `crate::seam::kv_rows_at`).
-            let (k_row, v_row) = crate::seam::kv_row_elems(cfg, l);
-            let rows_l = crate::seam::kv_rows_at(
+            // The same bytes the original allocation asked for, from the same function: a
+            // recurrent layer's fixed-size state, else this session's rows (ringed when it was
+            // ring-sized) of the layer's per-side width.
+            let (k_bytes, v_bytes) = crate::seam::kv_layer_alloc_bytes(
                 cfg,
                 l,
                 self.max_ctx,
                 self.kv_ring,
                 self.ubatch,
                 be.kv_row_align(),
+                self.k_fmt,
+                self.v_fmt,
             );
             kbufs.push(
-                be.alloc(
-                    crate::seam::kv_side_bytes(self.k_fmt, rows_l * k_row),
-                    BufferUsage::KvCache,
-                )
-                .map_err(|e| anyhow!("{e}"))?,
+                be.alloc(k_bytes, BufferUsage::KvCache)
+                    .map_err(|e| anyhow!("{e}"))?,
             );
             vbufs.push(
-                be.alloc(
-                    crate::seam::kv_side_bytes(self.v_fmt, rows_l * v_row),
-                    BufferUsage::KvCache,
-                )
-                .map_err(|e| anyhow!("{e}"))?,
+                be.alloc(v_bytes, BufferUsage::KvCache)
+                    .map_err(|e| anyhow!("{e}"))?,
             );
         }
         let cbufs = alloc_dsv4_comp_bufs(be, cfg, self.max_ctx, self.k_fmt)?;

@@ -411,6 +411,9 @@ struct VulkanShared {
     /// single alloc of a whole multi-GiB model is impossible. Falls back to a conservative 1 GiB
     /// (the Vulkan-guaranteed floor) if the device reports 0.
     max_mem_alloc_size: u64,
+    /// [`Backend::kv_alloc_align`]: the memory-requirements alignment of a KV cache buffer, never
+    /// below the rounding `fill_span` applies to every created buffer.
+    kv_alloc_align: usize,
     /// `maxPushConstantsSize` and the compute workgroup limits — every kernel's push block and
     /// `LocalSize` are checked against THESE rather than against the floors Vulkan merely
     /// guarantees (see `ops::try_make_compute_kernel`, which refuses an oversize kernel by name
@@ -992,6 +995,10 @@ fn kv_overflow_vram_cap(cfg: &infr_core::config::Config) -> Option<u64> {
 /// where "full" is. Absorbs allocation slop (alignment, gpu-allocator block rounding) and
 /// driver-internal allocations (descriptor pools, pipeline/shader memory, command buffers).
 const GUARD_HEADROOM: u64 = 256 * 1024 * 1024;
+
+/// Smallest buffer [`VulkanBackend::make_buf_ex`] gives its own dedicated `VkDeviceMemory`; a
+/// smaller one is sub-allocated from one of gpu-allocator's shared blocks.
+const DEDICATED_MIN: u64 = 32 * 1024 * 1024;
 
 /// Smallest device-local allocation the VRAM budget guard checks: anything below it
 /// is let through unasked. Public so a caller proving that an allocation set MUST be refused (the
@@ -2981,6 +2988,25 @@ impl VulkanBackend {
             );
         }
 
+        // A KV buffer's memory requirements, read off probes created with the KV usage
+        // (`make_buf_ex(.., device_address = true)`): one pooled-size and one at the dedicated
+        // threshold, since Vulkan lets the alignment depend on the size. A buffer object binds no
+        // memory, so the probes cost nothing on the device. gpu-allocator commits
+        // `requirements.size` for a dedicated buffer and places a pooled one at an
+        // `alignment`-aligned offset.
+        let mut kv_alloc_align = fill_span(1) as usize;
+        for size in [fill_span(1), DEDICATED_MIN] {
+            let ci = vk::BufferCreateInfo::default()
+                .size(size)
+                .usage(BUFFER_USAGE | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE);
+            let probe = unsafe { device.create_buffer(&ci, None) }
+                .map_err(|e| be(format!("create_buffer(KV alignment probe, {size} B): {e}")))?;
+            let req = unsafe { device.get_buffer_memory_requirements(probe) };
+            unsafe { device.destroy_buffer(probe, None) };
+            kv_alloc_align = kv_alloc_align.max(req.alignment as usize);
+        }
+
         // ── gpu-allocator ──────────────────────────────────────────────────────
         let allocator = Allocator::new(&AllocatorCreateDesc {
             instance: instance.clone(),
@@ -3063,6 +3089,7 @@ impl VulkanBackend {
                 caps,
                 has_mem_budget,
                 max_mem_alloc_size,
+                kv_alloc_align,
                 kernel_limits: crate::caps::KernelLimits::of(&props.limits),
                 rte_f16: AtomicBool::new(false),
                 wave64,
@@ -4162,7 +4189,6 @@ impl VulkanBackend {
         // they sub-allocate into gpu-allocator's 256MB blocks and waste the remainder (e.g. 3×67MB
         // KV buffers per block leave ~55MB unused — ~0.7GB across a long-context KV cache). Small/
         // transient buffers stay sub-allocated (cheap, pooled).
-        const DEDICATED_MIN: u64 = 32 * 1024 * 1024;
         let scheme = if force_dedicated || requirements.size >= DEDICATED_MIN {
             AllocationScheme::DedicatedBuffer(buffer)
         } else {
@@ -4711,6 +4737,10 @@ impl Backend for VulkanBackend {
 
     fn capabilities(&self) -> Capabilities {
         self.shared.caps.clone()
+    }
+
+    fn kv_alloc_align(&self) -> usize {
+        self.shared.kv_alloc_align
     }
 
     fn weight_progress(

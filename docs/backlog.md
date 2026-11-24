@@ -323,9 +323,10 @@ window between the weight upload and the KV allocation, against
    requires.** gemma-4-31B advertises 14 592 (the interim-margin build said 15
    872, and 19 021 was measured to miss by 2 MiB). The gap is
    `POST_KV_DEVICE_RESERVE` + the allocator's own 256 MiB `GUARD_HEADROOM` + the
-   reserve's pad + `KV_SLOP_ROWS` (B13). Reclaiming it means measuring the
-   driver-side growth on more than one GPU first — 181 MiB is one sample, on one
-   RADV version.
+   reserve's pad. Reclaiming it means measuring the driver-side growth on more
+   than one GPU first — 181 MiB is one sample, on one RADV version. The 14 592
+   was measured while every estimate still added 64 rows per layer; those rows
+   are gone (B13), so the figure is a little higher now and was not re-measured.
 4. **Every measurement here is from one 7900 XTX on RADV.** The arena-tail
    percentage, the driver-side growth and the activation peaks are all
    Mesa/RADV/discrete numbers. An Intel or NVIDIA driver could report its budget
@@ -396,23 +397,139 @@ refused in under a second with the sizes.
   context at all" may refuse, or every ordinary long-context model breaks on a
   24 GiB card.
 
-### B13 — the `+64` rows in every KV footprint estimate is slop, not padding
+### B13 — the KV estimate is the allocation: what plan 13 S2 left (2026-11-24)
 
-**Tag:** verified 2026-08-02 · **Blocked on:** nothing; left alone deliberately
+**Tag:** vram fit · kv · qwen35
 
-`seam::kv_bytes_estimate_fmt` adds `KV_SLOP_ROWS = 64` rows per layer before
-sizing each side's buffer, and the comment it inherited described this as
-mirroring a pad `SeamKv` allegedly applies. It does not: both allocation sites
-(`generate_dense_backend`'s KV loop and `SeamKv::fork`) allocate exactly
-`kv_rows(..) * n_kv * head_dim` elements. The 64 rows are a deliberate
-conservative margin and nothing more — the doc now says so.
+`seam::kv_bytes_estimate_fmt` is now the sum of `seam::kv_slot_allocs`, each
+buffer rounded up to the backend's `Backend::kv_alloc_align` (carried with
+`kv_row_align` in `seam::KvAlign`): each layer's two buffers from
+`kv_layer_alloc_bytes` (which the runner's cold init and `SeamKv::fork` allocate
+through), a DeepSeek V4 layer's compressed buffers, and the recurrent-state
+snapshot (`kv_recurrent_alloc_bytes`, which `snapshot_delta` allocates through).
+The refuse rung's floor, `kv_floor_alloc_bytes`, lists `kv_init_allocs`: the
+same without the snapshot. The 64 rows per layer every estimate used to add are
+gone. Held by `kv_estimate_is_the_sum_of_the_slot_allocations` (seeded draws
+over the arch families, row and byte alignments, per-side formats),
+`kv_sizes_price_each_side_in_its_own_format` (hand-computed sizes, the one that
+catches a K/V format swap),
+`kv_floor_is_the_cold_init_and_the_estimate_adds_the_snapshot`,
+`kv_floor_never_exceeds_a_cache_the_runner_could_allocate` (every family), and
+two tests that count `KvCache` bytes through a wrapper backend under CPU runs of
+the synthetic qwen35, LFM3, llama and gemma3 models:
+`cpu_kv_alloc_is_the_estimate_without_the_snapshot` and
+`kv_snapshot_and_fork_allocate_what_the_estimate_counts`. Left:
 
-Left in because every placement estimate shares this helper and removing it
-would loosen all of them at once. That argument has weakened since: the window a
-session actually gets is now re-decided against the device's measured free
-memory (B8), so these rows are no longer a cushion against an over-optimistic
-plan — they are context the fit hands back for nothing. Removing them is worth a
-measurement now, not just a revisit.
+- **The refuse rung leaves the snapshot out, against plan 13 S2's text.** The
+  plan had `kv_floor_alloc_bytes` gain the snapshot term. It did not: the floor
+  is documented and tested as never refusing a run that would have worked, and
+  the snapshot is allocated on first use, the decode loop survives its refusal
+  (B131), and a slot that never snapshots never allocates it. So an explicit
+  `--ctx` that fills the device is not refused over it, and the MTP path can
+  still fail a request on it. The guard (and so the floor) counts only buffers
+  of at least `infr_vulkan::VRAM_GUARD_MIN_ALLOC`: on Qwen3.5-0.8B each DeltaNet
+  layer's S state is exactly 1 MiB and counts, and only its 73 728-byte
+  convolution state is skipped (18 layers x (73 728 + 1 048 576) = 20 201 472
+  bytes, the `kv_snapshot_bytes` below).
+- **Callers can still pass the estimate something the runner will not
+  allocate.** The function is exact for the ring flag, chunk height and formats
+  it is given; three callers derive those apart from the runner. The MoE arm of
+  `vulkan_moe_binder` prices `kv_ring_wanted` and `kv_auto_q8()` (f16 or q8_0)
+  and so ignores an explicit `INFR_KV_TYPE_K` / `INFR_KV_TYPE_V`.
+  `SeamModel::kv_fit_fmts` prices a requested format the runner may gate back to
+  f16. `cpu_committed_bytes` prices f16 with no ring whatever the run picks.
+  Each is an estimate of the inputs, not of the bytes; none was changed.
+- **Extra slots are divided, not priced.** `SeamModel::vulkan_slot_ctx` gives
+  each of `n_slots` a context of one slot's fit divided by `n_slots`, so every
+  term that does not scale with the context is counted once for all of them:
+  - A recurrent layer's state and its snapshot. On Qwen3.5-0.8B, 2 x 20 201 472
+    = 40 402 944 bytes (38.5 MiB) per extra slot.
+  - The sliding-window rings, the largest. With the ring on, each slot's window
+    layers hold `kv_rows_at`'s `window + chunk` rows (rounded to 64) whatever
+    its context. Arithmetic from gemma-3-1b-it's GGUF metadata, not a run: 26
+    layers with a period of 6 leave 22 window layers, window 512 and the
+    discrete 1024-row chunk give 1536 rows, and a row of K and V at f16 is 2 x 1
+    KV head x 256 x 2 bytes = 1024, so 22 x 1536 x 1024 = 34 603 008 bytes (33.0
+    MiB) per extra slot.
+  - A V4 layer's compressor rings.
+- **What the device commits beyond the estimate.** Read in
+  `infr_vulkan::VulkanBackend::make_buf_ex` and gpu-allocator 0.27's
+  `MemoryType::allocate`. A KV buffer is created at `fill_span(bytes)` and the
+  guard (`check_vram_budget`) checks its `requirements.size`. The backend reads
+  the alignment at init off two probe buffers with the KV usage, one tiny and
+  one of `DEDICATED_MIN` bytes, and takes the larger. RADV (Mesa 26.3.1, read on
+  the Raphael iGPU; the RX 7900 XTX was not probed) reports alignment 16 and a
+  size rounded up to it, which the estimate now prices. A buffer of at least
+  `DEDICATED_MIN` (32 MiB) gets a dedicated `vkAllocateMemory` of exactly
+  `requirements.size`. A smaller one is sub-allocated from gpu-allocator's
+  shared device-local blocks (`AllocationSizes::default`, which infr passes:
+  `device_memblock_size` 256 MiB): when no open block has room, the allocator
+  commits a whole new block, which the guard did not check and the live budget
+  then shows. Small KV buffers are common: recurrent states, snapshots, short
+  window rings, and — where the fit actually binds — a clamped context. On
+  Qwen3.5-0.8B each attention side is ctx x 2 KV heads x 256 x 2 bytes = ctx x
+  1024 bytes, so below a 32 768-token context every attention buffer is pooled,
+  and a clamped run on a small device can put its whole cache in shared blocks.
+  Worst case: about one `device_memblock_size` block beyond the estimate (the
+  last block's unused tail), plus per extra block the tail a buffer that did not
+  fit left behind. What covers it today: `check_vram_budget`'s doc says
+  `GUARD_HEADROOM` (256 MiB) "absorbs allocation slop (alignment, gpu-allocator
+  block rounding)", but the fit budgets against `alloc_room`, the same ceiling
+  the guard enforces, so that headroom keeps the device from over-committing
+  without stopping the guard refusing a later allocation the fit counted on.
+  Against that, the cover is the slack `POST_KV_DEVICE_RESERVE` (256 MiB) keeps
+  over the 181 MiB of driver growth it was sized on, 75 MiB on that one device.
+  **Recommended, as its own slice (not done here):** give every `KvCache` buffer
+  its own dedicated allocation. That makes the commitment exact up to page
+  rounding, and KV buffers are allocated only at init, at a fork and at the
+  first snapshot, never per token. Costs to check: the allocation count per slot
+  against `maxMemoryAllocationCount` (RADV reports 4 294 967 295 on both GPUs
+  here; Vulkan only guarantees 4096), where V4 is the case to check — the
+  V4-Flash geometry is 2 x 43 + 20 x 3 + 21 x 6 = 272 KV allocations per slot,
+  multiplied by the slot count; and each tiny buffer (the 4-byte placeholders,
+  small states) would take at least a page, so the alignment priced would have
+  to become the page size. The alternatives are pricing one device block in the
+  reserve whenever a KV buffer falls under `DEDICATED_MIN`, or leaving it.
+  Whether the kernel rounds a dedicated allocation further (to its page size)
+  was not read or measured.
+- **Wrappers that report no rounding make no budget decision with it.** The
+  multi-device wrappers (`PipelineBackend`, `TensorParallelBackend`,
+  `ExpertParallelBackend`) forward neither `kv_row_align` nor `kv_alloc_align`.
+  None of them implements `Backend::device_alloc_room` either, whose default is
+  `None`: `reclamp_ctx_to_live_room` then returns the context at once, and the
+  runner's post-load `refuse_unallocatable_kv` returns `Ok` without calling its
+  fit closure (`kv_guarded_bytes` is `None` without a room). So through those
+  wrappers only the `KV cache allocated` debug line uses the default alignment;
+  no budget decision does. Read in code. Metal keeps the default 1 byte; what a
+  Metal shared buffer commits was not checked.
+- **A split model and KV allocations past two per layer.**
+  `PipelineBackend::next_kv_device` places `KvCache` allocations by pair index
+  and, on more than one device, refuses any past `2 x n_layer`
+  (`kv_past_the_last_layer_is_refused_across_devices`). Neither a recurrent
+  snapshot nor a V4 compressed buffer reaches it today: `dense_multi_gpu_guard`
+  refuses recurrent-state and MoE models (V4 is MoE) under `INFR_PIPELINE` and
+  `INFR_TENSOR_PARALLEL` before anything is allocated. If those guards were
+  lifted, V4's cold init would fail on its first compressed buffer
+  (`alloc_dsv4_comp_bufs` runs after the pair loop), and a snapshot would be
+  refused on first use: the decode loop carries on without it, MTP fails the
+  request. Read in code, not run.
+- **Not observed in a real run:** a clamped auto-sized context. Both cached
+  Qwen3.5 files fit their trained 262 144 tokens on the integrated GPU, so the
+  clamp and the live re-clamp were exercised only as arithmetic
+  (`kv_fit_ctx_for` on the files' own configs at stated budgets). Plan 13 S4's
+  VRAM limit is where it gets its first run. No qwen35moe file is cached, so its
+  expert budget was not run either. gemma-4-31B's documented context (B8) was
+  measured with the 64 rows and not re-measured.
+- The MTP head's own K and V cache stays outside the fit (B191).
+
+A cold init logs `KV cache allocated` at debug level with the bytes its buffers
+hold, the snapshot's bytes and the estimate. On the integrated GPU (whose
+`kv_alloc_align` reads 16), Qwen3.5-0.8B Q4_K_M at its default context, the same
+figures before and after the byte rounding, so every one of its KV buffers is a
+multiple of 16 bytes: `want_ctx=262144`, `kv_alloc_bytes=3241426944`,
+`kv_snapshot_bytes=20201472`, `kv_estimate_bytes=3261628416`; with
+`INFR_KV_OVERFLOW=1` the backend's own tally read "all 48 KV buffers (3.02 GiB)
+fit in VRAM".
 
 ### B14 — verification gaps from the 2026-08-02 decode-attention and KV-fit slices
 
@@ -1737,10 +1854,11 @@ only its routed experts (`CpuBackend::moe_banks`). Left:
 - **`cpu_committed_bytes` prices the KV cache at f16**, the CPU default; a
   user-named f32 KV is under-priced. It goes through `kv_bytes_estimate`, the
   function the GPU fit uses, so V4's compressed caches are priced at what the
-  session allocates for them (`dsv4_comp_bytes`), and the raw cache is priced at
-  the whole context without the sliding-window ring the CPU uses, which
-  over-prices it (conservative). The 1 GiB activation reserve is a reserve, not
-  a measurement per model.
+  session allocates for them (`dsv4_comp_allocs`, each buffer
+  `Dsv4CompBuf::bytes`), and the raw cache is priced at the whole context
+  without the sliding-window ring the CPU uses, which over-prices it
+  (conservative). The 1 GiB activation reserve is a reserve, not a measurement
+  per model.
 - **A V4 prompt of several chunks now prefills layer-major and reads each routed
   expert once (2026-11-17); what that left.** `docs/deepseek.md` § "Layer-major
   prefill on the CPU" has the design, the tests and the runs. On the real file a
@@ -3809,21 +3927,12 @@ it. When a qwen35 chain stops early, the next turn restores a snapshot of the
 state taken at the previous turn's prefill boundary and prefills from there
 instead of from zero. Left:
 
-- **The snapshot and the fit ladder — needs a decision.** The snapshot is a
-  second copy of every DeltaNet layer's state, per slot:
-  `4 × ((ssm_d_conv − 1) × q35_conv_channels + q35_num_v_heads × q35_head_k_dim × q35_head_v_dim)`
-  bytes per layer, about 19.3 MiB for Qwen3.5-0.8B. Re-read 2026-11-12: the fit
-  does not count it, but `kv_bytes_estimate_fmt` already prices every DeltaNet
-  layer as a full per-token KV cache, which exceeds live state plus snapshot
-  above roughly 1.1k tokens at f16 — so an auto-sized context leaves room, and
-  adding a snapshot term there would count it twice. The gap is an explicit
-  `--ctx` that fills the device: the snapshot can then be refused, which is
-  handled (one warning, no snapshot on that slot, the next mid-chain turn
-  re-prefills from zero). The real fix is to price DeltaNet layers by
-  `kv_layer_alloc_bytes` plus the snapshot (when a chain or MTP can run), which
-  makes auto-sized qwen35 contexts LARGER — a visible change. Separately, the
-  MTP path's snapshot failure still fails the request (`?`) where the decode
-  loop degrades.
+- **The MTP path's snapshot failure still fails the request** (`?`) where the
+  decode loop degrades: one warning, no snapshot on that slot, and the next
+  mid-chain turn re-prefills from zero. The fit counts the snapshot (B13), so an
+  auto-sized context leaves room for it. The refuse rung does not, since the
+  decode loop survives its refusal, so an explicit `--ctx` that fills the device
+  can still have it refused.
 - **The MTP rollback can leave a half-restored state behind.**
   `mtp_restore_delta` (in `seam/weights.rs`, called from the MTP loop in
   `mtp/mod.rs` after a partial accept) copies the snapshot layer by layer and
@@ -4310,12 +4419,6 @@ of implemented:
 
 Left, confirmed by reading and not changed:
 
-- **qwen35 KV estimate.** `kv_bytes_estimate_fmt` prices every DeltaNet layer as
-  a full attention cache (`kv_row_elems` has no qwen35 branch) while
-  `kv_layer_alloc_bytes` allocates the fixed conv / S state — so the default
-  context clamps to a fraction of what fits and `moe_expert_budget`
-  over-reserves. Same decision as B131's snapshot bullet: fixing the estimate
-  makes qwen35 contexts much larger.
 - **`dsv4_plan.rs` is dead code and diverges from the reference** (no HCA dummy
   block when none completes; `n_kv` not padded to a multiple of 256). Part of
   the V4 compressed-tier feature.

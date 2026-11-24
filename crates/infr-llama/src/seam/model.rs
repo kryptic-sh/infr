@@ -777,6 +777,7 @@ impl SeamModel {
                 want,
                 crate::seam::kv_ring_wanted(&self.cfg, &self.ecfg),
                 crate::seam::ubatch_rows(&self.ecfg),
+                crate::seam::KvAlign::of(vk),
                 k_fmt,
                 v_fmt,
             );
@@ -866,8 +867,15 @@ impl SeamModel {
         n_slots: usize,
     ) -> Result<()> {
         let (k_fmt, v_fmt) = self.kv_fit_fmts(crate::seam::kv_auto_q8());
-        let sizes =
-            crate::seam::kv_floor_alloc_bytes(&self.cfg, &self.ecfg, want, n_slots, k_fmt, v_fmt);
+        let sizes = crate::seam::kv_floor_alloc_bytes(
+            &self.cfg,
+            &self.ecfg,
+            want,
+            n_slots,
+            infr_core::backend::Backend::kv_row_align(vk),
+            k_fmt,
+            v_fmt,
+        );
         crate::seam::refuse_unallocatable_kv(
             &self.ecfg,
             &sizes,
@@ -916,7 +924,15 @@ impl SeamModel {
         // that the rest of this math is exact rather than 5%-shy — that overhang landed as a
         // mid-prefill alloc failure. The placement sweeps derive from the same function, so the
         // context this validates is one placement will actually take (`seam`'s drift tests).
-        crate::seam::kv_fit_ctx_for(&self.cfg, &self.ecfg, fp.total(), &vram, k_fmt, v_fmt)
+        crate::seam::kv_fit_ctx_for(
+            &self.cfg,
+            &self.ecfg,
+            fp.total(),
+            &vram,
+            crate::seam::KvAlign::of(vk),
+            k_fmt,
+            v_fmt,
+        )
     }
 
     /// The per-side KV dtypes a fit/footprint estimate must price: the user's explicit

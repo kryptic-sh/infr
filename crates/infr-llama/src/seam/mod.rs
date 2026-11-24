@@ -255,7 +255,9 @@ fn exps_layer(name: &str) -> Option<usize> {
 fn cpu_committed_bytes(ec: &EngineConfig, g: &Gguf, cfg: &Config) -> u64 {
     let ctx = crate::chat::cfg_ctx(ec, cfg.n_ctx_train)
         .unwrap_or_else(|| cfg.n_ctx_train.min(CPU_BUDGET_CTX));
-    let kv = kv_bytes_estimate(cfg, ctx, false, 1, false);
+    // No backend exists when the arena is budgeted. The CPU backend rounds its cache neither way,
+    // which `cpu_kv_alloc_is_the_estimate_without_the_snapshot` checks on `CpuBackend` itself.
+    let kv = kv_bytes_estimate(cfg, ctx, false, 1, KvAlign::NONE, false);
     let small: u64 = g
         .tensors()
         .iter()
@@ -1458,9 +1460,10 @@ pub(crate) fn kv_v_fmt(cfg: &Config, k_fmt: DType, v_fmt: DType) -> DType {
 /// sliding-window layer, so `kv_rows_at` returns the whole context — and why the allocation asserts it
 /// (see `generate_dense_backend`'s KV loop).
 ///
-/// Recurrent-state layers (qwen35 DeltaNet, LFM short convolution) have no per-token cache to
-/// size; every caller branches to their fixed state ([`Config::recurrent_state_elems`]) before
-/// reaching here.
+/// Recurrent-state layers (qwen35 DeltaNet, LFM short convolution) cache nothing per token, so
+/// both counts are 0: their two buffers hold a fixed-size state instead
+/// ([`Config::recurrent_state_elems`]), which the allocation and the graph declaration size
+/// before they would read a row width.
 ///
 /// **deepseek4 (V4) caches ONE `head_dim`-wide MQA row per token and has no V cache**: its raw
 /// attention is `build_attn_mha(q, k_all, k_all, …)`, so K and V are the same rows. The emit writes
@@ -1476,6 +1479,9 @@ pub(crate) fn kv_v_fmt(cfg: &Config, k_fmt: DType, v_fmt: DType) -> DType {
 pub(crate) fn kv_row_elems(cfg: &Config, l: usize) -> (usize, usize) {
     if cfg.deepseek2 {
         return (cfg.kv_lora_rank + cfg.qk_rope_dim, cfg.indexer_head_size);
+    }
+    if cfg.is_recurrent_layer(l) {
+        return (0, 0);
     }
     if cfg.deepseek4 {
         // Read straight off `head_dim` rather than through `layer_head_dim`/`layer_n_kv`: those
@@ -1568,14 +1574,6 @@ pub(crate) fn dsv4_comp_bufs(
         .concat(),
         _ => unreachable!("Config::from_gguf accepts compress ratios 0, 4 and 128 only"),
     }
-}
-
-/// Bytes all of layer `l`'s [`dsv4_comp_bufs`] allocate.
-pub(crate) fn dsv4_comp_bytes(cfg: &Config, l: usize, want_ctx: usize, k_fmt: DType) -> usize {
-    dsv4_comp_bufs(cfg, l, want_ctx, k_fmt)
-        .iter()
-        .map(Dsv4CompBuf::bytes)
-        .sum()
 }
 
 /// Elements a KV side that the arch does NOT cache still allocates: MLA's V and deepseek4's V,
@@ -1708,9 +1706,7 @@ pub(crate) fn mla_kv_fmt(
 ///
 /// `row_align` is the backend's `Backend::kv_row_align`: the capacity is rounded up to it, so a
 /// backend whose attention reads whole KV blocks finds every row it reads allocated. The extra
-/// rows are capacity only (the session's context stays `want_ctx`). Pre-load estimates, which have
-/// no backend yet, pass `1`: [`KV_SLOP_ROWS`] covers the padding in the fit estimate, and the
-/// floor stays a floor without it.
+/// rows are capacity only (the session's context stays `want_ctx`).
 pub(crate) fn kv_rows_at(
     cfg: &Config,
     l: usize,
@@ -1743,75 +1739,110 @@ pub fn window_ring_rows(
         .min()
 }
 
-/// KV-cache footprint ESTIMATE summed over all layers at chunk height `ubatch` and side format:
-/// `q8` prices BOTH sides Q8_0 (34 B / 32-elem block, `next_multiple_of(4)`, mirroring
-/// [`kv_fmt_bytes`]), else f16 (2 B/elem); +64 rows/layer slop. The ONE pricing helper the dense
-/// placement sweep AND the MoE expert-placement budget share, so both reserve exactly the cache the
-/// runner will allocate — including a pinned auto-q8 cache. (The MoE path used to hard-code f16
-/// `*2*2` regardless, over-reserving ~2× under auto-q8 and forcing avoidable expert paging.)
+/// How the backend a session runs on rounds its KV cache: every layer's row capacity up to `rows`
+/// (`Backend::kv_row_align`, see [`kv_rows_at`]) and every buffer's committed memory up to `bytes`
+/// (`Backend::kv_alloc_align`). The footprint estimates take both; the allocation itself asks for
+/// the padded rows and leaves the byte rounding to the allocator.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct KvAlign {
+    pub(crate) rows: usize,
+    pub(crate) bytes: usize,
+}
+
+impl KvAlign {
+    /// No rounding at all: the CPU backend's, and what a sizing decision without a backend prices.
+    pub(crate) const NONE: KvAlign = KvAlign { rows: 1, bytes: 1 };
+
+    /// The rounding `be` applies.
+    pub(crate) fn of(be: &(impl Backend + ?Sized)) -> KvAlign {
+        KvAlign {
+            rows: be.kv_row_align(),
+            bytes: be.kv_alloc_align(),
+        }
+    }
+}
+
+/// [`kv_bytes_estimate_fmt`] with one format for both sides: `q8` prices them Q8_0, else f16. The
+/// pricing helper the MoE expert-placement budget and the CPU arena budget read, so both reserve
+/// the cache the runner will allocate, a pinned auto-q8 cache included.
 pub(crate) fn kv_bytes_estimate(
     cfg: &Config,
     want_ctx: usize,
     ring: bool,
     ubatch: usize,
+    align: KvAlign,
     q8: bool,
 ) -> u64 {
     let side = if q8 { DType::Q8_0 } else { DType::F16 };
-    kv_bytes_estimate_fmt(cfg, want_ctx, ring, ubatch, side, side)
+    kv_bytes_estimate_fmt(cfg, want_ctx, ring, ubatch, align, side, side)
 }
 
-/// Rows of headroom every KV footprint estimate adds PER LAYER on top of the context's own rows.
+/// Bytes of device memory one session slot's KV cache takes: every buffer of [`kv_slot_allocs`],
+/// each rounded up to the allocator's `align.bytes`, so the figure every fit and placement decision
+/// compares against a budget is the allocation itself and not a model of it. `align` is the
+/// [`KvAlign`] of the backend the session will run on.
 ///
-/// The runner allocates exactly `kv_rows_at(..) * kv_row_elems(..)` elements per side (see
-/// `generate_dense_backend`'s KV loop and `SeamKv::fork`) — this is deliberate slop, not a
-/// pad the allocation actually contains, so every estimate that uses it is conservative by a
-/// bounded, layer-proportional amount rather than by an unexplained percentage.
-pub(crate) const KV_SLOP_ROWS: usize = 64;
-
-/// [`kv_bytes_estimate`] with the two sides priced INDEPENDENTLY. `INFR_KV_TYPE_K` and
-/// `INFR_KV_TYPE_V` are separate knobs and the runner allocates each side in its own dtype, so
-/// the context-fit math — which must compare against the REAL allocation size — cannot go through
-/// the single-`q8` flavor above.
+/// The recurrent-state snapshot is in it although a slot allocates that on first use: a context
+/// sized to fill the device has to leave room for it. That is where this differs from the refuse
+/// rung's floor ([`kv_floor_alloc_bytes`]), which lists only what the runner's init allocates.
+///
+/// What the device commits beyond the rounded buffers is not here: on Vulkan a buffer below
+/// `make_buf_ex`'s dedicated threshold is sub-allocated from gpu-allocator's shared blocks and can
+/// open a whole new one, and the driver may round a dedicated allocation further
+/// (docs/backlog.md B13).
 pub(crate) fn kv_bytes_estimate_fmt(
     cfg: &Config,
     want_ctx: usize,
     ring: bool,
     ubatch: usize,
+    align: KvAlign,
     k_fmt: DType,
     v_fmt: DType,
 ) -> u64 {
-    (0..cfg.n_layer)
-        .map(|l| {
-            // A recurrent layer's state is fixed-size f32 whatever the context, and is priced
-            // twice: the live state and the one snapshot of it a slot can hold
-            // (`SeamKv::mtp_delta_ckpt`, which MTP rollback and the decode loop's prefill-boundary
-            // snapshot share). MTP fails a request whose snapshot cannot be allocated, so a
-            // context fitted to fill the device must leave room for it.
-            if let Some((k_elems, v_elems)) = cfg.recurrent_state_elems(l) {
-                return (2 * (k_elems + v_elems) * 4) as u64;
-            }
-            let rows = kv_rows_at(cfg, l, want_ctx, ring, ubatch, 1) + KV_SLOP_ROWS;
-            // Per-side widths, NOT one shared width: MLA's K row is `kv_lora_rank + qk_rope_dim`
-            // and it has no V side (see `kv_row_elems`).
-            let (k_row, v_row) = kv_row_elems(cfg, l);
-            // A V4 compressed layer's block caches and rings, priced at exactly what the session
-            // allocates for them (`dsv4_comp_bufs`).
-            kv_pair_bytes(k_row * rows, v_row * rows, k_fmt, v_fmt)
-                + dsv4_comp_bytes(cfg, l, want_ctx, k_fmt) as u64
-        })
+    let committed = |bytes: usize| bytes.next_multiple_of(align.bytes) as u64;
+    kv_slot_allocs(cfg, want_ctx, ring, ubatch, align.rows, k_fmt, v_fmt)
+        .map(|(a, b)| committed(a) + committed(b))
         .sum()
 }
 
-/// K+V byte footprint for ONE layer at `k_elems`/`v_elems` per-side elements, each side in its own
-/// dtype. The pure per-layer core of [`kv_bytes_estimate_fmt`].
+/// The `BufferUsage::KvCache` allocations the runner's cold init makes for one slot, in bytes, in
+/// the `(bytes, bytes)` form the KV guard reads ([`refuse_unallocatable_kv`]), in the order the
+/// cold init makes them:
 ///
-/// The two sides are counted SEPARATELY because they are not always the same width: an MLA layer
-/// caches a wide K row and no V at all, so a single `elems` argument (what this took while three of
-/// the five geometry sites had drifted) cannot express it.
-fn kv_pair_bytes(k_elems: usize, v_elems: usize, k_fmt: DType, v_fmt: DType) -> u64 {
-    // Priced through the SAME sizer the runner allocates with, so "mirrors `kv_fmt_bytes`" is
-    // now a call rather than a comment.
-    (kv_fmt_bytes(k_fmt, k_elems) + kv_fmt_bytes(v_fmt, v_elems)) as u64
+/// - first `cfg.n_layer` entries, layer by layer: its two cache buffers
+///   ([`kv_layer_alloc_bytes`]), which `SeamKv::fork` also allocates through;
+/// - then a DeepSeek V4 compressed layer's block caches and rings ([`dsv4_comp_allocs`]), layer by
+///   layer.
+///
+/// The cold init allocates its K/V pairs from the leading `cfg.n_layer` entries of this list.
+pub(crate) fn kv_init_allocs(
+    cfg: &Config,
+    want_ctx: usize,
+    ring: bool,
+    ubatch: usize,
+    row_align: usize,
+    k_fmt: DType,
+    v_fmt: DType,
+) -> impl Iterator<Item = (usize, usize)> + '_ {
+    (0..cfg.n_layer)
+        .map(move |l| kv_layer_alloc_bytes(cfg, l, want_ctx, ring, ubatch, row_align, k_fmt, v_fmt))
+        .chain((0..cfg.n_layer).flat_map(move |l| dsv4_comp_allocs(cfg, l, want_ctx, k_fmt)))
+}
+
+/// Every `BufferUsage::KvCache` allocation one session slot can make, in the form
+/// [`kv_init_allocs`] gives: those, then the snapshot of each recurrent layer's state
+/// ([`kv_recurrent_alloc_bytes`]), which `snapshot_delta` allocates on first use.
+pub(crate) fn kv_slot_allocs(
+    cfg: &Config,
+    want_ctx: usize,
+    ring: bool,
+    ubatch: usize,
+    row_align: usize,
+    k_fmt: DType,
+    v_fmt: DType,
+) -> impl Iterator<Item = (usize, usize)> + '_ {
+    kv_init_allocs(cfg, want_ctx, ring, ubatch, row_align, k_fmt, v_fmt)
+        .chain((0..cfg.n_layer).filter_map(|l| kv_recurrent_alloc_bytes(cfg, l)))
 }
 
 /// Config/env-level gate for SWA ring KV sizing, shared by the runner's allocation and the
@@ -1880,12 +1911,13 @@ pub(crate) fn dense_resident_need(
     want_ctx: usize,
     ring: bool,
     ubatch: usize,
+    align: KvAlign,
     k_fmt: DType,
     v_fmt: DType,
 ) -> u64 {
     weights
         .saturating_add(kv_bytes_estimate_fmt(
-            cfg, want_ctx, ring, ubatch, k_fmt, v_fmt,
+            cfg, want_ctx, ring, ubatch, align, k_fmt, v_fmt,
         ))
         .saturating_add(dense_act_reserve_at(cfg, want_ctx, ubatch))
 }
@@ -1903,6 +1935,7 @@ pub(crate) fn dense_placement_fits(
     vram: &infr_vulkan::VramInfo,
     want_ctx: usize,
     ubatch: usize,
+    align: KvAlign,
     k_fmt: DType,
     v_fmt: DType,
 ) -> bool {
@@ -1916,7 +1949,8 @@ pub(crate) fn dense_placement_fits(
     } else {
         0
     };
-    dense_resident_need(cfg, weights, want_ctx, ring, ubatch, k_fmt, v_fmt).saturating_add(lm)
+    dense_resident_need(cfg, weights, want_ctx, ring, ubatch, align, k_fmt, v_fmt)
+        .saturating_add(lm)
         <= vram.alloc_room()
 }
 
@@ -1929,12 +1963,13 @@ pub(crate) fn dense_resident_rung(
     weights: u64,
     vram: &infr_vulkan::VramInfo,
     want_ctx: usize,
+    align: KvAlign,
     k_fmt: DType,
     v_fmt: DType,
 ) -> Option<usize> {
     ubatch_candidates(ec)
         .into_iter()
-        .find(|&ub| dense_placement_fits(cfg, ec, weights, vram, want_ctx, ub, k_fmt, v_fmt))
+        .find(|&ub| dense_placement_fits(cfg, ec, weights, vram, want_ctx, ub, align, k_fmt, v_fmt))
 }
 
 /// Streaming budget: what is left of the allocator's ceiling for the dense weight-streaming arenas
@@ -1948,6 +1983,7 @@ pub(crate) fn dense_stream_budget_at(
     vram: &infr_vulkan::VramInfo,
     want_ctx: usize,
     ubatch: usize,
+    align: KvAlign,
     k_fmt: DType,
     v_fmt: DType,
 ) -> u64 {
@@ -1967,6 +2003,7 @@ pub(crate) fn dense_stream_budget_at(
             want_ctx,
             ring,
             ubatch,
+            align,
             k_fmt,
             v_fmt,
         ))
@@ -2025,6 +2062,7 @@ pub(crate) fn kv_fit_ctx_for(
     ec: &EngineConfig,
     weights: u64,
     vram: &infr_vulkan::VramInfo,
+    align: KvAlign,
     k_fmt: DType,
     v_fmt: DType,
 ) -> Option<usize> {
@@ -2042,6 +2080,7 @@ pub(crate) fn kv_fit_ctx_for(
         vram.alloc_room().saturating_sub(weights),
         moe_reserve,
         &ubatch_candidates(ec),
+        align,
         k_fmt,
         v_fmt,
     )
@@ -2065,6 +2104,7 @@ pub(crate) fn kv_fit_ctx_in_budget(
     budget: u64,
     moe_reserve: Option<u64>,
     cands: &[usize],
+    align: KvAlign,
     k_fmt: DType,
     v_fmt: DType,
 ) -> Option<usize> {
@@ -2075,7 +2115,7 @@ pub(crate) fn kv_fit_ctx_in_budget(
     let ring = placement_ring(cfg, ec, k_fmt, v_fmt);
     let fits = |ctx: usize| -> bool {
         cands.iter().any(|&ubatch| {
-            let kv = kv_bytes_estimate_fmt(cfg, ctx, ring, ubatch, k_fmt, v_fmt);
+            let kv = kv_bytes_estimate_fmt(cfg, ctx, ring, ubatch, align, k_fmt, v_fmt);
             let reserve = moe_reserve.unwrap_or_else(|| dense_act_reserve_at(cfg, ctx, ubatch));
             kv.saturating_add(reserve) <= budget
         })
@@ -2156,6 +2196,7 @@ pub(crate) fn reclamp_ctx_to_live_room(
     };
     let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
     let budget = room.saturating_sub(POST_KV_DEVICE_RESERVE);
+    let align = KvAlign::of(be);
     // Walk the chunk ladder HERE too, and price each rung on its own: a shorter chunk shrinks both
     // the activation reserve and the SWA ring, so it buys context, and the rung the pre-load sweep
     // pinned was chosen against weight bytes that turned out to be ~2% light. Pricing only the
@@ -2166,7 +2207,7 @@ pub(crate) fn reclamp_ctx_to_live_room(
     // MoE: the pager's arenas are already allocated by the binder at this point, so the live room
     // has them netted out and the flat `total/12` stand-in would double-count. The dense reserve
     // is what an MoE forward's activations actually need beside them.
-    let at = |ub: usize| kv_fit_ctx_in_budget(cfg, ec, budget, None, &[ub], k_fmt, v_fmt);
+    let at = |ub: usize| kv_fit_ctx_in_budget(cfg, ec, budget, None, &[ub], align, k_fmt, v_fmt);
     let Some(_) = at(cands[0]) else {
         return Ok(want_ctx); // pure recurrent-state arch: no per-token KV to size.
     };
@@ -2193,7 +2234,7 @@ pub(crate) fn reclamp_ctx_to_live_room(
         room_bytes = room,
         post_kv_reserve_bytes = POST_KV_DEVICE_RESERVE,
         act_reserve_bytes = dense_act_reserve_at(cfg, fit, ubatch),
-        kv_bytes = kv_bytes_estimate_fmt(cfg, fit, ring, ubatch, k_fmt, v_fmt),
+        kv_bytes = kv_bytes_estimate_fmt(cfg, fit, ring, ubatch, align, k_fmt, v_fmt),
         ubatch,
         want_ctx,
         fit,
@@ -2218,7 +2259,7 @@ pub(crate) fn reclamp_ctx_to_live_room(
         // Not one token of context fits: say so with the measured numbers, rather than let the
         // request fail later as a context overflow against a capacity of 0.
         let floor = dense_act_reserve_at(cfg, 1, ubatch)
-            + kv_bytes_estimate_fmt(cfg, 1, ring, ubatch, k_fmt, v_fmt);
+            + kv_bytes_estimate_fmt(cfg, 1, ring, ubatch, align, k_fmt, v_fmt);
         return Err(anyhow!(
             "this model does not fit the device's free memory: after its weights are resident the \
              device reports {:.2} GiB allocatable, and even a one-token context needs {:.2} GiB \
@@ -2241,15 +2282,27 @@ pub(crate) fn reclamp_ctx_to_live_room(
          pre-load estimate does not price the weight arena's block tails or the driver's own \
          memory; set INFR_CTX to override",
         gib(room),
-        gib(kv_bytes_estimate_fmt(cfg, fit, ring, ubatch, k_fmt, v_fmt)),
+        gib(kv_bytes_estimate_fmt(cfg, fit, ring, ubatch, align, k_fmt, v_fmt)),
         gib(dense_act_reserve_at(cfg, fit, ubatch)),
         gib(POST_KV_DEVICE_RESERVE),
     );
     Ok(fit)
 }
 
+/// Bytes a recurrent layer's two state buffers allocate (`Config::recurrent_state_elems`, f32
+/// whatever the session's KV formats), or `None` for a layer that caches K/V per token. The slot's
+/// live state ([`kv_layer_alloc_bytes`]) and the one snapshot of it a slot can hold
+/// (`SeamKv::mtp_delta_ckpt`, shared by MTP rollback and the decode loop's prefill-boundary
+/// snapshot) are each this size.
+pub(crate) fn kv_recurrent_alloc_bytes(cfg: &Config, l: usize) -> Option<(usize, usize)> {
+    let f32_bytes = |elems: usize| elems * std::mem::size_of::<f32>();
+    cfg.recurrent_state_elems(l)
+        .map(|(k_elems, v_elems)| (f32_bytes(k_elems), f32_bytes(v_elems)))
+}
+
 /// Bytes layer `l`'s two cache buffers ALLOCATE at `want_ctx` and prefill chunk `ubatch` —
-/// `(K side, V side)`, exactly what the runner hands `Backend::alloc` with `BufferUsage::KvCache`.
+/// `(K side, V side)`, exactly what the runner's cold init and `SeamKv::fork` hand `Backend::alloc`
+/// with `BufferUsage::KvCache`, and the per-layer term of every estimate ([`kv_slot_allocs`]).
 /// A recurrent layer (qwen35 DeltaNet, LFM short convolution) holds its fixed-size f32 state there
 /// instead ([`Config::recurrent_state_elems`], not `want_ctx`-scaled); an attention layer holds
 /// `kv_rows_at` rows of its own per-side width.
@@ -2263,8 +2316,8 @@ pub(crate) fn kv_layer_alloc_bytes(
     k_fmt: DType,
     v_fmt: DType,
 ) -> (usize, usize) {
-    if let Some((k_elems, v_elems)) = cfg.recurrent_state_elems(l) {
-        return (k_elems * 4, v_elems * 4);
+    if let Some(state) = kv_recurrent_alloc_bytes(cfg, l) {
+        return state;
     }
     // Per-token row widths, MLA included: DeepSeek2 caches ONE compressed row
     // (kv_lora_rank + qk_rope_dim) per token and has no V side, so `v_row` is 0 and `kv_side_bytes`
@@ -2294,16 +2347,24 @@ pub(crate) fn kv_layer_alloc_bytes(
 }
 
 /// The smallest KV cache `n_slots` sessions of `want_ctx` tokens can still end up allocating,
-/// priced BEFORE the runner settles the details: each side at the cheapest of the format the fit
-/// math expects, f16 and q8_0 (the runner falls back to one of those when it gates a format out),
-/// the SWA ring wherever ringing is possible at all, and the shortest prefill chunk placement may
-/// lower to. Every choice can only shrink the figure, so [`refuse_unallocatable_kv`] reading it
-/// stays provable before a single weight is loaded.
+/// priced BEFORE the runner settles the details: [`kv_init_allocs`] with each side at the cheapest
+/// of the format the fit math expects, f16 and q8_0 (the runner falls back to one of those when it
+/// gates a format out), the SWA ring wherever ringing is possible at all, and the shortest prefill
+/// chunk placement may lower to. Each of those choices can only shrink the figure, so
+/// [`refuse_unallocatable_kv`] reading it stays provable before a single weight is loaded.
+///
+/// It lists what the runner's init must allocate and nothing more, which is where it differs from
+/// the estimate a context is fitted with ([`kv_bytes_estimate_fmt`]): the recurrent-state snapshot
+/// is left out. A slot allocates that on first use, a decode loop that is refused it carries on
+/// without it, and a slot that never snapshots never allocates it, so counting it here could
+/// refuse a run that would have worked. Nor is the allocator's byte rounding here: the guard
+/// checks a request's memory requirements, which are never below the request.
 pub(crate) fn kv_floor_alloc_bytes(
     cfg: &Config,
     ec: &EngineConfig,
     want_ctx: usize,
     n_slots: usize,
+    row_align: usize,
     k_fmt: DType,
     v_fmt: DType,
 ) -> Vec<(usize, usize)> {
@@ -2319,14 +2380,8 @@ pub(crate) fn kv_floor_alloc_bytes(
         .into_iter()
         .min()
         .expect("ubatch_candidates is never empty");
-    let one: Vec<(usize, usize)> = (0..cfg.n_layer)
-        .flat_map(|l| {
-            std::iter::once(kv_layer_alloc_bytes(
-                cfg, l, want_ctx, ring, ubatch, 1, k_fmt, v_fmt,
-            ))
-            .chain(dsv4_comp_allocs(cfg, l, want_ctx, k_fmt))
-        })
-        .collect();
+    let one: Vec<(usize, usize)> =
+        kv_init_allocs(cfg, want_ctx, ring, ubatch, row_align, k_fmt, v_fmt).collect();
     std::iter::repeat_n(one, n_slots.max(1)).flatten().collect()
 }
 
@@ -2485,6 +2540,8 @@ pub(crate) fn vulkan_moe_binder<'a>(
     // of layers' banks to a wider format) split into per-(role, slot_bytes) arena pools — see
     // `infr_vulkan::pager`'s MoE-session doc.
     let cache_override = ec.paging.cache;
+    // Every estimate below prices the cache this backend will allocate, rounding included.
+    let align = KvAlign::of(vk);
 
     let mut n_paged = 0usize; // paged layer-count (0 = fully resident, or all = cfg.n_layer)
     let mut pager_budget_bytes = 0u64;
@@ -2517,13 +2574,13 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 let fp = crate::weights::weight_footprint(g);
                 let vram = vk.vram();
                 // Per-layer rows: SWA layers ring at window+ubatch rows (see `kv_rows_at`), so a
-                // mostly-SWA model's KV prices far below n_layer * ctx. +64 rows/layer slop.
+                // mostly-SWA model's KV prices far below n_layer * ctx.
                 let ring = kv_ring_wanted(cfg, ec);
                 // Route through the shared q8-aware helper (the dense placement path already does),
                 // so a pinned auto-q8 KV cache is priced at ~half the bytes instead of the old
                 // hard-coded f16 `*2*2` — which over-reserved ~2× and forced avoidable expert paging.
                 let kv_bytes: u64 =
-                    kv_bytes_estimate(cfg, want_ctx, ring, ubatch_rows(ec), kv_auto_q8());
+                    kv_bytes_estimate(cfg, want_ctx, ring, ubatch_rows(ec), align, kv_auto_q8());
                 // Budgeted against the ALLOCATOR's ceiling (`VramInfo::alloc_room`), like the
                 // dense sweeps below and the context-fit math: the last 256 MiB of "free" VRAM is
                 // the guard's headroom and can never be handed out, so an expert budget sized
@@ -2819,7 +2876,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
         // the fit math validated the context at 256 rows while this went resident at 512).
         let fits = |ubatch: usize, q8: bool| {
             let (k, v) = kv_fmts(q8);
-            dense_placement_fits(cfg, ec, fp.total(), &vram, want_ctx, ubatch, k, v)
+            dense_placement_fits(cfg, ec, fp.total(), &vram, want_ctx, ubatch, align, k, v)
         };
         // Try-resident-first: a dense model goes FULLY RESIDENT (the exact pre-streaming fast
         // path) whenever weights + this session's KV + an HONEST dense activation estimate fit
@@ -2849,7 +2906,9 @@ pub(crate) fn vulkan_moe_binder<'a>(
             // to decide a context fits, so the rung it lands on here is the rung that math priced.
             // Its first entry is the height `resident` above already priced and rejected.
             let (k, v) = kv_fmts(kv_auto_q8());
-            if let Some(cand) = dense_resident_rung(cfg, ec, fp.total(), &vram, want_ctx, k, v) {
+            if let Some(cand) =
+                dense_resident_rung(cfg, ec, fp.total(), &vram, want_ctx, align, k, v)
+            {
                 pin_ubatch(cand);
                 // Re-read through the pin (a racing earlier set wins — use whatever stuck).
                 if fits(ubatch_rows(ec), kv_auto_q8()) {
@@ -2882,7 +2941,9 @@ pub(crate) fn vulkan_moe_binder<'a>(
             && kv_q8_layout_ok(cfg)
         {
             let (k, v) = kv_fmts(true);
-            if let Some(cand) = dense_resident_rung(cfg, ec, fp.total(), &vram, want_ctx, k, v) {
+            if let Some(cand) =
+                dense_resident_rung(cfg, ec, fp.total(), &vram, want_ctx, align, k, v)
+            {
                 pin_kv_auto_q8();
                 if cand != ubatch_rows(ec) {
                     pin_ubatch(cand);
@@ -2931,7 +2992,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 // over-states is an arena slot the allocator then refuses.
                 let budget_at = |ub: usize| {
                     let (k, v) = kv_fmts(q8);
-                    dense_stream_budget_at(cfg, ec, base, &vram, want_ctx, ub, k, v)
+                    dense_stream_budget_at(cfg, ec, base, &vram, want_ctx, ub, align, k, v)
                 };
                 if !user_pinned_ubatch(ec) && !eligible.is_empty() {
                     let need: u64 = eligible
@@ -3024,8 +3085,15 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 // message about the weights alone sends the user after the wrong thing.
                 let (k, v) = kv_fmts(kv_auto_q8());
                 let ub = ubatch_rows(ec);
-                let kv =
-                    kv_bytes_estimate_fmt(cfg, want_ctx, placement_ring(cfg, ec, k, v), ub, k, v);
+                let kv = kv_bytes_estimate_fmt(
+                    cfg,
+                    want_ctx,
+                    placement_ring(cfg, ec, k, v),
+                    ub,
+                    align,
+                    k,
+                    v,
+                );
                 return Err(anyhow!(
                     "context {want_ctx} does not fit this device: after its KV cache ({:.2} GB in \
                      {k:?}/{v:?}) and the activation reserve, {:.2} GB is left for streaming the \
@@ -5015,10 +5083,7 @@ mod bda_cap_tests {
 
 #[cfg(test)]
 mod seam_helper_tests {
-    use super::{
-        cpu_repack_reserve, kv_pair_bytes, Config, DType, EngineConfig, PlacementPins,
-        PlacementScope,
-    };
+    use super::{cpu_repack_reserve, Config, DType, EngineConfig, PlacementPins, PlacementScope};
 
     /// Whether this process's default prefill chunk is the discrete one these tests assert. The
     /// device class is process-global and published by the first Vulkan backend any test in this
@@ -5129,28 +5194,6 @@ mod seam_helper_tests {
         assert!(!super::kv_unset(&Config::default(), &q8));
     }
 
-    #[test]
-    fn kv_pair_bytes_prices_each_side_in_its_own_dtype() {
-        // q8 prices K+V at ~half the f16 bytes (34 B / 32-elem block vs 2 B/elem, ×2 sides).
-        let elems = 32_000usize;
-        let f16 = kv_pair_bytes(elems, elems, DType::F16, DType::F16);
-        let q8 = kv_pair_bytes(elems, elems, DType::Q8_0, DType::Q8_0);
-        assert_eq!(f16, 2 * 2 * elems as u64); // 128_000
-        assert_eq!(q8, 2 * (elems as u64 / 32 * 34)); // 68_000, already u32-aligned
-        assert!(
-            q8 < f16 && q8 * 2 > f16,
-            "q8 must be ~half of f16, not equal"
-        );
-        // The MIXED case the single-flag helper could not express: `INFR_KV_TYPE_K=q8_0` with V
-        // left at f16 is exactly one of each, not two of either.
-        let mixed = kv_pair_bytes(elems, elems, DType::Q8_0, DType::F16);
-        assert_eq!(mixed, q8 / 2 + f16 / 2);
-        assert!(mixed > q8 && mixed < f16);
-        // A side the arch does not cache at all (MLA's V) is priced at nothing, not at the K
-        // side's width — the two sides are independent widths, not one width used twice.
-        assert_eq!(kv_pair_bytes(elems, 0, DType::F16, DType::F16), f16 / 2);
-    }
-
     // ── MLA (deepseek2) KV geometry + dtype gate — docs/backlog.md B41/B42 ───────────────────
 
     /// The KV-geometry fields of DeepSeek-V2-Lite-Chat, as `cpu_deepseek2_config` prints them off
@@ -5241,14 +5284,22 @@ mod seam_helper_tests {
         let cfg = deepseek_v2_lite_kv();
         let ec = EngineConfig::default();
         let (ctx, ubatch) = (4096usize, super::ubatch_rows(&ec));
-        let rows = ctx + super::KV_SLOP_ROWS;
-        let est = super::kv_bytes_estimate_fmt(&cfg, ctx, false, ubatch, DType::F16, DType::F16);
-        // 27 layers x (4096+64) rows x 576 elements x 2 bytes, K only.
-        let want = (cfg.n_layer * rows * (cfg.kv_lora_rank + cfg.qk_rope_dim) * 2) as u64;
+        let est = super::kv_bytes_estimate_fmt(
+            &cfg,
+            ctx,
+            false,
+            ubatch,
+            super::KvAlign::NONE,
+            DType::F16,
+            DType::F16,
+        );
+        // Per layer: the context's rows of the compressed K row in f16, and the V placeholder.
+        let k_side = ctx * (cfg.kv_lora_rank + cfg.qk_rope_dim) * 2;
+        let want = (cfg.n_layer * (k_side + super::kv_side_bytes(DType::F16, 0))) as u64;
         assert_eq!(est, want);
         // The pre-fix pricing, spelled out: K+V at the head-dim product.
-        let old = (cfg.n_layer * rows * 2 * (cfg.n_kv * cfg.head_dim) * 2) as u64;
-        assert_eq!(est, old * 3 / 2, "the estimate was 1.5x short");
+        let old = ctx * 2 * (cfg.n_kv * cfg.head_dim) * 2;
+        assert_eq!(k_side, old * 3 / 2, "the estimate was 1.5x short");
     }
 
     /// deepseek4 stores its K=V row once (`build_attn_mha(q, k_all, k_all, …)`), so the footprint
@@ -5268,12 +5319,29 @@ mod seam_helper_tests {
             ..Default::default()
         };
         assert_eq!(super::kv_row_elems(&cfg, 0), (512, 0));
-        // Full context 4096: (4096 + 64 slop) rows x 512 elements x 2 bytes (f16) x 43 layers.
-        let full = super::kv_bytes_estimate_fmt(&cfg, 4096, false, 512, DType::F16, DType::F16);
-        assert_eq!(full, 183_173_120);
-        // Ring: min(4096, (128 + 512) rounded up to 64) + 64 = 704 rows per layer.
-        let ring = super::kv_bytes_estimate_fmt(&cfg, 4096, true, 512, DType::F16, DType::F16);
-        assert_eq!(ring, 30_998_528);
+        // Full context 4096: 4096 rows x 512 elements x 2 bytes (f16) of K and the 8-byte V
+        // placeholder, x 43 layers.
+        let full = super::kv_bytes_estimate_fmt(
+            &cfg,
+            4096,
+            false,
+            512,
+            super::KvAlign::NONE,
+            DType::F16,
+            DType::F16,
+        );
+        assert_eq!(full, 180_355_416);
+        // Ring: min(4096, (128 + 512) rounded up to 64) = 640 rows per layer.
+        let ring = super::kv_bytes_estimate_fmt(
+            &cfg,
+            4096,
+            true,
+            512,
+            super::KvAlign::NONE,
+            DType::F16,
+            DType::F16,
+        );
+        assert_eq!(ring, 28_180_824);
         // The allocation: 4096 x 512 x 2 bytes of K, and the placeholder V (4 f16 elements).
         let alloc =
             super::kv_layer_alloc_bytes(&cfg, 0, 4096, false, 512, 1, DType::F16, DType::F16);
@@ -5321,16 +5389,25 @@ mod seam_helper_tests {
             .collect();
         assert_eq!(csa, [1_048_576, 32_768, 32_768, 262_144, 8_192, 8_192]);
         assert!(super::dsv4_comp_bufs(&cfg, 1, 4096, DType::F16).is_empty());
-        // The raw caches as before (`kv_footprint_of_deepseek4_is_the_k_side_alone`: 183_173_120),
+        // The raw caches as before (`kv_footprint_of_deepseek4_is_the_k_side_alone`: 180_355_416),
         // plus 20 HCA layers x 557_056 = 11_141_120 and 21 CSA layers x 1_392_640 = 29_245_440.
-        let full = super::kv_bytes_estimate_fmt(&cfg, 4096, false, 512, DType::F16, DType::F16);
-        assert_eq!(full, 223_559_680);
+        let full = super::kv_bytes_estimate_fmt(
+            &cfg,
+            4096,
+            false,
+            512,
+            super::KvAlign::NONE,
+            DType::F16,
+            DType::F16,
+        );
+        assert_eq!(full, 220_741_976);
         // The pre-load floor lists each compressed buffer as an allocation of its own beside the
         // layer's K/V pair: 43 pairs, 20 x 3 HCA buffers and 21 x 6 CSA ones.
         let floor = super::kv_floor_alloc_bytes(
             &cfg,
             &EngineConfig::default(),
             4096,
+            1,
             1,
             DType::F16,
             DType::F16,
@@ -5421,10 +5498,20 @@ mod seam_helper_tests {
             shortconv_l_cache: 4,
             ..Default::default()
         };
-        let est = |ctx| super::kv_bytes_estimate_fmt(&cfg, ctx, false, 512, DType::F16, DType::F16);
+        let est = |ctx| {
+            super::kv_bytes_estimate_fmt(
+                &cfg,
+                ctx,
+                false,
+                512,
+                super::KvAlign::NONE,
+                DType::F16,
+                DType::F16,
+            )
+        };
         let state = ((cfg.shortconv_l_cache - 1) * cfg.n_embd + 1) * 4;
         for ctx in [1024usize, 4096] {
-            let attn = (ctx + super::KV_SLOP_ROWS) * 2 * (cfg.n_kv * cfg.head_dim) * 2;
+            let attn = ctx * 2 * (cfg.n_kv * cfg.head_dim) * 2;
             assert_eq!(est(ctx), (2 * state + attn) as u64, "ctx {ctx}");
         }
     }
@@ -5434,21 +5521,7 @@ mod seam_helper_tests {
     /// room for the copy: two of each recurrent layer's state, one attention layer's rows.
     #[test]
     fn kv_bytes_estimate_prices_the_qwen35_snapshot_copy() {
-        let cfg = Config {
-            n_layer: 4,
-            n_embd: 64,
-            n_head: 4,
-            n_kv: 2,
-            head_dim: 16,
-            qwen35: true,
-            full_attn_interval: 4,
-            ssm_d_conv: 4,
-            ssm_d_inner: 64,
-            ssm_d_state: 16,
-            ssm_n_group: 2,
-            ssm_dt_rank: 4,
-            ..Default::default()
-        };
+        let cfg = qwen35_small();
         let recurrent: Vec<usize> = (0..cfg.n_layer)
             .filter(|&l| cfg.is_recurrent_layer(l))
             .collect();
@@ -5459,9 +5532,17 @@ mod seam_helper_tests {
         );
         let (k, v) = cfg.recurrent_state_elems(0).expect("a DeltaNet layer");
         let ctx = 2048usize;
-        let attn = (ctx + super::KV_SLOP_ROWS) * 2 * (cfg.n_kv * cfg.head_dim) * 2;
+        let attn = ctx * 2 * (cfg.n_kv * cfg.head_dim) * 2;
         let want = recurrent.len() * 2 * (k + v) * 4 + attn;
-        let est = super::kv_bytes_estimate_fmt(&cfg, ctx, false, 512, DType::F16, DType::F16);
+        let est = super::kv_bytes_estimate_fmt(
+            &cfg,
+            ctx,
+            false,
+            512,
+            super::KvAlign::NONE,
+            DType::F16,
+            DType::F16,
+        );
         assert_eq!(est, want as u64);
     }
 
@@ -5632,7 +5713,7 @@ mod seam_helper_tests {
             && matches!(v, DType::F16 | DType::Q8_0);
         let need = |ctx: usize, ub: usize| {
             weights
-                + super::kv_bytes_estimate_fmt(cfg, ctx, ring, ub, k, v)
+                + super::kv_bytes_estimate_fmt(cfg, ctx, ring, ub, super::KvAlign::NONE, k, v)
                 + super::dense_act_reserve_at(cfg, ctx, ub)
         };
         let cands = super::ubatch_candidates(ec);
@@ -5660,16 +5741,39 @@ mod seam_helper_tests {
         let ec = EngineConfig::default();
         let weights = 9 * (1u64 << 30);
         for (k, v) in [(DType::F16, DType::F16), (DType::Q8_0, DType::Q8_0)] {
-            let fit =
-                super::kv_fit_ctx_for(&cfg, &ec, weights, &xtx(XTX_FREE), k, v).expect("has KV");
+            let fit = super::kv_fit_ctx_for(
+                &cfg,
+                &ec,
+                weights,
+                &xtx(XTX_FREE),
+                super::KvAlign::NONE,
+                k,
+                v,
+            )
+            .expect("has KV");
             assert_exact_boundary(&cfg, &ec, weights, XTX_ROOM, k, v, fit);
         }
         // q8 is ~half the bytes per token, so it must buy materially more context than f16.
-        let f16 = super::kv_fit_ctx_for(&cfg, &ec, weights, &xtx(XTX_FREE), DType::F16, DType::F16)
-            .expect("has KV");
-        let q8 =
-            super::kv_fit_ctx_for(&cfg, &ec, weights, &xtx(XTX_FREE), DType::Q8_0, DType::Q8_0)
-                .expect("has KV");
+        let f16 = super::kv_fit_ctx_for(
+            &cfg,
+            &ec,
+            weights,
+            &xtx(XTX_FREE),
+            super::KvAlign::NONE,
+            DType::F16,
+            DType::F16,
+        )
+        .expect("has KV");
+        let q8 = super::kv_fit_ctx_for(
+            &cfg,
+            &ec,
+            weights,
+            &xtx(XTX_FREE),
+            super::KvAlign::NONE,
+            DType::Q8_0,
+            DType::Q8_0,
+        )
+        .expect("has KV");
         assert!(q8 > f16, "q8 {q8} must beat f16 {f16}");
         assert!(q8 < 2 * f16, "q8 {q8} is ~2x f16 {f16}, not more");
     }
@@ -5691,10 +5795,26 @@ mod seam_helper_tests {
         let ring = EngineConfig::default();
         assert!(super::kv_ring_wanted(&cfg, &ring) && !super::kv_ring_wanted(&cfg, &no_ring));
         for (k, v) in [(DType::F16, DType::F16), (DType::Q8_0, DType::Q8_0)] {
-            let a = super::kv_fit_ctx_for(&cfg, &ring, GEMMA3_12B_WEIGHTS, &xtx(XTX_FREE), k, v)
-                .expect("has KV");
-            let b = super::kv_fit_ctx_for(&cfg, &no_ring, GEMMA3_12B_WEIGHTS, &xtx(XTX_FREE), k, v)
-                .expect("has KV");
+            let a = super::kv_fit_ctx_for(
+                &cfg,
+                &ring,
+                GEMMA3_12B_WEIGHTS,
+                &xtx(XTX_FREE),
+                super::KvAlign::NONE,
+                k,
+                v,
+            )
+            .expect("has KV");
+            let b = super::kv_fit_ctx_for(
+                &cfg,
+                &no_ring,
+                GEMMA3_12B_WEIGHTS,
+                &xtx(XTX_FREE),
+                super::KvAlign::NONE,
+                k,
+                v,
+            )
+            .expect("has KV");
             assert_exact_boundary(&cfg, &ring, GEMMA3_12B_WEIGHTS, XTX_ROOM, k, v, a);
             assert_exact_boundary(&cfg, &no_ring, GEMMA3_12B_WEIGHTS, XTX_ROOM, k, v, b);
             assert!(
@@ -5729,7 +5849,15 @@ mod seam_helper_tests {
         let want = cfg.n_ctx_train;
         let need = |ub: usize| {
             GEMMA3_12B_WEIGHTS
-                + super::kv_bytes_estimate_fmt(&cfg, want, true, ub, DType::F16, DType::F16)
+                + super::kv_bytes_estimate_fmt(
+                    &cfg,
+                    want,
+                    true,
+                    ub,
+                    super::KvAlign::NONE,
+                    DType::F16,
+                    DType::F16,
+                )
                 + super::dense_act_reserve_at(&cfg, want, ub)
         };
         let cands = super::ubatch_candidates(&ec);
@@ -5750,6 +5878,7 @@ mod seam_helper_tests {
             &ec,
             GEMMA3_12B_WEIGHTS,
             &xtx(XTX_FREE),
+            super::KvAlign::NONE,
             DType::F16,
             DType::F16,
         )
@@ -5855,9 +5984,22 @@ mod seam_helper_tests {
         let f16 = (DType::F16, DType::F16);
         // Weights that make a resident session land EXACTLY on the ceiling (KV + reserve priced
         // from the shared primitives, weights = whatever is left of the ceiling).
-        let kv_and_act = super::dense_resident_need(&cfg, 0, ctx, true, ub, f16.0, f16.1);
+        let kv_and_act =
+            super::dense_resident_need(&cfg, 0, ctx, true, ub, super::KvAlign::NONE, f16.0, f16.1);
         let exact = XTX_ROOM - kv_and_act;
-        let fits = |w: u64| super::dense_placement_fits(&cfg, &ec, w, &vram, ctx, ub, f16.0, f16.1);
+        let fits = |w: u64| {
+            super::dense_placement_fits(
+                &cfg,
+                &ec,
+                w,
+                &vram,
+                ctx,
+                ub,
+                super::KvAlign::NONE,
+                f16.0,
+                f16.1,
+            )
+        };
         assert!(
             fits(exact),
             "a session that exactly fills the ceiling is resident"
@@ -5879,8 +6021,19 @@ mod seam_helper_tests {
             lm > 0,
             "the layer-major term must be a real subtraction here"
         );
-        let budget =
-            |w: u64| super::dense_stream_budget_at(&cfg, &ec, w, &vram, ctx, ub, f16.0, f16.1);
+        let budget = |w: u64| {
+            super::dense_stream_budget_at(
+                &cfg,
+                &ec,
+                w,
+                &vram,
+                ctx,
+                ub,
+                super::KvAlign::NONE,
+                f16.0,
+                f16.1,
+            )
+        };
         assert_eq!(
             budget(exact),
             0,
@@ -5908,6 +6061,7 @@ mod seam_helper_tests {
                 &vram,
                 ctx,
                 ub,
+                super::KvAlign::NONE,
                 f16.0,
                 f16.1
             ),
@@ -6056,7 +6210,7 @@ mod seam_helper_tests {
         let cands = super::ubatch_candidates(&ec);
         let need = |ctx: usize, ub: usize| {
             GEMMA3_12B_WEIGHTS
-                + super::kv_bytes_estimate_fmt(&cfg, ctx, true, ub, k, v)
+                + super::kv_bytes_estimate_fmt(&cfg, ctx, true, ub, super::KvAlign::NONE, k, v)
                 + super::dense_act_reserve_at(&cfg, ctx, ub)
         };
         let expect_rung = |ctx: usize| cands.iter().copied().find(|&ub| need(ctx, ub) <= XTX_ROOM);
@@ -6070,11 +6224,11 @@ mod seam_helper_tests {
         // `kv_fit_walks_the_placement_chunk_ladder_gemma3_12b`.)
         let want = cfg.n_ctx_train;
         let heavy = XTX_ROOM
-            - super::kv_bytes_estimate_fmt(&cfg, want, true, 512, k, v)
+            - super::kv_bytes_estimate_fmt(&cfg, want, true, 512, super::KvAlign::NONE, k, v)
             - super::dense_act_reserve_at(&cfg, want, 512);
         let need_heavy = |ub: usize| {
             heavy
-                + super::kv_bytes_estimate_fmt(&cfg, want, true, ub, k, v)
+                + super::kv_bytes_estimate_fmt(&cfg, want, true, ub, super::KvAlign::NONE, k, v)
                 + super::dense_act_reserve_at(&cfg, want, ub)
         };
         assert!(need_heavy(1024) > XTX_ROOM, "the default chunk must miss");
@@ -6083,25 +6237,61 @@ mod seam_helper_tests {
             "…and the 512-row rung must save it"
         );
         assert_eq!(
-            super::dense_resident_rung(&cfg, &ec, heavy, &vram, want, k, v),
+            super::dense_resident_rung(&cfg, &ec, heavy, &vram, want, super::KvAlign::NONE, k, v),
             Some(512),
             "placement must settle on the rung the fit math priced"
         );
 
         // And at the exact boundary the fit math hands out: placement takes it resident, and one
         // token past it neither of them accepts.
-        let fit =
-            super::kv_fit_ctx_for(&cfg, &ec, GEMMA3_12B_WEIGHTS, &vram, k, v).expect("has KV");
+        let fit = super::kv_fit_ctx_for(
+            &cfg,
+            &ec,
+            GEMMA3_12B_WEIGHTS,
+            &vram,
+            super::KvAlign::NONE,
+            k,
+            v,
+        )
+        .expect("has KV");
         assert_eq!(
-            super::dense_resident_rung(&cfg, &ec, GEMMA3_12B_WEIGHTS, &vram, fit, k, v),
+            super::dense_resident_rung(
+                &cfg,
+                &ec,
+                GEMMA3_12B_WEIGHTS,
+                &vram,
+                fit,
+                super::KvAlign::NONE,
+                k,
+                v
+            ),
             expect_rung(fit),
         );
         assert!(
-            super::dense_resident_rung(&cfg, &ec, GEMMA3_12B_WEIGHTS, &vram, fit, k, v).is_some(),
+            super::dense_resident_rung(
+                &cfg,
+                &ec,
+                GEMMA3_12B_WEIGHTS,
+                &vram,
+                fit,
+                super::KvAlign::NONE,
+                k,
+                v
+            )
+            .is_some(),
             "the advertised context must be one placement can hold resident"
         );
         assert_eq!(
-            super::dense_resident_rung(&cfg, &ec, GEMMA3_12B_WEIGHTS, &vram, fit + 1, k, v),
+            super::dense_resident_rung(
+                &cfg,
+                &ec,
+                GEMMA3_12B_WEIGHTS,
+                &vram,
+                fit + 1,
+                super::KvAlign::NONE,
+                k,
+                v
+            ),
             None,
             "one token past the advertised context must miss at EVERY rung — a placement that \
              still says yes here is budgeting against a wider ceiling than the fit math"
@@ -6123,6 +6313,7 @@ mod seam_helper_tests {
             &ec,
             XTX_ROOM - 64 * 1024 * 1024,
             &xtx(XTX_FREE),
+            super::KvAlign::NONE,
             DType::F16,
             DType::F16,
         )
@@ -6148,6 +6339,7 @@ mod seam_helper_tests {
             &EngineConfig::default(),
             1 << 30,
             &xtx(XTX_FREE),
+            super::KvAlign::NONE,
             DType::F16,
             DType::F16,
         )
@@ -6228,10 +6420,11 @@ mod seam_helper_tests {
         assert_eq!(call(&RoomOnly(None), &ec), want);
 
         // Roomy: the fit is past `want`, so the window is kept rather than raised.
-        let roomy = super::kv_bytes_estimate_fmt(&cfg, want, true, 1024, k, v)
-            + super::dense_act_reserve_at(&cfg, want, 1024)
-            + super::POST_KV_DEVICE_RESERVE
-            + (1 << 30);
+        let roomy =
+            super::kv_bytes_estimate_fmt(&cfg, want, true, 1024, super::KvAlign::NONE, k, v)
+                + super::dense_act_reserve_at(&cfg, want, 1024)
+                + super::POST_KV_DEVICE_RESERVE
+                + (1 << 30);
         assert_eq!(call(&RoomOnly(Some(roomy)), &ec), want);
 
         // Tight: cut, and cut to a window that really fits the budget it was given.
@@ -6239,7 +6432,7 @@ mod seam_helper_tests {
         let got = call(&RoomOnly(Some(tight)), &ec);
         assert!(got < want, "a tight device must shrink the window: {got}");
         let ub = super::ubatch_rows(&ec);
-        let need = super::kv_bytes_estimate_fmt(&cfg, got, true, ub, k, v)
+        let need = super::kv_bytes_estimate_fmt(&cfg, got, true, ub, super::KvAlign::NONE, k, v)
             + super::dense_act_reserve_at(&cfg, got, ub);
         assert!(
             need <= tight - super::POST_KV_DEVICE_RESERVE,
@@ -6311,8 +6504,7 @@ mod seam_helper_tests {
     }
 
     /// A backend's KV row alignment pads every layer's capacity up to it — the global layers and
-    /// the SWA rings alike — and an alignment of 1 (CPU, Vulkan) leaves every size as it was. The
-    /// padding stays inside the fit estimate's per-layer slop.
+    /// the SWA rings alike — and an alignment of 1 (CPU, Vulkan) leaves every size as it was.
     #[test]
     fn kv_row_align_pads_capacity_and_one_changes_nothing() {
         let cfg = gemma3_12b();
@@ -6322,10 +6514,6 @@ mod seam_helper_tests {
                     let plain = super::kv_rows_at(&cfg, l, want, ring, 512, 1);
                     let padded = super::kv_rows_at(&cfg, l, want, ring, 512, 16);
                     assert_eq!(padded, plain.next_multiple_of(16), "layer {l}, ctx {want}");
-                    assert!(
-                        padded - plain <= super::KV_SLOP_ROWS,
-                        "padding exceeds the slop"
-                    );
                     assert_eq!(
                         super::kv_layer_alloc_bytes(
                             &cfg,
@@ -6356,38 +6544,322 @@ mod seam_helper_tests {
         assert_eq!(super::kv_rows_at(&cfg, 0, 101, false, 512, 16), 112);
     }
 
-    /// The pre-load floor must never price more than any cache the runner can still settle on —
-    /// that is what lets the refuse rung read it before a weight is loaded.
+    /// A qwen35 model in miniature: DeltaNet layers with a full-attention layer after them.
+    fn qwen35_small() -> Config {
+        Config {
+            n_layer: 4,
+            n_embd: 64,
+            n_head: 4,
+            n_kv: 2,
+            head_dim: 16,
+            qwen35: true,
+            full_attn_interval: 4,
+            ssm_d_conv: 4,
+            ssm_d_inner: 64,
+            ssm_d_state: 16,
+            ssm_n_group: 2,
+            ssm_dt_rank: 4,
+            ..Default::default()
+        }
+    }
+
+    /// Every KV geometry family the sizing tests cover, by name: recurrent state beside attention
+    /// (qwen35; LFM3's short convolutions around a sliding-window layer), sliding-window rings
+    /// (gemma3), MLA with and without the lightning indexer's cache, DeepSeek V4's shared K/V row
+    /// and compressed tiers, and plain attention.
+    fn kv_families() -> Vec<(&'static str, Config)> {
+        let lfm3 = Config {
+            n_layer: 3,
+            n_embd: 64,
+            n_head: 4,
+            n_kv: 2,
+            head_dim: 16,
+            lfm3: true,
+            shortconv_layers: vec![true, false, true],
+            shortconv_l_cache: 4,
+            swa_window: 4,
+            ..Default::default()
+        };
+        let deepseek32 = Config {
+            deepseek32: true,
+            indexer_head_size: 128,
+            ..deepseek_v2_lite_kv()
+        };
+        let deepseek4 = Config {
+            n_layer: 5,
+            n_embd: 4096,
+            n_head: 64,
+            n_kv: 1,
+            head_dim: 512,
+            swa_window: 128,
+            indexer_head_size: 128,
+            compress_ratios: vec![0, 0, 4, 128, 4],
+            deepseek4: true,
+            ..Default::default()
+        };
+        vec![
+            ("qwen35", qwen35_small()),
+            ("lfm3", lfm3),
+            ("gemma3 ring", gemma3_12b()),
+            ("mla", deepseek_v2_lite_kv()),
+            ("mla + indexer", deepseek32),
+            ("deepseek4", deepseek4),
+            ("plain", qwen3_14b()),
+        ]
+    }
+
+    /// Bytes the runner's cold init allocates for one slot, summed from the allocation sites' own
+    /// sizers: each layer's two buffers and a V4 layer's compressed buffers.
+    fn cold_init_bytes(
+        cfg: &Config,
+        ctx: usize,
+        ring: bool,
+        ubatch: usize,
+        row_align: usize,
+        k_fmt: DType,
+        v_fmt: DType,
+    ) -> usize {
+        (0..cfg.n_layer)
+            .map(|l| {
+                let (k, v) =
+                    super::kv_layer_alloc_bytes(cfg, l, ctx, ring, ubatch, row_align, k_fmt, v_fmt);
+                let comp: usize = super::dsv4_comp_bufs(cfg, l, ctx, k_fmt)
+                    .iter()
+                    .map(super::Dsv4CompBuf::bytes)
+                    .sum();
+                k + v + comp
+            })
+            .sum()
+    }
+
+    /// Bytes of a slot's recurrent-state snapshot, from the config alone: a second f32 copy of
+    /// every recurrent layer's two state buffers.
+    fn snapshot_bytes(cfg: &Config) -> usize {
+        (0..cfg.n_layer)
+            .filter_map(|l| cfg.recurrent_state_elems(l))
+            .map(|(k, v)| (k + v) * 4)
+            .sum()
+    }
+
+    /// The estimate is the sum of what a slot allocates, for any geometry: each layer's two cache
+    /// buffers as the runner and `SeamKv::fork` size them (`kv_layer_alloc_bytes`), a V4
+    /// compressed layer's buffers as `alloc_dsv4_comp_bufs` sizes them, and a second copy of each
+    /// recurrent layer's state for its snapshot, every buffer rounded up to the allocator's byte
+    /// alignment. Seeded draws over [`kv_families`], contexts, chunk heights, row and byte
+    /// alignments and per-side formats. An estimate that pads a row, drops the snapshot or rounds
+    /// a sum instead of each buffer differs from the sum.
+    #[test]
+    fn kv_estimate_is_the_sum_of_the_slot_allocations() {
+        let formats = [
+            DType::F16,
+            DType::Q8_0,
+            DType::F32,
+            DType::Q4_0,
+            DType::Turbo3,
+        ];
+        let mut rng = infr_core::pager::shapes::XorShift64::new(0x5eed_4b56);
+        let (mut recurrent, mut ringed, mut compressed, mut mixed, mut rounded) = (0, 0, 0, 0, 0);
+        for (name, cfg) in &kv_families() {
+            for _ in 0..200 {
+                let ctx = match rng.below(4) {
+                    0 => rng.below(3),
+                    1 => 1 + rng.below(200),
+                    _ => 1 + rng.below(1 << 18),
+                };
+                let ring = rng.below(2) == 1;
+                let ubatch = [8, 128, 512, 1024][rng.below(4)];
+                let align = super::KvAlign {
+                    rows: [1, 16, 64][rng.below(3)],
+                    bytes: [1, 16, 4096][rng.below(3)],
+                };
+                let k_fmt = formats[rng.below(formats.len())];
+                let v_fmt = formats[rng.below(formats.len())];
+                let committed = |b: usize| b.next_multiple_of(align.bytes);
+                let mut want = 0usize;
+                let mut pairs = Vec::new();
+                for l in 0..cfg.n_layer {
+                    let (k, v) = super::kv_layer_alloc_bytes(
+                        cfg, l, ctx, ring, ubatch, align.rows, k_fmt, v_fmt,
+                    );
+                    pairs.push((k, v));
+                    want += committed(k) + committed(v);
+                    rounded += usize::from(committed(k) != k || committed(v) != v);
+                    if cfg.is_recurrent_layer(l) {
+                        want += committed(k) + committed(v);
+                        recurrent += 1;
+                    }
+                    let comp = super::dsv4_comp_bufs(cfg, l, ctx, k_fmt);
+                    compressed += comp.len();
+                    want += comp.iter().map(|b| committed(b.bytes())).sum::<usize>();
+                    ringed += usize::from(
+                        super::kv_rows_at(cfg, l, ctx, ring, ubatch, align.rows)
+                            < ctx.next_multiple_of(align.rows),
+                    );
+                }
+                mixed += usize::from(k_fmt != v_fmt);
+                // The runner's cold init allocates its K/V pairs from the head of this list.
+                let init: Vec<(usize, usize)> =
+                    super::kv_init_allocs(cfg, ctx, ring, ubatch, align.rows, k_fmt, v_fmt)
+                        .collect();
+                assert_eq!(
+                    &init[..cfg.n_layer],
+                    &pairs[..],
+                    "{name}: the pairs lead the list"
+                );
+                assert_eq!(
+                    super::kv_bytes_estimate_fmt(cfg, ctx, ring, ubatch, align, k_fmt, v_fmt),
+                    want as u64,
+                    "{name}: ctx {ctx}, ring {ring}, chunk {ubatch}, {align:?}, {k_fmt:?}/{v_fmt:?}"
+                );
+            }
+        }
+        assert!(
+            recurrent > 0 && ringed > 0 && compressed > 0 && mixed > 0 && rounded > 0,
+            "the draws missed a family: {recurrent} recurrent layers, {ringed} ringed, \
+             {compressed} compressed buffers, {mixed} mixed-format draws, {rounded} rounded layers"
+        );
+    }
+
+    /// Each side is sized in its own format, by hand. `INFR_KV_TYPE_K=q8_0` with V at f16 on a
+    /// plain layer of 2 KV heads x 64: at 1000 rows, K is 128 000 elements in 34-byte blocks of
+    /// 32 and V is 128 000 f16. At a row alignment of 16 the rows are 1008; on an MLA model with
+    /// the indexer cache the two sides also differ in width (576 and 128 elements), so a swap of
+    /// the formats changes the estimate too. A byte alignment rounds each buffer, not their sum.
+    #[test]
+    fn kv_sizes_price_each_side_in_its_own_format() {
+        let plain = Config {
+            n_layer: 1,
+            n_embd: 256,
+            n_head: 4,
+            n_kv: 2,
+            head_dim: 64,
+            ..Default::default()
+        };
+        let (k8, v16) = (DType::Q8_0, DType::F16);
+        assert_eq!(
+            super::kv_layer_alloc_bytes(&plain, 0, 1000, false, 512, 1, k8, v16),
+            (136_000, 256_000)
+        );
+        assert_eq!(
+            super::kv_bytes_estimate_fmt(&plain, 1000, false, 512, super::KvAlign::NONE, k8, v16),
+            392_000
+        );
+        let page = super::KvAlign {
+            rows: 1,
+            bytes: 4096,
+        };
+        assert_eq!(
+            super::kv_bytes_estimate_fmt(&plain, 1000, false, 512, page, k8, v16),
+            139_264 + 258_048
+        );
+        assert_eq!(
+            super::kv_layer_alloc_bytes(&plain, 0, 1000, false, 512, 16, k8, v16),
+            (137_088, 258_048)
+        );
+        let mla = Config {
+            deepseek32: true,
+            indexer_head_size: 128,
+            ..deepseek_v2_lite_kv()
+        };
+        let rows16 = super::KvAlign { rows: 16, bytes: 1 };
+        // Per layer: 1008 x 576 q8_0 = 616 896 bytes of K, 1008 x 128 f16 = 258 048 of V.
+        assert_eq!(
+            super::kv_bytes_estimate_fmt(&mla, 1000, false, 512, rows16, k8, v16),
+            27 * (616_896 + 258_048)
+        );
+    }
+
+    /// The refuse rung's floor is what the runner's cold init allocates and the fit's estimate
+    /// adds the recurrent-state snapshot to it. At the floor's own choices (the cheapest format,
+    /// the ring wherever one is possible, the shortest chunk), for every family: the floor is the
+    /// init's bytes exactly, and the estimate is those plus the snapshot, which only the recurrent
+    /// families have.
+    #[test]
+    fn kv_floor_is_the_cold_init_and_the_estimate_adds_the_snapshot() {
+        let ec = EngineConfig::default();
+        let want = 2048;
+        let ub = super::ubatch_candidates(&ec)
+            .into_iter()
+            .min()
+            .expect("a chunk height");
+        for (name, cfg) in &kv_families() {
+            let ring = super::kv_ring_wanted(cfg, &ec);
+            // Asked for f16, the floor prices q8_0, the cheaper format the runner can fall to.
+            let floor: usize =
+                super::kv_floor_alloc_bytes(cfg, &ec, want, 1, 1, DType::F16, DType::F16)
+                    .iter()
+                    .map(|&(k, v)| k + v)
+                    .sum();
+            let init = cold_init_bytes(cfg, want, ring, ub, 1, DType::Q8_0, DType::Q8_0);
+            assert_eq!(floor, init, "{name}: the floor is the cold init");
+            let snapshot = snapshot_bytes(cfg);
+            assert_eq!(
+                snapshot > 0,
+                matches!(*name, "qwen35" | "lfm3"),
+                "{name}: a snapshot"
+            );
+            let estimate = super::kv_bytes_estimate_fmt(
+                cfg,
+                want,
+                ring,
+                ub,
+                super::KvAlign::NONE,
+                DType::Q8_0,
+                DType::Q8_0,
+            );
+            assert_eq!(
+                estimate,
+                (init + snapshot) as u64,
+                "{name}: the estimate adds the snapshot"
+            );
+        }
+    }
+
+    /// The pre-load floor must never price more than any cache the runner's cold init can still
+    /// allocate — that is what lets the refuse rung read it before a weight is loaded without ever
+    /// refusing a run that would have worked. Every family, both formats the runner falls back to,
+    /// every chunk height placement may settle on, ring on and off, and two row alignments.
     #[test]
     fn kv_floor_never_exceeds_a_cache_the_runner_could_allocate() {
-        let cfg = gemma3_12b();
         let ec = EngineConfig::default();
         let want = 32768;
         let total =
             |sizes: Vec<(usize, usize)>| -> usize { sizes.iter().map(|&(k, v)| k + v).sum() };
-        let exact = |ring: bool, ub: usize, dt: DType| {
-            total(
-                (0..cfg.n_layer)
-                    .map(|l| super::kv_layer_alloc_bytes(&cfg, l, want, ring, ub, 1, dt, dt))
-                    .collect(),
-            )
-        };
-        let floor =
-            |n: usize, dt: DType| total(super::kv_floor_alloc_bytes(&cfg, &ec, want, n, dt, dt));
-        let f16 = floor(1, DType::F16);
-        for ub in super::ubatch_candidates(&ec) {
-            for ring in [false, true] {
-                for dt in [DType::F16, DType::Q8_0] {
-                    assert!(
-                        f16 <= exact(ring, ub, dt),
-                        "floor {f16} > the {dt:?} cache at chunk {ub}, ring {ring}"
-                    );
+        for (name, cfg) in &kv_families() {
+            for row_align in [1, 16] {
+                let floor = |n: usize, dt: DType| {
+                    total(super::kv_floor_alloc_bytes(
+                        cfg, &ec, want, n, row_align, dt, dt,
+                    ))
+                };
+                let f16 = floor(1, DType::F16);
+                for ub in super::ubatch_candidates(&ec) {
+                    for ring in [false, true] {
+                        for dt in [DType::F16, DType::Q8_0] {
+                            let exact = cold_init_bytes(cfg, want, ring, ub, row_align, dt, dt);
+                            assert!(
+                                f16 <= exact,
+                                "{name}: floor {f16} > the {dt:?} cache at chunk {ub}, ring \
+                                 {ring}, row align {row_align} ({exact})"
+                            );
+                        }
+                    }
                 }
+                assert_eq!(
+                    floor(2, DType::F16),
+                    2 * f16,
+                    "{name}: each slot owns a cache"
+                );
             }
         }
-        assert_eq!(floor(2, DType::F16), 2 * f16, "each slot owns a cache");
+        let gemma3 = gemma3_12b();
+        let floor = |dt: DType| {
+            total(super::kv_floor_alloc_bytes(
+                &gemma3, &ec, want, 1, 1, dt, dt,
+            ))
+        };
         assert!(
-            floor(1, DType::Turbo2) < f16,
+            floor(DType::Turbo2) < floor(DType::F16),
             "a requested format cheaper than q8_0 is the floor"
         );
     }

@@ -710,6 +710,17 @@ pub trait Backend: Send + Sync {
         1
     }
 
+    /// The byte multiple the backend's allocator rounds one `BufferUsage::KvCache` buffer up to: a
+    /// buffer of `n` bytes takes at least `n.next_multiple_of(kv_alloc_align())` of the device. KV
+    /// footprint estimates round every buffer up to it, so a context fitted to fill the device
+    /// leaves room for that rounding. It is a lower bound on what the device commits, not the
+    /// commitment itself: a pooled buffer can open a whole new memory block, and the driver may
+    /// round a dedicated allocation further (see the infr-llama KV estimate's own caveat). `1`
+    /// unless a backend says otherwise.
+    fn kv_alloc_align(&self) -> usize {
+        1
+    }
+
     /// Perf (DiffusionGemma denoise, perf slice 3 — docs/diffusion-gemma.md): fused per-canvas-row
     /// entropy-bound sampler reduction over raw `[rows, dim]` logits, avoiding a full `[rows,
     /// dim]` host download. `u` is `rows` host-drawn uniform `[0,1)` floats (the seeded

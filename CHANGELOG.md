@@ -999,14 +999,25 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   Q4_K_M 610.0 and 620.9 to 680.6 and 672.1 (the LFM3 means include a cold first
   rep near 160 t/s; the warm reps reached 774.2 and 790.4 before, 863.5 and
   865.5 after). Decode is unchanged.
-- **The KV-cache estimate prices a recurrent layer at its fixed state size.**
-  The context fit and the placement sweep used to price a qwen35 DeltaNet layer
-  as if it cached K and V per token, so a qwen35 session's default context was
-  sized against memory the runner never allocates. They now price its conv and
-  `S` state (and LFM3's convolution history) at what is allocated, twice over:
-  the live state and the one snapshot of it a slot keeps for MTP rollback and
-  for resuming at a prefill boundary. The snapshot's allocation fails the
-  request when refused, so the fit now keeps room for it.
+- **The KV-cache estimate is the allocation, and auto-sized Qwen3.5 / Qwen3.6
+  contexts are about 3.4 to 3.5 times larger.** The context fit, the placement
+  sweeps and the MoE expert budget used to price a model of the cache: every
+  layer as per-token K and V rows, plus 64 spare rows per layer. They now sum
+  the buffers a session allocates, through the functions that allocate them, at
+  the backend's own row alignment, each buffer rounded up to the alignment the
+  device's allocator gives it (the new `Backend::kv_alloc_align`, which Vulkan
+  reads from the driver's memory requirements for a KV buffer). A qwen35
+  DeltaNet layer (and an LFM3 short-convolution layer) is priced at its
+  fixed-size state, twice over: the live state and the one snapshot of it a slot
+  keeps for MTP rollback and for resuming at a prefill boundary, so a context
+  fitted to fill the device leaves room for the snapshot. Where the default
+  context is clamped to VRAM it grows: computed from the files' own geometry,
+  Qwen3.5-0.8B Q4_K_M with 4 GiB free fits 221 497 tokens where the old pricing
+  gave 65 860, and Qwen3.5-4B UD-Q4_K_XL with 8 GiB free fits 131 265 where it
+  gave 37 924 (the old figures are the old KV pricing under today's activation
+  reserve). A device with room for the trained context is unchanged, and a
+  qwen35moe model keeps more experts resident. Every other model's fit moves by
+  the 64 rows per layer it no longer reserves.
 - **Paged MoE decode on Vulkan reaches its no-readback path from a short prompt
   when the expert cache can hold the whole model.** A MoE layer decodes without
   reading its router ids back only once every one of its experts is in VRAM, and

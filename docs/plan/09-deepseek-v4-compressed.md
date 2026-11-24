@@ -277,7 +277,7 @@ listed one entry each in the KV allocation guard (`dsv4_comp_allocs`, from the
 runner and `kv_floor_alloc_bytes`). `kv_row_align_ok` holds the compressed rows
 to the 32-element block rule too. Pinned by
 `kv_footprint_of_deepseek4_flash_counts_its_compressed_tiers`: at the V4-Flash
-geometry and 4096 tokens of f16, 223 559 680 bytes, of which 40 386 560 are the
+geometry and 4096 tokens of f16, 220 741 976 bytes, of which 40 386 560 are the
 compressed tiers. Multi-session serving forks slots, so it gets the buffers
 through `fork`.
 

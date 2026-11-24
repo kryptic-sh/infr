@@ -8617,4 +8617,20 @@ copy-on-write go through the same code. Verified on the RX 580:
 through a paged Q8 engine and the second answer, restored out of the store into
 a page pool, is byte-identical. Still open, and separate: a wrapped ring with a
 Q8_0 cache has only the window's rows stored, which the coverage check turns
-into a miss rather than a wrong window — same as any other format.
+into a miss rather than a wrong window — same as any other format. The test also
+asserts the cache's own counters moved, so the guard that used to refuse this
+layout cannot come back unnoticed.
+
+### B240 — a table array under a known scalar key warns instead of failing (2026-11-24)
+
+**Tag:** config · **Plan:** `docs/plan/18-kv-tiers.md` (P6)
+
+`[[kv.tiers]]` taught the file walker to flatten an array of tables into
+`<path>.<i>.<field>` (crates/infr-core/src/config/file.rs). The branch is taken
+whenever the path is a known leaf, and the walker has no leaf types, so
+`kv.type_k = [{ ... }]` recurses into `kv.type_k.0.<field>` and each field warns
+"unknown key" instead of the hard type error a scalar leaf should give. Harmless
+as long as `kv.tiers` is the only list, but a second one, or a typo that turns a
+scalar into a table, is reported as a set of unknown keys rather than as the
+wrong shape. The fix is a list of list-valued paths generated beside `all_paths`,
+so the walker can tell "this leaf is a list" from "this path is unknown".

@@ -80,11 +80,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   prefixes survive a restart, and leaving `path` out keeps the same database in
   memory. `backend = "redis"` (or `"valkey"`) is a shared tier; its budget is
   the server's `maxmemory`, which is why it must be last. The store loads its
-  index at startup without reading the rows. A `kv.store_file` pointing at the
-  old journal now opens as an empty database, so the first start after upgrading
-  loses the prefixes that file held. There is no env spelling for the list; the
-  config file is the only place it is written (`--set kv.tiers=redb` gives a
-  single in-memory tier for a quick comparison).
+  index at startup without reading the rows. A redb `path` that points at the
+  old `kv.store_file` journal opens as an empty database, so the first start
+  after upgrading loses the prefixes that file held. There is no env spelling for
+  the list; the config file is the only place it is written (`--set
+  kv.tiers=redb` gives a single in-memory tier for a quick comparison).
 
 - **A request that outgrows the page pool parks an idle conversation instead of
   failing.** `infr serve` with `kv.paged` and a pool too small for every slot now

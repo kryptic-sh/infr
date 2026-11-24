@@ -228,6 +228,11 @@ fn q8_kv_keeps_its_rows_through_pages_and_the_store() {
     let (first, _) = run(&prompt);
     let (again, warm) = run(&prompt);
     assert!(warm.n_cached > 0, "the second run restored nothing");
+    let (restores, restored_tokens, captures) = seam.kv_store_stats();
+    assert!(
+        captures > 0 && restores > 0 && restored_tokens > 0,
+        "the prefix store skipped a planar Q8_0 cache: {captures} captures, {restores} restores"
+    );
     assert_eq!(
         again, first,
         "a restored planar Q8_0 cache changed the answer"

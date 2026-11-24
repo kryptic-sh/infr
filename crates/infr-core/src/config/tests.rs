@@ -250,6 +250,18 @@ fn unknown_toml_section_warns_once() {
     assert!(warnings[0].contains("kernels.opencl"), "{}", warnings[0]);
 }
 
+/// An unknown `[[...]]` list of tables is an unknown key like any other: warn once, keep going.
+#[test]
+fn unknown_toml_table_array_warns_once() {
+    let (_, warnings) = file::parse_str(
+        "[[connectors]]\nname = \"a\"\n\n[[connectors]]\nname = \"b\"\n",
+        Path::new("infr.toml"),
+    )
+    .expect("an unknown list must not fail the file");
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].contains("connectors"), "{}", warnings[0]);
+}
+
 /// Invalid TOML syntax is still a hard error.
 #[test]
 fn malformed_toml_is_an_error() {

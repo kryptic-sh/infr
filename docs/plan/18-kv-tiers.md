@@ -14,7 +14,7 @@ KV rows can live in four places today, and each move between them is hand-writte
 `fill_from_device`, `restore`, `read_rows`, `write_rows`, `write_ring_block`, `import_linear` and
 `copy_tail` each re-derive where a logical row sits. The cold tier is not a spill tier: the RAM
 LRU drops a block and the drop-time rewrite deletes it from Redis too, so Redis never holds more
-than `store_mb`. An idle slot that loses its pages to a new request loses its reply rows, because
+than the RAM budget. An idle slot that loses its pages to a new request loses its reply rows, because
 capture only keeps the prompt.
 
 ## Constraint
@@ -115,14 +115,17 @@ from a hole.
   restore and the runner, and `park_idle` capturing the victim before `reset`. Test: two
   conversations in a one-conversation pool both resume with `cached_tokens > 0`, plus the
   panic-safety of the park reservation.
-- **P6** the store list: `[[kv.tiers]]` entries replace `kv.store_mb` / `kv.store_path` /
-  `kv.store_url`, `DiskKv` becomes `RedbKv` with a file or in-memory database, and `RamKv` goes —
-  one store with a location instead of a RAM tier in front of a disk tier. Fixed with it: Vulkan's
-  planar Q8_0 cache (codes, then the scales at the buffer's element capacity) is addressed by
-  `SideLayout` in the row copies, so capture, restore, a fork's tail copy and page copy-on-write
-  all work on it, and the page pool no longer refuses it. Also fixed: a redb `put` recorded an
-  empty index meta when it had none, which a later demotion copied over the real one, so a restart
-  dropped those blocks.
+- **P6** (done, `06246237`) the store list: `[[kv.tiers]]` entries replace `kv.store_mb` /
+  `kv.store_path` / `kv.store_url`, `DiskKv` becomes `RedbKv` with a file or in-memory database, and
+  `RamKv` goes — one store with a location instead of a RAM tier in front of a disk tier. Fixed
+  with it: Vulkan's planar Q8_0 cache (codes, then the scales at the buffer's element capacity) is
+  addressed by `SideLayout` in the row copies, so capture, restore, a fork's tail copy and page
+  copy-on-write all work on it, and the page pool no longer refuses it. Also fixed: a redb `put`
+  recorded an empty index meta when it had none, which a later demotion copied over the real one, so
+  a restart dropped those blocks. Follow-ups with the review: a promotion now carries the meta up
+  with the rows, an empty redb meta reads as absent, a tier's `url`/`path`/`size` are checked
+  against its backend instead of ignored, credentials are stripped from a logged `url`, and a redb
+  tier without a `size` keeps 1 GiB, which is what `--set kv.tiers=redb` builds.
 
 ## Measures
 

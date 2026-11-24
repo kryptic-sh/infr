@@ -722,18 +722,30 @@ impl KvTier {
         }
     }
 
-    /// A one-line description for logs.
+    /// A one-line description for logs, with any credentials stripped from a `url`.
     pub fn describe(&self) -> String {
         let where_ = self
             .path
             .as_ref()
             .map(|p| p.display().to_string())
-            .or_else(|| self.url.clone())
+            .or_else(|| self.url.as_deref().map(redact_url))
             .unwrap_or_else(|| "memory".to_string());
         match self.bytes() {
             Some(b) => format!("{} {where_} ({b} bytes)", self.backend),
             None => format!("{} {where_}", self.backend),
         }
+    }
+}
+
+/// `scheme://user:secret@host` as `scheme://host`: a URL in a log line keeps its shape and loses
+/// its credentials.
+fn redact_url(url: &str) -> String {
+    match url.split_once("://") {
+        Some((scheme, rest)) => match rest.rsplit_once('@') {
+            Some((_, host)) => format!("{scheme}://{host}"),
+            None => url.to_string(),
+        },
+        None => url.to_string(),
     }
 }
 

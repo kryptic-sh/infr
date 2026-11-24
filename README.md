@@ -25,9 +25,9 @@ that is not specific to older GPUs is meant to go upstream.
 
 **Both directions of KV paging**, neither of which upstream has:
 
-- **`kv.store_mb` (`INFR_KV_STORE_MB`) — reverse PagedAttention.** A prompt's
+- **The `[[kv.tiers]]` cache (`INFR_KV_PAGED`'s sibling) — reverse PagedAttention.** A prompt's
   K/V rows are captured in 128-token blocks, chained by a hash of
-  `(parent id, tokens)`, and kept in host RAM under an LRU byte budget. The next
+  `(parent id, tokens)`, and kept in the configured stores, fastest first. The next
   request walks the chain from token 0 as far as its prompt agrees, then uploads
   the matched run in one contiguous copy instead of re-prefilling it. Gemma 4 E4B
   on the RX 580: a 1068-token prompt took 3677 ms cold, 319 ms on a repeat,

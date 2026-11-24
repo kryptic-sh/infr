@@ -138,8 +138,8 @@ pub(crate) enum SideLayout {
 
 impl SideLayout {
     /// The side's layout, from the backend that owns it and the buffer it lives in. A planar side
-    /// is refused when its length is not exactly a capacity plus its scales, so a padded or
-    /// half-allocated side is a miss rather than a read of somebody else's bytes.
+    /// whose length is not exactly a capacity plus its scales is refused, so a padded or
+    /// half-allocated side fails loudly instead of reading somebody else's bytes.
     pub(crate) fn of(be: &dyn Backend, fmt: DType, buf: &dyn Buffer) -> Result<Self> {
         if fmt != DType::Q8_0 || !be.kv_q8_planar() {
             return Ok(Self::Packed);

@@ -136,11 +136,15 @@ fn walk(
         // `[[path]]`: an array of tables is a list of entries, addressed as `path.<i>.<key>`. Only
         // a known leaf takes one, so an unknown `[[...]]` still warns once.
         if let toml::Value::Array(items) = value {
-            if items.iter().all(|v| v.is_table()) && known.contains(&path) {
-                for (i, item) in items.iter().enumerate() {
-                    if let toml::Value::Table(sub) = item {
-                        walk(sub, &format!("{path}.{i}."), known, out, warnings)?;
+            if items.iter().all(toml::Value::is_table) {
+                if known.contains(&path) {
+                    for (i, item) in items.iter().enumerate() {
+                        if let toml::Value::Table(sub) = item {
+                            walk(sub, &format!("{path}.{i}."), known, out, warnings)?;
+                        }
                     }
+                } else {
+                    warnings.push(unknown_line(&path));
                 }
                 continue;
             }

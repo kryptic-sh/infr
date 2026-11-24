@@ -46,11 +46,6 @@ pub(crate) fn capture_upto(cfg: &Config, kv: &SeamKv, prompt_len: usize) -> usiz
     }
 }
 
-/// Whether a Q8_0 KV side here has no packed rows to address (see [`Backend::kv_q8_planar`]).
-fn planar_q8(be: &dyn Backend, k_fmt: DType, v_fmt: DType) -> bool {
-    (k_fmt == DType::Q8_0 || v_fmt == DType::Q8_0) && be.kv_q8_planar()
-}
-
 /// Chain id of a block: the previous block's id mixed with this block's tokens.
 ///
 /// FNV-1a, not `DefaultHasher`: the ids are written to a tier, so they must not change with the
@@ -376,10 +371,6 @@ impl<S: KvStore> BlockCache<S> {
         if !self.enabled() {
             return Ok(0);
         }
-        if planar_q8(be, kv.k_fmt, kv.v_fmt) {
-            tracing::debug!("kv store: a planar Q8_0 cache has no packed rows to restore");
-            return Ok(0);
-        }
         let (mut p, hits) = self.matched(prompt);
         if p < MIN_PREFIX_TOKENS || self.k_fmt != kv.k_fmt || self.v_fmt != kv.v_fmt {
             return Ok(0);
@@ -463,10 +454,6 @@ impl<S: KvStore> BlockCache<S> {
         upto: usize,
     ) -> Result<usize> {
         if !self.enabled() {
-            return Ok(0);
-        }
-        if planar_q8(be, kv.k_fmt, kv.v_fmt) {
-            tracing::debug!("kv store: a planar Q8_0 cache has no packed rows to capture");
             return Ok(0);
         }
         let p = upto.min(kv.cached.len()).min(kv.max_ctx);
@@ -629,20 +616,45 @@ enum Opened {
     Plain(Box<dyn KvStore>),
 }
 
+/// A redb tier's budget when its entry names none, which is what `--set kv.tiers=redb` produces.
+const DEFAULT_TIER_BYTES: u64 = 1 << 30;
+
 fn open_tier(tier: &infr_core::config::KvTier, key: u64) -> anyhow::Result<Opened> {
     match tier.backend.trim().to_ascii_lowercase().as_str() {
         "redb" => {
-            let size = tier
-                .bytes()
-                .ok_or_else(|| anyhow!("a redb tier needs a byte `size`"))?;
-            let size = size as usize;
+            if tier.url.is_some() {
+                return Err(anyhow!(
+                    "a redb tier keeps its blocks in `path`, and `url` belongs to a redis tier"
+                ));
+            }
+            let size = match tier.size {
+                None => DEFAULT_TIER_BYTES,
+                Some(infr_core::SizeSpec::Percent(_)) => {
+                    return Err(anyhow!("a tier `size` is bytes, not a share of something"))
+                }
+                Some(infr_core::SizeSpec::Bytes(0)) => {
+                    return Err(anyhow!("a tier `size` has to be more than zero"))
+                }
+                Some(infr_core::SizeSpec::Bytes(bytes)) => bytes,
+            };
             let store = match &tier.path {
-                Some(path) => RedbKv::open_file(path, key, size)?,
-                None => RedbKv::open_memory(key, size)?,
+                Some(path) => RedbKv::open_file(path, key, size as usize)?,
+                None => RedbKv::open_memory(key, size as usize)?,
             };
             Ok(Opened::Budgeted(Box::new(store)))
         }
         "redis" | "valkey" => {
+            if tier.path.is_some() {
+                return Err(anyhow!(
+                    "a redis tier is named by `url`, and `path` belongs to a redb tier"
+                ));
+            }
+            if tier.size.is_some() {
+                tracing::warn!(
+                    tier = %tier.describe(),
+                    "kv store: a redis tier is budgeted by the server, so `size` is ignored"
+                );
+            }
             let url = tier
                 .url
                 .as_deref()
@@ -1030,6 +1042,66 @@ mod tests {
         assert!(!t.fast().contains(2), "the other block went down");
         assert!(t.slow().contains(2));
         assert!(t.fast().used() <= t.fast().capacity());
+    }
+
+    /// The index entry travels with the rows: a promoted block carries the meta that names its
+    /// tokens up with it, so a start that loads the fast tier alone still finds the block.
+    #[test]
+    fn a_promotion_carries_the_index_entry_up() {
+        let mut t = Tiered::new(
+            RedbKv::open_memory(0, 8).unwrap(),
+            RedbKv::open_memory(1, 0).unwrap(),
+        );
+        let rows = KvRows::whole(1, vec![vec![1; 4]], vec![vec![2; 2]]);
+        t.put(1, 0, rows).unwrap();
+        t.fast_mut().set_meta(1, b"entry").unwrap();
+        t.slow_mut().set_meta(1, b"entry").unwrap();
+        t.put(2, 0, KvRows::whole(1, vec![vec![3; 4]], vec![vec![4; 2]]))
+            .unwrap();
+        assert!(!t.fast().contains(1), "1 was demoted by the second write");
+
+        let mut got = KvRows::default();
+        assert!(t.get(1, 0..1, &mut got).unwrap());
+        assert_eq!(
+            t.fast_mut().meta(1).unwrap().as_deref(),
+            Some(&b"entry"[..])
+        );
+    }
+
+    /// A redb tier gets 1 GiB when its entry names no size, which is what `--set kv.tiers=redb`
+    /// builds; a field that belongs to the other backend is refused instead of ignored.
+    #[test]
+    fn a_tier_is_checked_against_its_backend() {
+        use infr_core::SizeSpec;
+        let tier = |backend: &str| infr_core::config::KvTier {
+            backend: backend.to_string(),
+            ..Default::default()
+        };
+        let Ok(Opened::Budgeted(redb)) = open_tier(&tier("redb"), 7) else {
+            panic!("a redb tier with no size opens")
+        };
+        assert_eq!(redb.capacity(), DEFAULT_TIER_BYTES as usize);
+
+        let wrong_url = infr_core::config::KvTier {
+            url: Some("redis://127.0.0.1:1/0".into()),
+            ..tier("redb")
+        };
+        assert!(open_tier(&wrong_url, 7).is_err(), "redb has no url");
+
+        let wrong_path = infr_core::config::KvTier {
+            path: Some(std::path::PathBuf::from("/tmp/kv.redb")),
+            ..tier("redis")
+        };
+        assert!(open_tier(&wrong_path, 7).is_err(), "redis has no path");
+
+        for size in [SizeSpec::Bytes(0), SizeSpec::Percent(50.0)] {
+            let bad = infr_core::config::KvTier {
+                size: Some(size),
+                ..tier("redb")
+            };
+            assert!(open_tier(&bad, 7).is_err(), "{size:?} is not a budget");
+        }
+        assert!(open_tier(&tier("lmcache"), 7).is_err(), "unknown backend");
     }
 
     /// A block rewritten while an older copy sits below it must not leave that copy behind: the

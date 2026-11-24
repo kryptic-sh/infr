@@ -318,6 +318,12 @@ impl ParallelSeam {
             .map(|p| (p.used_pages(), p.free_pages()))
     }
 
+    /// The prefix cache's `(restores, restored tokens, captures)`.
+    pub fn kv_store_stats(&self) -> (u64, u64, u64) {
+        let store = self.store.lock().expect("kv store lock");
+        (store.restores, store.restored_tokens, store.captures)
+    }
+
     /// Materialize slot 0 (weights + KV + pipelines) with a throwaway generation, then fork the
     /// rest off it. `&mut self` — this runs at startup, before the engine is shared.
     fn init_slots(&mut self, n_slots: usize) -> Result<()> {

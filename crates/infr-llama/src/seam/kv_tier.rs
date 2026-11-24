@@ -660,7 +660,6 @@ impl DeviceKv<'_> {
         let (k_row, v_row) = kv_row_elems(self.cfg, l);
         let layout = self.kv.row_layout(self.be, self.cfg, l);
         // Rows a chain wrote past `cached` still recycled the ring under them.
-        // Rows a chain wrote past `cached` still recycled the ring under them.
         let oldest = layout.oldest_resident(self.kv.written_end.max(self.kv.cached.len()));
         Some(DeviceLayer {
             k: self.kv.kbufs[l].as_ref(),
@@ -723,6 +722,10 @@ impl<Fast: BudgetedStore, Slow: KvStore> KvStore for Tiered<Fast, Slow> {
         // A read from row 0 is a whole block extent, which is what the cache stores.
         if rows.start == 0 && !rows.is_empty() {
             self.fast.put(id, 0, hit)?;
+            // The index entry lives beside the rows, so a promoted block carries its own.
+            if let Some(meta) = self.slow.meta(id)? {
+                self.fast.set_meta(id, &meta)?;
+            }
             self.settle()?;
             return self.fast.get(id, rows, out);
         }
@@ -1158,9 +1161,12 @@ impl KvStore for RedbKv {
         let table = txn.open_table(REDB_METAS)?;
         let mut out = Vec::with_capacity(ids.len());
         for &id in ids {
+            // An extent's record holds nothing but its byte count until the cache has an index
+            // entry for it, and that is not a meta a reader may take.
             let meta = table
                 .get((self.key, id))?
-                .map(|v| record_meta(v.value()).to_vec());
+                .map(|v| record_meta(v.value()).to_vec())
+                .filter(|m| !m.is_empty());
             out.push(meta);
         }
         Ok(out)

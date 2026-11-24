@@ -242,7 +242,7 @@ read falls through and promotes it back:
 ```toml
 [[kv.tiers]]
 backend = "redb"
-size = "1g"                 # required: the tier evicts when it is full
+size = "1g"                 # bytes this tier keeps before evicting
 path = "/var/cache/infr/kv-prefix.redb"   # optional: unset keeps it in memory
 
 [[kv.tiers]]
@@ -252,14 +252,16 @@ url = "redis://127.0.0.1:6379/2"          # required; redis, rediss or valkey
 
 A redb tier is one database file that loads its index at startup (not the rows),
 so a restart keeps its prefixes; leaving `path` out keeps the same database in
-anonymous memory, which is faster and gone with the process. A redis tier is
-shared, so several servers can point at it; its budget is the server's
-`maxmemory`, which is why it goes last. Sizes take the shared size grammar
-(`1GiB`, `512Mi`). The config file is the only place a tier list is written: the
-store holds prompt-derived data, so enabling it is a deliberate choice, and
-`--set kv.tiers=redb` gives a single in-memory tier for a quick comparison. A
-planar Q8_0 KV cache on Vulkan is handled: the row copies interleave its codes
-and scales, so no backend is refused.
+anonymous memory, which is faster and gone with the process. A redb tier with
+no `size` keeps 1 GiB. A redis tier is shared, so several servers can point at
+it; its budget is the server's `maxmemory`, which is why it goes last.
+
+Sizes take the shared size grammar (`1g`, `512m`). The config file is the only
+place a tier list is written, because the store holds prompt-derived data and
+switching it on should be deliberate; `--set kv.tiers=redb` gives a single
+in-memory tier for a quick comparison, and any other list replaced this way loses
+the file's entries. A planar Q8_0 KV cache on Vulkan is handled: the row copies
+interleave its codes and scales, so no backend is refused.
 `paged`
 (`INFR_KV_PAGED`) turns on forward PagedAttention instead: the session's slots
 share one pool of physical pages, built with the session's KV in the cold init;

@@ -8,7 +8,7 @@ block size, and nothing else.
 2. **Reuse inside a slot set.** Two live sequences share a prefix, so their
    page tables point at the same physical rows and diverge by copy-on-write.
 
-This tree ships both: (1) as `kv.store_mb`, (2) as `kv.paged`. When writing
+This tree ships both: (1) as the `[[kv.tiers]]` cache, (2) as `kv.paged`. When writing
 about them, be blunt: (1) is **reverse PagedAttention** — paging turned inside
 out. Physical rows stay contiguous in a slot; the blocks are the thing that
 travels, and the "restore" is a bulk upload back into a linear buffer. It is a
@@ -20,7 +20,7 @@ Two mechanisms, two knobs, and neither implies the other:
 
 | Knob | Config / env | Direction | Status |
 | --- | --- | --- | --- |
-| `store_mb` | `kv.store_mb` / `INFR_KV_STORE_MB` | reverse (host block store) | shipped |
+| `tiers` | `[[kv.tiers]]` (config file) | reverse (host block store) | shipped |
 | `paged` | `kv.paged` / `INFR_KV_PAGED` | forward (page pool) | shipped |
 
 `kv.paged` puts a session's KV in one page pool at the first fork: the slot that
@@ -40,7 +40,7 @@ What it does not do, and the reasons:
   goes for the recurrent (DeltaNet), MLA and diffusion layers, which have no
   row-addressed cache at all. On Gemma 4 E4B that is 35 of 42 layers, so paging
   buys little there and a great deal on a full-attention model.
-- **A paged slot composes with the host store.** `kv.store_mb`'s capture and
+- **A paged slot composes with the host store.** The cache's capture and
   restore offset every layer by the slot's row base, so a recycled slot restores
   into its block (and copies a page it shares before it writes).
   `tests/kv_paged_session.rs` runs both knobs together.
@@ -52,7 +52,7 @@ lookup per chunk, and prefill on a paged cache takes the split-K attention
 kernel — the coopmat prefill tiers read the cache as one flat run and would
 need a page walk in their K/V tile loads.
 
-## Reverse PagedAttention: what `kv.store_mb` does
+## Reverse PagedAttention: what the prefix cache does
 
 `crates/infr-llama/src/seam/kv_store.rs` keys captured KV in 128-token blocks
 (`BLOCK_TOKENS`), chained by a hash of `(previous block id, tokens)`, and keeps

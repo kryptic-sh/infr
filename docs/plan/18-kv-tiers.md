@@ -1,7 +1,7 @@
 # Plan 18: KV tiers behind traits
 
-Status: P1–P4 shipped; P5 shipped except the `Paged<S>` rewrite, which is dropped with a reason
-in its phase.
+Status: shipped. P1–P5 built the trait, the tiers and parked slots; P6 replaced the fixed RAM/disk/Redis knobs
+with a list of pluggable stores and taught the row copies Vulkan's planar Q8_0 layout.
 
 ## Problem
 
@@ -38,11 +38,12 @@ extent.
 
 - `DeviceKv`: GPU buffers, one extent per slot, with a `RowLayout` (linear, ring, page map)
   resolving rows to buffer offsets;
-- `RamKv`: a hash map of extents in host memory;
-- `DiskKv`: one redb table. A B-tree reuses the pages a deleted extent freed, which suits a
-  budgeted cache that evicts all the time. Commits use `Durability::None`, because a lost
-  extent is only a cache miss;
-- `RedisKv`: one key per extent on Redis or Valkey.
+- `RedbKv`: one redb database, in a file (`kv.store_path`) or in redb's in-memory backend. A
+  B-tree reuses the pages a deleted extent freed, which suits a cache that evicts all the time;
+  commits use `Durability::None`, because a lost extent is only a cache miss, and `Drop` flushes
+  once;
+- `RedisKv`: one key per extent on Redis or Valkey;
+- `NoStore`: the store behind a disabled cache, which holds nothing.
 
 **Capability traits** extend it where a store can do more:
 
@@ -57,12 +58,19 @@ pool pages and have no `SeamKv` to wrap.
 **Combinators** wrap stores and implement `KvStore` themselves:
 
 - `Tiered<Fast, Slow>`: reads fall through and promote, evictions from `Fast` demote to `Slow`
-  with their index entry, so `Tiered<RamKv, Tiered<DiskKv, RedisKv>>` is a single store;
+  with their index entry, so a list of stores folds into one;
 - `Bounded<S: BudgetedStore>`: the last tier, which drops its own LRU instead of demoting, so a
-  RAM-only cache stays inside `kv.store_mb`;
+  cache that ends here stays inside its tier's `size`;
 - `BlockCache<S: KvStore>`: the prefix cache, a token index over content-addressed extents
   (FNV chain id) in any store. The index entry (tokens, snapshot flag, bytes) is side metadata on
   the store itself (`KvStore::meta`), so startup lists extent ids and reads metas only.
+
+**The store list is config.** `[[kv.tiers]]` is one entry per store, fastest first, each with a
+`backend` and its own `size`; `redb` takes a `path` (a file) or none (memory), `redis` takes a
+`url`. The builder folds the list innermost-first into `Tiered`, `Bounded` at the bottom, so a new
+backend is one `KvStore` impl and one arm in `open_tier`. Every entry except the last has to be
+able to evict, which is why a `redis` tier that is not last is dropped with a warning: the server
+owns its own `maxmemory`.
 
 `Paged<S>` was proposed here and is not built: its only possible `S` is the one page pool, whose
 buffers the attention kernels bind directly, so the wrapper would have a single implementor and no
@@ -107,12 +115,21 @@ from a hole.
   restore and the runner, and `park_idle` capturing the victim before `reset`. Test: two
   conversations in a one-conversation pool both resume with `cached_tokens > 0`, plus the
   panic-safety of the park reservation.
+- **P6** the store list: `[[kv.tiers]]` entries replace `kv.store_mb` / `kv.store_path` /
+  `kv.store_url`, `DiskKv` becomes `RedbKv` with a file or in-memory database, and `RamKv` goes —
+  one store with a location instead of a RAM tier in front of a disk tier. Fixed with it: Vulkan's
+  planar Q8_0 cache (codes, then the scales at the buffer's element capacity) is addressed by
+  `SideLayout` in the row copies, so capture, restore, a fork's tail copy and page copy-on-write
+  all work on it, and the page pool no longer refuses it. Also fixed: a redb `put` recorded an
+  empty index meta when it had none, which a later demotion copied over the real one, so a restart
+  dropped those blocks.
 
 ## Measures
 
-- Restore cost per tier, on the RX 580 with Qwen2.5-0.5B: 2k tokens take 21 ms from host RAM, 20 ms
-  from redb and 92 ms from loopback Valkey, against 864-906 ms to prefill them. The table lives in
-  `docs/perf/kv-prefix.md`, and `crates/infr-llama/tests/kv_tier_latency.rs` regenerates it.
-- The same comparison at long context: 4k 2138 → 34 ms, 31561 tokens 44.7 s → 272 ms. A parked
+- Restore cost per tier, on the RX 580 with Qwen2.5-0.5B: 2k tokens take 43 ms from an in-memory
+  redb, a redb file on NVMe or loopback Redis, against 856-864 ms to prefill them. All three land on
+  the same number because the upload is the floor. The table lives in `docs/perf/kv-prefix.md`, and
+  `crates/infr-llama/tests/kv_tier_latency.rs` regenerates it.
+- The same comparison at long context: 4k 2095 → 77 ms, 31561 tokens 38.5 s → 593 ms. A parked
   conversation resumes through that restore; the parking test asserts both conversations come back
   with `cached_tokens > 0`.

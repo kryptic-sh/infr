@@ -8600,20 +8600,21 @@ window. On the RX 580 that forces a 128-row prefill chunk even for a 4k request
 request prefill at the tallest chunk that fits. Measure TTFT at 4k before and
 after; the 112k case stays at the window-sized reserve.
 
-### B239 — a Q8_0 KV cache opts out of the prefix store instead of being addressed (2026-11-24)
+### B239 — fixed: a planar Q8_0 KV cache is addressed, not refused (2026-11-24)
 
-**Tag:** kv · store · **Plan:** `docs/plan/18-kv-tiers.md`
+**Tag:** kv · store · **Plan:** `docs/plan/18-kv-tiers.md` (P6)
 
 Vulkan keeps a Q8_0 KV side planar: every int8 code, then every block's f16
 scale in a second region (`store_q8.comp`, `VulkanBackend::copy_kv_prefix`). The
-store's rows are packed byte runs, so a planar side has no row boundaries to
-address: reading rows `[a, b)` at `a * 136` samples the codes of rows `[a, b)`
-plus the first codes of later rows, and writing them to a slot of another
-geometry lands them on the wrong elements. Since `HEAD` the store refuses a
-planar Q8_0 cache outright (`Backend::kv_q8_planar`, checked in
-`BlockCache::capture`/`restore`), so an auto-q8 session simply re-prefills. The
-fix is to convert during the transfer: download the code region and the scale
-region, interleave them into GGUF blocks on the host, and reverse it for a
-write, which costs one extra pass over the block. Reachable with `kv.force_q8`
-or the auto-q8 placement pin; verify on a GPU box that capture and restore of a
-Q8_0 cache match an f16 run, at 4k and with a wrapped ring.
+store used to refuse such a cache because its rows are packed byte runs. P6
+added `SideLayout`, which derives the side's layout from the backend and the
+buffer (planar when `Backend::kv_q8_planar`, with the scale region at the
+buffer's element capacity), so a read downloads the codes and the scales and
+interleaves them into GGUF blocks, a write splits them back out, and a
+planar-to-planar copy moves both runs directly. A fork's tail copy and a page's
+copy-on-write go through the same code. Verified on the RX 580:
+`q8_kv_keeps_its_rows_through_pages_and_the_store` runs the same prompt twice
+through a paged Q8 engine and the second answer, restored out of the store into
+a page pool, is byte-identical. Still open, and separate: a wrapped ring with a
+Q8_0 cache has only the window's rows stored, which the coverage check turns
+into a miss rather than a wrong window — same as any other format.

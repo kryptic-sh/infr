@@ -231,23 +231,35 @@ On `serve` these are the server defaults — a per-request OpenAI
 **`[kv]`** — cache element format (`type_k` / `type_v`, plus the legacy
 `force_q8` alias), prefix-cache `slots`, the sliding-window `ring`, and the
 host-overflow trio (`overflow`, `overflow_vram_mb`, `overflow_reserve_mb`) that
-spills KV to system RAM when VRAM runs out. `store_mb` turns on the
+spills KV to system RAM when VRAM runs out. `[[kv.tiers]]` turns on the
 cross-conversation prefix store (reverse PagedAttention, see
-`docs/perf/kv-prefix.md`): the K/V rows of a prompt stay in host RAM after
-its slot is recycled, and a later request sharing that prefix uploads them
-instead of re-prefilling, with LRU eviction once the budget is full. It is
-off by default because those rows are derived from the prompt. `store_file`
-(`INFR_KV_STORE_FILE`) pours what the RAM tier evicts into one redb database and
-loads its index at startup (not the rows), so a restart keeps its prefixes;
-`store_disk_mb` (`INFR_KV_STORE_DISK_MB`, default four times `store_mb`, `0` for
-no limit) caps it. Setting `store_file` without `store_mb` enables the store with
-a 256 MiB RAM tier in front of the disk. `store_url` (`INFR_KV_STORE_URL`,
-`redis://` / `rediss://` / `valkey://`) puts the same blocks in Redis or
-Valkey, so several servers can share one prefix cache; with both set the disk
-tier spills into Redis. Use TLS and a dedicated database, since these rows are
-model input. A planar Q8_0 KV cache (Vulkan's auto-q8) has no packed rows for
-the store or the page pool to address, so both stay off and the session
-re-prefills.
+`docs/perf/kv-prefix.md`) and says where it keeps its blocks: the K/V rows of a
+prompt stay there after its slot is recycled, and a later request sharing that
+prefix uploads them instead of re-prefilling. One entry per store, fastest
+first — a write that no longer fits a tier is demoted to the next one, and a
+read falls through and promotes it back:
+
+```toml
+[[kv.tiers]]
+backend = "redb"
+size = "1g"                 # required: the tier evicts when it is full
+path = "/var/cache/infr/kv-prefix.redb"   # optional: unset keeps it in memory
+
+[[kv.tiers]]
+backend = "redis"
+url = "redis://127.0.0.1:6379/2"          # required; redis, rediss or valkey
+```
+
+A redb tier is one database file that loads its index at startup (not the rows),
+so a restart keeps its prefixes; leaving `path` out keeps the same database in
+anonymous memory, which is faster and gone with the process. A redis tier is
+shared, so several servers can point at it; its budget is the server's
+`maxmemory`, which is why it goes last. Sizes take the shared size grammar
+(`1GiB`, `512Mi`). The config file is the only place a tier list is written: the
+store holds prompt-derived data, so enabling it is a deliberate choice, and
+`--set kv.tiers=redb` gives a single in-memory tier for a quick comparison. A
+planar Q8_0 KV cache on Vulkan is handled: the row copies interleave its codes
+and scales, so no backend is refused.
 `paged`
 (`INFR_KV_PAGED`) turns on forward PagedAttention instead: the session's slots
 share one pool of physical pages, built with the session's KV in the cold init;

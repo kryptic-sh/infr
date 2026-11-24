@@ -14,7 +14,7 @@
 //! re-prefilling the same tokens costs tens of seconds.
 
 use crate::Config;
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use infr_core::backend::Backend;
 use infr_core::DType;
 use std::collections::HashMap;
@@ -22,8 +22,8 @@ use std::sync::Arc;
 
 use super::{
     kv_tier::{
-        decode_meta, encode_meta, Bounded, DeviceKv, DiskKv, Fnv, KvRows, KvStore, RedisKv, Tiered,
-        FORMATS_META_ID,
+        decode_meta, encode_meta, Bounded, BudgetedStore, DeviceKv, Fnv, KvRows, KvStore, RedbKv,
+        RedisKv, Tiered, FORMATS_META_ID,
     },
     weights::{RecurrentSnap, SeamKv},
 };
@@ -65,8 +65,8 @@ fn block_id(prev: u64, tokens: &[u32]) -> u64 {
     h.0
 }
 
-/// Identity of the model a lower tier's blocks belong to: the geometry that shapes every row, plus
-/// the context and vocabulary. Blocks under another key are never loaded.
+/// Identity of the model a store's blocks belong to: the geometry that shapes every row, plus the
+/// context and vocabulary. Blocks under another key are never loaded.
 pub(crate) fn store_key(cfg: &Config) -> u64 {
     let mut h = Fnv::new();
     for v in [
@@ -164,7 +164,7 @@ struct Entry {
 pub(crate) struct BlockCache<S: KvStore> {
     store: S,
     index: HashMap<u64, Entry>,
-    /// Whether `kv.store_mb` configured a cache at all.
+    /// Whether `kv.tiers` configured a cache at all.
     enabled: bool,
     /// The KV layouts the blocks were captured with; a dtype change invalidates every block.
     k_fmt: DType,
@@ -585,53 +585,73 @@ pub(crate) fn redact(url: &str) -> String {
     }
 }
 
-/// The tier below RAM that `kv.store_url` / `kv.store_file` select, nested disk-then-Redis when
-/// both are set. A missing or broken tier only costs persistence: log and keep the RAM tier.
-pub(crate) fn lower_tier_for(kv: &crate::EngineConfig, key: u64) -> Option<Box<dyn KvStore>> {
-    let redis = kv
-        .kv
-        .store_url
-        .as_deref()
-        .map(str::trim)
-        .filter(|u| !u.is_empty())
-        .and_then(|url| match RedisKv::connect(url, key) {
-            Ok(r) => {
-                tracing::info!(endpoint = %r.describe(), "kv store: sharing the lower tier over Redis");
-                Some(r)
-            }
+/// The store `kv.tiers` declares: one backend per entry, fastest first, folded so an eviction from
+/// one entry demotes into the next and a read promotes back up. `None` when the cache is off. A
+/// tier that cannot be opened costs only that tier: log and keep the rest.
+pub(crate) fn prefix_store_for(kv: &crate::EngineConfig, key: u64) -> Option<Box<dyn KvStore>> {
+    let tiers = &kv.kv.tiers;
+    if tiers.is_empty() {
+        return None;
+    }
+    let mut chain: Option<Box<dyn KvStore>> = None;
+    for (i, tier) in tiers.iter().enumerate().rev() {
+        let opened = match open_tier(tier, key) {
+            Ok(opened) => opened,
             Err(e) => {
-                tracing::warn!(
-                    endpoint = %redact(url),
-                    error = %e,
-                    "kv store: cannot reach the Redis tier"
-                );
-                None
+                tracing::warn!(tier = %tier.describe(), error = %e, "kv store: dropping a tier");
+                continue;
             }
-        });
-    let disk = kv.kv.store_file.as_ref().and_then(|path| {
-        let cap_mb = kv
-            .kv
-            .store_disk_mb
-            .or_else(|| kv.kv.store_mb.map(|mb| mb.saturating_mul(4)))
-            .unwrap_or(0);
-        let cap = (cap_mb as usize).saturating_mul(1024 * 1024);
-        match DiskKv::open(path, key, cap) {
-            Ok(d) => Some(d),
-            Err(e) => {
-                tracing::warn!(
-                    path = %path.display(),
-                    error = %e,
-                    "kv store: cannot open the disk tier; keeping the RAM tier only"
-                );
-                None
-            }
+        };
+        tracing::info!(tier = %tier.describe(), "kv store: tier {i} of {}", tiers.len());
+        chain = match chain {
+            Some(slow) => match opened {
+                Opened::Budgeted(fast) => Some(Box::new(Tiered::new(fast, slow))),
+                Opened::Plain(_) => {
+                    tracing::warn!(
+                        tier = %tier.describe(),
+                        "kv store: a tier that cannot evict must be the last one; dropping it"
+                    );
+                    Some(slow)
+                }
+            },
+            None => Some(match opened {
+                Opened::Budgeted(store) => Box::new(Bounded::new(store)),
+                Opened::Plain(store) => store,
+            }),
+        };
+    }
+    chain
+}
+
+/// A tier that can demote (it has a budget) or one that cannot (the server owns its eviction).
+enum Opened {
+    Budgeted(Box<dyn BudgetedStore>),
+    Plain(Box<dyn KvStore>),
+}
+
+fn open_tier(tier: &infr_core::config::KvTier, key: u64) -> anyhow::Result<Opened> {
+    match tier.backend.trim().to_ascii_lowercase().as_str() {
+        "redb" => {
+            let size = tier
+                .bytes()
+                .ok_or_else(|| anyhow!("a redb tier needs a byte `size`"))?;
+            let size = size as usize;
+            let store = match &tier.path {
+                Some(path) => RedbKv::open_file(path, key, size)?,
+                None => RedbKv::open_memory(key, size)?,
+            };
+            Ok(Opened::Budgeted(Box::new(store)))
         }
-    });
-    match (disk, redis) {
-        (Some(disk), Some(redis)) => Some(Box::new(Tiered::new(disk, redis))),
-        (Some(disk), None) => Some(Box::new(Bounded::new(disk))),
-        (None, Some(redis)) => Some(Box::new(redis)),
-        (None, None) => None,
+        "redis" | "valkey" => {
+            let url = tier
+                .url
+                .as_deref()
+                .ok_or_else(|| anyhow!("a redis tier needs a `url`"))?;
+            RedisKv::connect(url, key)
+                .map(|store| Opened::Plain(Box::new(store)))
+                .map_err(|e| anyhow!("{}: {e}", redact(url)))
+        }
+        other => Err(anyhow!("unknown backend {other:?} (redb, redis)")),
     }
 }
 
@@ -641,12 +661,23 @@ const SLOT: u64 = 0;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::seam::kv_tier::RamKv;
     use crate::seam::kv_tier::{decode_rows, encode_rows, BudgetedStore, LayerRows};
     use crate::seam::rows::{read_rows, write_rows};
     use std::path::Path;
 
-    type Cache = BlockCache<RamKv>;
+    type Cache = BlockCache<RedbKv>;
+
+    /// A cache over redb's in-memory backend, unbounded.
+    fn cache() -> Cache {
+        Cache::new(RedbKv::open_memory(0, 1 << 20).unwrap(), true)
+    }
+
+    /// The first `n` rows of extent `id`, read back through the store's own `get`.
+    fn held<S: KvStore>(store: &mut S, id: u64, n: usize) -> KvRows {
+        let mut out = KvRows::default();
+        assert!(store.get(id, 0..n, &mut out).unwrap(), "extent {id:x}");
+        out
+    }
 
     fn tokens(seed: u32, n: usize) -> Vec<u32> {
         (0..n as u32).map(|i| seed * 1000 + i).collect()
@@ -685,7 +716,7 @@ mod tests {
     #[test]
     fn matched_walks_the_chain_and_stops_at_a_gap() {
         let a = tokens(1, 300);
-        let mut s = Cache::new(RamKv::default(), true);
+        let mut s = cache();
         seed(&mut s, &a, 1);
         assert_eq!(s.matched(&a).0, 300);
         let mut extended = a.clone();
@@ -700,7 +731,7 @@ mod tests {
     #[test]
     fn a_gone_extent_forgets_its_entry_and_stops_the_walk() {
         let a = tokens(1, 300);
-        let mut s = Cache::new(RamKv::default(), true);
+        let mut s = cache();
         let ids = seed(&mut s, &a, 1);
         s.store.remove(ids[1]).unwrap();
         assert_eq!(s.matched(&a).0, BLOCK_TOKENS);
@@ -712,7 +743,7 @@ mod tests {
         let a = tokens(1, 300);
         let mut b = a[..256].to_vec();
         b.extend(tokens(2, 200));
-        let mut s = Cache::new(RamKv::default(), true);
+        let mut s = cache();
         seed(&mut s, &a, 1);
         assert_eq!(s.index.len(), 3);
         // The second prompt shares two blocks and adds two of its own.
@@ -725,7 +756,7 @@ mod tests {
     #[test]
     fn block_at_names_only_a_complete_chain_position() {
         let a = tokens(1, 300);
-        let mut s = Cache::new(RamKv::default(), true);
+        let mut s = cache();
         seed(&mut s, &a, 1);
         assert!(s.block_at(&a, 0).is_none());
         assert!(s.block_at(&a, 128).is_some());
@@ -750,14 +781,14 @@ mod tests {
     #[test]
     fn a_snapshot_rides_the_block_that_ends_at_it() {
         let a = tokens(1, 512);
-        let mut s = Cache::new(RamKv::default(), true);
+        let mut s = cache();
         seed(&mut s, &a, 1);
         s.attach_snapshots(&[snap(512)], &a, 512, None).unwrap();
         let id = s.block_at(&a, 512).expect("block at 512");
         assert_eq!(s.index[&id].bytes, 96);
         assert!(s.index[&id].snap);
-        let held = s.store.host(id).and_then(|r| r.snap.clone());
-        assert_eq!(held.expect("the snapshot in the block extent").pos, 512);
+        let snap = held(&mut s.store, id, BLOCK_TOKENS).snap;
+        assert_eq!(snap.expect("the snapshot in the block extent").pos, 512);
         // The stored metadata names the snapshot, so a reload rebuilds the index.
         let (_, snap_flag, bytes) = decode_meta(&s.store.meta(id).unwrap().unwrap()).unwrap();
         assert!(snap_flag);
@@ -766,7 +797,7 @@ mod tests {
 
     #[test]
     fn formats_load_from_the_store() {
-        let mut store = RamKv::default();
+        let mut store = RedbKv::open_memory(0, 1 << 20).unwrap();
         let blob = encode_formats(DType::Q8_0, DType::F16).unwrap();
         store.set_meta(FORMATS_META_ID, &blob).unwrap();
         assert_eq!(decode_formats(&blob), Some((DType::Q8_0, DType::F16)));
@@ -851,13 +882,41 @@ mod tests {
         tempfile::tempdir().expect("a temporary directory")
     }
 
+    /// Three extents, each in its own `Durability::None` commit, then one flush on drop: the next
+    /// open must see all three.
+    #[test]
+    fn three_extents_in_separate_commits_survive_a_reopen() {
+        let dir = temp_dir();
+        let path = dir.path().join("kv.redb");
+        {
+            let mut d = RedbKv::open_file(&path, 1, 1 << 20).unwrap();
+            for id in 1..=3u64 {
+                d.put(
+                    id,
+                    0,
+                    KvRows::whole(1, vec![vec![id as u8; 4]], vec![vec![0; 2]]),
+                )
+                .unwrap();
+                d.set_meta(id, b"m").unwrap();
+            }
+        }
+        let mut d = RedbKv::open_file(&path, 1, 1 << 20).unwrap();
+        let mut ids = d.extents().unwrap();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![1, 2, 3],
+            "every commit is in the file after the flush"
+        );
+    }
+
     #[test]
     fn a_disk_store_round_trips_and_survives_a_reopen() {
         let dir = temp_dir();
         let path = dir.path().join("kv.redb");
         let key = 0x55u64;
         {
-            let mut d = DiskKv::open(&path, key, 1 << 20).unwrap();
+            let mut d = RedbKv::open_file(&path, key, 1 << 20).unwrap();
             let a = KvRows::whole(2, vec![vec![1; 8]], vec![vec![2; 4]]);
             d.put(1, 0, a.clone()).unwrap();
             d.set_meta(1, b"one").unwrap();
@@ -876,7 +935,7 @@ mod tests {
             assert!(!d.contains(2));
         }
         {
-            let mut d = DiskKv::open(&path, key, 1 << 20).unwrap();
+            let mut d = RedbKv::open_file(&path, key, 1 << 20).unwrap();
             assert!(d.contains(1));
             assert_eq!(d.meta(1).unwrap().as_deref(), Some(&b"one"[..]));
             let mut out = KvRows::default();
@@ -885,7 +944,7 @@ mod tests {
             assert_eq!(d.extents().unwrap(), vec![1]);
         }
         // Another model's key sees none of it.
-        let mut other = DiskKv::open(&path, key + 1, 1 << 20).unwrap();
+        let mut other = RedbKv::open_file(&path, key + 1, 1 << 20).unwrap();
         assert!(other.extents().unwrap().is_empty());
     }
 
@@ -894,14 +953,14 @@ mod tests {
         let dir = temp_dir();
         let path = dir.path().join("kv.journal");
         std::fs::write(&path, b"INFRKV02 not a redb database").unwrap();
-        assert!(DiskKv::open(&path, 1, 1 << 20).is_err());
+        assert!(RedbKv::open_file(&path, 1, 1 << 20).is_err());
     }
 
     #[test]
     fn a_disk_store_takes_its_lru_in_order() {
         let dir = temp_dir();
         let path = dir.path().join("kv.redb");
-        let mut d = DiskKv::open(&path, 1, 1 << 20).unwrap();
+        let mut d = RedbKv::open_file(&path, 1, 1 << 20).unwrap();
         d.put(1, 0, KvRows::whole(1, vec![vec![1]], vec![vec![2]]))
             .unwrap();
         d.put(2, 0, KvRows::whole(1, vec![vec![3]], vec![vec![4]]))
@@ -916,7 +975,10 @@ mod tests {
 
     #[test]
     fn tiered_demotes_on_overflow_and_promotes_on_read() {
-        let mut t = Tiered::new(RamKv::new(8), RamKv::default());
+        let mut t = Tiered::new(
+            RedbKv::open_memory(0, 8).unwrap(),
+            RedbKv::open_memory(1, 0).unwrap(),
+        );
         let a = KvRows::whole(1, vec![vec![1; 4]], vec![vec![2; 2]]);
         let b = KvRows::whole(1, vec![vec![3; 4]], vec![vec![4; 2]]);
         t.put(1, 0, a.clone()).unwrap();
@@ -924,21 +986,24 @@ mod tests {
         assert!(!t.fast().contains(1), "the older extent left RAM");
         assert!(t.slow().contains(1), "and landed in the slow tier");
         assert!(t.fast().contains(2));
-        assert_eq!(t.fast().host(2).unwrap().layers, b.layers);
-        assert_eq!(t.slow().host(1).unwrap().layers, a.layers);
+        assert_eq!(held(t.fast_mut(), 2, 1).layers, b.layers);
+        assert_eq!(held(t.slow_mut(), 1, 1).layers, a.layers);
 
         let mut got = KvRows::default();
         assert!(t.get(1, 0..1, &mut got).unwrap());
         assert_eq!(got.layers, a.layers);
         assert!(t.fast().contains(1), "a read promotes the extent");
         assert!(t.slow().contains(1), "the slow copy stays");
-        assert_eq!(t.fast().host(1).unwrap().layers, a.layers);
-        assert_eq!(t.slow().host(1).unwrap().layers, a.layers);
+        assert_eq!(held(t.fast_mut(), 1, 1).layers, a.layers);
+        assert_eq!(held(t.slow_mut(), 1, 1).layers, a.layers);
     }
 
     #[test]
     fn tiered_keeps_the_only_extent_even_over_budget() {
-        let mut t = Tiered::new(RamKv::new(4), RamKv::default());
+        let mut t = Tiered::new(
+            RedbKv::open_memory(0, 4).unwrap(),
+            RedbKv::open_memory(1, 0).unwrap(),
+        );
         let a = KvRows::whole(1, vec![vec![1; 4]], vec![vec![2; 2]]);
         t.put(1, 0, a.clone()).unwrap();
         assert!(t.fast().contains(1));
@@ -949,7 +1014,10 @@ mod tests {
     /// and whatever became least recently used goes down.
     #[test]
     fn a_promotion_settles_the_fast_tier() {
-        let mut t = Tiered::new(RamKv::new(8), RamKv::default());
+        let mut t = Tiered::new(
+            RedbKv::open_memory(0, 8).unwrap(),
+            RedbKv::open_memory(1, 0).unwrap(),
+        );
         t.put(1, 0, KvRows::whole(1, vec![vec![1; 4]], vec![vec![2; 2]]))
             .unwrap();
         t.put(2, 0, KvRows::whole(1, vec![vec![3; 4]], vec![vec![4; 2]]))
@@ -968,7 +1036,10 @@ mod tests {
     /// next start would load the stale rows, snapshot flag and all.
     #[test]
     fn a_rewritten_extent_drops_the_stale_copy_below_it() {
-        let mut t = Tiered::new(RamKv::new(8), RamKv::default());
+        let mut t = Tiered::new(
+            RedbKv::open_memory(0, 8).unwrap(),
+            RedbKv::open_memory(1, 0).unwrap(),
+        );
         t.put(1, 0, KvRows::whole(1, vec![vec![1; 4]], vec![vec![2; 2]]))
             .unwrap();
         t.put(2, 0, KvRows::whole(1, vec![vec![3; 4]], vec![vec![4; 2]]))
@@ -988,7 +1059,7 @@ mod tests {
     /// A budgeted store with nothing below it drops its own LRU instead of growing past the cap.
     #[test]
     fn a_bounded_store_drops_its_own_lru() {
-        let mut b = Bounded::new(RamKv::new(8));
+        let mut b = Bounded::new(RedbKv::open_memory(0, 8).unwrap());
         b.put(1, 0, KvRows::whole(1, vec![vec![1; 4]], vec![vec![2; 2]]))
             .unwrap();
         b.put(2, 0, KvRows::whole(1, vec![vec![3; 4]], vec![vec![4; 2]]))
@@ -1081,7 +1152,7 @@ mod tests {
         let be = infr_cpu::CpuBackend::new();
         let cfg = slot_cfg(0);
         let src = filled_slot(&be, &cfg, false, 300);
-        let mut s = Cache::new(RamKv::default(), true);
+        let mut s = cache();
         assert_eq!(s.capture(&be, &cfg, &src, 300).unwrap(), 300);
         assert_eq!(s.index.len(), 3);
         // Capturing the same prefix again stores nothing new.
@@ -1114,14 +1185,15 @@ mod tests {
         let src = filled_slot(&be, &cfg, true, n);
         let ring = src.window_ring_rows(&be, &cfg).expect("a ring");
         assert_eq!(ring, 256);
-        let mut s = Cache::new(RamKv::default(), true);
+        let mut s = cache();
         assert_eq!(s.capture(&be, &cfg, &src, n).unwrap(), n);
         let ids = s.matched(&src.cached).1;
         assert_eq!(ids.len(), 6);
         // The window starts at row 444: blocks below it are empty, the one straddling it keeps
         // the rows from 444 on, and the rest are whole.
         for (j, id) in ids.iter().enumerate() {
-            let rows = s.store.host(*id).unwrap();
+            let len = BLOCK_TOKENS.min(n - j * BLOCK_TOKENS);
+            let rows = held(&mut s.store, *id, len);
             let runs = &rows.layers[0].runs;
             let run = (runs.len() == 1).then(|| runs[0].clone());
             match j {
@@ -1156,7 +1228,7 @@ mod tests {
         let src_cfg = slot_cfg(200);
         let n = 700;
         let src = filled_slot(&be, &src_cfg, true, n);
-        let mut s = Cache::new(RamKv::default(), true);
+        let mut s = cache();
         s.capture(&be, &src_cfg, &src, n).unwrap();
 
         let dst_cfg = slot_cfg(400);
@@ -1174,12 +1246,12 @@ mod tests {
         let cfg = slot_cfg(200);
         let mut src = filled_slot(&be, &cfg, true, 600);
         src.written_end = 800;
-        let mut s = Cache::new(RamKv::default(), true);
+        let mut s = cache();
         assert_eq!(s.capture(&be, &cfg, &src, 600).unwrap(), 600);
         let ids = s.matched(&src.cached).1;
         assert_eq!(ids.len(), 5);
         // Rows below 544 are gone: the block over 512..640 keeps only 544..600.
-        let rows = s.store.host(ids[4]).unwrap();
+        let rows = held(&mut s.store, ids[4], 88);
         assert_eq!(rows.layers[0].runs, vec![32..88]);
     }
 
@@ -1188,11 +1260,14 @@ mod tests {
         cfg.n_layer * BLOCK_TOKENS * ROW * 2 * 2
     }
 
-    type DiskCache = BlockCache<Tiered<RamKv, DiskKv>>;
+    type RedbCache = BlockCache<Tiered<RedbKv, RedbKv>>;
 
-    fn disk_cache(path: &Path, cap: usize, key: u64) -> DiskCache {
-        let disk = DiskKv::open(path, key, 1 << 20).unwrap();
-        BlockCache::new(Tiered::new(RamKv::new(cap), disk), true)
+    fn redb_cache(path: &Path, cap: usize, key: u64) -> RedbCache {
+        let local = RedbKv::open_file(path, key, 1 << 20).unwrap();
+        BlockCache::new(
+            Tiered::new(RedbKv::open_memory(0, cap).unwrap(), local),
+            true,
+        )
     }
 
     fn assert_slot_rows(be: &dyn Backend, cfg: &Config, kv: &SeamKv, n: usize) {
@@ -1218,7 +1293,7 @@ mod tests {
         let src = filled_slot(&be, &cfg, false, 300);
         let cap = block_bytes(&cfg);
         {
-            let mut s = disk_cache(&path, cap, key);
+            let mut s = redb_cache(&path, cap, key);
             assert_eq!(s.capture(&be, &cfg, &src, 300).unwrap(), 300);
             let ids = s.matched(&src.cached).1;
             assert_eq!(ids.len(), 3);
@@ -1239,7 +1314,7 @@ mod tests {
         {
             // The restart path: the index comes back from extents and metas alone, and the
             // restore above moved every block through disk, so all three are there.
-            let mut s = disk_cache(&path, cap, key);
+            let mut s = redb_cache(&path, cap, key);
             assert_eq!(s.index.len(), 3);
             assert_eq!(
                 s.store.slow().block_reads(),
@@ -1257,7 +1332,7 @@ mod tests {
     /// prompt re-prefills.
     #[test]
     fn a_damaged_disk_extent_is_a_miss() {
-        use crate::seam::kv_tier::DISK_EXTENTS;
+        use crate::seam::kv_tier::REDB_EXTENTS;
 
         let be = infr_cpu::CpuBackend::new();
         let cfg = slot_cfg(0);
@@ -1267,7 +1342,7 @@ mod tests {
         let src = filled_slot(&be, &cfg, false, 300);
         let cap = block_bytes(&cfg);
         let first = {
-            let mut s = disk_cache(&path, cap, key);
+            let mut s = redb_cache(&path, cap, key);
             s.capture(&be, &cfg, &src, 300).unwrap();
             let ids = s.matched(&src.cached).1;
             assert!(
@@ -1280,13 +1355,13 @@ mod tests {
             let db = redb::Database::create(&path).unwrap();
             let txn = db.begin_write().unwrap();
             {
-                let mut table = txn.open_table(DISK_EXTENTS).unwrap();
+                let mut table = txn.open_table(REDB_EXTENTS).unwrap();
                 table.insert((key, first), b"not rows".as_slice()).unwrap();
             }
             txn.commit().unwrap();
         }
 
-        let mut s = disk_cache(&path, cap, key);
+        let mut s = redb_cache(&path, cap, key);
         assert!(s.index.contains_key(&first), "the index still names it");
         let mut dst = SeamKv::for_test(&be, &cfg, 1024, false, 56, DType::F16).unwrap();
         assert_eq!(s.restore(&be, &cfg, &mut dst, &src.cached).unwrap(), 0);
@@ -1303,8 +1378,13 @@ mod tests {
         let mut b = filled_slot(&be, &cfg, false, 300);
         b.cached = tokens(4, 300);
         let cap = block_bytes(&cfg);
-        let mut s: BlockCache<Tiered<RamKv, RamKv>> =
-            BlockCache::new(Tiered::new(RamKv::new(cap), RamKv::default()), true);
+        let mut s: BlockCache<Tiered<RedbKv, RedbKv>> = BlockCache::new(
+            Tiered::new(
+                RedbKv::open_memory(0, cap).unwrap(),
+                RedbKv::open_memory(1, 0).unwrap(),
+            ),
+            true,
+        );
         assert_eq!(s.capture(&be, &cfg, &a, 300).unwrap(), 300);
         assert_eq!(s.capture(&be, &cfg, &b, 300).unwrap(), 300);
         let a_ids = s.matched(&a.cached).1;

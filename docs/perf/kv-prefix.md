@@ -94,34 +94,36 @@ into a shared page copies it. Restore becomes "fill the table", with uploads
 only for pages that are not resident. The host store survives as the cold tier
 under the pool instead of being the whole mechanism.
 
-## The lower tiers
+## The tiers
 
-The store's blocks can outlive the process. `kv.store_file` spills them to one
-redb database; `kv.store_url` puts them in Redis or Valkey under a per-model
-prefix, which lets several servers share one prefix cache. Both sit behind the
-same store trait as host RAM, so a block is read, written, demoted and promoted
-without the cache knowing where it landed: RAM evicts into the disk tier, disk
-into Redis, and a read falls through and promotes. A startup reads the extent
-ids and their metadata only (one `SMEMBERS` plus chunked `MGET`s for Redis, one
-table scan for redb), never the rows, so the index comes back in milliseconds
-whatever the cache holds. Block ids are chained FNV hashes, not `DefaultHasher`,
-because a toolchain upgrade must not silently rename every stored block.
+The store's blocks can outlive the slot that produced them, and `[[kv.tiers]]` says where: one
+entry per store, fastest first. `backend = "redb"` is one database, in a file when `path` is set
+(prefixes survive a restart) or in redb's in-memory backend otherwise; `backend = "redis"` puts the
+same blocks in Redis or Valkey under a per-model prefix, which lets several servers share one
+prefix cache. Every entry sits behind the same trait, so a block is read, written, demoted and
+promoted without the cache knowing where it landed: a write that no longer fits a tier is demoted
+to the next one, and a read falls through and promotes it back. A startup reads the extent ids and
+their metadata only (one `SMEMBERS` plus chunked `MGET`s for Redis, one table scan for redb), never
+the rows, so the index comes back in milliseconds whatever the cache holds. Block ids are chained
+FNV hashes, not `DefaultHasher`, because a toolchain upgrade must not silently rename every stored
+block.
 
 ## What a restore costs, per tier
 
 Measured on the RX 580 with Qwen2.5-0.5B-Instruct q4_k_m, one slot, 4k ctx, a 2k-token prompt and
 one generated token (the clock covers the whole call, so the restore is inside it), after a 512-token
-run built the pipelines the prompt's chunk heights use:
+run built the pipelines the prompt's chunk heights use. One `[[kv.tiers]]` entry in each row:
 
 | Tier | Prompt tokens | First call | Same prompt again | Speedup |
 | --- | ---: | ---: | ---: | ---: |
-| host RAM | 1999 | 864 ms | 21 ms | 40× |
-| redb, with a 1 MiB RAM tier so every block demoted | 2000 | 894 ms | 20 ms | 45× |
-| Valkey on loopback, same 1 MiB RAM tier | 2000 | 906 ms | 92 ms | 10× |
+| `redb`, no `path` (in memory) | 1999 | 864 ms | 43 ms | 20× |
+| `redb`, `path` on NVMe | 2000 | 856 ms | 43 ms | 20× |
+| `redis` on loopback | 2000 | 862 ms | 43 ms | 20× |
 
-The disk tier is within noise of RAM at this size: 24 MB of rows crosses the page cache faster
-than the 1.1-1.3 ms per 128-token block a RAM restore already costs, and the upload is the floor.
-Loopback Valkey costs about 90 ms for the same rows, which is the socket, not the server.
+All three land on the same number because the floor is the upload, not the store: 24 MB of rows
+crosses PCIe in about the time the last of them comes out of the page cache, the database, or a
+socket. The store costs one decode and one host copy along the way, which is why the long-context
+row below is slower than a borrowed slice would be.
 
 At long context the gap is the prefill being avoided, so it grows with the prompt, and a parked
 conversation resumes through the same path (`kv_paged_session`'s parking test asserts
@@ -129,8 +131,11 @@ conversation resumes through the same path (`kv_paged_session`'s parking test as
 
 | Prompt tokens | First call | Same prompt again | Speedup |
 | ---: | ---: | ---: | ---: |
-| 4096 | 2138 ms | 34 ms | 63× |
-| 31561 | 44.7 s | 272 ms | 165× |
+| 4096 | 2095 ms | 77 ms | 27× |
+| 31561 | 38.5 s | 593 ms | 65× |
+
+A 32k restore is 385 MB of rows: the redb decode and host copy are about half of that 593 ms, the
+rest is the upload. Cheap next to the 38.5 s prefill it replaces.
 
 ## What the inversion costs
 

@@ -437,8 +437,8 @@ pub(crate) struct SeamKv {
     pub(super) recurrent_snaps: Vec<RecurrentSnap>,
 }
 
-/// Host memory one slot may spend on [`SeamKv::recurrent_snaps`]. The store keeps its own copies
-/// under `kv.store_mb`; this budget only covers the live slot's resume points.
+/// Host memory one slot may spend on [`SeamKv::recurrent_snaps`]. The prefix store keeps its own
+/// copies under its tier sizes; this budget only covers the live slot's resume points.
 pub(super) const RECURRENT_SNAP_CAP_BYTES: usize = 512 << 20;
 
 /// One host copy of every recurrent layer's state at token position `pos`.

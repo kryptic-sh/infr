@@ -72,14 +72,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
-- **The KV prefix store spills to disk and to Redis or Valkey.** `kv.store_file`
-  is now one redb database rather than an append-only journal: the host-RAM
-  tier evicts into it, it spills into `store_url` when both are set, and a
-  startup reloads the block index without reading the rows. `kv.store_disk_mb`
-  (`INFR_KV_STORE_DISK_MB`) caps the disk tier (default four times `store_mb`,
-  `0` for no limit). A `store_file` that names an old journal is opened as an
-  empty database, so the first start after upgrading loses the prefixes that file
-  held. `store_url` alone still works and no longer overrides `store_file`.
+- **The KV prefix cache is a list of pluggable stores.** `[[kv.tiers]]` replaces
+  `kv.store_mb`, `kv.store_file` and `kv.store_url`: one entry per store, fastest
+  first, each naming a `backend` and its own `size`. A write that no longer fits
+  a tier is demoted to the next one, and a read falls through and promotes it
+  back. `backend = "redb"` is one database — `path` keeps it in a file so
+  prefixes survive a restart, and leaving `path` out keeps the same database in
+  memory. `backend = "redis"` (or `"valkey"`) is a shared tier; its budget is
+  the server's `maxmemory`, which is why it must be last. The store loads its
+  index at startup without reading the rows. A `kv.store_file` pointing at the
+  old journal now opens as an empty database, so the first start after upgrading
+  loses the prefixes that file held. There is no env spelling for the list; the
+  config file is the only place it is written (`--set kv.tiers=redb` gives a
+  single in-memory tier for a quick comparison).
 
 - **A request that outgrows the page pool parks an idle conversation instead of
   failing.** `infr serve` with `kv.paged` and a pool too small for every slot now

@@ -147,22 +147,12 @@ cfg_struct! {
         overflow_vram_mb: Option<u64> = None,
         /// `INFR_KV_OVERFLOW_RESERVE_MB`, in MiB. `None` = `max(12% of VRAM, 2 GiB)`.
         overflow_reserve_mb: Option<u64> = None,
-        /// `INFR_KV_STORE_MB`: host-RAM budget for the cross-conversation KV prefix store, in MiB.
-        /// `None` = off, and the store is never built.
-        store_mb: Option<u64> = None,
-        /// `INFR_KV_STORE_DISK_MB`: redb budget behind `store_file`, in MiB. `None` = 4×
-        /// `store_mb`; `0` = no limit.
-        store_disk_mb: Option<u64> = None,
         /// `INFR_KV_POOL_MB`: device-RAM budget for the `kv.paged` page pool, in MiB. `None` =
         /// auto, which sizes the pool at `slots` full windows (today's linear allocation).
         pool_mb: Option<u64> = None,
-        /// `INFR_KV_STORE_FILE`: redb database file the cross-conversation prefix store spills to
-        /// and loads from at startup, so a restart keeps its reusable prefixes. `None` keeps the
-        /// store in RAM only.
-        store_file: Option<std::path::PathBuf> = None,
-        /// `INFR_KV_STORE_URL`: a shared lower tier (`redis://`, `rediss://`, `valkey://`) that the
-        /// disk tier spills into. One cache then serves every server pointed at it.
-        store_url: Option<String> = None,
+        /// `[[kv.tiers]]`: where the cross-conversation prefix cache keeps its blocks, fastest
+        /// first. Empty = the cache is off. Each entry is a [`KvTier`].
+        tiers: Vec<KvTier> = Vec::new(),
         /// `INFR_KV_PAGED`: forward PagedAttention — one page pool shared by the slots, with
         /// copy-on-write for a shared prefix. `None`/`false` = every slot owns a contiguous cache.
         /// The pool is built at the session's first fork (see `docs/perf/kv-prefix.md`), so a
@@ -705,6 +695,48 @@ cfg_struct! {
 /// This replaces `INFR_METAL_PROFILE`, which was three exact string literals masquerading as an
 /// integer level (`=1` on, `=2` flush, `=3` counters — so `=20` meant "on, level unrecognized",
 /// not "≥ 2"). Named modes cannot be misread that way.
+/// One entry of `[[kv.tiers]]`: a place the cross-conversation prefix cache keeps blocks.
+///
+/// The list is the chain: entry 0 is the fastest, an eviction from it falls to entry 1, and so on;
+/// a read that misses entry 0 falls through and promotes back up. Every entry but the last must be
+/// able to evict (a size is what makes it evict), which `redis` entries cannot: the server owns
+/// that policy.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct KvTier {
+    /// `redb` (local: a file, or memory when `path` is unset) or `redis` (a shared server).
+    pub backend: String,
+    /// Bytes this entry keeps before evicting (or demoting, when an entry follows it).
+    pub size: Option<SizeSpec>,
+    /// `redb`: the database file. Unset keeps the database in memory.
+    pub path: Option<std::path::PathBuf>,
+    /// `redis`: the server URL (`redis://`, `rediss://`, `valkey://`).
+    pub url: Option<String>,
+}
+
+impl KvTier {
+    /// The bytes this entry keeps, or `None` for an entry with no budget.
+    pub fn bytes(&self) -> Option<u64> {
+        match self.size {
+            Some(SizeSpec::Bytes(b)) => Some(b),
+            _ => None,
+        }
+    }
+
+    /// A one-line description for logs.
+    pub fn describe(&self) -> String {
+        let where_ = self
+            .path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .or_else(|| self.url.clone())
+            .unwrap_or_else(|| "memory".to_string());
+        match self.bytes() {
+            Some(b) => format!("{} {where_} ({b} bytes)", self.backend),
+            None => format!("{} {where_}", self.backend),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MetalDeviceTime {
     /// No device timing: the profile reports host encode wall only. (Still a finding — a large

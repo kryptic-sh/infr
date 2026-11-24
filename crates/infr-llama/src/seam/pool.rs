@@ -21,7 +21,7 @@ use infr_core::budget::kv_fmt_bytes;
 use infr_core::paging::KvPagesExhausted;
 use infr_core::DType;
 
-use crate::seam::rows::{copy_rows, Linear};
+use crate::seam::rows::{copy_rows, Linear, SideLayout, Q8_BLOCK_ELEMS};
 use crate::seam::{kv_row_elems, kv_side_bytes};
 use crate::Config;
 use infr_vulkan::paged::{PagePool, PAGE_ROWS};
@@ -102,14 +102,6 @@ impl KvPool {
             return Err(anyhow!(
                 "a TurboQuant KV cache ({k_fmt:?} K / {v_fmt:?} V) has no page-aware store or \
                  dequant, so kv.paged stays off"
-            ));
-        }
-        // A fork's tail copy and a page's copy-on-write move byte runs, which only exist when a
-        // Q8_0 side packs rows.
-        if (k_fmt == DType::Q8_0 || v_fmt == DType::Q8_0) && be.kv_q8_planar() {
-            return Err(anyhow!(
-                "a planar Q8_0 KV cache ({k_fmt:?} K / {v_fmt:?} V) has no packed page rows, so \
-                 kv.paged stays off"
             ));
         }
         let pages = pages.max(2);
@@ -380,11 +372,9 @@ impl SlotMap {
             let Some(k) = pool.k[l].as_ref() else {
                 continue;
             };
-            let kb = kv_fmt_bytes(pool.k_fmt, PAGE_ROWS * pool.k_row[l]);
-            copy_page(be, k.as_ref(), src, own, kb)?;
             let v = pool.v[l].as_ref().expect("pooled layer has both sides");
-            let vb = kv_fmt_bytes(pool.v_fmt, PAGE_ROWS * pool.v_row[l]);
-            copy_page(be, v.as_ref(), src, own, vb)?;
+            copy_page(be, k.as_ref(), pool.k_fmt, pool.k_row[l], src, own)?;
+            copy_page(be, v.as_ref(), pool.v_fmt, pool.v_row[l], src, own)?;
         }
         if src != 0 {
             pool.ledger().lock().expect("page-pool lock").release(src);
@@ -394,14 +384,40 @@ impl SlotMap {
     }
 }
 
-/// Copy one page of `buf` from physical page `src` to physical page `dst`; `bytes` is that page's
-/// size, so page `p` starts at `p * bytes`.
-fn copy_page(be: &dyn Backend, buf: &dyn Buffer, src: u32, dst: u32, bytes: usize) -> AResult<()> {
-    if bytes == 0 || src == dst {
+/// Copy one page of `buf` from physical page `src` to physical page `dst`. A planar side moves as
+/// two runs, its codes and the scales that follow them at the buffer's element capacity.
+fn copy_page(
+    be: &dyn Backend,
+    buf: &dyn Buffer,
+    fmt: DType,
+    row_elems: usize,
+    src: u32,
+    dst: u32,
+) -> AResult<()> {
+    if row_elems == 0 || src == dst {
         return Ok(());
     }
-    be.copy_buffer_at(buf, src as usize * bytes, buf, dst as usize * bytes, bytes)
-        .map_err(|e| anyhow!("{e}"))
+    let elems = PAGE_ROWS * row_elems;
+    let copy = |from: usize, to: usize, bytes: usize| {
+        be.copy_buffer_at(buf, from, buf, to, bytes)
+            .map_err(|e| anyhow!("{e}"))
+    };
+    match SideLayout::of(be, fmt, buf)? {
+        SideLayout::Packed => {
+            let bytes = kv_fmt_bytes(fmt, elems);
+            copy(src as usize * bytes, dst as usize * bytes, bytes)
+        }
+        SideLayout::PlanarQ8 { cap_elems } => {
+            let (s, d) = (src as usize * elems, dst as usize * elems);
+            copy(s, d, elems)?;
+            let scales = elems / Q8_BLOCK_ELEMS * 2;
+            copy(
+                cap_elems + s / Q8_BLOCK_ELEMS * 2,
+                cap_elems + d / Q8_BLOCK_ELEMS * 2,
+                scales,
+            )
+        }
+    }
 }
 
 impl Drop for SlotMap {

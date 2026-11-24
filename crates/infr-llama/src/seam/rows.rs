@@ -3,7 +3,8 @@
 //! A slot's cache keeps logical row `r` at one of three physical rows: `r` for a linear cache,
 //! `r % rows` for a sliding-window ring, or inside the page the slot's table maps `r` to. Every
 //! store, restore and page copy walks [`RowLayout::spans`] instead of re-deriving that mapping.
-//! A row's byte offset is always `kv_fmt_bytes(fmt, physical_row * row_elems)`.
+//! A row's byte offset is `kv_fmt_bytes(fmt, physical_row * row_elems)`, except on a backend whose
+//! Q8_0 side is planar ([`SideLayout`]): there the codes and the scales are two separate runs.
 
 use std::ops::Range;
 
@@ -122,6 +123,84 @@ pub(crate) fn row_bytes(fmt: DType, row_elems: usize) -> Result<usize> {
     Ok(one)
 }
 
+/// Bytes of one GGUF Q8_0 block, and the elements it holds: a 2-byte f16 scale, then 32 int8 codes.
+const Q8_BLOCK_BYTES: usize = 34;
+pub(crate) const Q8_BLOCK_ELEMS: usize = 32;
+
+/// How one side's rows sit in its buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SideLayout {
+    /// GGUF blocks back to back: a row's bytes are its whole row.
+    Packed,
+    /// Vulkan's planar Q8_0: every int8 code, then every block's scale from `cap_elems` bytes on.
+    PlanarQ8 { cap_elems: usize },
+}
+
+impl SideLayout {
+    /// The side's layout, from the backend that owns it and the buffer it lives in. A planar side
+    /// is refused when its length is not exactly a capacity plus its scales, so a padded or
+    /// half-allocated side is a miss rather than a read of somebody else's bytes.
+    pub(crate) fn of(be: &dyn Backend, fmt: DType, buf: &dyn Buffer) -> Result<Self> {
+        if fmt != DType::Q8_0 || !be.kv_q8_planar() {
+            return Ok(Self::Packed);
+        }
+        let bytes = buf.len_bytes();
+        let cap_elems = bytes * Q8_BLOCK_ELEMS / Q8_BLOCK_BYTES;
+        ensure!(
+            cap_elems.is_multiple_of(Q8_BLOCK_ELEMS)
+                && bytes == cap_elems + cap_elems / Q8_BLOCK_ELEMS * 2,
+            "a planar Q8_0 side of {bytes} bytes is not {cap_elems} codes plus their scales"
+        );
+        Ok(Self::PlanarQ8 { cap_elems })
+    }
+}
+
+/// Gather a planar side's codes and scales into GGUF Q8_0 blocks, one per 32-element block.
+fn planar_to_packed(codes: &[u8], scales: &[u8], row_elems: usize, out: &mut [u8]) -> Result<()> {
+    ensure!(
+        row_elems.is_multiple_of(Q8_BLOCK_ELEMS),
+        "a planar Q8_0 row of {row_elems} elements is not whole blocks"
+    );
+    let blocks = out.len() / Q8_BLOCK_BYTES;
+    ensure!(
+        codes.len() == blocks * Q8_BLOCK_ELEMS && scales.len() == blocks * 2,
+        "planar Q8_0 codes/scales do not cover {blocks} blocks"
+    );
+    for (b, block) in out
+        .as_chunks_mut::<Q8_BLOCK_BYTES>()
+        .0
+        .iter_mut()
+        .enumerate()
+    {
+        block[..2].copy_from_slice(&scales[b * 2..b * 2 + 2]);
+        block[2..].copy_from_slice(&codes[b * Q8_BLOCK_ELEMS..(b + 1) * Q8_BLOCK_ELEMS]);
+    }
+    Ok(())
+}
+
+/// Split GGUF Q8_0 blocks into a planar side's codes and scales.
+fn packed_to_planar(
+    data: &[u8],
+    row_elems: usize,
+    codes: &mut [u8],
+    scales: &mut [u8],
+) -> Result<()> {
+    ensure!(
+        row_elems.is_multiple_of(Q8_BLOCK_ELEMS),
+        "a planar Q8_0 row of {row_elems} elements is not whole blocks"
+    );
+    let blocks = data.len() / Q8_BLOCK_BYTES;
+    ensure!(
+        codes.len() == blocks * Q8_BLOCK_ELEMS && scales.len() == blocks * 2,
+        "planar Q8_0 codes/scales do not cover {blocks} blocks"
+    );
+    for (b, block) in data.as_chunks::<Q8_BLOCK_BYTES>().0.iter().enumerate() {
+        scales[b * 2..b * 2 + 2].copy_from_slice(&block[..2]);
+        codes[b * Q8_BLOCK_ELEMS..(b + 1) * Q8_BLOCK_ELEMS].copy_from_slice(&block[2..]);
+    }
+    Ok(())
+}
+
 /// Download logical `rows` of `buf` into `out`, which holds exactly those rows in order.
 pub(crate) fn read_rows(
     be: &dyn Backend,
@@ -139,11 +218,36 @@ pub(crate) fn read_rows(
         "read_rows: {} bytes for {len} rows of {row_elems} elements",
         out.len()
     );
+    let side = SideLayout::of(be, fmt, buf)?;
     for s in layout.spans(rows.start, len) {
         let at = (s.logical - rows.start) * rb;
-        be.download_at(buf, s.physical * rb, &mut out[at..at + s.rows * rb])?;
+        let slice = &mut out[at..at + s.rows * rb];
+        match side {
+            SideLayout::Packed => be.download_at(buf, s.physical * rb, slice)?,
+            SideLayout::PlanarQ8 { cap_elems } => {
+                let (codes, scales) = download_planar(be, buf, cap_elems, row_elems, s)?;
+                planar_to_packed(&codes, &scales, row_elems, slice)?;
+            }
+        }
     }
     Ok(())
+}
+
+/// A span's codes and scales, as the planar buffer holds them.
+fn download_planar(
+    be: &dyn Backend,
+    buf: &dyn Buffer,
+    cap_elems: usize,
+    row_elems: usize,
+    s: RowSpan,
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    let elems = s.rows * row_elems;
+    let base = s.physical * row_elems;
+    let mut codes = vec![0u8; elems];
+    let mut scales = vec![0u8; elems / Q8_BLOCK_ELEMS * 2];
+    be.download_at(buf, base, &mut codes)?;
+    be.download_at(buf, cap_elems + base / Q8_BLOCK_ELEMS * 2, &mut scales)?;
+    Ok((codes, scales))
 }
 
 /// Upload `data`, which holds exactly logical `rows` in order, into `buf`.
@@ -163,14 +267,29 @@ pub(crate) fn write_rows(
         "write_rows: {} bytes for {len} rows of {row_elems} elements",
         data.len()
     );
+    let side = SideLayout::of(be, fmt, buf)?;
     for s in layout.spans(rows.start, len) {
         let at = (s.logical - rows.start) * rb;
-        be.upload_at(buf, s.physical * rb, &data[at..at + s.rows * rb])?;
+        let slice = &data[at..at + s.rows * rb];
+        match side {
+            SideLayout::Packed => be.upload_at(buf, s.physical * rb, slice)?,
+            SideLayout::PlanarQ8 { cap_elems } => {
+                let elems = s.rows * row_elems;
+                let base = s.physical * row_elems;
+                let mut codes = vec![0u8; elems];
+                let mut scales = vec![0u8; elems / Q8_BLOCK_ELEMS * 2];
+                packed_to_planar(slice, row_elems, &mut codes, &mut scales)?;
+                be.upload_at(buf, base, &codes)?;
+                be.upload_at(buf, cap_elems + base / Q8_BLOCK_ELEMS * 2, &scales)?;
+            }
+        }
     }
     Ok(())
 }
 
 /// Copy logical `rows` from `src` to `dst` on the device, one copy per run both layouts agree on.
+/// A planar side moves as two runs, its codes and its scales; a planar run into a packed buffer (or
+/// a mixed pair, which no engine builds) goes through host memory.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn copy_rows(
     be: &dyn Backend,
@@ -186,6 +305,16 @@ pub(crate) fn copy_rows(
         return Ok(());
     }
     let rb = row_bytes(fmt, row_elems)?;
+    let side = SideLayout::of(be, fmt, src)?;
+    let dst_side = SideLayout::of(be, fmt, dst)?;
+    if side != dst_side
+        && matches!(side, SideLayout::PlanarQ8 { .. })
+            != matches!(dst_side, SideLayout::PlanarQ8 { .. })
+    {
+        let mut host = vec![0u8; rows.len() * rb];
+        read_rows(be, src, fmt, row_elems, src_layout, rows.clone(), &mut host)?;
+        return write_rows(be, dst, fmt, row_elems, dst_layout, rows, &host);
+    }
     let a = src_layout.spans(rows.start, rows.len());
     let b = dst_layout.spans(rows.start, rows.len());
     let same_buffer = std::ptr::addr_eq(src, dst);
@@ -197,8 +326,29 @@ pub(crate) fn copy_rows(
         if lo < hi {
             let from = x.physical + (lo - x.logical);
             let to = y.physical + (lo - y.logical);
-            if !(same_buffer && from == to) {
-                be.copy_buffer_at(src, from * rb, dst, to * rb, (hi - lo) * rb)?;
+            let n = (hi - lo) * row_elems;
+            match (side, dst_side) {
+                (SideLayout::Packed, SideLayout::Packed) => {
+                    if !(same_buffer && from == to) {
+                        be.copy_buffer_at(src, from * rb, dst, to * rb, (hi - lo) * rb)?;
+                    }
+                }
+                (
+                    SideLayout::PlanarQ8 { cap_elems: scap },
+                    SideLayout::PlanarQ8 { cap_elems: dcap },
+                ) => {
+                    let (s_base, d_base) = (from * row_elems, to * row_elems);
+                    be.copy_buffer_at(src, s_base, dst, d_base, n)?;
+                    let scales = n / Q8_BLOCK_ELEMS * 2;
+                    be.copy_buffer_at(
+                        src,
+                        scap + s_base / Q8_BLOCK_ELEMS * 2,
+                        dst,
+                        dcap + d_base / Q8_BLOCK_ELEMS * 2,
+                        scales,
+                    )?;
+                }
+                _ => unreachable!("a mixed pair went through host memory above"),
             }
         }
         if x.logical + x.rows <= y.logical + y.rows {
@@ -254,6 +404,33 @@ mod tests {
         b.reserve_rows(be, 1536).unwrap();
         assert_eq!((a.map.page(0), b.map.page(0), b.map.page(2)), (1, 2, 4));
         (pool, a, b)
+    }
+
+    #[test]
+    fn a_planar_side_interleaves_into_gguf_blocks() {
+        // Two rows of 64 elements: four blocks, each a 2-byte scale then 32 codes.
+        let row_elems = 64;
+        let mut packed = Vec::new();
+        for (row, block) in [(0u8, 0u8), (0, 1), (1, 0), (1, 1)] {
+            packed.extend_from_slice(&[row, block]);
+            packed.extend(std::iter::repeat_n(row * 16 + block, 32));
+        }
+        let mut codes = vec![0u8; 128];
+        let mut scales = vec![0u8; 8];
+        packed_to_planar(&packed, row_elems, &mut codes, &mut scales).unwrap();
+        assert_eq!(&codes[..32], &[0u8; 32]);
+        assert_eq!(&codes[32..64], &[1u8; 32]);
+        assert_eq!(&codes[64..96], &[16u8; 32]);
+        assert_eq!(&codes[96..], &[17u8; 32]);
+        assert_eq!(scales, [0, 0, 0, 1, 1, 0, 1, 1]);
+
+        let mut back = vec![0u8; packed.len()];
+        planar_to_packed(&codes, &scales, row_elems, &mut back).unwrap();
+        assert_eq!(back, packed);
+
+        // A count that does not match the bytes is refused, not read past.
+        assert!(planar_to_packed(&codes, &scales[..4], row_elems, &mut back).is_err());
+        assert!(packed_to_planar(&packed[..70], row_elems, &mut codes, &mut scales).is_err());
     }
 
     #[test]

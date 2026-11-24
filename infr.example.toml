@@ -103,21 +103,25 @@ slots = 4
 # The sliding-window ring cache (INFR_NO_KV_RING inverted).
 ring = true
 
-# Host-RAM budget (MiB) for the cross-conversation KV prefix store — reverse
-# PagedAttention: a prompt's K/V rows are kept after the slot is recycled, so a
-# later chat that starts with the same tokens uploads them instead of
-# re-prefilling. Unrelated to forward PagedAttention (slots sharing pages
-# inside one pool), which has its own knob. Off by default — the store holds
-# prompt-derived data, so enabling it is a deliberate choice.
-# store_mb = 1024
-
-# Disk budget (MiB) for the redb tier behind `store_file`. Default: 4× store_mb,
-# only read when `store_file` is set; 0 means no limit.
-# store_disk_mb = 4096
-
-# Where the RAM tier spills, so prefixes survive a restart. It loads its index
-# at startup, and spills into `store_url` when both are set.
-# store_file = "/var/lib/infr/prefix.redb"
+# Where the cross-conversation KV prefix cache keeps a prompt's K/V rows after the
+# slot that produced them is recycled (reverse PagedAttention; unrelated to the
+# `paged` page pool below). One entry per store, fastest first: a block that does
+# not fit a tier is demoted to the next one, and a read falls through and promotes
+# it back. Every entry except the last needs a `size`; it evicts when it is full.
+#   backend = "redb"   `size` required; `path` keeps it in a file (survives a
+#                      restart), unset keeps the same database in memory (faster).
+#   backend = "redis"  `url` required (`redis://`, `rediss://`, `valkey://`); the
+#                      server's maxmemory is its budget, so it goes last.
+# Off by default: the store holds prompt-derived data.
+#
+# [[kv.tiers]]
+# backend = "redb"
+# size = "1g"
+# path = "/var/cache/infr/kv-prefix.redb"
+#
+# [[kv.tiers]]
+# backend = "redis"
+# url = "redis://127.0.0.1:6379/2"
 
 # Decode-time inline KV write, and the coopmat/BDA KV path.
 inline_decode = false

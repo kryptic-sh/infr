@@ -43,16 +43,24 @@ fn model_path() -> Option<std::path::PathBuf> {
 }
 
 fn engine(paged: bool) -> infr_llama::EngineConfig {
+    engine_kv(paged, infr_core::DType::F16)
+}
+
+fn engine_kv(paged: bool, fmt: infr_core::DType) -> infr_llama::EngineConfig {
     let mut c = infr_llama::EngineConfig::default();
     c.kv.paged = Some(paged);
     c.kv.slots = 2;
-    // Pin f16 KV: a page copy moves one contiguous run per page, which is only the whole story for
-    // a non-planar layout (Q8_0 keeps its scales in a second region).
-    c.kv.type_k = Some(infr_core::DType::F16);
-    c.kv.type_v = Some(infr_core::DType::F16);
+    // No auto-q8: the format under test is the one asked for, and Vulkan's Q8_0 cache is planar
+    // (codes first, then the scales), which is what the row copies have to handle.
+    c.kv.type_k = Some(fmt);
+    c.kv.type_v = Some(fmt);
     // A tiny host store, so a recycled slot restores into its block (and copies a shared page
     // before it writes) — the two prefix mechanisms have to compose.
-    c.kv.store_mb = Some(64);
+    c.kv.tiers.push(infr_core::config::KvTier {
+        backend: "redb".to_string(),
+        size: Some(infr_core::SizeSpec::Bytes(64 << 20)),
+        ..Default::default()
+    });
     c
 }
 
@@ -171,6 +179,68 @@ fn paged_slots_answer_the_same_bytes_as_contiguous_ones() {
     );
 }
 
+/// Vulkan keeps a Q8_0 KV side planar: every int8 code, then every block's f16 scale. The store,
+/// a fork's tail copy and a page's copy-on-write all move rows of that cache, so this runs the same
+/// prompt twice through a paged engine: the second answer comes from rows restored out of the store
+/// into a page pool, and has to match the first one byte for byte.
+///
+/// Run: `cargo test -p infr-llama --test kv_paged_session -- --ignored --nocapture`
+#[test]
+#[ignore = "requires a Vulkan GPU and a cached GGUF"]
+fn q8_kv_keeps_its_rows_through_pages_and_the_store() {
+    let Some(path) = model_path() else {
+        eprintln!("skip: no GGUF in the HF cache");
+        return;
+    };
+    let ctx = 2048;
+    let model = infr_llama::SeamModel::load_with(
+        &path,
+        None,
+        Arc::new(engine_kv(true, infr_core::DType::Q8_0)),
+    )
+    .expect("load q8 paged");
+    let seam = infr_llama::parallel::ParallelSeam::new(
+        model,
+        2,
+        Some(infr_core::SizeSpec::Bytes(ctx as u64)),
+    )
+    .expect("engine");
+    assert!(
+        seam.kv_pages().is_some(),
+        "the pool was not built for a planar Q8_0 cache"
+    );
+
+    let greedy = infr_llama::sampling::RequestSampling {
+        temp: Some(0.0),
+        ..Default::default()
+    };
+    let run = |prompt: &str| {
+        let req = seam.request_ctx(greedy.clone());
+        let mut text = String::new();
+        let stats = seam
+            .generate(prompt, 8, None, &req, |p| text.push_str(p))
+            .expect("generation");
+        (text, stats)
+    };
+
+    let sys = shared_prefix();
+    let prompt = format!("{sys}Name the three places the log is kept.");
+    let (first, _) = run(&prompt);
+    let (again, warm) = run(&prompt);
+    assert!(warm.n_cached > 0, "the second run restored nothing");
+    assert_eq!(
+        again, first,
+        "a restored planar Q8_0 cache changed the answer"
+    );
+
+    // A different tail off the same prefix writes into the pages the fork shares.
+    let (_, other) = run(&format!("{sys}Which copy rides the train?"));
+    assert!(
+        other.n_cached > 0,
+        "the second conversation reused none of the shared prefix"
+    );
+}
+
 /// Two conversations in a pool that holds one: the second parks the first, and the first resumes
 /// from the store with its prefix cached instead of re-prefilling it.
 ///
@@ -201,7 +271,7 @@ fn parked_slots_resume_two_conversations_in_a_one_conversation_pool() {
     let pps = ctx.div_ceil(infr_vulkan::paged::PAGE_ROWS) as u64;
     let mut c = engine(true);
     c.kv.pool_mb = Some((page_bytes * (pps + 1)).div_ceil(1 << 20));
-    c.kv.store_mb = Some(256);
+    c.kv.tiers[0].size = Some(infr_core::SizeSpec::Bytes(256 << 20));
     let model = infr_llama::SeamModel::load_with(&path, None, Arc::new(c)).expect("load paged");
     let seam = infr_llama::parallel::ParallelSeam::new(
         model,

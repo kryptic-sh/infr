@@ -216,6 +216,31 @@ fn unknown_toml_key_warns_and_is_ignored() {
     assert_eq!(cfg.kernels.vulkan.flash_splits, Some(3));
 }
 
+/// `[[kv.tiers]]` is a list of entries, each a table of its own keys; the entry index is part of
+/// the dotted path, so a typo inside an entry still reaches the warning line.
+#[test]
+fn a_kv_tier_list_parses_from_a_config_file() {
+    let (partial, warnings) = file::parse_str(
+        "[kv]\ntype_k = \"q8_0\"\n\n[[kv.tiers]]\nbackend = \"redb\"\nsize = \"1g\"\n\n[[kv.tiers]]\nbackend = \"redis\"\nurl = \"redis://127.0.0.1:6379/2\"\nbogus = 1\n",
+        Path::new("infr.toml"),
+    )
+    .expect("a tier list must load");
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].contains("kv.tiers.1.bogus"), "{}", warnings[0]);
+
+    let tiers = partial.kv.tiers.expect("two tiers");
+    assert_eq!(tiers.len(), 2);
+    assert_eq!(tiers[0].backend, "redb");
+    assert_eq!(tiers[0].bytes(), Some(1 << 30));
+    assert!(
+        tiers[0].path.is_none(),
+        "no path keeps the database in memory"
+    );
+    assert_eq!(tiers[1].backend, "redis");
+    assert_eq!(tiers[1].url.as_deref(), Some("redis://127.0.0.1:6379/2"));
+    assert_eq!(tiers[1].bytes(), None);
+}
+
 /// A whole unknown SECTION warns once, not once per key inside it.
 #[test]
 fn unknown_toml_section_warns_once() {
@@ -1191,12 +1216,8 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_EXPERT_PARALLEL",
         "INFR_KV_Q8",
         "INFR_KV_SLOTS",
-        "INFR_KV_STORE_MB",
-        "INFR_KV_STORE_DISK_MB",
         "INFR_KV_PAGED",
         "INFR_KV_POOL_MB",
-        "INFR_KV_STORE_FILE",
-        "INFR_KV_STORE_URL",
         "INFR_KV_TYPE_K",
         "INFR_KV_TYPE_V",
         "INFR_MTP",

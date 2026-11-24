@@ -1,9 +1,9 @@
 //! KV extents behind one trait, whichever memory holds them.
 //!
 //! A [`KvStore`] holds extents: runs of rows for every layer, addressed by a `u64` id. A device
-//! slot ([`DeviceKv`]) and a host map ([`RamKv`]) both implement it, so moving a prefix between
-//! them is a [`get`](KvStore::get) into [`KvRows`] and a [`put`](KvStore::put) out of it. Attention
-//! never goes through the trait; it binds the slot's buffers directly.
+//! slot ([`DeviceKv`]) and a redb database ([`RedbKv`]) both implement it, so moving a prefix
+//! between them is a [`get`](KvStore::get) into [`KvRows`] and a [`put`](KvStore::put) out of it.
+//! Attention never goes through the trait; it binds the slot's buffers directly.
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -442,15 +442,7 @@ pub(crate) trait KvStore: Send {
         }
         Ok(out)
     }
-
-    /// The extent's rows when they sit in host memory, so a reader can skip the copy.
-    #[cfg_attr(not(test), allow(dead_code))]
-    fn host(&self, id: u64) -> Option<&KvRows> {
-        let _ = id;
-        None
-    }
 }
-
 /// The formats blob's meta entry. No extent may use this id.
 pub(crate) const FORMATS_META_ID: u64 = u64::MAX;
 
@@ -489,10 +481,6 @@ impl<S: KvStore + ?Sized> KvStore for Box<S> {
     fn metas(&mut self, ids: &[u64]) -> Result<Vec<Option<Vec<u8>>>> {
         (**self).metas(ids)
     }
-
-    fn host(&self, id: u64) -> Option<&KvRows> {
-        (**self).host(id)
-    }
 }
 
 /// An extent taken out of a budgeted store, with the side metadata that belonged to it.
@@ -511,6 +499,9 @@ pub(crate) trait BudgetedStore: KvStore {
     fn capacity(&self) -> usize;
     /// Remove the least-recently-used extent and hand back its rows and metadata.
     fn take_lru(&mut self) -> Option<Taken>;
+    /// Remove the least-recently-used extent without reading its rows, for a store with nothing
+    /// below it to demote into.
+    fn drop_lru(&mut self) -> Option<u64>;
 }
 
 /// One layer of a device slot: its buffers, formats and where its rows sit.
@@ -658,11 +649,6 @@ impl KvStore for DeviceKv<'_> {
     fn contains(&self, id: u64) -> bool {
         id == self.id
     }
-
-    fn host(&self, id: u64) -> Option<&KvRows> {
-        let _ = id;
-        None
-    }
 }
 
 impl DeviceKv<'_> {
@@ -685,134 +671,6 @@ impl DeviceKv<'_> {
             v_row,
             layout,
             oldest,
-        })
-    }
-}
-
-/// One extent in a [`RamKv`].
-struct RamExtent {
-    first: usize,
-    rows: KvRows,
-    used: u64,
-}
-
-/// Extents in host memory. A zero capacity is unbounded; eviction is the caller's, through
-/// [`BudgetedStore::take_lru`].
-pub(crate) struct RamKv {
-    cap: usize,
-    clock: u64,
-    extents: HashMap<u64, RamExtent>,
-    metas: HashMap<u64, Vec<u8>>,
-}
-
-impl Default for RamKv {
-    fn default() -> Self {
-        Self::new(0)
-    }
-}
-
-impl RamKv {
-    /// A store holding `cap_bytes`, or unbounded when it is zero.
-    pub(crate) fn new(cap_bytes: usize) -> Self {
-        Self {
-            cap: cap_bytes,
-            clock: 0,
-            extents: HashMap::new(),
-            metas: HashMap::new(),
-        }
-    }
-
-    fn stamp(&mut self) -> u64 {
-        self.clock += 1;
-        self.clock
-    }
-}
-
-impl KvStore for RamKv {
-    fn get(&mut self, id: u64, rows: Range<usize>, out: &mut KvRows) -> Result<bool> {
-        let Some(ext) = self.extents.get_mut(&id) else {
-            return Ok(false);
-        };
-        ensure!(
-            rows.start >= ext.first,
-            "kv rows {rows:?} before extent {id:x} starts at {}",
-            ext.first
-        );
-        ensure!(
-            rows.end <= ext.first + ext.rows.rows,
-            "kv rows {rows:?} past extent {id:x} of {} rows",
-            ext.rows.rows
-        );
-        let (first, rowsref) = (ext.first, &ext.rows);
-        let used = self.clock + 1;
-        out.append(rowsref, rows.start - first..rows.end - first)?;
-        self.clock = used;
-        if let Some(e) = self.extents.get_mut(&id) {
-            e.used = used;
-        }
-        Ok(true)
-    }
-
-    fn put(&mut self, id: u64, first: usize, rows: KvRows) -> Result<()> {
-        let used = self.stamp();
-        self.extents.insert(id, RamExtent { first, rows, used });
-        Ok(())
-    }
-
-    fn remove(&mut self, id: u64) -> Result<()> {
-        self.extents.remove(&id);
-        self.metas.remove(&id);
-        Ok(())
-    }
-
-    fn contains(&self, id: u64) -> bool {
-        self.extents.contains_key(&id)
-    }
-
-    fn extents(&mut self) -> Result<Vec<u64>> {
-        Ok(self.extents.keys().copied().collect())
-    }
-
-    fn meta(&mut self, id: u64) -> Result<Option<Vec<u8>>> {
-        Ok(self.metas.get(&id).cloned())
-    }
-
-    fn set_meta(&mut self, id: u64, meta: &[u8]) -> Result<()> {
-        self.metas.insert(id, meta.to_vec());
-        Ok(())
-    }
-
-    fn host(&self, id: u64) -> Option<&KvRows> {
-        self.extents.get(&id).map(|e| &e.rows)
-    }
-}
-
-impl BudgetedStore for RamKv {
-    fn used(&self) -> usize {
-        self.extents.values().map(|e| e.rows.bytes()).sum()
-    }
-
-    fn capacity(&self) -> usize {
-        if self.cap == 0 {
-            usize::MAX
-        } else {
-            self.cap
-        }
-    }
-
-    fn take_lru(&mut self) -> Option<Taken> {
-        let id = *self
-            .extents
-            .iter()
-            .min_by_key(|(_, e)| e.used)
-            .map(|(id, _)| id)?;
-        let ext = self.extents.remove(&id)?;
-        let meta = self.metas.remove(&id);
-        Some(Taken {
-            id,
-            first: ext.first,
-            rows: ext.rows,
-            meta,
         })
     }
 }
@@ -933,10 +791,6 @@ impl<Fast: BudgetedStore, Slow: KvStore> KvStore for Tiered<Fast, Slow> {
         }
         Ok(out)
     }
-
-    fn host(&self, id: u64) -> Option<&KvRows> {
-        self.fast.host(id)
-    }
 }
 
 #[cfg(test)]
@@ -948,10 +802,40 @@ impl<Fast: BudgetedStore, Slow: KvStore> Tiered<Fast, Slow> {
     pub(crate) fn slow(&self) -> &Slow {
         &self.slow
     }
+
+    pub(crate) fn fast_mut(&mut self) -> &mut Fast {
+        &mut self.fast
+    }
+
+    pub(crate) fn slow_mut(&mut self) -> &mut Slow {
+        &mut self.slow
+    }
+}
+
+/// The store behind a disabled cache: it holds nothing, so every read is a miss and nothing is
+/// ever written.
+pub(crate) struct NoStore;
+
+impl KvStore for NoStore {
+    fn get(&mut self, _id: u64, _rows: Range<usize>, _out: &mut KvRows) -> Result<bool> {
+        Ok(false)
+    }
+
+    fn put(&mut self, _id: u64, _first: usize, _rows: KvRows) -> Result<()> {
+        Ok(())
+    }
+
+    fn remove(&mut self, _id: u64) -> Result<()> {
+        Ok(())
+    }
+
+    fn contains(&self, _id: u64) -> bool {
+        false
+    }
 }
 
 /// A budgeted store with nothing below it: a write drops the least recently used extents until it
-/// fits again, so a cache over host memory alone stays inside `kv.store_mb`.
+/// fits again, so a cache that ends here stays inside its tier's `size`.
 pub(crate) struct Bounded<S: BudgetedStore> {
     inner: S,
 }
@@ -969,7 +853,7 @@ impl<S: BudgetedStore> KvStore for Bounded<S> {
 
     fn put(&mut self, id: u64, first: usize, rows: KvRows) -> Result<()> {
         self.inner.put(id, first, rows)?;
-        while self.inner.used() > self.inner.capacity() && self.inner.take_lru().is_some() {}
+        while self.inner.used() > self.inner.capacity() && self.inner.drop_lru().is_some() {}
         Ok(())
     }
 
@@ -996,48 +880,53 @@ impl<S: BudgetedStore> KvStore for Bounded<S> {
     fn metas(&mut self, ids: &[u64]) -> Result<Vec<Option<Vec<u8>>>> {
         self.inner.metas(ids)
     }
-
-    fn host(&self, id: u64) -> Option<&KvRows> {
-        self.inner.host(id)
-    }
 }
 
-pub(crate) const DISK_EXTENTS: TableDefinition<'static, (u64, u64), &'static [u8]> =
+pub(crate) const REDB_EXTENTS: TableDefinition<'static, (u64, u64), &'static [u8]> =
     TableDefinition::new("kv_extents");
-const DISK_METAS: TableDefinition<'static, (u64, u64), &'static [u8]> =
+const REDB_METAS: TableDefinition<'static, (u64, u64), &'static [u8]> =
     TableDefinition::new("kv_metas");
 
 /// One extent tracked in memory: its bytes and its last use.
-struct DiskExtent {
+struct RedbExtent {
     bytes: usize,
     used: u64,
 }
 
-/// Extents in one redb database, under one model key. A commit is not flushed (`Durability::None`)
-/// because a lost extent is only a cache miss; `Drop` flushes once.
-pub(crate) struct DiskKv {
+/// Extents in one redb database under one model key, wherever that database lives: a file or
+/// redb's in-memory backend. Commits skip the flush (`Durability::None`); `Drop` flushes once.
+pub(crate) struct RedbKv {
     db: Database,
     key: u64,
     cap: usize,
     clock: u64,
-    extents: HashMap<u64, DiskExtent>,
+    extents: HashMap<u64, RedbExtent>,
     #[cfg(test)]
     reads: usize,
 }
 
-impl DiskKv {
+impl RedbKv {
     /// Open (or create) `path` for the extents of `key`, keeping `cap_bytes`.
-    pub(crate) fn open(path: &Path, key: u64, cap_bytes: usize) -> Result<Self> {
+    pub(crate) fn open_file(path: &Path, key: u64, cap_bytes: usize) -> Result<Self> {
         if let Some(dir) = path.parent() {
             if !dir.as_os_str().is_empty() {
                 std::fs::create_dir_all(dir)?;
             }
         }
-        let db = Database::create(path)?;
+        Self::open_db(Database::create(path)?, key, cap_bytes)
+    }
+
+    /// The same tables and budget with no file behind them: redb's in-memory backend, for a tier that lives in RAM without the page cache keeping a second copy.
+    pub(crate) fn open_memory(key: u64, cap_bytes: usize) -> Result<Self> {
+        let db = Database::builder().create_with_backend(redb::backends::InMemoryBackend::new())?;
+        Self::open_db(db, key, cap_bytes)
+    }
+
+    fn open_db(db: Database, key: u64, cap_bytes: usize) -> Result<Self> {
         {
             let txn = db.begin_write()?;
-            txn.open_table(DISK_EXTENTS)?;
-            txn.open_table(DISK_METAS)?;
+            txn.open_table(REDB_EXTENTS)?;
+            txn.open_table(REDB_METAS)?;
             txn.commit()?;
         }
         let mut kv = Self {
@@ -1058,7 +947,7 @@ impl DiskKv {
         let mut ids = Vec::new();
         {
             let txn = self.db.begin_read()?;
-            let table = txn.open_table(DISK_EXTENTS)?;
+            let table = txn.open_table(REDB_EXTENTS)?;
             for item in table.range((self.key, 0u64)..=(self.key, u64::MAX))? {
                 let (k, _) = item?;
                 let (_, id) = k.value();
@@ -1067,8 +956,8 @@ impl DiskKv {
         }
         let (orphan_extents, orphan_metas): (Vec<u64>, Vec<u64>) = {
             let txn = self.db.begin_read()?;
-            let extents = txn.open_table(DISK_EXTENTS)?;
-            let metas = txn.open_table(DISK_METAS)?;
+            let extents = txn.open_table(REDB_EXTENTS)?;
+            let metas = txn.open_table(REDB_METAS)?;
             let mut orphan_extents = Vec::new();
             for id in &ids {
                 match metas.get((self.key, *id))? {
@@ -1077,7 +966,7 @@ impl DiskKv {
                         self.clock += 1;
                         self.extents.insert(
                             *id,
-                            DiskExtent {
+                            RedbExtent {
                                 bytes,
                                 used: self.clock,
                             },
@@ -1103,13 +992,13 @@ impl DiskKv {
             let mut txn = self.db.begin_write()?;
             txn.set_durability(Durability::None)?;
             {
-                let mut table = txn.open_table(DISK_EXTENTS)?;
+                let mut table = txn.open_table(REDB_EXTENTS)?;
                 for id in orphan_extents {
                     table.remove((self.key, id))?;
                 }
             }
             {
-                let mut table = txn.open_table(DISK_METAS)?;
+                let mut table = txn.open_table(REDB_METAS)?;
                 for id in orphan_metas {
                     table.remove((self.key, id))?;
                 }
@@ -1127,7 +1016,7 @@ impl DiskKv {
     /// The extent's rows, without stamping its use.
     fn load(&self, id: u64) -> Result<Option<(usize, KvRows)>> {
         let txn = self.db.begin_read()?;
-        let table = txn.open_table(DISK_EXTENTS)?;
+        let table = txn.open_table(REDB_EXTENTS)?;
         let Some(v) = table.get((self.key, id))? else {
             return Ok(None);
         };
@@ -1141,7 +1030,7 @@ impl DiskKv {
         let mut txn = self.db.begin_write()?;
         txn.set_durability(Durability::None)?;
         {
-            let mut table = txn.open_table(DISK_METAS)?;
+            let mut table = txn.open_table(REDB_METAS)?;
             table.insert((self.key, id), record.as_slice())?;
         }
         txn.commit()?;
@@ -1168,7 +1057,7 @@ fn record_meta(record: &[u8]) -> &[u8] {
     record.get(8..).unwrap_or(&[])
 }
 
-impl KvStore for DiskKv {
+impl KvStore for RedbKv {
     fn get(&mut self, id: u64, rows: Range<usize>, out: &mut KvRows) -> Result<bool> {
         #[cfg(test)]
         {
@@ -1200,11 +1089,11 @@ impl KvStore for DiskKv {
         let mut txn = self.db.begin_write()?;
         txn.set_durability(Durability::None)?;
         {
-            let mut table = txn.open_table(DISK_EXTENTS)?;
+            let mut table = txn.open_table(REDB_EXTENTS)?;
             table.insert((self.key, id), blob.as_slice())?;
         }
         {
-            let mut table = txn.open_table(DISK_METAS)?;
+            let mut table = txn.open_table(REDB_METAS)?;
             let meta = table
                 .get((self.key, id))?
                 .map(|v| record_meta(v.value()).to_vec())
@@ -1216,7 +1105,7 @@ impl KvStore for DiskKv {
         }
         txn.commit()?;
         let used = self.stamp();
-        self.extents.insert(id, DiskExtent { bytes, used });
+        self.extents.insert(id, RedbExtent { bytes, used });
         Ok(())
     }
 
@@ -1224,11 +1113,11 @@ impl KvStore for DiskKv {
         let mut txn = self.db.begin_write()?;
         txn.set_durability(Durability::None)?;
         {
-            let mut table = txn.open_table(DISK_EXTENTS)?;
+            let mut table = txn.open_table(REDB_EXTENTS)?;
             table.remove((self.key, id))?;
         }
         {
-            let mut table = txn.open_table(DISK_METAS)?;
+            let mut table = txn.open_table(REDB_METAS)?;
             table.remove((self.key, id))?;
         }
         txn.commit()?;
@@ -1247,10 +1136,13 @@ impl KvStore for DiskKv {
     fn meta(&mut self, id: u64) -> Result<Option<Vec<u8>>> {
         let meta = {
             let txn = self.db.begin_read()?;
-            let table = txn.open_table(DISK_METAS)?;
+            let table = txn.open_table(REDB_METAS)?;
+            // A record with no payload still holds the extent's byte count, but it carries no
+            // index entry: reading it back as an empty meta would clobber one a lower tier holds.
             let meta = table
                 .get((self.key, id))?
-                .map(|v| record_meta(v.value()).to_vec());
+                .map(|v| record_meta(v.value()).to_vec())
+                .filter(|m| !m.is_empty());
             meta
         };
         Ok(meta)
@@ -1263,7 +1155,7 @@ impl KvStore for DiskKv {
 
     fn metas(&mut self, ids: &[u64]) -> Result<Vec<Option<Vec<u8>>>> {
         let txn = self.db.begin_read()?;
-        let table = txn.open_table(DISK_METAS)?;
+        let table = txn.open_table(REDB_METAS)?;
         let mut out = Vec::with_capacity(ids.len());
         for &id in ids {
             let meta = table
@@ -1275,7 +1167,27 @@ impl KvStore for DiskKv {
     }
 }
 
-impl BudgetedStore for DiskKv {
+/// A budgeted trait object is a budgeted store: the tier chain is built from a runtime list, so
+/// its middle layers are `Box<dyn BudgetedStore>`.
+impl BudgetedStore for Box<dyn BudgetedStore> {
+    fn used(&self) -> usize {
+        (**self).used()
+    }
+
+    fn capacity(&self) -> usize {
+        (**self).capacity()
+    }
+
+    fn take_lru(&mut self) -> Option<Taken> {
+        (**self).take_lru()
+    }
+
+    fn drop_lru(&mut self) -> Option<u64> {
+        (**self).drop_lru()
+    }
+}
+
+impl BudgetedStore for RedbKv {
     fn used(&self) -> usize {
         self.extents.values().map(|e| e.bytes).sum()
     }
@@ -1321,9 +1233,22 @@ impl BudgetedStore for DiskKv {
             meta,
         })
     }
+
+    fn drop_lru(&mut self) -> Option<u64> {
+        let id = *self
+            .extents
+            .iter()
+            .min_by_key(|(_, e)| e.used)
+            .map(|(id, _)| id)?;
+        if let Err(e) = self.remove(id) {
+            tracing::warn!(error = %e, "kv store: dropping a redb extent failed");
+            return None;
+        }
+        Some(id)
+    }
 }
 
-impl Drop for DiskKv {
+impl Drop for RedbKv {
     fn drop(&mut self) {
         match self.db.begin_write() {
             Ok(mut txn) => {
@@ -1344,7 +1269,6 @@ impl Drop for DiskKv {
 /// model. The server's `maxmemory` policy is the budget.
 pub(crate) struct RedisKv {
     conn: redis::Connection,
-    endpoint: String,
     key: u64,
     ids: std::collections::HashSet<u64>,
 }
@@ -1357,14 +1281,9 @@ impl RedisKv {
         conn.set_write_timeout(Some(std::time::Duration::from_secs(30)))?;
         Ok(Self {
             conn,
-            endpoint: crate::seam::kv_store::redact(url),
             key,
             ids: std::collections::HashSet::new(),
         })
-    }
-
-    pub(crate) fn describe(&self) -> String {
-        self.endpoint.clone()
     }
 
     fn prefix(&self) -> String {
@@ -1493,8 +1412,8 @@ mod tests {
     }
 
     #[test]
-    fn ram_kv_round_trips_and_removes() {
-        let mut s = RamKv::default();
+    fn an_in_memory_store_round_trips_and_removes() {
+        let mut s = RedbKv::open_memory(0, 1 << 20).unwrap();
         let a = rows(3, 1, 2);
         s.put(7, 0, a.clone()).unwrap();
         assert!(s.contains(7));
@@ -1518,6 +1437,23 @@ mod tests {
         s.remove(7).unwrap();
         assert!(!s.contains(7));
         assert!(!s.get(7, 0..3, &mut out).unwrap());
+    }
+
+    /// The in-memory backend reports and enforces the same byte budget as a file-backed store.
+    #[test]
+    fn an_in_memory_store_keeps_its_budget() {
+        let a = KvRows::whole(1, vec![vec![1; 4]], vec![vec![2; 2]]);
+        let mut s = RedbKv::open_memory(7, 6).unwrap();
+        s.put(1, 0, a.clone()).unwrap();
+        assert_eq!(s.used(), 6);
+        assert!(s.used() <= s.capacity());
+
+        s.put(2, 0, a).unwrap();
+        assert!(s.used() > s.capacity(), "two extents over the budget");
+
+        assert_eq!(s.drop_lru(), Some(1));
+        assert_eq!(s.extents().unwrap(), vec![2]);
+        assert!(s.used() <= s.capacity());
     }
 
     #[test]

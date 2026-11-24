@@ -42,9 +42,6 @@ use crate::{Config, GenStats, SeamModel};
 use anyhow::{anyhow, Result};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
-/// RAM a prefix cache gets when only a lower tier (`kv.store_file`/`kv.store_url`) is configured.
-const DEFAULT_STORE_RAM_BYTES: usize = 256 * 1024 * 1024;
-
 /// Pure continuation-slot selection (the "this conversation continuing" case of [`checkout`], and
 /// the twin of `seam::model::SlotPool::pick`'s first arm). Given `(slot_idx, prefix_score,
 /// cached_len)` for each candidate free slot and the `prompt_len`, pick the qualifying slot with
@@ -234,7 +231,7 @@ pub struct ParallelSeam {
     /// token, and single-request decode speed is a hard non-regression requirement.
     gate: Option<Arc<StepGate>>,
     /// The cross-conversation KV prefix cache shared by every conversation on this engine (see
-    /// [`crate::seam::BlockCache`]). Empty and inert unless `kv.store_mb` is set.
+    /// [`crate::seam::BlockCache`]). Empty and inert unless `kv.tiers` names a store.
     store: Mutex<crate::seam::BlockCache<Box<dyn crate::seam::KvStore>>>,
     max_ctx: usize,
     /// The session's page pool when `kv.paged` built one, kept here so `/status` can report its
@@ -287,27 +284,12 @@ impl ParallelSeam {
         let pins = Arc::new(crate::seam::PlacementPins::default());
         let scope = crate::seam::PlacementScope::enter(pins.clone());
         let max_ctx = model.vulkan_slot_ctx(&vk, n_slots, want_ctx)?;
-        // `store_mb` sizes the RAM tier; a lower tier alone still needs one to sit in front.
-        let store_bytes = model
-            .cfg()
-            .kv
-            .store_mb
-            .map(|mb| (mb as usize).saturating_mul(1024 * 1024));
+        // One store per `[[kv.tiers]]` entry, fastest first, with Redis above it when asked for.
         let store_key = crate::seam::store_key(model.config());
-        let lower = if store_bytes != Some(0) {
-            crate::seam::lower_tier_for(model.cfg(), store_key)
-        } else {
-            None
-        };
-        let enabled = store_bytes != Some(0) && (store_bytes.is_some() || lower.is_some());
-        let ram = store_bytes.unwrap_or(DEFAULT_STORE_RAM_BYTES);
-        let store: Box<dyn crate::seam::KvStore> = match lower {
-            Some(lower) => Box::new(crate::seam::Tiered::new(
-                crate::seam::RamKv::new(ram),
-                lower,
-            )),
-            None => Box::new(crate::seam::Bounded::new(crate::seam::RamKv::new(ram))),
-        };
+        let store = crate::seam::prefix_store_for(model.cfg(), store_key);
+        let enabled = store.is_some();
+        let store: Box<dyn crate::seam::KvStore> =
+            store.unwrap_or_else(|| Box::new(crate::seam::NoStore));
         let mut engine = Self {
             model,
             vk,

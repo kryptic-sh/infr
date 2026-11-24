@@ -49,9 +49,20 @@ fn engine(
 ) -> infr_llama::EngineConfig {
     let mut c = infr_llama::EngineConfig::default();
     c.kv.slots = 1;
-    c.kv.store_mb = Some(store_mb);
-    c.kv.store_file = disk.map(std::path::Path::to_path_buf);
-    c.kv.store_url = url.map(str::to_string);
+    let mut redb = infr_core::config::KvTier {
+        backend: "redb".to_string(),
+        size: Some(infr_core::SizeSpec::Bytes(store_mb << 20)),
+        ..Default::default()
+    };
+    redb.path = disk.map(std::path::Path::to_path_buf);
+    c.kv.tiers.push(redb);
+    if let Some(url) = url {
+        c.kv.tiers.push(infr_core::config::KvTier {
+            backend: "redis".to_string(),
+            url: Some(url.to_string()),
+            ..Default::default()
+        });
+    }
     c
 }
 
@@ -123,35 +134,34 @@ fn restore_cost_per_tier() {
     std::fs::create_dir_all(&dir).expect("temp dir");
     let tokens = 2048;
     let ctx = 4096;
-    println!("\ntier     tokens       first  same prompt again  speedup");
+    println!("\ntier        tokens       first  same prompt again  speedup");
 
-    // A roomy RAM store keeps the blocks resident: the second run measures the host copy.
+    // One in-memory database: the store lives in RSS and dies with the process.
     println!(
         "{}",
         row(
-            "ram",
-            &twice(&path, engine(1024, None, None), ctx, tokens, "ram")
+            "redb-mem",
+            &twice(&path, engine(1024, None, None), ctx, tokens, "mem")
         )
     );
 
-    // A 1 MiB RAM tier cannot hold a block, so every capture lands on disk and every restore reads
-    // it back from there.
+    // One database file: the same code path, with the rows on disk and the page cache in front.
     let disk_path = dir.join("kv.redb");
     let disk = twice(
         &path,
-        engine(1, Some(&disk_path), None),
+        engine(1024, Some(&disk_path), None),
         ctx,
         tokens,
         "redb",
     );
-    println!("{}", row("redb", &disk));
+    println!("{}", row("redb-file", &disk));
 
     match std::env::var("INFR_TEST_REDIS_URL") {
         Ok(url) => {
-            let redis = twice(&path, engine(1, None, Some(&url)), ctx, tokens, "valkey");
+            let redis = twice(&path, engine(1024, None, Some(&url)), ctx, tokens, "valkey");
             println!("{}", row("valkey", &redis));
         }
-        Err(_) => println!("valkey   skipped (INFR_TEST_REDIS_URL is unset)"),
+        Err(_) => println!("valkey      skipped (INFR_TEST_REDIS_URL is unset)"),
     }
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -163,7 +173,7 @@ fn restore_cost_at_long_context() {
         eprintln!("skip: no GGUF in the HF cache");
         return;
     };
-    println!("\ntokens         first  same prompt again  speedup  (host RAM store)");
+    println!("\ntokens         first  same prompt again  speedup  (in-memory store)");
     for (tokens, ctx) in [(4096, 8192), (32768, 36864)] {
         let t = twice(&path, engine(1024, None, None), ctx, tokens, "long");
         println!("{}", row(&tokens.to_string(), &t));

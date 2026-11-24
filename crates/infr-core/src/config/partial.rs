@@ -204,6 +204,52 @@ impl<T: ConfigValue> ConfigValue for Option<T> {
     }
 }
 
+impl ConfigValue for Vec<super::KvTier> {
+    /// `--set`'s shorthand: backend names, comma separated, each with no options. A config file
+    /// spells the same list as `[[kv.tiers]]` tables, which arrive here as `<i>.<field>` paths.
+    fn parse_set(raw: &str) -> Result<Self, String> {
+        Ok(raw
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|backend| super::KvTier {
+                backend: backend.to_string(),
+                ..super::KvTier::default()
+            })
+            .collect())
+    }
+
+    fn to_display(&self) -> String {
+        self.iter()
+            .map(|t| t.backend.clone())
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    /// `kv.tiers.<i>.<field>`: the entry's index is the first path segment.
+    fn set_below(slot: &mut Option<Self>, rest: &str, raw: &str) -> Result<(), SetPathError> {
+        let (index, field) = rest.split_once('.').ok_or(SetPathError::Unknown)?;
+        let index: usize = index.parse().map_err(|_| SetPathError::Unknown)?;
+        let list = slot.get_or_insert_with(Vec::new);
+        if list.len() <= index {
+            list.resize_with(index + 1, super::KvTier::default);
+        }
+        let tier = &mut list[index];
+        match field {
+            "backend" => tier.backend = raw.to_string(),
+            "size" => {
+                tier.size = Some(SizeSpec::parse_set(raw).map_err(SetPathError::Value)?);
+            }
+            "path" => {
+                tier.path = Some(PathBuf::parse_set(raw).map_err(SetPathError::Value)?);
+            }
+            "url" => tier.url = Some(raw.to_string()),
+            _ => return Err(SetPathError::Unknown),
+        }
+        Ok(())
+    }
+}
+
 /// Split `a.b.c` into `("a", Some("b.c"))`; a bare `a` into `("a", None)`.
 pub(crate) fn split_path(path: &str) -> (&str, Option<&str>) {
     match path.split_once('.') {

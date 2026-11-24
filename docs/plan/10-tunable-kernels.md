@@ -96,7 +96,9 @@ without including `wave64.glsl`.
   `MAX_SG` sizes partials for a minimum 8-wide subgroup), `dg_eb_sample`,
   `quant_f8_row`, `quant_q8` (lane = element of a Q8 block; blocks per workgroup
   is the knob, with a host group count and a drift test), `store_q8`,
-  `deltanet_norm`, `deltanet_seq` (register arrays sized `kd/32`). The unpinned
+  `deltanet_norm`, `deltanet_seq` (register arrays sized `kd/32`), and
+  `attn_nc_fa` (its base build is subgroup-free; the `_sg64` twin reduces the
+  softmax rows with clustered ops). The unpinned
   ones already run at whatever width the driver picks; which width AMD's Windows
   driver picks is **[U]**.
 - **Class 3 — shape baked into a layout shared with the host or other kernels:**
@@ -114,7 +116,7 @@ without including `wave64.glsl`.
   kernels where local size is the only, arbitrary, knob; (b) shared-memory tree
   or tiled kernels whose workgroup or tile is a real knob independent of width
   (the `native_gemm_mmq_*` family, `native_gemm_dp4a_kq`, `native_gemm_fma`,
-  `attn_nc_fa`, the tree GEMVs, `linear_*`, `attention_kv`, `lightning_indexer`
+  the tree GEMVs, `linear_*`, `attention_kv`, `lightning_indexer`
   and others).
 
 **Where GCN loses time today [I]:** workgroups of 64 or more already fill each

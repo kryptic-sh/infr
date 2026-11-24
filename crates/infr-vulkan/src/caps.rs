@@ -1566,7 +1566,8 @@ mod tests {
         let mut p = sg(64, 64);
         p.stages = vk::ShaderStageFlags::FRAGMENT;
         assert!(subgroup_mode(&p, false).is_err(), "no subgroups in compute");
-        // Shuffle, ballot, vote and quad are not required: no kernel uses them.
+        // Shuffle, ballot, vote and quad are not required: only the optional `_sg64` nc_fa
+        // softmax uses shuffle, and that build is gated on the capability.
         let mut p = sg(64, 64);
         p.operations = REQUIRED_SUBGROUP_OPS;
         assert_eq!(

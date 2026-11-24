@@ -80,6 +80,18 @@ peak and is the ceiling, not the target.
 - End to end: pp58728 against 539 t/s; llama.cpp on the same card does
   pp1024@d32768 at 456 t/s.
 
+## P1 result (RX 580, LFM3 Q4_K_M, q8 KV)
+
+- Paired `INFR_WAVE64_NATIVE` A/B at pp1024, three pairs per depth: the twin
+  did 773/700/697 t/s against the base build's 678/647/652 at d16384 (+7 to
+  +14%), and 551/487/467 against 459/520/484 at d32768 (neutral; run variance
+  reaches 20%, so only adjacent pairs compare).
+- The K/V vec2 split removed the 4-way LDS bank conflict: attention at d16384
+  fell from 606 ms (origin/main) to 552 ms median for the base build.
+- The twin needs `subgroupShuffle`, which the backend does not require, so the
+  `_sg64` build is chosen only when the device reports the shuffle capability;
+  everywhere else the base build runs.
+
 ## Risks
 
 - A wave64-only kernel needs `subgroup_size_control` with a pinned size of 64;

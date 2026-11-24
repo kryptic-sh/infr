@@ -6679,7 +6679,8 @@ impl<'a> Recorder<'a> {
 
     /// Non-coopmat shared-memory fma flash-attention prefill (`attn_nc_fa.comp`, adapter.rs
     /// `nc_fa_ok` — the Intel Arc tier): fused tile QK^T → online softmax → PV, one workgroup per
-    /// (BM-row query tile, head), no subgroup ops, no pinned subgroup size, no scratch buffers.
+    /// (BM-row query tile, head), no scratch buffers. No subgroup ops and no pinned subgroup size,
+    /// except where `Recorder::sg64` holds: there the `_sg64` twin runs on a pinned full wave64.
     /// Handles causal + sliding-window masks, ring KV caches (position → row via the `cap` push
     /// constant, attn_partial's mapping), caller scale (0 → 1/√hd) and GQA. f16 KV only (the
     /// adapter dequants quantized KV to the f16 ring-layout scratch before rows>1 attention).
@@ -6701,9 +6702,14 @@ impl<'a> Recorder<'a> {
         scale: f32,
         cap: usize,
     ) {
-        let (name, spv, bm) =
-            crate::gemm::attn_nc_fa_spv(hd).expect("attention_prefill_nc_fa: hd gated <= 512");
-        let k = self.be.kernel(name, spv, 4, 36);
+        let sg64 = self.sg64() && self.be.shared.subgroup_shuffle;
+        let (name, spv, bm) = crate::gemm::attn_nc_fa_spv(hd, sg64)
+            .expect("attention_prefill_nc_fa: hd gated <= 512");
+        let k = if sg64 {
+            self.be.kernel_sg64_native(name, spv, 4, 36)
+        } else {
+            self.be.kernel(name, spv, 4, 36)
+        };
         let mut p = [0u8; 36];
         p[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         p[4..8].copy_from_slice(&(kv_len as u32).to_ne_bytes());
@@ -15114,7 +15120,8 @@ mod tests {
     /// Non-coopmat fma flash prefill (`attn_nc_fa`): host-reference parity across causal /
     /// windowed / ring-wrapped / GQA configs on all three HD_MAX builds, PLUS same-dispatch-3x
     /// bitwise determinism (the mmq barrier-race lesson — goldens can't catch intra-dispatch
-    /// races). Runs on any GPU: the kernel uses no coopmat and no subgroup ops.
+    /// races). Runs on any GPU. On a wave64 device it runs both the `_sg64` twin and the base
+    /// build, which must agree bit for bit: the twin keeps the softmax's summation order.
     #[test]
     #[ignore = "requires a Vulkan GPU"]
     fn attention_prefill_nc_fa_matches_cpu() {
@@ -15148,6 +15155,8 @@ mod tests {
         run_attn_nc_fa(256, 1536, 16, 1, 512, 0, 1.0, None);
     }
 
+    /// Runs one `attn_nc_fa` shape on the `_sg64` twin (where the device takes it) and on the
+    /// base build, checks each against the host, and requires the two to match bit for bit.
     #[allow(clippy::too_many_arguments)]
     fn run_attn_nc_fa(
         q_len: usize,
@@ -15159,7 +15168,46 @@ mod tests {
         scale: f32,
         ring_rows: Option<usize>,
     ) {
-        let be = VulkanBackend::new().unwrap();
+        let native = be_with(|v| v.wave64_native = true);
+        let base = be_with(|v| v.wave64_native = false);
+        let args = (q_len, kv_len, nh, nkv, hd, window, scale, ring_rows);
+        let got_native = run_attn_nc_fa_on(&native, args);
+        let got_base = run_attn_nc_fa_on(&base, args);
+        let sg64 = |be: &VulkanBackend| {
+            be.built_kernel_names()
+                .iter()
+                .any(|n| n.starts_with("attn_nc_fa_") && n.ends_with("_sg64"))
+        };
+        assert_eq!(
+            sg64(&native),
+            native.shared.wave64 && native.shared.subgroup_shuffle,
+            "native leg's nc_fa build"
+        );
+        assert!(!sg64(&base), "the base leg built an _sg64 twin");
+        let mismatch = got_native
+            .iter()
+            .zip(&got_base)
+            .position(|(a, b)| a.to_bits() != b.to_bits());
+        assert_eq!(
+            mismatch, None,
+            "attn_nc_fa q={q_len} kv={kv_len} hd={hd}: _sg64 twin differs from the base build"
+        );
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn run_attn_nc_fa_on(
+        be: &VulkanBackend,
+        (q_len, kv_len, nh, nkv, hd, window, scale, ring_rows): (
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            f32,
+            Option<usize>,
+        ),
+    ) -> Vec<f32> {
         let pos_offset = kv_len - q_len;
         let gen = |n: usize, salt: usize| -> Vec<f32> {
             (0..n)
@@ -15181,9 +15229,9 @@ mod tests {
             kr[r * rw..(r + 1) * rw].copy_from_slice(&k[j * rw..(j + 1) * rw]);
             vr[r * rw..(r + 1) * rw].copy_from_slice(&v[j * rw..(j + 1) * rw]);
         }
-        let bq = upf16(&be, &q);
-        let bk = upf16(&be, &kr);
-        let bv = upf16(&be, &vr);
+        let bq = upf16(be, &q);
+        let bk = upf16(be, &kr);
+        let bv = upf16(be, &vr);
         // dst is NOT tile-padded — the kernel guards pad-row writes (no Internal requirement)
         let outs: Vec<_> = (0..3)
             .map(|_| {
@@ -15242,6 +15290,7 @@ mod tests {
              ring={ring_rows:?} max_err={err:e}"
         );
         assert!(err < 5e-3, "attn_nc_fa mismatch: {err}");
+        got
     }
 
     /// The work bound cuts the non-coopmat flash prefill (`attn_nc_fa`, one workgroup per query

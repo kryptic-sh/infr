@@ -32,6 +32,9 @@ pub(crate) struct ComputeKernel {
     /// The subgroup pin the pipeline was created with, so a `DISPATCH_BASE` twin
     /// ([`VulkanBackend::dispatch_base_pipeline`]) is created the same way.
     pub pin: Option<SubgroupPin>,
+    /// Whether the pipeline was specialized with `W64` (`kernel_sg64_native` builds are not, even
+    /// on the wave64 path), so a `DISPATCH_BASE` twin gets the same specialization.
+    pub wave64: bool,
     /// The shader declares `gl_NumWorkGroups` (`spirv::reads_num_workgroups`): its grid may then
     /// be cut into ranges only under a convention the op states (`work::Split::WideGrid`).
     pub reads_num_workgroups: bool,
@@ -250,6 +253,7 @@ pub(crate) fn try_make_compute_kernel(
         push_size,
         spv_hash: hash_spv(spv),
         pin,
+        wave64,
         reads_num_workgroups: crate::spirv::reads_num_workgroups(spv),
     })
 }
@@ -529,7 +533,7 @@ impl VulkanBackend {
             k.shader,
             k.pipeline_layout,
             k.pin,
-            self.shared.wave64,
+            k.wave64,
             vk::PipelineCreateFlags::DISPATCH_BASE,
         );
         match built {

@@ -8,20 +8,22 @@
 // non-coopmat device ran ALL prefill attention rows one at a time.
 //
 // Design constraints (Intel Arc audit):
-//  • NO subgroup ops anywhere — reductions go through shared memory, and no layout depends on
-//    gl_SubgroupSize (Arc enumerates 8-32; ANV may pick any).
+//  • NO subgroup ops in the base builds — reductions go through shared memory, and no layout
+//    depends on gl_SubgroupSize (Arc enumerates 8-32; ANV may pick any). Only the `_sg64`
+//    builds (pinned wave64) reduce the softmax rows with subgroup ops.
 //  • SMALL row tile: BM=32 (16 for the hd=512 build) × BN=64 kv block, 256 threads.
 //  • Shared within the 32 KB every Vulkan device guarantees (`maxComputeSharedMemorySize`): Q is
 //    staged in KC-dim chunks next to the matching K chunk, V in VC-dim chunks into the same
 //    buffer, and the output accumulator lives in registers.
 //  • Barriers AFTER all shared reads of an iteration (the mmq race lesson) — a fast thread must
-//    never restage Qs/KVs/Ss while a slow one still reads the previous block's values.
+//    never restage Qs/KVlo/KVhi/Ss while a slow one still reads the previous block's values.
 //
 // Register blocking, which is what makes the tier fast on a small GPU: shared-memory reads, not
 // arithmetic, bound the earlier one-score-column-per-load form. Each thread computes RS query
 // rows × 2 key columns of the score tile from vec4 reads (RS + 2 reads per 4·2·RS fmas), and
 // RO rows × 4 dims of the output per V chunk (RO + 4 reads per 16·RO fmas per 4 keys). The
-// softmax runs SM_T threads per row with the row max and sum combined through shared memory.
+// softmax runs SM_T threads per row with the row max and sum combined through shared memory
+// (`_sg64` twin: clustered subgroup ops over the same SM_T consecutive lanes).
 // Every score and output sum keeps the order of the scalar form it replaced (k ascending, keys
 // ascending within a block), so only the block partial's fold into the accumulator moved.
 //
@@ -44,6 +46,14 @@
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_control_flow_attributes : require
 
+// -DSG=64 (`_sg64` builds, pinned full wave64): a softmax row's SM_T threads are SM_T consecutive
+// lanes of one subgroup, so the row max and sum skip shared memory and their two barriers.
+#if defined(SG) && SG == 64
+#define WAVE_SOFTMAX
+#extension GL_KHR_shader_subgroup_shuffle : require
+#include "wave64.glsl"
+#endif
+
 #ifndef HD_MAX
 #define HD_MAX 128
 #endif
@@ -57,7 +67,7 @@ const uint BN = 64u;            // kv positions per block
 const uint THREADS = 256u;
 const uint KC = 32u;            // dims per QK chunk
 const uint VC = 64u;            // dims per PV chunk
-const uint QP4 = KC / 4u + 1u;  // vec4 pitch of a Q or K chunk row (+1 spreads banks)
+const uint QP4 = KC / 4u + 1u;  // vec4 pitch of a Q or K chunk row (+1 rotates rows across banks)
 const uint VP4 = VC / 4u;       // vec4 pitch of a V chunk row
 const uint SP = BN + 4u;        // float pitch of a score row (+4 keeps rows 16-byte aligned)
 // QK: thread (rg, cg) owns rows rg·RS .. +RS and key columns cg, cg + BN/2.
@@ -90,16 +100,29 @@ layout(binding = 2) readonly buffer VB { f16vec4 v4[]; }; // [rcap, nkv, hd]
 layout(binding = 3) writeonly buffer OB { float o[]; };   // [q_len, nh, hd]
 
 shared vec4 Qs[BM * QP4];       // KC-dim chunk of the query tile
-shared vec4 KVs[BN * VP4];      // KC-dim chunk of the K block, then VC-dim chunks of V
+// KC-dim chunk of the K block, then VC-dim chunks of V. A vec4 is split into .xy and .zw planes
+// because GCN reads it as two ds_read_b64, which a 16-byte pitch confines to half the banks.
+shared vec2 KVlo[BN * VP4];
+shared vec2 KVhi[BN * VP4];
+void kv_put(uint n, vec4 v) {
+    KVlo[n] = v.xy;
+    KVhi[n] = v.zw;
+}
+vec4 kv_get(uint n) {
+    return vec4(KVlo[n], KVhi[n]);
+}
 shared float Ss[BM * SP];       // masked scores, then probabilities
+#ifndef WAVE_SOFTMAX
 shared float redm[THREADS];     // per-thread partial row max
 shared float reds[THREADS];     // per-thread partial row sum
 shared float mrow[BM];          // running row max
+#endif
 shared float lrow[BM];          // running row sum
 shared float corr[BM];          // per-row rescale for the current block
 
 void main() {
-    uint qt = gl_WorkGroupID.x / pc.nh;
+    // Last query tile first: the causal tiles with the most keys start before the short ones.
+    uint qt = (pc.q_len + BM - 1u) / BM - 1u - gl_WorkGroupID.x / pc.nh;
     uint h = gl_WorkGroupID.x % pc.nh;
     uint qr0 = qt * BM;
     uint kvh = h / (pc.nh / pc.nkv);
@@ -112,12 +135,18 @@ void main() {
     uint rcap = (pc.cap > 0u) ? pc.cap / (pc.nkv * hd) : 0u;
 #define RROW(j) ((rcap > 0u) ? ((j) % rcap) : (j))
 
+#ifdef WAVE_SOFTMAX
+    // Every thread of a softmax row keeps the row's running max and sum.
+    float m_run = -1e30;
+    float l_run = 0.0;
+#else
     if (li < BM) {
         mrow[li] = -1e30;
         lrow[li] = 0.0;
     }
     // A tile with no live block reads lrow straight after this, with no barrier in between.
     barrier();
+#endif
 
     uint cg = li % QK_COLS;
     uint rg = li / QK_COLS;
@@ -173,14 +202,14 @@ void main() {
                 uint c4 = idx % (KC / 4u);
                 uint kpos = b0 + j;
                 uint d = k0 + c4 * 4u;
-                KVs[j * QP4 + c4] = (kpos < pc.kv_len && d < hd)
-                                        ? vec4(k4[(RROW(kpos) * pc.nkv + kvh) * hd4 + (d >> 2u)])
-                                        : vec4(0.0);
+                kv_put(j * QP4 + c4, (kpos < pc.kv_len && d < hd)
+                                         ? vec4(k4[(RROW(kpos) * pc.nkv + kvh) * hd4 + (d >> 2u)])
+                                         : vec4(0.0));
             }
             barrier();
             [[unroll]] for (uint c4 = 0u; c4 < KC / 4u; c4++) {
-                vec4 ka = KVs[cg * QP4 + c4];
-                vec4 kb = KVs[(cg + QK_COLS) * QP4 + c4];
+                vec4 ka = kv_get(cg * QP4 + c4);
+                vec4 kb = kv_get((cg + QK_COLS) * QP4 + c4);
                 [[unroll]] for (uint i = 0u; i < RS; i++) {
                     vec4 qv = Qs[(rg * RS + i) * QP4 + c4];
                     s[i][0] += qv.x * ka.x;
@@ -214,6 +243,10 @@ void main() {
             sv[c] = Ss[srow * SP + spart * SM_C + c];
             pmax = max(pmax, sv[c]);
         }
+#ifdef WAVE_SOFTMAX
+        float mold = m_run;
+        float rmax = max(mold, subgroupClusteredMax(pmax, SM_T));
+#else
         redm[li] = pmax;
         barrier();
         float mold = mrow[srow];
@@ -221,6 +254,7 @@ void main() {
         [[unroll]] for (uint t = 0u; t < SM_T; t++) {
             rmax = max(rmax, redm[srow * SM_T + t]);
         }
+#endif
         float psum = 0.0;
         [[unroll]] for (uint c = 0u; c < SM_C; c++) {
             // dead scores stay EXACTLY zero even in an all-dead block (where rmax would be
@@ -229,6 +263,20 @@ void main() {
             Ss[srow * SP + spart * SM_C + c] = p;
             psum += p;
         }
+#ifdef WAVE_SOFTMAX
+        // Lane by lane, so the sum keeps the shared-memory path's order.
+        uint row_lane0 = gl_SubgroupInvocationID & ~(SM_T - 1u);
+        float rsum = 0.0;
+        [[unroll]] for (uint t = 0u; t < SM_T; t++) {
+            rsum += subgroupShuffle(psum, row_lane0 + t);
+        }
+        float cf = exp(mold - rmax);
+        l_run = l_run * cf + rsum;
+        m_run = rmax;
+        if (spart == 0u) {
+            corr[srow] = cf;
+        }
+#else
         reds[li] = psum;
         barrier();
         if (spart == 0u) {
@@ -241,8 +289,9 @@ void main() {
             mrow[srow] = rmax;
             corr[srow] = cf;
         }
+#endif
 
-        // ── O = O·corr + P·V over VC-dim chunks of V (KVs restaged per chunk) ──
+        // ── O = O·corr + P·V over VC-dim chunks of V (KVlo/KVhi restaged per chunk) ──
         [[unroll]] for (uint c = 0u; c < NVC; c++) {
             uint d0 = c * VC;
             if (d0 < hd) {
@@ -251,9 +300,10 @@ void main() {
                     uint c4 = idx % VP4;
                     uint kpos = b0 + j;
                     uint d = d0 + c4 * 4u;
-                    KVs[j * VP4 + c4] = (kpos < pc.kv_len && d < hd)
-                                            ? vec4(v4[(RROW(kpos) * pc.nkv + kvh) * hd4 + (d >> 2u)])
-                                            : vec4(0.0);
+                    kv_put(j * VP4 + c4,
+                           (kpos < pc.kv_len && d < hd)
+                               ? vec4(v4[(RROW(kpos) * pc.nkv + kvh) * hd4 + (d >> 2u)])
+                               : vec4(0.0));
                 }
                 barrier();
                 [[unroll]] for (uint i = 0u; i < RO; i++) {
@@ -262,7 +312,7 @@ void main() {
                     // A full 64-key unroll hoists every load and spills past 256 VGPRs on RADV GCN.
                     [[dont_unroll]] for (uint j = 0u; j < BN; j += 8u) {
                         [[unroll]] for (uint jj = 0u; jj < 8u; jj++) {
-                            part += Ss[r * SP + j + jj] * KVs[(j + jj) * VP4 + dq];
+                            part += Ss[r * SP + j + jj] * kv_get((j + jj) * VP4 + dq);
                         }
                     }
                     acc_o[i][c] = acc_o[i][c] * corr[r] + part;
@@ -272,6 +322,12 @@ void main() {
         }
     }
 
+#ifdef WAVE_SOFTMAX
+    if (spart == 0u) {
+        lrow[srow] = l_run;
+    }
+    barrier();
+#endif
     [[unroll]] for (uint i = 0u; i < RO; i++) {
         uint r = rp * RO + i;
         uint gr = qr0 + r;

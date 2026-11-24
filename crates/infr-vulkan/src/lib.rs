@@ -389,6 +389,10 @@ struct VulkanShared {
     /// forced onto it by `kernels.vulkan.force_wave64`. Every pipeline pins subgroup 64 and sets
     /// `shaders/wave64.glsl`'s `W64`, which gives the wave32 kernels 32-lane virtual subgroups.
     wave64: bool,
+    /// `VK_SUBGROUP_FEATURE_SHUFFLE_BIT` in compute: the `_sg64` nc_fa softmax uses
+    /// `subgroupShuffle` to keep the base build's sum order, so a wave64 device without shuffle
+    /// keeps the base build there.
+    subgroup_shuffle: bool,
     /// No matrix units and no fast int8 dot: seeds the submit splitter even on a discrete GPU.
     slow_device: bool,
     /// Set once the int8 coopmat accumulator-layout known-answer probe has run on this device:
@@ -2135,7 +2139,7 @@ impl VulkanBackend {
         let has_sgsize = sgsize_feat.subgroup_size_control != 0;
         let has_full_sg = sgsize_feat.compute_full_subgroups != 0;
         // ── subgroup width ── decided before the coopmat tiers below, which wave64 turns off.
-        let sg_mode = {
+        let (sg_mode, subgroup_shuffle) = {
             let mut sg_props = vk::PhysicalDeviceSubgroupProperties::default();
             let mut sgsize_props = vk::PhysicalDeviceSubgroupSizeControlProperties::default();
             let mut p2 = vk::PhysicalDeviceProperties2::default()
@@ -2157,8 +2161,12 @@ impl VulkanBackend {
                 operations: sg_props.supported_operations,
                 stages: sg_props.supported_stages,
             };
-            crate::caps::subgroup_mode(&probe, vkcfg.force_wave64)
-                .map_err(|e| be(format!("{e} — falling back to another backend")))?
+            let mode = crate::caps::subgroup_mode(&probe, vkcfg.force_wave64)
+                .map_err(|e| be(format!("{e} — falling back to another backend")))?;
+            let shuffle = sg_props
+                .supported_operations
+                .contains(vk::SubgroupFeatureFlags::SHUFFLE);
+            (mode, shuffle)
         };
         let wave64 = matches!(sg_mode, crate::caps::SubgroupMode::Wave64 { .. });
         // Packed i8 dot: ext advertised AND the feature bit set (same ext-AND-feature discipline as
@@ -3031,6 +3039,7 @@ impl VulkanBackend {
                 kernel_limits: crate::caps::KernelLimits::of(&props.limits),
                 rte_f16: AtomicBool::new(false),
                 wave64,
+                subgroup_shuffle,
                 slow_device,
                 i8cm_layout_ok: OnceLock::new(),
                 push_descriptor,

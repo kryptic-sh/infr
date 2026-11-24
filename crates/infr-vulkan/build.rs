@@ -2452,9 +2452,10 @@ fn main() {
         ("native_gemm_fma", "native_gemm_fma_bf16", &["-DFMT_BF16"]),
         ("native_gemm_fma", "native_gemm_fma_f32", &["-DFMT_F32"]),
         // Non-coopmat shared-memory fma flash-attention prefill (adapter.rs `nc_fa_ok`, see
-        // attn_nc_fa.comp): the attention companion of the fma GEMM tier above. No subgroup ops.
-        // One build per shared-Os ceiling: hd<=128 (37.6 KB), hd<=256 (54.0 KB), hd<=512 (BM=16,
-        // 47.6 KB) — the recorder picks the smallest that fits the layer's head dim.
+        // attn_nc_fa.comp): the attention companion of the fma GEMM tier above. The base builds
+        // use no subgroup ops; only the `_sg64` twin does. One build per shared-memory budget:
+        // hd<=128 and hd<=256 (31.4 KB base, 29.3 KB twin), hd<=512 (BM=16, 24.7 KB base,
+        // 22.6 KB twin) — the recorder picks the smallest that fits the layer's head dim.
         ("attn_nc_fa", "attn_nc_fa_hd128", &[]),
         ("attn_nc_fa", "attn_nc_fa_hd256", &["-DHD_MAX=256"]),
         ("attn_nc_fa", "attn_nc_fa_hd512", &["-DHD_MAX=512"]),
@@ -3633,13 +3634,13 @@ fn main() {
         "quant_q8_row",
     ];
     // Subgroup-64 NATIVE twins for wave64-only devices (GCN, EXL3 #6): every build of these
-    // SOURCES also gets a `<stem>_sg64` variant compiled with -DSG=64 — one full wave64 per
-    // workgroup with plain (un-emulated) subgroup ops (`W64=false` at pipeline time, so the
+    // SOURCES also gets a `<stem>_sg64` variant compiled with -DSG=64 — each wave is one pinned
+    // 64-lane subgroup with plain (un-emulated) subgroup ops (`W64=false` at pipeline time, so the
     // wave64.glsl macros fold back to the native builtins). Selected by
-    // `kernels.vulkan.wave64_native` on wave64 devices; never created elsewhere. Tight scope:
-    // only the dense Q6_K decode GEMV — the id/multi and mmv/quant families keep the emulated
-    // path until a measurement says otherwise.
-    const SG64_SOURCES: &[&str] = &["native_gemv_sg"];
+    // `kernels.vulkan.wave64_native` on wave64 devices with shuffle support; never created
+    // elsewhere. The decode GEMV and the nc_fa softmax twin; the id/multi and mmv/quant families
+    // keep the emulated path until a measurement says otherwise.
+    const SG64_SOURCES: &[&str] = &["native_gemv_sg", "attn_nc_fa"];
     let builds: Vec<(String, String, Vec<String>)> = builds
         .iter()
         .flat_map(|(src_stem, dst_stem, defines)| {

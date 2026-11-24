@@ -35,6 +35,17 @@ pub(crate) const BLOCK_TOKENS: usize = 128;
 /// Below this many shared tokens the upload costs more than re-prefilling them.
 pub(crate) const MIN_PREFIX_TOKENS: usize = 256;
 
+/// Rows a capture keeps: every row the slot wrote, so the reply is reusable too. A recurrent model
+/// resumes only from a snapshot, which prefill takes at prompt boundaries, so its reply rows would
+/// never be read back.
+pub(crate) fn capture_upto(cfg: &Config, kv: &SeamKv, prompt_len: usize) -> usize {
+    if cfg.has_recurrent_state() {
+        prompt_len
+    } else {
+        kv.cached_len()
+    }
+}
+
 /// Chain id of a block: the previous block's id mixed with this block's tokens.
 ///
 /// FNV-1a, not `DefaultHasher`: the ids are written to a tier, so they must not change with the
@@ -1030,6 +1041,26 @@ mod tests {
         let mut out = vec![0u8; rows.len() * ROW * 2];
         read_rows(be, buf.as_ref(), DType::F16, ROW, &*layout, rows, &mut out).unwrap();
         out
+    }
+
+    /// A capture keeps the reply's rows too; a recurrent model can only resume at a snapshot,
+    /// which prefill takes at prompt boundaries, so its reply rows would never be read back.
+    #[test]
+    fn capture_upto_follows_what_the_slot_wrote() {
+        let be = infr_cpu::CpuBackend::new();
+        let cfg = slot_cfg(0);
+        let mut kv = SeamKv::for_test(&be, &cfg, 1024, false, 56, DType::F16).unwrap();
+        kv.cached = tokens(1, 400);
+        assert_eq!(capture_upto(&cfg, &kv, 256), 400);
+
+        let rec = Config {
+            lfm3: true,
+            shortconv_layers: vec![true, false],
+            shortconv_l_cache: 4,
+            ..slot_cfg(0)
+        };
+        assert!(rec.has_recurrent_state());
+        assert_eq!(capture_upto(&rec, &kv, 256), 256);
     }
 
     #[test]

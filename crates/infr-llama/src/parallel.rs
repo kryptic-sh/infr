@@ -586,11 +586,12 @@ impl ParallelSeam {
             None, // paged_blocks
             1,    // slot_copies
         )?;
-        // Keep this prompt's rows for whoever asks the adjacent question next. A failure here is a
-        // cache miss on the next request, never a failed request.
+        // Keep this turn's rows — prompt and reply — for whoever asks the adjacent question next.
+        // A failure here is a cache miss on the next request, never a failed request.
         if let Some(kv) = guard.kv.as_ref() {
+            let upto = crate::seam::capture_upto(self.model.config(), kv, prompt_tokens.len());
             match self.store.lock().map(|mut s| {
-                s.capture(&self.vk, self.model.config(), kv, prompt_tokens.len())
+                s.capture(&self.vk, self.model.config(), kv, upto)
                     .map(|kept| (kept, s.stats()))
             }) {
                 Ok(Ok((kept, (blocks, bytes)))) if kept > 0 => {

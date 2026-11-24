@@ -113,8 +113,8 @@ pub struct RequestSampling {
 
 impl Default for RequestSampling {
     /// Neutral: every field inherits the env/CLI default, no penalty applied. `repeat_last_n`
-    /// mirrors llama.cpp's default window (64) so a request that sets only `repeat_penalty` gets
-    /// llama.cpp's behavior.
+    /// mirrors llama.cpp's default window (64), which every penalty reads, so a request that sets
+    /// only `repeat_penalty` sees llama.cpp's window — though not its prompt-seeded counts.
     fn default() -> Self {
         Self {
             temp: None,

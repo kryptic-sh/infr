@@ -6470,15 +6470,17 @@ shader bodies.
   **Needs a decision:** keep the HF order and document the difference, or
   switch, which changes four implementations together and re-pins the GPU parity
   and `reference_full_sort` tests.
-- **Penalties differ from llama.cpp.** `Penalties::resolve` starts empty and
-  `observe` sees generated tokens only, where llama.cpp's server feeds every
-  prompt token to the sampler first; presence and frequency count over the whole
-  generation, where llama.cpp windows one count to `penalty_last_n` for all
-  three. `RequestSampling::default`'s doc says a request setting only
-  `repeat_penalty` "gets llama.cpp's behavior", which is false, and
-  `repeat_last_n` is not a request field. **Needs a decision:** match llama.cpp,
-  or keep the OpenAI reading for presence/frequency and seed only the repeat
-  window from the prompt. Fix the doc either way.
+- **Penalties still differ from llama.cpp in one place.** Settled: the window,
+  in `ff608c32` — presence and frequency now read the same `repeat_last_n`
+  counts as the repeat penalty, and `repeat_last_n = 0` disables all three, as
+  llama.cpp's `penalty_last_n = 0` does. SillyTavern's recommended
+  `frequency_penalty: 1.1` used to eat the vocabulary because the counts never
+  expired: LFM3-1.7B spent 10,240 tokens of reasoning without closing the block
+  (`finish="length"` twice in the served log). Still open: `Penalties::resolve`
+  starts empty and `observe` sees generated tokens only, where llama.cpp feeds
+  the prompt's tail into the window first, so our first generated token is
+  unpenalized against it; and `repeat_last_n` is not a request field. Both need
+  the prompt's ids plumbed into the sampler — separate work, not a decision.
 - **What is left of `logit_bias`, `min_p`, `logprobs` and `n`.** `infr serve`
   applies `logit_bias` (in `Penalties::apply`, ahead of the penalties) and
   `min_p` (in `truncated_softmax`) on the dense seam decode loop, returns

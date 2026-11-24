@@ -286,6 +286,27 @@ and these exist to force one off when bisecting a correctness or perf problem.
   ceiling, so the last backend built decides for the whole process. A misspelt
   name is a config error at load; see [`math.md`](math.md)).
 
+**`kernels.vulkan.vram_limit`** (`INFR_VRAM_LIMIT`, the size grammar: `4g`,
+`1536m`, or a percentage of the device's own figure) makes a Vulkan device
+report no more memory than the limit: its total becomes the limit, and its free
+memory the limit less what the device already reports as not free. On a device
+with a live budget (`VK_EXT_memory_budget`) that is this process's memory, other
+processes', and whatever part of the heap the driver keeps out of the budget it
+hands out; without one it is nothing, and the free figure is the whole limit.
+The context fit, the KV format rungs, the placement budgets and the allocation
+guard all read those figures, so a run budgets and is refused as it would be on
+a device that small, while still running on the real GPU. It exists to test
+memory pressure on a device with room to spare. It only lowers: a limit at or
+above the device's memory does nothing. Zero is refused (a limit of nothing is
+never meant; unset it for no limit), as is a value that is not a size. It
+applies to each device a run opens, to the figure the guard counts there (the
+device-local heaps on a discrete GPU, every heap on an integrated one).
+`infr devices` prints the limit under each device it lowers, a run's startup log
+says what it budgets against beside the device's own figure, and the guard's
+refusal, the `ctx clamp` warning and the "no usable KV cache fits" refusal label
+their figures as limited. `infr serve`'s `/status` reports the limited figures
+without saying so.
+
 ### Vulkan kernel tuning
 
 Every hardware-shaped number a Vulkan kernel choice depends on — a split count,

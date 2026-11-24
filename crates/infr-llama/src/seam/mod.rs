@@ -5658,6 +5658,7 @@ mod seam_helper_tests {
             available,
             live: true,
             uma: false,
+            limited_from: None,
         }
     }
 

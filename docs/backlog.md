@@ -389,10 +389,21 @@ refused in under a second with the sizes.
   (observed on the iGPU: Qwen3-0.6B, f16 KV, `INFR_CTX=500000`). Folding the
   weights into the early refusal is provable only for a model that cannot stream
   them.
-- **Not observed in a real run:** the q8 pin, and the runner's post-load
-  refusal. Both need an explicit window close to the whole device: on this box
-  that means filling the iGPU's shared memory or using the dGPU, both
-  off-limits. Only their decision functions are tested.
+- **Observed now, on the integrated GPU only, under `INFR_VRAM_LIMIT`**
+  (`seam::model::vram_limit_tests`, Qwen3-0.6B with 1880 MiB of room above what
+  is in use): `explicit_ctx_f16_cannot_hold_is_served_in_q8` (f16 fit 11 104
+  tokens, q8_0 20 903, asked 16 003, served 16 003 in q8_0) and
+  `explicit_ctx_short_of_the_room_after_the_weights_is_refused` (asked 11 104,
+  the largest f16 window the pre-load fit accepts: refused after the weights,
+  1.19 GiB of KV against 1.10 GiB left). The q8 pin has a backstop the test had
+  to work around: dense placement's own auto-q8 rung in `vulkan_moe_binder` pins
+  q8_0 for the same window, so with `auto_q8_for_explicit_ctx` disabled the
+  window is still served in q8_0; the test reads the session's pins before any
+  weight loads to see which rung decided. The post-load refusal is reached only
+  through the weights' unpriced memory (arena tails, staging, driver), not
+  through a window the pre-load fit already rejects: one whose f16 cache cannot
+  sit beside the weights stops at dense placement's streaming-floor error first
+  (the gap above). Not run on the RX 7900 XTX.
 - The DEFAULT-path refuse rung stays as narrow as it was: only "no usable
   context at all" may refuse, or every ordinary long-context model breaks on a
   24 GiB card.
@@ -492,6 +503,44 @@ the synthetic qwen35, LFM3, llama and gemma3 models:
   reserve whenever a KV buffer falls under `DEDICATED_MIN`, or leaving it.
   Whether the kernel rounds a dedicated allocation further (to its page size)
   was not read or measured.
+- **The pooled-block exposure, observed.** Measured 2026-11-24 on the integrated
+  GPU (RADV Raphael, unified memory) under `INFR_VRAM_LIMIT`, reading what the
+  KV allocation took from the device's live budget (`Backend::device_alloc_room`
+  before less after; the runner's `kv_committed_bytes`). Committed minus the
+  estimate, where runs succeeded: Qwen3-0.6B with every buffer pooled, +21 762
+  048 to +292 282 368 (the commitment moves about one 268 435 456-byte block at
+  a time, and passes the estimate by more than a whole block when the tails of
+  the earlier blocks add up); Qwen3-0.6B with every buffer dedicated (ctx 17 266
+  and up), +335 872 to +450 560; Qwen3.5-0.8B, +228 110 336 to +228 220 928 at
+  every room whose attention buffers are dedicated, because its 36 small
+  recurrent-state buffers open a block of their own. A deep prefill did not
+  fail: Qwen3.5-0.8B at a 2 GiB limit, `infr bench -p 512 -n 4 -d 40000`
+  (context 40 532, committed 248 385 536 past the allocation) ran to completion.
+- **And a clamped run refused at the guard on a context the fit said fits.**
+  Qwen3-0.6B Q4_K_M, every K and V buffer pooled (56 of them, 9 to a block):
+  - absolute limits (`infr run`, 20 MiB steps): refused from 2660 to 2720 MiB,
+    and at 2730 in a separate run; 2640 and 2740 ran. Clamped to 13 244 to 13
+    792 tokens; the refused buffers measured 26.6 MiB (2700), 26.8 (2714) and
+    27.1 (2730). Rooms after the weights 1 825 898 496 (2660) to 1 888 813 056
+    (2720), 1 882 521 600 at 2714 and 1 899 298 816 at 2730. The 7 blocks the
+    cache needs measured 1 879 154 688 bytes committed at 2740 (7 x 268 435 456
+    - 106 496).
+  - rooms above what was in use
+    (`clamped_run_is_not_refused_over_pooled_kv_blocks` as first written):
+    refused from 2480 to 2560 MiB of room, buffers 25.7 to 27.1 MiB; 2460 and
+    2580 ran. Where that band falls moves with the weights' own memory, the
+    driver and the device, which is why the test was replaced.
+
+  Two causes. Below the commitment (2660 to 2700 MiB) the seventh block does not
+  fit the room: this entry's exposure. Above it (2714, 2720, 2730) the room
+  holds all 7 blocks and the guard still refuses: that is a guard defect,
+  B-GUARD-POOLED. `clamped_kv_opens_no_pooled_block` now asserts what the
+  dedicated-KV fix must produce at any room (no more than a page per buffer past
+  the buffers) and is red today, `#[ignore]`d with this entry as the reason and
+  left out of the GPU gate filter (`docs/gpu-tolerance.md`). The dedicated-KV
+  slice recommended above is the fix; it was not made in the slice that measured
+  this.
+
 - **Wrappers that report no rounding make no budget decision with it.** The
   multi-device wrappers (`PipelineBackend`, `TensorParallelBackend`,
   `ExpertParallelBackend`) forward neither `kv_row_align` nor `kv_alloc_align`.
@@ -513,13 +562,13 @@ the synthetic qwen35, LFM3, llama and gemma3 models:
   (`alloc_dsv4_comp_bufs` runs after the pair loop), and a snapshot would be
   refused on first use: the decode loop carries on without it, MTP fails the
   request. Read in code, not run.
-- **Not observed in a real run:** a clamped auto-sized context. Both cached
-  Qwen3.5 files fit their trained 262 144 tokens on the integrated GPU, so the
-  clamp and the live re-clamp were exercised only as arithmetic
-  (`kv_fit_ctx_for` on the files' own configs at stated budgets). Plan 13 S4's
-  VRAM limit is where it gets its first run. No qwen35moe file is cached, so its
-  expert budget was not run either. gemma-4-31B's documented context (B8) was
-  measured with the 64 rows and not re-measured.
+- **A clamped auto-sized context now runs under `INFR_VRAM_LIMIT`**
+  (`clamped_default_ctx_allocates_its_estimate`, integrated GPU only):
+  Qwen3-0.6B and Qwen3.5-0.8B at seeded rooms, from the smallest that leaves a
+  context of at least `MIN_SESSION_CTX`, allocate exactly the estimate (snapshot
+  included). No qwen35moe file is cached, so its expert budget was not run.
+  gemma-4-31B's documented context (B8) was measured with the 64 rows and not
+  re-measured.
 - The MTP head's own K and V cache stays outside the fit (B191).
 
 A cold init logs `KV cache allocated` at debug level with the bytes its buffers
@@ -530,6 +579,97 @@ multiple of 16 bytes: `want_ctx=262144`, `kv_alloc_bytes=3241426944`,
 `kv_snapshot_bytes=20201472`, `kv_estimate_bytes=3261628416`; with
 `INFR_KV_OVERFLOW=1` the backend's own tally read "all 48 KV buffers (3.02 GiB)
 fit in VRAM".
+
+### B-GUARD-POOLED — the VRAM guard charges a pooled buffer for a block already committed (2026-11-24)
+
+**Tag:** vram guard · found under `INFR_VRAM_LIMIT`, real without it · **Blocked
+on:** nothing; a fix to choose
+
+`VulkanBackend::make_buf_ex` calls `check_vram_budget(requirements.size)` for
+every device-local buffer of a MiB or more before allocating it, dedicated or
+pooled. With `VK_EXT_memory_budget`, `vram_budget_fits` takes `used` as total
+less live free, and the live figure counts every gpu-allocator block whole from
+the moment it is opened. A buffer that gpu-allocator will place in the free tail
+of a block already open is charged again, for memory already counted, so the
+guard can refuse an allocation that needs no new memory at all. Read in code and
+confirmed by arithmetic on a refused run: Qwen3-0.6B Q4_K_M under
+`INFR_VRAM_LIMIT=2714m` on the integrated GPU clamps to a context whose 56 KV
+buffers (26.8 MiB, 9 to a 256 MiB block) need 7 blocks, 1 879 154 688 bytes
+committed (measured at 2740m). The room after the weights was 1 882 521 600.
+Buffer 55 opens block 7 with about 271 MB of room left; buffer 56 lands in that
+block, but the guard sees 3 366 912 bytes left against 28 MB asked and refuses
+(which buffer was refused is inferred from this arithmetic, not logged). At
+2720m (room 1 888 813 056) and 2730m (1 899 298 816) the same. The B13 entry has
+the runs.
+
+Not KV-specific: any pooled allocation (activations, small states, staging the
+guard checks) near the budget can be refused falsely, with or without the limit.
+Dedicated KV allocations (B13's fix) would hide it for the KV cache only.
+Without `VK_EXT_memory_budget` the fallback charges `device_used`, which counts
+each sub-allocation's own size, so there the guard under-counts blocks instead
+of double-counting them.
+
+Fix options, none made: (a) check after allocating: allocate, read the live
+budget, and free and refuse if it is now over, so a placement inside an open
+block costs nothing (one driver query per guarded allocation, as today); (b)
+before allocating a pooled buffer, ask gpu-allocator's report whether a block of
+the right memory type has a free range that large, and charge zero when it does
+(fragmentation makes "has room" approximate); (c) charge a pooled request a
+whole `device_memblock_size` only when it would open a block, which needs the
+same knowledge as (b).
+
+### B-PRELOAD-CLAMP — the pre-load clamp over-promises on a small device (2026-11-24)
+
+**Tag:** vram fit · predates the VRAM limit slice, which made it visible ·
+**Blocked on:** a decision
+
+`SeamModel::clamp_default_ctx` sizes the default context with `kv_fit_ctx_for`,
+which budgets `alloc_room - weight_footprint` and leaves out both
+`POST_KV_DEVICE_RESERVE` and the weights' unpriced memory (arena tails, staging,
+the driver's own). The runner's `reclamp_ctx_to_live_room` then re-fits against
+the measured room with the reserve. The gap between the two, measured without
+any limit on the integrated GPU (`alloc_room` and `weight_footprint` before the
+load, through a debug line added for the measurement and removed, against the
+re-clamp's `room_bytes`): Qwen3-0.6B Q4_K_M 127 120 384 bytes of unpriced weight
+memory, Qwen3.5-0.8B Q4_K_M 144 388 864; with the reserve, the pre-load fit
+over-promises by 395 555 840 and 412 824 320 bytes. On a device the trained
+window fits, nothing sees it. On one where the clamp binds:
+
+- Qwen3.5-0.8B Q4_K_M at 1280 MiB: the pre-load clamp picked 17 739 tokens, the
+  room after the weights was 230 793 216 bytes, less than the reserve, so the
+  run was refused after loading ("this model does not fit the device's free
+  memory"). At 1300 MiB it was refused the same way.
+- Qwen3.5-0.8B at 1400 MiB ran with a 64-token context, and Qwen3-0.6B at 1150
+  MiB of room above what was in use with 980: the post-load re-clamp has no
+  `MIN_SESSION_CTX` floor, which the pre-load refuse rung has.
+- Qwen3-0.6B at 1536 MiB: pre-load 6 416 tokens, after the load 2 967 (a room of
+  647 299 072 bytes after the weights).
+
+Options, none taken:
+
+- **Subtract `POST_KV_DEVICE_RESERVE` before the load too.** For an auto-sized
+  Vulkan context on a single device this costs no final context: the re-clamp
+  only shrinks, and its budget (room after the load, less the reserve) is never
+  above the pre-load one with the reserve taken off, so the context it settles
+  on is the same. What changes is what is decided before the load against the
+  pre-load figure: the auto-q8 rung (f16 misses sooner, so q8_0 is pinned for
+  some windows that f16 would have served after a shrink) and the refuse rung.
+  Where no re-clamp runs (the multi-device wrappers report no
+  `device_alloc_room`, B13), the pre-load context is final, and there it costs
+  the reserve's worth of context. Reasoned from the code, not run.
+- **Give the re-clamp a minimum:** refuse when its fit is below
+  `min(MIN_SESSION_CTX, want)`, so a small explicit or capped window is not
+  refused for being small.
+- **Re-try q8_0 after the load** when the f16 re-clamp falls below that minimum,
+  before refusing, as the pre-load ladder does.
+
+`clamped_default_ctx_allocates_its_estimate` starts each model's rooms at the
+smallest that leaves a context of at least `MIN_SESSION_CTX`, measured.
+
+Also from the VRAM limit slice, not done: `infr serve`'s `/status` reports the
+limited `VramInfo` totals without saying they are limited
+(`infr_server::DeviceMemory` has no field for it); `infr tune show` prints no
+memory figure, so only its startup log line names the limit.
 
 ### B14 — verification gaps from the 2026-08-02 decode-attention and KV-fit slices
 

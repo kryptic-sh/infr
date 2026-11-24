@@ -363,6 +363,12 @@ pub(crate) struct SeamKv {
     /// `crate::seam::reclamp_ctx_to_live_room`), which is why callers holding a `want_ctx` of
     /// their own read it back from here ([`SeamKv::max_ctx`]) once the first generation returns.
     pub(super) max_ctx: usize,
+    /// The device memory this slot's cold-init KV allocation took from the budget, read as
+    /// `Backend::device_alloc_room` before less after: the buffers plus whatever the allocator
+    /// committed around them. `None` on a backend that reports no room, and on a fork. Kept for
+    /// the tests that read it; a run sees the same figure on the `KV cache allocated` debug line.
+    #[cfg(test)]
+    pub(super) kv_committed: Option<u64>,
     /// Whether this session's SWA layers were allocated as window-sized RINGS (see
     /// `crate::seam::kv_rows_at`): fork must size its buffers identically, and seed must respect
     /// that a wrapped ring no longer retains the early prefix rows a seed would copy.
@@ -784,6 +790,8 @@ impl SeamKv {
                 .alloc(cfg.vocab * 4, BufferUsage::Readback)
                 .map_err(|e| anyhow!("{e}"))?,
             max_ctx: self.max_ctx,
+            #[cfg(test)]
+            kv_committed: None,
             kv_ring: self.kv_ring,
             ubatch: self.ubatch,
             cached: Vec::new(),

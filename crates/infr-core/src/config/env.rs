@@ -100,8 +100,8 @@ fn opt_kv_dtype(get: Get, key: &str) -> Option<Option<DType>> {
     get(key).map(|v| crate::budget::parse_kv_dtype(&v))
 }
 
-/// A multi-GPU device list. This is one of the six knobs that ERROR on a bad value today, so the
-/// error propagates out of the layer instead of falling back. The per-knob minimum device counts
+/// A multi-GPU device list. Its keys are among those the manifest marks `BadValue::Error`
+/// ([`super::manifest::KEYS`]), so the error propagates out of the layer instead of falling back. The per-knob minimum device counts
 /// differ (2 / 2 / 1) and are passed straight through to the shared parser.
 ///
 /// The grammar itself is [`super::parse_device_spec`] — the ONE copy, shared with the
@@ -282,6 +282,20 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     v.gfx_queue = presence(get, "INFR_GFX_QUEUE");
     v.pipeline_cache_disk = presence_inv(get, "INFR_NO_PIPELINE_CACHE");
     v.no_vram_guard = presence(get, "INFR_NO_VRAM_GUARD");
+    // A limit that silently fell back to none would run a pressure test against the whole device.
+    // Zero is refused too: elsewhere "0" often means "off", and a limit of nothing is never meant.
+    if let Some(s) = get("INFR_VRAM_LIMIT") {
+        let limit = crate::parse_size(&s)
+            .filter(|l| *l != SizeSpec::Bytes(0))
+            .ok_or_else(|| ConfigError::Env {
+                key: "INFR_VRAM_LIMIT",
+                message: format!(
+                    "expected a size above zero (`4g`, `1536m`, `50%`; unset for no limit), \
+                     got {s:?}"
+                ),
+            })?;
+        v.vram_limit = Some(Some(limit));
+    }
     v.no_moe_sm_pool = presence(get, "INFR_NO_MOE_SM_POOL");
     v.no_replay = presence(get, "INFR_SEAM_NO_REPLAY");
     v.gpu_pos = presence_inv(get, "INFR_NO_GPU_POS");

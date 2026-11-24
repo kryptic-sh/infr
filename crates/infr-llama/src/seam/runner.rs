@@ -1456,11 +1456,20 @@ pub(crate) fn generate_dense_backend_bound(
             );
         }
         let cbufs = super::weights::alloc_dsv4_comp_bufs(be, c, want_ctx, k_fmt)?;
+        // What the allocations above took from the device's budget, as the device reports it: the
+        // buffers themselves plus whatever the allocator committed around them (a new shared block
+        // for buffers too small for a dedicated allocation — docs/backlog.md B13). One driver
+        // query, made only when the debug line below is on or a test reads the figure.
+        let kv_committed = (cfg!(test) || tracing::enabled!(tracing::Level::DEBUG))
+            .then(|| room.zip(be.device_alloc_room()))
+            .flatten()
+            .map(|(before, after)| before.saturating_sub(after));
         // What the buffers just allocated hold, beside the estimate the context was fitted with.
         // The two differ by the recurrent-state snapshot, which a slot allocates on first use, and
         // by the allocator's rounding of each buffer (`KvAlign::bytes`).
         tracing::debug!(
             want_ctx,
+            kv_committed_bytes = kv_committed,
             kv_alloc_align = be.kv_alloc_align(),
             kv_alloc_bytes = kbufs
                 .iter()
@@ -1558,6 +1567,8 @@ pub(crate) fn generate_dense_backend_bound(
             ipl_buf,
             logits_buf,
             max_ctx: want_ctx,
+            #[cfg(test)]
+            kv_committed,
             kv_ring,
             ubatch,
             cached: Vec::new(),
@@ -1587,6 +1598,8 @@ pub(crate) fn generate_dense_backend_bound(
         ipl_buf,
         logits_buf,
         max_ctx,
+        #[cfg(test)]
+            kv_committed: _,
         cached,
         written_end,
         denoise_cache,

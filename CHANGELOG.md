@@ -55,7 +55,26 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   and its `n` and `top_logprobs` are raw JSON values validated by
   `GenParams::from_request`.
 
+- **`infr_vulkan::VramInfo` gains `limited_from`** and **`DeviceInfo` gains
+  `vram_limit`**, both public, so struct literals of either must set them (both
+  structs have only public fields, so callers can build them).
+
 ### Added
+
+- **`INFR_VRAM_LIMIT` (`kernels.vulkan.vram_limit`): run as if the GPU had less
+  memory.** A size (`4g`, `1536m`, or a percentage) that caps the total and free
+  memory a Vulkan device reports, so the context fit, the KV format rungs, the
+  placement budgets and the allocation guard all decide as they would on a
+  device that small, on the real GPU. It only lowers: a limit at or above the
+  device's memory does nothing. It applies to each device a run opens, to the
+  figure the guard counts there (every heap on an integrated GPU).
+  `infr devices` prints the limit under each device it lowers, the startup log
+  says what a run budgets against beside the device's own figure, and a guard
+  refusal under a limit names both, as do the `ctx clamp` warning and the "no
+  usable KV cache fits" refusal. Zero, or a value that is not a size, is an
+  error. For testing memory pressure. With debug logging on, the
+  `KV cache allocated` line now also prints `kv_committed_bytes`, what the KV
+  allocation took from the device's budget. New: `VramInfo::limit_note`.
 
 - **`infr tune check <model>`: is this GPU still within tolerance of the CPU
   reference?** It scores a Vulkan device, under the tuning in effect (table

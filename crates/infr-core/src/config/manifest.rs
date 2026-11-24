@@ -226,6 +226,7 @@ knobs! {
     "INFR_GFX_QUEUE"          => "kernels.vulkan.gfx_queue",          Presence,    Ignored, "1", migrated;
     "INFR_NO_PIPELINE_CACHE"  => "kernels.vulkan.pipeline_cache_disk", PresenceInv, Ignored, "1", migrated;
     "INFR_NO_VRAM_GUARD"      => "kernels.vulkan.no_vram_guard",      Presence,    Ignored, "1", migrated;
+    "INFR_VRAM_LIMIT"         => "kernels.vulkan.vram_limit",         Size,        Error,   "4g", migrated;
     "INFR_NO_MOE_SM_POOL"     => "kernels.vulkan.no_moe_sm_pool",     Presence,    Ignored, "1", migrated;
     "INFR_SEAM_NO_REPLAY"     => "kernels.vulkan.no_replay",          Presence,    Ignored, "1", migrated;
     "INFR_NO_GPU_POS"         => "kernels.vulkan.gpu_pos",            PresenceInv, Ignored, "1", migrated;

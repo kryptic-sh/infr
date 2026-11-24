@@ -1065,6 +1065,16 @@ fn cmd_devices(cfg: &Config) -> anyhow::Result<()> {
             "  Vulkan{}: {} [{}, {} device-local]{}",
             d.index, d.name, d.device_type, vram, mark
         );
+        if let Some((cap, real)) = d.vram_limit {
+            let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+            // print-ok: program OUTPUT — the `infr devices` / `infr resolve` listing users pipe.
+            println!(
+                "           vram limit: a run budgets against {:.1} GiB, not this device's \
+                 {:.1} GiB (INFR_VRAM_LIMIT / kernels.vulkan.vram_limit)",
+                gib(cap),
+                gib(real)
+            );
+        }
         let mut ext = Vec::new();
         if d.external_memory {
             ext.push("external_memory");

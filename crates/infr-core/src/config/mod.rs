@@ -454,6 +454,13 @@ cfg_struct! {
         pipeline_cache_disk: bool = true,
         /// `INFR_NO_VRAM_GUARD` — sanctioned negative field.
         no_vram_guard: bool = false,
+        /// `INFR_VRAM_LIMIT`: the most device memory each Vulkan device reports, in the shared
+        /// size grammar (a percentage is of the device's own figure). Caps the total and free
+        /// bytes `VulkanBackend::vram` returns, so the context fit, the placement budgets and the
+        /// allocation guard all budget against it; a limit at or above the device's memory does
+        /// nothing. Applied per device, to the figure the guard counts (every heap on a
+        /// unified-memory part). For testing memory pressure on a device with room to spare.
+        vram_limit: Option<SizeSpec> = None,
         /// `INFR_NO_MOE_SM_POOL` — sanctioned negative field.
         no_moe_sm_pool: bool = false,
         /// `INFR_SEAM_NO_REPLAY` — sanctioned negative field. Read `is_ok()` in the Vulkan

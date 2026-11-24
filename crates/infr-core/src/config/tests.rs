@@ -236,9 +236,8 @@ fn malformed_toml_is_an_error() {
 /// A bad value fails where it fails TODAY, and is swallowed where it is swallowed today (R1).
 ///
 /// Two classes, both taken from `manifest::KnobKey::bad_value`:
-/// - [`BadValue::Error`] — `INFR_SG`, `INFR_SUBMIT_DISPATCHES`, `INFR_GPU_WAIT_TIMEOUT_MS` and
-///   the three multi-GPU device lists reject garbage LOUDLY today. The env layer must keep
-///   erroring, not `unwrap_or`.
+/// - [`BadValue::Error`] — every key the manifest ([`KEYS`]) marks `Error` rejects garbage
+///   LOUDLY. The env layer must keep erroring, not `unwrap_or`.
 /// - [`BadValue::Ignored`] — everything else does `.and_then(parse).ok().unwrap_or(default)`, so
 ///   garbage falls back to the default and the layer reports "not specified".
 ///
@@ -273,6 +272,11 @@ fn bad_value_is_an_error_not_a_silent_default() {
             }
         }
     }
+
+    // A zero limit is refused like garbage: "0" is not "off" for `INFR_VRAM_LIMIT`.
+    assert!(try_env_layer(&[("INFR_VRAM_LIMIT", "0")]).is_err());
+    assert!(try_env_layer(&[("INFR_VRAM_LIMIT", "0g")]).is_err());
+    assert!(try_env_layer(&[("INFR_VRAM_LIMIT", "1536m")]).is_ok());
 
     // `INFR_SG` is the string-literal member of the Error class.
     assert!(try_env_layer(&[("INFR_SG", "8")]).is_err());
@@ -1399,6 +1403,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_SERVE_ALLOWED_HOSTS",
         "INFR_SERVE_SSE_KEEPALIVE_SECS",
         "INFR_SERVE_MAX_BODY_BYTES",
+        "INFR_VRAM_LIMIT",
     ];
 
     let mut got: Vec<&str> = KEYS.iter().filter(|k| k.migrated).map(|k| k.env).collect();

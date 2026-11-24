@@ -787,7 +787,7 @@ impl SeamModel {
                  fits at {k_fmt:?}/{v_fmt:?} KV : {fit} tokens\n  \
                  fits at q8_0 KV     : {}\n  \
                  KV cache needed     : {:.2} GiB at {want} tokens in {k_fmt:?}/{v_fmt:?}\n  \
-                 free after weights  : {:.2} GiB ({:.2} GiB {} - {:.2} GiB weights)\n\
+                 free after weights  : {:.2} GiB ({:.2} GiB {}{} - {:.2} GiB weights)\n\
                  Try a smaller window (--ctx N / INFR_CTX=N), an explicitly quantized cache \
                  (INFR_KV_TYPE_K=q8_0 INFR_KV_TYPE_V=q8_0), INFR_KV_OVERFLOW=1 to place the cache \
                  in system RAM, or a smaller quant of the model.",
@@ -799,15 +799,17 @@ impl SeamModel {
                 gib(free),
                 gib(vram.available),
                 if vram.live { "free, live" } else { "heap" },
+                vram.limit_note(),
                 gib(fp.total()),
             ));
         }
         tracing::warn!(
             "ctx clamp: default context {want} -> {fit} to fit VRAM (weights {:.2} GiB vs \
-             {:.2} GiB available{}); set INFR_CTX to override",
+             {:.2} GiB available{}{}); set INFR_CTX to override",
             fp.total() as f64 / (1u64 << 30) as f64,
             vram.available as f64 / (1u64 << 30) as f64,
             if vram.live { ", live" } else { ", total heap" },
+            vram.limit_note(),
         );
         Ok(fit)
     }
@@ -2907,6 +2909,9 @@ mod pick_continuation_tests {
         assert_eq!(pick_continuation(std::iter::empty(), 100), None);
     }
 }
+
+#[cfg(test)]
+mod vram_limit_tests;
 
 #[cfg(test)]
 mod explicit_ctx_q8_tests {

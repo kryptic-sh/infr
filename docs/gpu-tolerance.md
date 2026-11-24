@@ -913,7 +913,8 @@ INFR_DEV=Vulkan0 cargo nextest run --release --run-ignored all --test-threads 1 
     | binary(kq_fma_gemv) | binary(logits_tail) | test(linear_f32)))
   | test(gpu_seam) | test(gpu_synthetic) | test(gpu_prefill) | test(lfm3)
   | test(qwen35) | test(gemma) | test(paged) | test(deepseek) | test(dsv4)
-  | test(mtp_head_cpu_vulkan_parity))
+  | test(mtp_head_cpu_vulkan_parity)
+  | (test(vram_limit_tests) & not test(opens_no_pooled_block)))
   & not test(qwen3_14b) & not binary(gemm_bench)
   & not (test(/_bw$/) | test(logits_tail_time))'
 ```
@@ -927,6 +928,14 @@ micro-benches that share those binaries out. A test that opens its backend
 through `infr_testkit::gpu_or_skip` skips, printing why, when no Vulkan device
 opens; with `INFR_DEV` set, as in every gate run, a device that does not open is
 a failure instead, so a gate run cannot pass such a test without running it.
+
+`test(vram_limit_tests)` selects the clamped-context and explicit-context tests
+that run under `INFR_VRAM_LIMIT` (`infr-llama`'s
+`seam::model::vram_limit_tests`; `infr-vulkan`'s own limit tests come in through
+`kind(lib)`). It leaves out `clamped_kv_opens_no_pooled_block`, which is red
+until KV buffers get their own allocations (backlog B13): it asserts what that
+fix must produce, and the gate runs ignored tests. When B13 ships, drop the
+`not test(opens_no_pooled_block)`.
 
 On the integrated GPU the gate of 2026-11-22 ran the same filter with
 `& not (test(moe) | test(ernie))` appended, and the ERNIE tolerance case on its

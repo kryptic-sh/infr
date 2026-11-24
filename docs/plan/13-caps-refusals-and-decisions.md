@@ -78,14 +78,12 @@ alignment (`Backend::kv_alloc_align`), which the plan did not foresee.
 - Resolve the `INFR_CACHE` percentage against `alloc_room()` in the MoE and
   dense override arms; update the `SizeSpec` and manifest text.
 
-### S4 — a VRAM limit knob, and the device class into the pins (M)
+### S4 — the device class into the pins (S–M)
 
-- `INFR_VRAM_LIMIT` (`kernels.vulkan.vram_limit`, size grammar) caps what
-  `vram_info` reports, which makes the q8 pin and the post-load refusal (B12)
-  testable here with Qwen3-0.6B. Its first use is S2's missing run: a clamped
-  auto-sized context allocates. Both cached Qwen3.5 files fit their trained
-  context on this machine, so the clamp S2 changed was checked only as
-  arithmetic.
+The VRAM limit knob (`INFR_VRAM_LIMIT`), its first half, shipped 2026-11-24 with
+the clamped-context and B12 tests it made possible; what it found is in backlog
+B12, B13, B-GUARD-POOLED and B-PRELOAD-CLAMP. Left:
+
 - Move the default prefill chunk into `PlacementPins::for_caps`; delete
   `DeviceClass`, `DEVICE_CLASS` and `device_class()`; add scopes at the entry
   points that relied on the global. A missed site runs an integrated GPU at the

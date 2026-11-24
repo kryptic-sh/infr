@@ -71,7 +71,7 @@ use infr_core::{
     config::Config,
     error::Result,
     graph::Graph,
-    Backend,
+    Backend, SizeSpec,
 };
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -362,6 +362,14 @@ pub struct VramInfo {
     /// True when this snapshot counted every heap because the device has unified memory (see
     /// [`Capabilities::unified_memory`]) — only affects how the guard words its error.
     pub uma: bool,
+    /// The device's own `total` when `kernels.vulkan.vram_limit` (`INFR_VRAM_LIMIT`) capped this
+    /// snapshot below it; `None` when nothing was capped. [`VramInfo::limit_note`] labels the
+    /// figures where this crate prints them (the allocation guard's refusal, the `prof.vram`
+    /// post-load line) and where `infr-llama` prints them (the `ctx clamp` warning and the "no
+    /// usable KV cache fits" refusal); the startup log and `infr devices` name the limit
+    /// themselves. `infr serve`'s `/status` passes the capped figures on unlabelled
+    /// (docs/backlog.md B-PRELOAD-CLAMP lists it).
+    pub limited_from: Option<u64>,
 }
 
 impl VramInfo {
@@ -381,6 +389,54 @@ impl VramInfo {
     pub fn alloc_room(&self) -> u64 {
         self.available.saturating_sub(GUARD_HEADROOM)
     }
+
+    /// This snapshot as a device with `limit` bytes would report it: `total` becomes the limit and
+    /// `available` the limit less what is already in use, so the bytes in use are unchanged and
+    /// the free figure only ever drops. A limit at or above `total`, or none, returns the snapshot
+    /// unchanged.
+    fn capped(self, limit: Option<SizeSpec>) -> VramInfo {
+        let Some(cap) = vram_cap(limit, self.total) else {
+            return self;
+        };
+        let used = self.total.saturating_sub(self.available);
+        VramInfo {
+            total: cap,
+            available: cap.saturating_sub(used),
+            limited_from: Some(self.total),
+            ..self
+        }
+    }
+
+    /// `" (limited from <device total> by INFR_VRAM_LIMIT)"` when this snapshot was capped, else
+    /// empty: the label a message printing this snapshot's figures appends to them.
+    pub fn limit_note(&self) -> String {
+        match self.limited_from {
+            Some(real) => format!(" (limited from {} by INFR_VRAM_LIMIT)", fmt_bytes(real)),
+            None => String::new(),
+        }
+    }
+}
+
+/// Refuse a `kernels.vulkan.vram_limit` of zero bytes, from any layer (the environment layer
+/// already refuses it with its own message): a limit of nothing is never meant, and it would turn
+/// every allocation into a refusal rather than switching the limit off.
+fn check_vram_limit(limit: Option<SizeSpec>) -> Result<()> {
+    match limit {
+        Some(SizeSpec::Bytes(0)) => Err(be(
+            "kernels.vulkan.vram_limit is 0 bytes: a limit must leave the device some memory \
+             (unset it to run without one)"
+                .to_string(),
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// The bytes `limit` (`kernels.vulkan.vram_limit`, a percentage of `total`) leaves a device whose
+/// guard counts `total` bytes: `None` when there is no limit or it is at or above `total`, where it
+/// changes nothing. A limit never raises a figure.
+fn vram_cap(limit: Option<SizeSpec>, total: u64) -> Option<u64> {
+    let cap = limit?.resolve(total);
+    (cap < total).then_some(cap)
 }
 
 struct VulkanShared {
@@ -405,6 +461,9 @@ struct VulkanShared {
     caps: Capabilities,
     /// VK_EXT_memory_budget enabled → `vram()` can report live free bytes (else total only).
     has_mem_budget: bool,
+    /// `kernels.vulkan.vram_limit`, copied off the backend's `Config` at construction: the cap
+    /// [`vram_info`] puts on every snapshot (see [`VramInfo::capped`]).
+    vram_limit: Option<SizeSpec>,
     /// `maxMemoryAllocationSize` — the largest single `vkAllocateMemory` this device accepts
     /// (`VkPhysicalDeviceMaintenance3Properties`, ~4 GiB on RADV). The weight arena
     /// (`reserve_weights`) splits its up-front reservation into blocks no larger than this, since a
@@ -1123,6 +1182,11 @@ pub struct DeviceInfo {
     pub vram_bytes: u64,
     /// True for the device `VulkanBackend::new()` would bind today (INFR_DEV, else discrete, else 0).
     pub is_default_pick: bool,
+    /// The memory a backend on this device budgets against under `kernels.vulkan.vram_limit`
+    /// (`INFR_VRAM_LIMIT`), and the device's own figure it caps — the device-local heaps on a
+    /// discrete device, every heap on an integrated one (see `vram_info`). `None` when no limit is
+    /// set or it is at or above the device's figure.
+    pub vram_limit: Option<(u64, u64)>,
     pub external_memory: bool,
     pub external_memory_fd: bool,
     pub external_memory_dma_buf: bool,
@@ -1385,7 +1449,9 @@ fn vram_info(s: &VulkanShared) -> VramInfo {
         available,
         live: s.has_mem_budget,
         uma,
+        limited_from: None,
     }
+    .capped(s.vram_limit)
 }
 
 /// RAII scope for a weight-load progress bar (see [`VulkanBackend::weight_progress`]). While alive,
@@ -1416,9 +1482,10 @@ impl Drop for WeightProgress {
         if self.vram_log {
             let v = vram_info(&self.shared);
             tracing::info!(
-                "post-load vram in use: {:.2} GiB of {:.2} GiB ({})",
+                "post-load vram in use: {:.2} GiB of {:.2} GiB{} ({})",
                 v.total.saturating_sub(v.available) as f64 / (1u64 << 30) as f64,
                 v.total as f64 / (1u64 << 30) as f64,
+                v.limit_note(),
                 if v.live { "live" } else { "tracked" },
             );
         }
@@ -1789,6 +1856,16 @@ impl VulkanBackend {
                     })
                     .map(|h| mp.memory_heaps[h].size)
                     .sum();
+                // The figure the guard counts on this device (`vram_info`): every heap on a
+                // unified-memory part, which is every integrated one.
+                let integrated = p.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU;
+                let budgeted = if integrated {
+                    (0..mp.memory_heap_count as usize)
+                        .map(|h| mp.memory_heaps[h].size)
+                        .sum()
+                } else {
+                    vram_bytes
+                };
                 let exts = unsafe { instance.enumerate_device_extension_properties(pd) }
                     .unwrap_or_default();
                 let has = |name: &CStr| {
@@ -1799,9 +1876,11 @@ impl VulkanBackend {
                     index,
                     name,
                     device_type: device_type_str(p.device_type),
-                    integrated: p.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU,
+                    integrated,
                     vram_bytes,
                     is_default_pick: default_pick == Some(pd),
+                    vram_limit: vram_cap(cfg.kernels.vulkan.vram_limit, budgeted)
+                        .map(|cap| (cap, budgeted)),
                     external_memory: has(c"VK_KHR_external_memory"),
                     external_memory_fd: has(c"VK_KHR_external_memory_fd"),
                     external_memory_dma_buf: has(c"VK_EXT_external_memory_dma_buf"),
@@ -1888,6 +1967,7 @@ impl VulkanBackend {
         // tier. Borrowed, never cloned (R6); `cfg` itself moves onto the backend at the bottom of
         // this function.
         let vkcfg = &cfg.kernels.vulkan;
+        check_vram_limit(vkcfg.vram_limit)?;
 
         // ── entry ──────────────────────────────────────────────────────────────
         let entry =
@@ -2981,10 +3061,14 @@ impl VulkanBackend {
             }
             tracing::info!(
                 "[infr] GPU: UNIFIED MEMORY — budgeting against all {} heaps ({}), not the \
-                 device-local slice alone ({}); this GPU's memory IS system RAM",
+                 device-local slice alone ({}); this GPU's memory IS system RAM{}",
                 mp.memory_heap_count,
                 fmt_bytes(all),
                 fmt_bytes(dev_local),
+                match vram_cap(cfg.kernels.vulkan.vram_limit, all) {
+                    Some(cap) => format!("; INFR_VRAM_LIMIT caps that at {}", fmt_bytes(cap)),
+                    None => String::new(),
+                },
             );
         }
 
@@ -3071,6 +3155,7 @@ impl VulkanBackend {
         // destruction). Disarm so `cleanup`'s Drop is a no-op and never double-frees them.
         cleanup.armed = false;
 
+        let vram_limit = cfg.kernels.vulkan.vram_limit;
         let backend = Self {
             moe_pager: Mutex::new(None),
             dense_pager: Mutex::new(None),
@@ -3088,6 +3173,7 @@ impl VulkanBackend {
                 allocator: ManuallyDrop::new(Mutex::new(allocator)),
                 caps,
                 has_mem_budget,
+                vram_limit,
                 max_mem_alloc_size,
                 kv_alloc_align,
                 kernel_limits: crate::caps::KernelLimits::of(&props.limits),
@@ -3136,6 +3222,27 @@ impl VulkanBackend {
                 gpu_wait,
             }),
         };
+
+        // `kernels.vulkan.vram_limit`: say what every budget on this device will be measured
+        // against, beside the device's own figure, so a limited run's numbers are not read as the
+        // device's — and say so too when the limit is set but changes nothing.
+        if let Some(limit) = vram_limit {
+            let v = vram_info(&backend.shared);
+            match v.limited_from {
+                Some(real) => tracing::warn!(
+                    "[infr] GPU: VRAM LIMIT — budgeting against {} of this device's {} \
+                     (INFR_VRAM_LIMIT / kernels.vulkan.vram_limit); the context fit, placement \
+                     and the allocation guard all see the limit",
+                    fmt_bytes(v.total),
+                    fmt_bytes(real),
+                ),
+                None => tracing::info!(
+                    "[infr] GPU: VRAM LIMIT {} is at or above this device's {}: no effect",
+                    fmt_bytes(limit.resolve(v.total)),
+                    fmt_bytes(v.total),
+                ),
+            }
+        }
 
         // Before any other kernel is built: every f16 kernel compiled from here on is patched or not
         // according to what this finds.
@@ -3808,7 +3915,7 @@ impl VulkanBackend {
             "device-local"
         };
         Err(be(format!(
-            "{} budget exceeded: {} requested + {} already in use ({}) > {} budget ({} {pool} \
+            "{} budget exceeded: {} requested + {} already in use ({}) > {} budget ({} {pool}{} \
                  minus 256 MiB headroom). Refusing to over-commit: exceeding it doesn't fail \
                  cleanly — the driver evicts (weights get read back over the bus) or the device is \
                  lost (TDR) mid-inference. Use a smaller context (INFR_CTX), a smaller/more- \
@@ -3824,6 +3931,7 @@ impl VulkanBackend {
             },
             fmt_bytes(budget),
             fmt_bytes(v.total),
+            v.limit_note(),
         )))
     }
 
@@ -6248,6 +6356,113 @@ mod tests {
             unguarded.check_vram_budget(huge).is_ok(),
             "`no_vram_guard = true` must make the check a no-op"
         );
+    }
+
+    /// `kernels.vulkan.vram_limit` as a snapshot sees it: below the device's figure it becomes the
+    /// total, the bytes in use stay what they were, and the free figure shrinks by what the limit
+    /// took (to nothing when the limit is below what is in use); a percentage is of the device's
+    /// figure; at or above that figure, or unset, nothing changes. Pure, so no GPU.
+    #[test]
+    fn vram_limit_caps_a_snapshot_and_never_raises_it() {
+        const GIB: u64 = 1 << 30;
+        let snap = VramInfo {
+            total: 24 * GIB,
+            available: 20 * GIB,
+            live: true,
+            uma: false,
+            limited_from: None,
+        };
+        let capped = |limit: SizeSpec| snap.capped(Some(limit));
+
+        let six = capped(SizeSpec::Bytes(6 * GIB));
+        assert_eq!(
+            (six.total, six.available, six.limited_from),
+            (6 * GIB, 2 * GIB, Some(24 * GIB)),
+            "the 4 GiB in use stay in use under the limit"
+        );
+        assert_eq!(six.alloc_room(), 2 * GIB - GUARD_HEADROOM);
+        assert_eq!((six.live, six.uma), (snap.live, snap.uma));
+
+        let half = capped(SizeSpec::Percent(0.5));
+        assert_eq!((half.total, half.available), (12 * GIB, 8 * GIB));
+
+        let under_use = capped(SizeSpec::Bytes(3 * GIB));
+        assert_eq!((under_use.total, under_use.available), (3 * GIB, 0));
+
+        for no_op in [
+            Some(SizeSpec::Bytes(24 * GIB)),
+            Some(SizeSpec::Bytes(64 * GIB)),
+            Some(SizeSpec::Percent(1.5)),
+            None,
+        ] {
+            let same = snap.capped(no_op);
+            assert_eq!(
+                (same.total, same.available, same.limited_from),
+                (snap.total, snap.available, None),
+                "{no_op:?} must change nothing"
+            );
+        }
+    }
+
+    /// A zero-byte limit is refused before any device work; every other spelling is accepted.
+    #[test]
+    fn a_zero_vram_limit_is_refused() {
+        let err = check_vram_limit(Some(SizeSpec::Bytes(0))).expect_err("a 0-byte limit");
+        assert!(err.to_string().contains("vram_limit is 0 bytes"), "{err}");
+        for ok in [None, Some(SizeSpec::Bytes(1)), Some(SizeSpec::Percent(0.5))] {
+            assert!(check_vram_limit(ok).is_ok(), "{ok:?}");
+        }
+    }
+
+    /// On real hardware: `kernels.vulkan.vram_limit` reaches the figures every budget reads and the
+    /// guard that enforces them. A limit leaving the guard 1 GiB above what is in use refuses an
+    /// allocation of that size, with an error naming the device's own figure, where the same
+    /// device without the limit lets it through; a limit above the device's memory changes
+    /// nothing. Drives `check_vram_budget` and an `alloc` the guard refuses, so it commits nothing.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn config_vram_limit_caps_the_budget_and_the_guard() {
+        const GIB: u64 = 1 << 30;
+        let build = |limit: Option<SizeSpec>| {
+            let mut cfg = test_config();
+            cfg.kernels.vulkan.vram_limit = limit;
+            VulkanBackend::new_with(Arc::new(cfg)).expect("VulkanBackend::new_with")
+        };
+        let free = build(None);
+        let real = free.vram();
+        assert_eq!(real.limited_from, None);
+        let used = real.total - real.available;
+        assert!(
+            free.check_vram_budget(GIB).is_ok(),
+            "the device must have 1 GiB to spare for this test: {real:?}"
+        );
+        drop(free);
+
+        let limit = used + GIB;
+        let limited = build(Some(SizeSpec::Bytes(limit)));
+        let v = limited.vram();
+        assert_eq!((v.total, v.limited_from), (limit, Some(real.total)));
+        assert!(
+            limited.alloc_room() < GIB,
+            "the fit's ceiling under the limit: {}",
+            limited.alloc_room()
+        );
+        let refused = limited
+            .check_vram_budget(GIB)
+            .expect_err("the guard must refuse what the limit forbids");
+        assert!(
+            refused.to_string().contains("limited from"),
+            "the refusal must say the budget is limited: {refused}"
+        );
+        assert!(limited
+            .alloc(GIB as usize, BufferUsage::Activations)
+            .is_err());
+        drop(limited);
+
+        let above = build(Some(SizeSpec::Bytes(real.total.saturating_mul(2))));
+        let v = above.vram();
+        assert_eq!((v.total, v.limited_from), (real.total, None));
+        assert!(above.check_vram_budget(GIB).is_ok());
     }
 
     /// `device.submit_dispatches` (`INFR_SUBMIT_DISPATCHES`) overrides the measured initial submit

@@ -50,9 +50,9 @@ reference to judge tuned values against.
 
 ## Caps, refusals and open decisions
 
-| Phase | What                                                                                                    | Status                             |
-| ----- | ------------------------------------------------------------------------------------------------------- | ---------------------------------- |
-| 13    | [Replace the caps, refusals and open decisions with implementations](13-caps-refusals-and-decisions.md) | S1, S2 done; S3 onward not started |
+| Phase | What                                                                                                    | Status                                                            |
+| ----- | ------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------- |
+| 13    | [Replace the caps, refusals and open decisions with implementations](13-caps-refusals-and-decisions.md) | S1, S2 and the first half of S4 done; S3 and the rest not started |
 
 ## Notes on the model phases
 

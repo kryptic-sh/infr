@@ -570,47 +570,118 @@ measured it. Left:
   not re-measured.
 - The MTP head's own K and V cache stays outside the fit (B191).
 
-### B-GUARD-POOLED — the VRAM guard charges a pooled buffer for a block already committed (2026-11-24)
+### B-GUARD-POOLED — what the pooled-block charge left (2026-11-24)
 
-**Tag:** vram guard · found under `INFR_VRAM_LIMIT`, real without it · **Blocked
-on:** nothing; a fix to choose
+**Tag:** vram guard · vram fit · **Blocked on:** nothing
 
-`VulkanBackend::make_buf_ex` calls `check_vram_budget(requirements.size)` for
-every device-local buffer of a MiB or more before allocating it, dedicated or
-pooled. With `VK_EXT_memory_budget`, `vram_budget_fits` takes `used` as total
-less live free, and the live figure counts every gpu-allocator block whole from
-the moment it is opened. A buffer that gpu-allocator will place in the free tail
-of a block already open is charged again, for memory already counted, so the
-guard can refuse an allocation that needs no new memory at all. Found on the KV
-cache, when its buffers were still pooled, and confirmed by arithmetic on a
-refused run: Qwen3-0.6B Q4_K_M under `INFR_VRAM_LIMIT=2714m` on the integrated
-GPU clamped to a context whose 56 KV buffers (26.8 MiB, 9 to a 256 MiB block)
-needed 7 blocks, 1 879 154 688 bytes committed (measured at 2740m). The room
-after the weights was 1 882 521 600. Buffer 55 opened block 7 with about 271 MB
-of room left; buffer 56 fit that block, but the guard saw 3 366 912 bytes left
-against 28 MB asked and refused (which buffer was refused is inferred from this
-arithmetic, not logged). At 2720m (room 1 888 813 056) and 2730m (1 899 298 816)
-the same.
+`VulkanBackend::check_vram_commit` charges a device-local allocation what it
+commits (`pool::Commit`): an allocation of its own its size, a pooled buffer
+nothing when it fits the free space of an open gpu-allocator block, and the
+whole block when it opens one (checked even below `VRAM_GUARD_MIN_ALLOC`).
+`pool::Pool` holds gpu-allocator and a copy of its shared blocks
+(`pool::PoolLedger`) behind one lock and is the only way to reach gpu-allocator;
+the guard's check runs under that lock, before the allocation it admits. Left:
 
-KV buffers no longer hit it: since 2026-11-24 each has its own allocation, so
-the guard charges what the allocation commits, short only of the driver's page
-rounding. The same limits (2640 to 2740 MiB) now run, and no measured case
-reproduces the defect. What remains exposed is every other device-local pooled
-allocation of at least `VRAM_GUARD_MIN_ALLOC` and below `DEDICATED_MIN`:
-`BufferUsage::Activations` buffers (the graph's scratch and pooled attention/MoE
-tiers), with or without the limit. Host-visible classes (staging, readback, host
-weights) are not guarded. Without `VK_EXT_memory_budget` the fallback charges
-`device_used`, which counts each sub-allocation's own size, so there the guard
-under-counts blocks instead of double-counting them.
-
-Fix options, none made: (a) check after allocating: allocate, read the live
-budget, and free and refuse if it is now over, so a placement inside an open
-block costs nothing (one driver query per guarded allocation, as today); (b)
-before allocating a pooled buffer, ask gpu-allocator's report whether a block of
-the right memory type has a free range that large, and charge zero when it does
-(fragmentation makes "has room" approximate); (c) charge a pooled request a
-whole `device_memblock_size` only when it would open a block, which needs the
-same knowledge as (b).
+- **The fit reserves activations in bytes; the estimate's margin is what covers
+  the blocks.** The guard charges a new shared block whole, but the context fit,
+  the post-load re-clamp and placement still hold back `dense_act_reserve_at` in
+  bytes. Measured only on gemma-4-12b Q4_K_M (RX 7900 XTX, RADV) plus the small
+  `vram_limit_tests` models: activations peaked at 153 MB with a 128-row chunk
+  and 1.12 GB with a 1024-row chunk, against reserves of 0.38 to 2.77 GB.
+  `auto_ctx_prefills_full_chunks_on_a_large_model` with the reserve scaled down
+  (a throwaway edit): the 1024-row chunk ran at 30 % of the reserve and was
+  first refused by the guard at 20 % (10 500 MiB of room); the default chunk ran
+  at every factor down to 10 %. So the estimate carries at least about 3.3 times
+  what the 1024-row prefill needed there. Not measured on any other model,
+  driver or GPU.
+- **Considered and declined: pricing the reserve in whole blocks.** Built and
+  measured 2026-11-24 (`Backend::activation_block`, the reserve rounded up to
+  whole gpu-allocator blocks plus one) and taken out: no run with the reserve in
+  bytes failed under the new guard, and the block pricing cost context that
+  worked. RX 7900 XTX, auto context, HEAD against blocks: Qwen3-0.6B with 1150
+  to 1536 MiB of room 1 637 to 4 400 tokens against refused, 2600 MiB 14 090
+  against 9 746; Qwen3.5-0.8B 1280 to 1700 MiB 1 280 to 29 696 against refused,
+  3200 MiB 132 096 against 104 980; gemma-4-12b under `INFR_VRAM_LIMIT` 10 500
+  MiB 32 000 against 14 080. **What would reopen it:** a guard refusal during
+  prefill or decode on a context the fit admitted.
+- **No live budget, no change.** Without `VK_EXT_memory_budget` every request is
+  still charged its size against `device_used`, which counts each
+  sub-allocation's size and never a block's free tail, so there the guard
+  under-counts blocks. Making it count blocks whole needs a decision on the
+  unified-memory spill (`device_local_room` reads it too) and a device without
+  the extension to test on; none here lacks it.
+- **Coupled to gpu-allocator's internals.** The ledger copies its block sizes
+  (`AllocationSizes::default`, which `Allocator::new` uses whatever it is
+  given), its memory type choice per location, its free-list placement and its
+  keep-the-last-block rule. `the_mirror_is_of_the_resolved_gpu_allocator` fails
+  without a GPU when Cargo.lock resolves another version than
+  `pool::MIRRORED_GPU_ALLOCATOR`; `ledger_matches_gpu_allocators_blocks` and
+  `predicted_commits_are_what_gpu_allocator_opens` compare the copy with
+  gpu-allocator's report on a device. A `CpuToGpu` request that fails in its
+  preferred type and is retried in another is not foreseen (only host-visible
+  types, which the guard does not check). A mismatch found at run time
+  (`PoolLedger::lose`) logs once and charges every pooled request a whole block
+  from then on.
+- **The unified-memory spill still diverts a buffer that fits an open block.**
+  `make_buf_ex` spills any `GpuOnly` buffer to the overflow heap once
+  `device_local_room` is short of its size plus a margin, block room or not; it
+  is charged its size there (the spill is decided before the guard).
+- **Cost.** Each pooled allocation and free updates the ledger under the pool's
+  lock. Release build, in-process, 2000 allocate-and-free cycles with 300 pooled
+  buffers live, medians of 7 rounds over 3 alternated runs, load average 4.05
+  (from the builds just before; the CPU was otherwise idle): a 256 KiB buffer
+  284 to 292 ns on HEAD and 451 to 458 ns now on the RX 7900 XTX, 410 to 469
+  against 576 to 595 on the integrated GPU; a 2 MiB buffer (one the guard
+  checks), which no longer queries the driver's budget when it lands in an open
+  block, 535 to 559 against 444 to 450, and 574 to 595 against 576 to 580.
+  Decode and prefill do not move: `infr bench` on Qwen3.5-0.8B Q4_K_M, RX 7900
+  XTX, 6 rounds alternating which build ran first, load average 1.92 to 2.17:
+  decode (`-p 0 -n 128`) median 452.26 tok/s on HEAD (450.78 to 453.33) and
+  452.52 now (451.44 to 452.95); prefill (`-p 512 -n 0`) 23 449 (22 642 to
+  24 134) and 24 048 (22 365 to 24 702). Measured with the block pricing still
+  in the fit, which no allocation path read.
+- **The large-model run is discrete only in the gate.**
+  `auto_ctx_prefills_full_chunks_on_a_large_model` (gemma-4-12b, skipped when it
+  is not cached) skips on an integrated GPU: the integrated GPU here took 430 s
+  for it (passing). It runs four rooms at the default chunk and at a pinned
+  1024-row chunk.
+- **`PoolLedger::lose` is sticky.** After one mismatch between the ledger and
+  what gpu-allocator did, every pooled `GpuOnly` request is charged a whole
+  block until the process restarts, so a run within one block of its budget
+  would have every scratch allocation refused. Safe (it never admits more than
+  the device commits); no trigger is known and there is no path to resynchronise
+  from gpu-allocator's report.
+- **`a_pooled_buffer_that_opens_a_block_is_refused_by_the_guard` on a
+  unified-memory device.** Where the device-local heap's room is under the
+  request plus `UMA_SPILL_MARGIN`, `make_buf_ex` spills the probe buffer to the
+  overflow heap, charged its own size, and the test's expected refusal would not
+  come. Not observed on the integrated GPU here.
+- **Without a live budget the ledger is kept but never read.**
+  `PoolLedger::commit` returns the request's size when `live` is false, and
+  `Pool::allocate`'s `live` argument always receives `has_mem_budget`, which
+  could live inside `Pool`.
+- **Not checked: that RADV's reported heap usage counts a shared block in full
+  from the moment it is allocated,** which the whole-block charge relies on. The
+  guard tests pass on RADV, which is indirect evidence only.
+- **The driver's reported usage lags this process's frees.** Measured on the RX
+  7900 XTX: the first reading after gemma-4-12b's session was dropped was 4 456
+  771 584 bytes, and it settled at 1 832 218 624 half a second later. A
+  `vram_limit_tests` limit built on the first reading left the next test
+  gigabytes of extra room (the 2026-11-24 flake in
+  `clamped_default_ctx_allocates_its_estimate`, and, inferred from the same
+  mechanism rather than observed, a streaming-floor error in
+  `explicit_ctx_short_of_the_room_after_the_weights_is_refused` after its probe
+  backend was dropped); the module's `settled_use` now waits for the figure to
+  settle, and every session's limit is built on a reading taken just before it,
+  through one reader backend the test process never drops. Separately, other
+  processes on the shared GPU moved the reading by 60 to 77 MB within one
+  `auto_ctx_before_the_load_is_the_ctx_after_it` run (observed twice on the RX
+  7900 XTX, 2026-11-24), past `AGREEMENT_SLACK`; that test now runs such a room
+  once more and fails only if it fails again. Anything in the product that reads
+  the room right after freeing a large session (a serve that swaps models) sees
+  the same lag; not investigated.
+- Not run on Windows, Metal (which has no gpu-allocator) or any driver other
+  than RADV.
 
 ### B-PRELOAD-CLAMP — what the pre-load fit still cannot price (2026-11-24)
 
@@ -7188,11 +7259,21 @@ values. What it leaves:
     experts is 1.6e-2. So an Int8 routing near tie set by the rule would hold
     almost nothing there: either the Int8 class of a real MoE model gets no
     routing check (its Float runs carry it), or the int8 activation error at the
-    router is looked into first. Needs a decision before its rows are set.
-    Qwen3-30B-A3B is cached and was not run. Adding a row is a measurement on
-    both GPUs plus a `gpu_seam_tolerance_*` test; whether the gate should carry
-    a 13 GB model is the owner's call (on the integrated GPU the test's memory
-    rule needs about 39 GB of free host memory for it).
+    router is looked into first. **Decided 2026-11-24 (owner): investigate
+    first, not started.** Measure ERNIE's routing both ways before its rows are
+    set: (a) int8 routing made more accurate (for example a finer quantisation
+    of the router projection's input alone), and (b) the router projection run
+    on the float path while everything else stays int8. For each: selections
+    differing and their largest margin against the CPU reference, forced and
+    unforced KL, and decode and prefill speed against today's int8 path, on both
+    GPUs; Qwen3-30B-A3B as a second model, since everything above rests on
+    ERNIE. That the int8 activation rounding at the router is the cause is
+    inferred from the figures above, not traced in code, so the first step is
+    confirming it. What to do next is decided from those results. Qwen3-30B-A3B
+    is cached and was not run. Adding a row is a measurement on both GPUs plus a
+    `gpu_seam_tolerance_*` test; whether the gate should carry a 13 GB model is
+    the owner's call (on the integrated GPU the test's memory rule needs about
+    39 GB of free host memory for it).
   - **The routing near tie has no rule for a model that never selects
     differently.** The synthetic row's is 1.5 times the one legitimate
     difference seen. A row whose legitimate runs show none would get 0 by that

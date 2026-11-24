@@ -1217,6 +1217,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   the estimate fell from 112 779 264 and 276 389 888 bytes (at 2640 and 2740
   MiB) to 335 872 at every limit. A KV allocation that would pass the device's
   `maxMemoryAllocationCount` is refused with the count and the limit.
+- **The Vulkan VRAM guard charges a pooled buffer what it commits.** A
+  device-local buffer below the dedicated threshold (activations, attention and
+  MoE scratch) is sub-allocated from one of gpu-allocator's shared blocks, which
+  the driver's live budget counts whole from the moment the block is opened. The
+  guard charged the buffer its own size on top, so near the budget it refused a
+  buffer that fit in an open block and committed nothing, and admitted one that
+  opened a new 256 MiB block when only the buffer's size was left. Under
+  `INFR_VRAM_LIMIT` on the RX 7900 XTX, an 8 MiB activation buffer was refused
+  with 4 186 112 bytes of room in a block that had room for it, and one that
+  opened a block left the device 130 027 520 bytes past the budget; the
+  integrated GPU did the same. The guard now keeps a copy of gpu-allocator's
+  shared blocks and charges nothing for a buffer that fits an open block and the
+  whole block for one that opens a block, whatever the buffer's size; its
+  refusal names the block. A device without `VK_EXT_memory_budget` is charged as
+  before.
 - **The production CPU's int8 activations keep the rest of a block that holds an
   outlier.** The int8 activation quantizer for K-quant, IQ, TQ and 256-wide Q8_0
   weights (`quantize_q8`) took one scale per 256 activations from the block's

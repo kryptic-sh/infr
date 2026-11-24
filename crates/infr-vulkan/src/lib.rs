@@ -25,6 +25,7 @@ pub mod p2p;
 pub mod pager;
 mod pcache;
 pub mod pipeline;
+mod pool;
 mod recorder;
 mod spirv;
 pub mod tp;
@@ -441,7 +442,7 @@ fn vram_cap(limit: Option<SizeSpec>, total: u64) -> Option<u64> {
 
 struct VulkanShared {
     // NOTE: field declaration order matters for drop.
-    // Rust drops struct fields in *declaration order*.  We keep `allocator`
+    // Rust drops struct fields in *declaration order*.  We keep `pool`
     // in a `ManuallyDrop` so we can drop it explicitly before calling
     // `destroy_device` in the `Drop` impl.
     _entry: ash::Entry,
@@ -456,8 +457,10 @@ struct VulkanShared {
     /// driving one backend from two threads at once — under `infr serve` that is the per-step GPU
     /// baton (`StepGate`).
     cmd_pool: Mutex<vk::CommandPool>,
-    /// Must be dropped before the device is destroyed.
-    allocator: ManuallyDrop<Mutex<Allocator>>,
+    /// gpu-allocator and the ledger of its shared blocks (see `pool`), the only way to reach
+    /// gpu-allocator, which tells the VRAM guard whether a pooled buffer opens a block or lands in
+    /// one already open. Must be dropped before the device is destroyed.
+    pool: ManuallyDrop<pool::Pool>,
     caps: Capabilities,
     /// VK_EXT_memory_budget enabled → `vram()` can report live free bytes (else total only).
     has_mem_budget: bool,
@@ -762,7 +765,7 @@ impl Drop for VulkanShared {
             let pool = *self.cmd_pool.lock().unwrap();
             self.device.destroy_command_pool(pool, None);
             // Drop the allocator *before* destroying the device.
-            ManuallyDrop::drop(&mut self.allocator);
+            ManuallyDrop::drop(&mut self.pool);
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);
         }
@@ -911,7 +914,9 @@ impl Drop for VkBuffer {
                             .device_used
                             .fetch_sub(alloc.size(), Ordering::Relaxed);
                     }
-                    self.shared.allocator.lock().unwrap().free(alloc).ok();
+                    if let Err(e) = self.shared.pool.free(alloc) {
+                        tracing::warn!("[infr] gpu_allocator::free on a buffer's drop: {e}");
+                    }
                 }
                 // A dedicated VkDeviceMemory we own outright — today only the UMA overflow spill
                 // (`spilled: true`). Only a device-local mapped buffer (`spilled: false`) is charged
@@ -1081,7 +1086,8 @@ fn kv_overflow_vram_cap(cfg: &infr_core::config::Config) -> Option<u64> {
 /// Headroom the VRAM budget reserves below the true heap size, shared by the hard guard
 /// ([`VulkanBackend::check_vram_budget`]) and the non-erroring probe
 /// ([`VulkanBackend::vram_budget_fits`]) so VRAM-first KV spill and the guard agree to the byte on
-/// where "full" is. Absorbs allocation slop (alignment, gpu-allocator block rounding) and
+/// where "full" is. Absorbs allocation slop (alignment; on a device without a live budget,
+/// gpu-allocator's block rounding, which a live budget charges in full — see `pool`) and
 /// driver-internal allocations (descriptor pools, pipeline/shader memory, command buffers).
 const GUARD_HEADROOM: u64 = 256 * 1024 * 1024;
 
@@ -1308,9 +1314,11 @@ fn admit_memory_allocation(bound: u64, exact: impl FnOnce() -> u64, limit: u64) 
     )))
 }
 
-/// Smallest device-local allocation the VRAM budget guard checks: anything below it
-/// is let through unasked. Public so a caller proving that an allocation set MUST be refused (the
-/// seam's KV refuse rung) can count exactly the allocations the guard will see.
+/// Smallest device-local commitment the VRAM budget guard checks: an allocation of its own (every
+/// KV buffer is one) below it is let through unasked, as is a pooled buffer that lands in a shared
+/// block already open, which commits nothing; a pooled buffer that opens a block is checked for
+/// the whole block. Public so a caller proving that an allocation set MUST be refused (the seam's
+/// KV refuse rung) can count exactly the allocations the guard will see.
 pub const VRAM_GUARD_MIN_ALLOC: u64 = 1 << 20;
 
 /// Free bytes on the DEVICE-LOCAL heaps alone — what the UMA spill decision keys off (unlike
@@ -3417,7 +3425,13 @@ impl VulkanBackend {
                 queue,
                 queue_family_index,
                 cmd_pool: Mutex::new(cmd_pool),
-                allocator: ManuallyDrop::new(Mutex::new(allocator)),
+                pool: ManuallyDrop::new(pool::Pool::new(
+                    allocator,
+                    mem_props.memory_types[..mem_props.memory_type_count as usize]
+                        .iter()
+                        .map(|t| t.property_flags)
+                        .collect(),
+                )),
                 caps,
                 has_mem_budget,
                 vram_limit,
@@ -4168,15 +4182,7 @@ impl VulkanBackend {
     /// under the allocator lock: for a test or the near-limit path of the KV allocation-count
     /// check (`admit_memory_allocation`), never per allocation.
     pub fn device_memory_allocations(&self) -> u64 {
-        let blocks = self
-            .shared
-            .allocator
-            .lock()
-            .unwrap()
-            .generate_report()
-            .blocks
-            .len() as u64;
-        blocks + self.shared.raw_memory_allocations.load(Ordering::Relaxed)
+        self.shared.pool.blocks() + self.shared.raw_memory_allocations.load(Ordering::Relaxed)
     }
 
     /// An upper bound on [`device_memory_allocations`](Self::device_memory_allocations), from
@@ -4215,37 +4221,63 @@ impl VulkanBackend {
     ///
     /// Sub-MiB allocations skip the check (no per-tiny-alloc driver query; they cannot
     /// individually blow the budget and stay covered by the next large allocation's check).
+    ///
+    /// This is the guard for an allocation of its own of `want` bytes; `make_buf_ex` asks
+    /// [`check_vram_commit`](Self::check_vram_commit) with what a pooled buffer commits.
     fn check_vram_budget(&self, want: u64) -> Result<()> {
-        if want < VRAM_GUARD_MIN_ALLOC || self.cfg.kernels.vulkan.no_vram_guard {
+        self.check_vram_commit(pool::Commit::Own(want))
+    }
+
+    /// [`check_vram_budget`](Self::check_vram_budget) for what an allocation commits (see
+    /// [`pool::Commit`]). The live budget counts every gpu-allocator block whole from the moment
+    /// it is opened, so a pooled buffer that lands in an open block's free space is charged
+    /// nothing, and is let through unasked, while one that opens a block is charged the whole
+    /// block, whatever its own size. Exact as far as the ledger of shared blocks (`pool`) is
+    /// exact; `make_buf_ex` runs it under the pool's lock, so no other allocation can take the
+    /// free range it counted on. The live budget it reads can still move between the check and
+    /// the allocation: with other processes, and with this process's own allocations that do not
+    /// go through the pool and so do not wait for its lock — the unified-memory spill and
+    /// `INFR_KV_OVERFLOW`'s host KV (`alloc_vram_mapped`), and P2P exports and imports (`p2p.rs`)
+    /// — made on another thread.
+    fn check_vram_commit(&self, commit: pool::Commit) -> Result<()> {
+        if self.cfg.kernels.vulkan.no_vram_guard {
             return Ok(());
         }
-        // The probe is the single source of truth for "does `want` fit?" so the hard guard here and
-        // the VRAM-first KV spill can never disagree (the guard errors iff the probe says it won't
-        // fit). Only build the detailed error — and re-query the driver for its fields — on failure.
-        if self.vram_budget_fits(want) {
+        // The decision is `pool::admits`, over the same snapshot arithmetic as `vram_budget_fits`
+        // (`budget_snapshot`, `pool::fits_budget`), so the hard guard here and the VRAM-first KV
+        // spill can never disagree. The driver is asked only for a commitment the guard checks.
+        let mut seen = None;
+        let admitted = pool::admits(commit, || {
+            let snapshot = self.budget_snapshot();
+            seen = Some(snapshot);
+            (snapshot.1, snapshot.2)
+        });
+        if admitted {
             return Ok(());
         }
-        let v = self.vram();
-        let used = if v.live {
-            v.total.saturating_sub(v.available)
-        } else {
-            self.shared.device_used.load(Ordering::Relaxed)
-        };
-        let budget = v.total.saturating_sub(GUARD_HEADROOM);
-        let pool = if v.uma {
+        let (v, used, budget) = seen.expect("a refused commitment was checked against a reading");
+        let want = commit.bytes();
+        let heaps = if v.uma {
             "unified memory (all heaps — this GPU shares system RAM)"
         } else {
             "device-local"
         };
+        let requested = match commit {
+            pool::Commit::NewBlock { block, request } => format!(
+                "{} requested (the new shared block a {} buffer opens)",
+                fmt_bytes(block),
+                fmt_bytes(request),
+            ),
+            _ => format!("{} requested", fmt_bytes(want)),
+        };
         Err(be(format!(
-            "{} budget exceeded: {} requested + {} already in use ({}) > {} budget ({} {pool}{} \
+            "{} budget exceeded: {requested} + {} already in use ({}) > {} budget ({} {heaps}{} \
                  minus 256 MiB headroom). Refusing to over-commit: exceeding it doesn't fail \
                  cleanly — the driver evicts (weights get read back over the bus) or the device is \
                  lost (TDR) mid-inference. Use a smaller context (INFR_CTX), a smaller/more- \
                  quantized model, close other GPU processes, or run on the CPU backend \
                  (INFR_DEV=cpu). INFR_NO_VRAM_GUARD=1 overrides at your own risk.",
             if v.uma { "Unified-memory" } else { "VRAM" },
-            fmt_bytes(want),
             fmt_bytes(used),
             if v.live {
                 "live driver budget"
@@ -4267,14 +4299,21 @@ impl VulkanBackend {
     /// unlike the guard it ignores `INFR_NO_VRAM_GUARD` and the sub-MiB skip — it is a placement
     /// decision, not a safety gate, so it always reports the honest budget answer.
     fn vram_budget_fits(&self, want: u64) -> bool {
+        let (_, used, budget) = self.budget_snapshot();
+        pool::fits_budget(used, want, budget)
+    }
+
+    /// The device memory snapshot the guard decides against, with the bytes it counts as used
+    /// (the live figure, or this backend's own tally without a live budget) and its budget (the
+    /// total less `GUARD_HEADROOM`).
+    fn budget_snapshot(&self) -> (VramInfo, u64, u64) {
         let v = self.vram();
         let used = if v.live {
             v.total.saturating_sub(v.available)
         } else {
             self.shared.device_used.load(Ordering::Relaxed)
         };
-        let budget = v.total.saturating_sub(GUARD_HEADROOM);
-        used.saturating_add(want) <= budget
+        (v, used, v.total.saturating_sub(GUARD_HEADROOM))
     }
 
     /// First device-local memory type compatible with `type_bits` (from a buffer's requirements).
@@ -4626,20 +4665,12 @@ impl VulkanBackend {
         // they sub-allocate into gpu-allocator's 256MB blocks and waste the remainder (e.g. 3×67MB
         // KV buffers per block leave ~55MB unused — ~0.7GB across a long-context KV cache). Small/
         // transient buffers stay sub-allocated (cheap, pooled).
-        let scheme = if force_dedicated || requirements.size >= DEDICATED_MIN {
+        let dedicated = force_dedicated || requirements.size >= DEDICATED_MIN;
+        let scheme = if dedicated {
             AllocationScheme::DedicatedBuffer(buffer)
         } else {
             AllocationScheme::GpuAllocatorManaged
         };
-        // Budget guard: fail fast, with a clear error, BEFORE committing device-local memory the
-        // budget can't cover (host-visible staging/readback/host-weights are exempt — the guard
-        // protects VRAM only).
-        if location == MemoryLocation::GpuOnly {
-            if let Err(e) = self.check_vram_budget(requirements.size) {
-                unsafe { self.shared.device.destroy_buffer(buffer, None) };
-                return Err(e);
-            }
-        }
 
         // ── UMA spill: device-local heap full, put this on the other heap ─────────────────────
         // UNIFIED-MEMORY PARTS ONLY (`uma_overflow_type` is `None` on every discrete GPU, so a
@@ -4647,9 +4678,10 @@ impl VulkanBackend {
         // before). Once the synthetic device-local heap is full, gpu-allocator would keep resolving
         // GpuOnly to it and RADV would keep saying yes, right up until the kernel can't validate
         // the buffer list and the SUBMIT dies. Place the overflow on the non-device-local heap
-        // instead: same DDR, same bandwidth on an APU. See `probe_uma_overflow_type`.
-        if location == MemoryLocation::GpuOnly {
-            if let Some(ty) = self.shared.uma_overflow_type {
+        // instead: same DDR, same bandwidth on an APU. See `probe_uma_overflow_type`. Decided
+        // before the guard, which charges a spilled buffer the memory of its own it takes.
+        let spill = match (location, self.shared.uma_overflow_type) {
+            (MemoryLocation::GpuOnly, Some(ty)) => {
                 // Leave the device-local heap a little slack rather than filling it to the last
                 // byte: the driver makes its own internal allocations there (descriptor pools,
                 // pipeline/shader memory, the command buffers themselves), and a heap with zero
@@ -4658,57 +4690,75 @@ impl VulkanBackend {
                 let dl_avail = device_local_room(&self.shared);
                 let fits_device_local =
                     dl_avail >= requirements.size.saturating_add(UMA_SPILL_MARGIN);
-                if !fits_device_local && requirements.memory_type_bits & (1 << ty) != 0 {
-                    // Both heaps are out if this fails, so report it rather than retrying on the
-                    // device-local heap we just established has no room (that path would recurse
-                    // straight back to here, and RADV would accept the allocation anyway and hand
-                    // the failure to the next submit as a device-lost — the exact thing this
-                    // spill exists to prevent).
-                    return match self.alloc_vram_mapped(
-                        buffer,
-                        size,
-                        &requirements,
-                        ty,
-                        true,
-                        device_address,
-                        // budget_check=false: the identical `check_vram_budget(requirements.size)`
-                        // at the top of `make_buf_ex` already ran for this GpuOnly buffer — don't
-                        // repeat it (and its memory-property driver round-trip) here.
-                        false,
-                    ) {
-                        Ok(b) => Ok(b),
-                        Err(e) => {
-                            // `alloc_vram_mapped` leaves the buffer to us on failure.
-                            unsafe { self.shared.device.destroy_buffer(buffer, None) };
-                            Err(be(format!(
-                                "unified memory exhausted: {} for {label} did not fit the \
-                                 device-local heap ({} free) and the overflow heap rejected it \
-                                 too ({e})",
-                                fmt_bytes(requirements.size),
-                                fmt_bytes(dl_avail),
-                            )))
-                        }
-                    };
-                }
+                (!fits_device_local && requirements.memory_type_bits & (1 << ty) != 0)
+                    .then_some((ty, dl_avail))
             }
+            _ => None,
+        };
+
+        // Budget guard: fail fast, with a clear error, BEFORE committing device-local memory the
+        // budget can't cover (host-visible staging/readback/host-weights are exempt — the guard
+        // protects VRAM only). A spilled buffer is charged its size here; a gpu-allocator one is
+        // checked by `pool.allocate` under its lock, charged what it commits: nothing inside a
+        // block already open, the whole block when it opens one.
+        if let Some((ty, dl_avail)) = spill {
+            if let Err(e) = self.check_vram_commit(pool::Commit::Own(requirements.size)) {
+                unsafe { self.shared.device.destroy_buffer(buffer, None) };
+                return Err(e);
+            }
+            // Both heaps are out if this fails, so report it rather than retrying on the
+            // device-local heap we just established has no room (that path would recurse
+            // straight back to here, and RADV would accept the allocation anyway and hand
+            // the failure to the next submit as a device-lost — the exact thing this
+            // spill exists to prevent).
+            return match self.alloc_vram_mapped(
+                buffer,
+                size,
+                &requirements,
+                ty,
+                true,
+                device_address,
+                // budget_check=false: the guard above already charged this GpuOnly buffer
+                // its size — don't repeat it (and its memory-property driver round-trip)
+                // here.
+                false,
+            ) {
+                Ok(b) => Ok(b),
+                Err(e) => {
+                    // `alloc_vram_mapped` leaves the buffer to us on failure.
+                    unsafe { self.shared.device.destroy_buffer(buffer, None) };
+                    Err(be(format!(
+                        "unified memory exhausted: {} for {label} did not fit the \
+                         device-local heap ({} free) and the overflow heap rejected it \
+                         too ({e})",
+                        fmt_bytes(requirements.size),
+                        fmt_bytes(dl_avail),
+                    )))
+                }
+            };
         }
 
-        let allocation = {
-            let mut alloc = self.shared.allocator.lock().unwrap();
-            alloc
-                .allocate(&AllocationCreateDesc {
-                    name: label,
-                    requirements,
-                    location,
-                    linear: true,
-                    allocation_scheme: scheme,
-                })
-                .map_err(|e| {
-                    // Clean up the buffer we created if allocation fails.
-                    unsafe { self.shared.device.destroy_buffer(buffer, None) };
-                    be(format!("gpu_allocator::allocate: {e}"))
-                })?
+        let desc = AllocationCreateDesc {
+            name: label,
+            requirements,
+            location,
+            // `pool` assumes every allocation is linear: gpu-allocator then never moves one off its
+            // alignment for the buffer-image granularity.
+            linear: true,
+            allocation_scheme: scheme,
         };
+        let admit = |commit| match location {
+            MemoryLocation::GpuOnly => self.check_vram_commit(commit),
+            _ => Ok(()),
+        };
+        let allocation = self
+            .shared
+            .pool
+            .allocate(&desc, self.shared.has_mem_budget, admit)
+            .inspect_err(|_| {
+                // Clean up the buffer we created if the guard or the allocation refuses it.
+                unsafe { self.shared.device.destroy_buffer(buffer, None) };
+            })?;
 
         let bound = unsafe {
             self.shared
@@ -4719,7 +4769,7 @@ impl VulkanBackend {
             // Nothing owns the buffer or its memory yet, so release both here, as the allocation
             // failure above does for the buffer.
             unsafe { self.shared.device.destroy_buffer(buffer, None) };
-            let freed = self.shared.allocator.lock().unwrap().free(allocation);
+            let freed = self.shared.pool.free(allocation);
             return Err(be(match freed {
                 Ok(()) => format!("bind_buffer_memory: {e}"),
                 Err(fe) => {

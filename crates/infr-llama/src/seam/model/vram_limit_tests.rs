@@ -70,12 +70,82 @@ mod tests {
         SeamModel::load_with(path, None, limited_cfg(limit, ctx)).expect("model load")
     }
 
+    /// How far apart [`in_use`]'s readings are taken.
+    const IN_USE_PERIOD: std::time::Duration = std::time::Duration::from_millis(100);
+
+    /// Consecutive readings within [`IN_USE_SLACK`] of each other that [`in_use`] takes as settled.
+    const IN_USE_STEADY: usize = 5;
+
+    /// How far two readings may differ and still count as the same figure: what the desktop
+    /// sharing the device moves by between readings.
+    const IN_USE_SLACK: u64 = 16 * MIB;
+
+    /// The longest [`in_use`] waits for the figure to settle before it fails.
+    const IN_USE_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// The backend this test process reads the device's memory in use with, or `None` (with the
+    /// skip line printed) when no backend opens on the test environment's device. Opened once and
+    /// never dropped, so every reading and every session counts it alike, and no reader's own
+    /// release lands in a later reading.
+    fn reader() -> Option<&'static infr_vulkan::VulkanBackend> {
+        static READER: std::sync::OnceLock<Option<infr_vulkan::VulkanBackend>> =
+            std::sync::OnceLock::new();
+        READER
+            .get_or_init(|| {
+                infr_testkit::gpu_or_skip_noted(open_backend(None, limited_cfg(u64::MAX, None)))
+            })
+            .as_ref()
+    }
+
     /// The device memory in use on the test environment's device, by this process and every other,
-    /// or `None` (with the skip line printed) when no backend opens there.
+    /// as `vk` reads it once the figure has settled.
+    ///
+    /// Memory this process freed keeps counting in the driver's reported usage for a while after
+    /// the free: measured on the RX 7900 XTX, the first reading after gemma-4-12b's session was
+    /// dropped was 4 456 771 584 bytes and settled at 1 832 218 624 half a second later. A limit
+    /// built on such a reading leaves far more room than the test meant, and a figure taken on
+    /// one backend and used on the next misses what the first one freed. Settled is
+    /// [`IN_USE_STEADY`] consecutive readings, [`IN_USE_PERIOD`] apart, within [`IN_USE_SLACK`]
+    /// of each other; one that does not settle within [`IN_USE_WAIT`] fails the test, since no
+    /// limit built on it would mean what the test says.
+    fn settled_use(vk: &infr_vulkan::VulkanBackend) -> u64 {
+        let used = || {
+            let v = vk.vram();
+            v.total - v.available
+        };
+        let start = std::time::Instant::now();
+        let first = used();
+        let mut window = vec![first];
+        loop {
+            let (lo, hi) = window
+                .iter()
+                .fold((u64::MAX, 0), |(lo, hi), &u| (lo.min(u), hi.max(u)));
+            if window.len() >= IN_USE_STEADY && hi - lo <= IN_USE_SLACK {
+                let settled = *window.last().expect("a reading");
+                eprintln!(
+                    "in use: {settled} bytes, settled after {} ms from a first reading of {first}",
+                    start.elapsed().as_millis()
+                );
+                return settled;
+            }
+            assert!(
+                start.elapsed() < IN_USE_WAIT,
+                "the device's memory in use did not settle within {IN_USE_WAIT:?}: first {first}, \
+                 last readings {window:?}"
+            );
+            std::thread::sleep(IN_USE_PERIOD);
+            window.push(used());
+            if window.len() > IN_USE_STEADY {
+                window.remove(0);
+            }
+        }
+    }
+
+    /// [`settled_use`] on the process's [`reader`], or `None` (with the skip line printed) when no
+    /// backend opens on the test environment's device. Every session a test opens is preceded by
+    /// one, so what the session before it freed has landed.
     fn in_use() -> Option<u64> {
-        let vk = infr_testkit::gpu_or_skip_noted(open_backend(None, limited_cfg(u64::MAX, None)))?;
-        let v = vk.vram();
-        Some(v.total - v.available)
+        Some(settled_use(reader()?))
     }
 
     fn qwen3_06b() -> Option<std::path::PathBuf> {
@@ -109,9 +179,8 @@ mod tests {
 
     /// What one clamped run allocated and committed for its KV cache.
     struct ClampedRun {
-        /// The model and the bytes in use the run's limit was set above, to run it again.
+        /// The model, to run it again.
         path: std::path::PathBuf,
-        used: u64,
         /// The room above what was in use that the limit left, in MiB.
         room_mib: u64,
         /// The context the slot was allocated for.
@@ -147,10 +216,12 @@ mod tests {
     }
 
     /// Open the default (auto-sized) session of the model at `path` with the device limited to
-    /// `room_mib` above the `used` bytes in use, check that the context was clamped below the
+    /// `room_mib` above the bytes in use as [`in_use`] reads them just before, check that the
+    /// context was clamped below the
     /// trained window, generate a few tokens, and report what the slot allocated — or why the
     /// session refused to open or the generation failed.
-    fn clamped_run(path: &std::path::Path, used: u64, room_mib: u64) -> Result<ClampedRun, RunErr> {
+    fn clamped_run(path: &std::path::Path, room_mib: u64) -> Result<ClampedRun, RunErr> {
+        let used = in_use().expect("a backend opened for the sweep");
         let model = load(path, used + room_mib * MIB, None);
         let mut sess = model.vulkan_session_default().map_err(|e| {
             let msg = format!("{room_mib} MiB of room: the default session did not open: {e}");
@@ -195,7 +266,6 @@ mod tests {
         );
         let run = ClampedRun {
             path: path.to_path_buf(),
-            used,
             room_mib,
             slot_ctx: kv.max_ctx,
             allocated: sizes.iter().sum(),
@@ -236,10 +306,10 @@ mod tests {
     /// `clamped_default_ctx_allocates_its_estimate` asserts). Any other failure on the way up is a
     /// failure, not a room to step past. Probed rather than computed: where the refusal falls moves
     /// with what the device reports in use while the test runs.
-    fn usable_room(path: &std::path::Path, used: u64, start: u64, hi: u64) -> u64 {
+    fn usable_room(path: &std::path::Path, start: u64, hi: u64) -> u64 {
         let mut room = start;
         while room < hi {
-            match clamped_run(path, used, room) {
+            match clamped_run(path, room) {
                 Ok(_) => return room,
                 Err(RunErr::NoUsableCache(_)) => {}
                 Err(e @ RunErr::Other(_)) => panic!("{e}"),
@@ -255,7 +325,7 @@ mod tests {
     /// its KV buffers, when they were sub-allocated from shared blocks, outgrew the room and the
     /// guard refused one. `None` when no backend opens.
     fn clamped_sweeps() -> Option<Vec<Result<ClampedRun, RunErr>>> {
-        let used = in_use()?;
+        reader()?;
         let mut runs = Vec::new();
         for (name, path, start, hi, seed) in [
             ("Qwen3-0.6B", qwen3_06b(), 1150, 2600, 0x5134),
@@ -265,11 +335,11 @@ mod tests {
                 eprintln!("skip: {name} is not in the HF cache");
                 continue;
             };
-            let lo = usable_room(&path, used, start, hi);
+            let lo = usable_room(&path, start, hi);
             runs.extend(
                 sweep(lo, hi, seed)
                     .into_iter()
-                    .map(|room| clamped_run(&path, used, room)),
+                    .map(|room| clamped_run(&path, room)),
             );
         }
         Some(runs)
@@ -351,7 +421,7 @@ mod tests {
                 continue;
             };
             eprintln!("{first}; running it once more, in case another process moved the figure");
-            match clamped_run(&run.path, run.used, run.room_mib) {
+            match clamped_run(&run.path, run.room_mib) {
                 Ok(again) => failed.extend(past_bound(&again)),
                 Err(e) => failed.push(e.to_string()),
             }
@@ -394,8 +464,10 @@ mod tests {
     }
 
     /// Open the default session of the model at `path` with the device limited to `room_mib` above
-    /// the `used` bytes in use and generate a few tokens, reporting where it stopped.
-    fn auto_run(path: &std::path::Path, used: u64, room_mib: u64) -> AutoEnd {
+    /// the bytes in use as [`in_use`] reads them just before, and generate a few tokens, reporting
+    /// where it stopped.
+    fn auto_run(path: &std::path::Path, room_mib: u64) -> AutoEnd {
+        let used = in_use().expect("a backend opened for the sweep");
         let model = load(path, used + room_mib * MIB, None);
         let mut sess = match model.vulkan_session_default() {
             Ok(sess) => sess,
@@ -449,12 +521,16 @@ mod tests {
     /// over-price on a device that charges the ring nothing (the integrated GPU charges about
     /// 12.4 MB less than its size, the RX 7900 XTX all of it; see docs/backlog.md
     /// B-PRELOAD-CLAMP). A fit that counted the ring twice is past it.
+    ///
+    /// A room that fails while the device's memory in use moved by more than [`IN_USE_SLACK`]
+    /// across its run (another process on the GPU: observed once on the RX 7900 XTX, 77 MB taken
+    /// during one run and kept) is run once more, and fails the test only if it fails again.
     #[test]
     #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
     fn auto_ctx_before_the_load_is_the_ctx_after_it() {
-        let Some(used) = in_use() else {
+        if reader().is_none() {
             return;
-        };
+        }
         let mut failed = Vec::new();
         for (name, path, rooms) in [
             (
@@ -476,8 +552,10 @@ mod tests {
                 eprintln!("skip: {name} is not in the HF cache");
                 continue;
             };
-            for &room in rooms {
-                let row = match auto_run(&path, used, room) {
+            // One room's run judged: the row it prints and what it failed.
+            let judge = |room: u64, end: AutoEnd| -> (String, Vec<String>) {
+                let mut fails = Vec::new();
+                let row = match end {
                     AutoEnd::RefusedBeforeLoad(e) => {
                         format!(
                             "refused before the load: {}",
@@ -489,7 +567,7 @@ mod tests {
                         weights_took,
                         err,
                     } => {
-                        failed.push(format!(
+                        fails.push(format!(
                             "{name} at {room} MiB: opened with {opened} tokens, refused after the \
                              weights took {weights_took} bytes: {err}"
                         ));
@@ -505,16 +583,16 @@ mod tests {
                         staging,
                     } => {
                         if ctx < MIN_SESSION_CTX {
-                            failed.push(format!("{name} at {room} MiB: ran with {ctx} tokens"));
+                            fails.push(format!("{name} at {room} MiB: ran with {ctx} tokens"));
                         }
                         if excess > AGREEMENT_SLACK {
-                            failed.push(format!(
+                            fails.push(format!(
                                 "{name} at {room} MiB: opened with {opened} tokens, ran with \
                                  {ctx}: {excess} bytes promised and not held"
                             ));
                         }
                         if unused > staging as i64 {
-                            failed.push(format!(
+                            fails.push(format!(
                                 "{name} at {room} MiB: the fit priced {unused} bytes the load did \
                                  not take, past the staging ring's {staging}"
                             ));
@@ -525,6 +603,22 @@ mod tests {
                         )
                     }
                 };
+                (row, fails)
+            };
+            for &room in rooms {
+                let before = in_use().expect("a backend opened for the sweep");
+                let (mut row, mut fails) = judge(room, auto_run(&path, room));
+                if !fails.is_empty() {
+                    let moved = in_use().expect("a backend").abs_diff(before);
+                    if moved > IN_USE_SLACK {
+                        eprintln!(
+                            "{name} at {room} MiB: {row}; the device's memory in use moved {moved} \
+                             bytes across the run, so it runs once more"
+                        );
+                        (row, fails) = judge(room, auto_run(&path, room));
+                    }
+                }
+                failed.extend(fails);
                 eprintln!("{name} at {room} MiB: {row}");
             }
         }
@@ -611,9 +705,10 @@ mod tests {
             eprintln!("skip: Qwen3-0.6B is not in the HF cache");
             return;
         };
-        let Some(used) = in_use() else {
+        let Some(reader) = reader() else {
             return;
         };
+        let used = settled_use(reader);
         let limit = used + B12_ROOM;
         let probe = load(&path, limit, None);
         let vk = open_backend(None, probe.ecfg.clone()).expect("backend");
@@ -622,6 +717,8 @@ mod tests {
             .expect("an attention model");
         let q8 = probe.kv_fit_ctx_fmt(&vk, true).expect("an attention model");
         drop(vk);
+        // What the probe backend freed lands before the session's own backend measures the room.
+        settled_use(reader);
         let want = (f16 + q8) / 2;
         assert!(
             f16 < want && want < q8,
@@ -657,10 +754,13 @@ mod tests {
     /// room for, so it runs as asked: the fit prices what the weights commit, the upload staging
     /// and the driver's reserve. What still reaches the refusal is a window the fit rejects and
     /// placement still takes resident, because placement prices the weights at their bare
-    /// footprint: with the cache format set to f16, so neither q8_0 rung can take it, the largest
-    /// such window loads and is refused between the weight upload and the KV allocation, with the
-    /// sizes — not by the allocation guard on one layer's buffer (docs/backlog.md
-    /// B-PRELOAD-CLAMP).
+    /// footprint: with the cache format set to f16, so neither q8_0 rung can take it, such a window
+    /// loads and is refused between the weight upload and the KV allocation, with the sizes — not
+    /// by the allocation guard on one layer's buffer (docs/backlog.md B-PRELOAD-CLAMP). Both
+    /// windows are the largest at [`IN_USE_SLACK`] less room than the sessions get: each session
+    /// reads the room again, and at the exact edge the desktop sharing the device moving a few
+    /// MiB between the readings was observed to send the fit's window to q8_0 and placement's to
+    /// streaming.
     #[test]
     #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
     fn explicit_ctx_short_of_the_room_after_the_weights_is_refused() {
@@ -668,12 +768,16 @@ mod tests {
             eprintln!("skip: Qwen3-0.6B is not in the HF cache");
             return;
         };
-        let Some(used) = in_use() else {
+        let Some(reader) = reader() else {
             return;
         };
+        let used = settled_use(reader);
         let limit = used + B12_ROOM;
         let probe = load(&path, limit, None);
-        let vk = open_backend(None, probe.ecfg.clone()).expect("backend");
+        // Both windows are taken at the edge of a room `IN_USE_SLACK` smaller than the sessions
+        // get, so the desktop moving between this reading and theirs cannot push either one past
+        // its edge.
+        let vk = open_backend(None, limited_cfg(limit - IN_USE_SLACK, None)).expect("backend");
         let fits = probe
             .kv_fit_ctx_fmt(&vk, false)
             .expect("an attention model");
@@ -688,6 +792,8 @@ mod tests {
         )
         .expect("an attention model");
         drop(vk);
+        // What the probe backend freed lands before the session's own backend measures the room.
+        settled_use(reader);
         assert!(
             fits < placed,
             "the fit ({fits}) must be below what the bare footprint leaves ({placed})"
@@ -704,6 +810,8 @@ mod tests {
         assert_eq!(kv.max_ctx, fits, "an explicit context is served as asked");
         assert_eq!((kv.k_fmt, kv.v_fmt), (DType::F16, DType::F16));
         drop(sess);
+        // What the first session freed lands before the second one's placement measures the room.
+        settled_use(reader);
 
         let f16 = limited_cfg_with(limit, Some(placed), |c| {
             c.kv.type_k = Some(DType::F16);
@@ -724,6 +832,142 @@ mod tests {
             msg.contains(&format!("context {placed} cannot be served"))
                 && msg.contains("after the weights"),
             "the refusal after the load, not another failure: {msg}"
+        );
+    }
+
+    /// gemma-4-12b-it Q4_K_M, the largest dense model the GPU tests use, or `None` (saying so)
+    /// when it is not in the HF cache. Not required by `INFR_TEST_REQUIRE_MODELS`: the gate runs
+    /// without it on a box that lacks it.
+    fn gemma4_12b() -> Option<std::path::PathBuf> {
+        let found = infr_hub::Store::discover().ok().and_then(|s| {
+            s.snapshot_file("unsloth/gemma-4-12b-it-GGUF", "gemma-4-12b-it-Q4_K_M.gguf")
+        });
+        if found.is_none() {
+            eprintln!("skip: unsloth/gemma-4-12b-it-GGUF is not in the HF cache");
+        }
+        found
+    }
+
+    /// The (room in MiB, pinned chunk) pairs `auto_ctx_prefills_full_chunks_on_a_large_model`
+    /// requires to run: every room at the default chunk, and every room but the tightest at a
+    /// 1024-row chunk, which ran with windows of 1 241 to 3 072 tokens across runs here, on either
+    /// side of the prompt.
+    const LARGE_MODEL_MUST_RUN: [(u64, Option<usize>); 7] = [
+        (9800, None),
+        (10500, None),
+        (11500, None),
+        (12800, None),
+        (10500, Some(1024)),
+        (11500, Some(1024)),
+        (12800, Some(1024)),
+    ];
+
+    /// More tokens than [`long_prompt`]`(1600)` tokenizes to on gemma-4 (1607 measured), with the
+    /// tokens decoded after it.
+    const PROMPT_TOKENS_MAX: usize = 1700;
+
+    /// A prompt of `words` words, several prefill chunks long at any chunk height the sessions
+    /// below run at.
+    fn long_prompt(words: usize) -> String {
+        let vocab = [
+            "river", "mountain", "cloud", "seven", "blue", "market", "window", "paper", "engine",
+        ];
+        let body: Vec<&str> = (0..words)
+            .map(|i| vocab[(i * 7 + i / 3) % vocab.len()])
+            .collect();
+        format!("Summarize this in one sentence: {}", body.join(" "))
+    }
+
+    /// The activation reserve as estimated in bytes ([`crate::seam::dense_act_reserve_at`]) covers
+    /// the allocator blocks the VRAM guard charges whole, on a run that opens several of them:
+    /// gemma-4-12b's auto-sized session, on a limited device where the context clamps, prefills a
+    /// prompt of many chunks and decodes, at the default chunk height and at a pinned 1024-row
+    /// chunk (whose activations peaked at 1.12 GB here), with no allocation refused. The fit holds
+    /// the reserve back in bytes and the guard charges a new shared block in full, so what covers
+    /// the blocks' rounding is the estimate's own margin over the activations it predicts. Every
+    /// room in [`LARGE_MODEL_MUST_RUN`] must load, prefill and decode at the chunk height it
+    /// names; the tightest room at the pinned chunk may instead leave a window shorter than the
+    /// prompt (before the load, or as the re-clamp after it keeps it), which is not run. That more
+    /// than one shared block opened is not asserted: the blocks a prefill opens are freed with its
+    /// scratch, and the backend keeps no count of the blocks opened.
+    #[test]
+    #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+    fn auto_ctx_prefills_full_chunks_on_a_large_model() {
+        use infr_core::backend::Backend;
+        let Some(path) = gemma4_12b() else {
+            return;
+        };
+        let Some(reader) = reader() else {
+            return;
+        };
+        if reader.capabilities().integrated {
+            // Measured: about seven minutes on the 2-CU integrated GPU here, past what the gate
+            // can spend; the blocks the guard charges are the same on every device.
+            eprintln!("skip: a 12B prefill sweep on an integrated GPU (run it on a discrete one)");
+            return;
+        }
+        let prompt = long_prompt(1600);
+        let mut ran = Vec::new();
+        let mut failed = Vec::new();
+        for ubatch in [None, Some(1024)] {
+            for room in [9800, 10500, 11500, 12800] {
+                let used = settled_use(reader);
+                let cfg = limited_cfg_with(used + room * MIB, None, |c| {
+                    c.device.ubatch = ubatch;
+                    c.device.ubatch_specified = ubatch.is_some();
+                });
+                let model = SeamModel::load_with(&path, None, cfg).expect("model load");
+                let mut sess = match model.vulkan_session_default() {
+                    Ok(sess) => sess,
+                    Err(e) if e.to_string().contains("no usable KV cache fits") => {
+                        eprintln!("{room} MiB, chunk {ubatch:?}: refused before the load");
+                        continue;
+                    }
+                    Err(e) => {
+                        failed.push(format!("{room} MiB, chunk {ubatch:?}: did not open: {e}"));
+                        continue;
+                    }
+                };
+                if sess.max_ctx < PROMPT_TOKENS_MAX {
+                    eprintln!(
+                        "{room} MiB, chunk {ubatch:?}: a {}-token window, shorter than the prompt",
+                        sess.max_ctx
+                    );
+                    continue;
+                }
+                match model.generate_vulkan_session(&mut sess, &prompt, 8, None, |_| {}) {
+                    Ok(stats) => {
+                        let (_, kv) = slot(&sess);
+                        eprintln!(
+                            "{room} MiB, chunk {ubatch:?}: ctx {} at a {}-row chunk, prefilled {} \
+                             tokens, decoded {}",
+                            kv.max_ctx, kv.ubatch, stats.n_prompt, stats.n_gen
+                        );
+                        if let Some(pinned) = ubatch {
+                            assert_eq!(
+                                kv.ubatch, pinned,
+                                "{room} MiB: the pinned chunk did not take effect"
+                            );
+                        }
+                        ran.push((room, ubatch));
+                    }
+                    // The window the post-load re-clamp kept, shorter than the prompt: a context
+                    // the room cannot hold, not an allocation the guard refused.
+                    Err(e) if e.to_string().contains("exceeds the session KV capacity") => {
+                        eprintln!("{room} MiB, chunk {ubatch:?}: {e}");
+                    }
+                    Err(e) => failed.push(format!("{room} MiB, chunk {ubatch:?}: {e}")),
+                }
+            }
+        }
+        assert!(failed.is_empty(), "{}", failed.join("\n"));
+        let missing: Vec<_> = LARGE_MODEL_MUST_RUN
+            .iter()
+            .filter(|must| !ran.contains(must))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "rooms (MiB, pinned chunk) that must run did not: {missing:?}; ran {ran:?}"
         );
     }
 }

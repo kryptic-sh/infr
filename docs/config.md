@@ -237,14 +237,17 @@ cross-conversation prefix store (reverse PagedAttention, see
 its slot is recycled, and a later request sharing that prefix uploads them
 instead of re-prefilling, with LRU eviction once the budget is full. It is
 off by default because those rows are derived from the prompt. `store_file`
-(`INFR_KV_STORE_FILE`) adds a disk tier in front of nothing: captured blocks
-spill to one redb database and load at startup (index only, not the rows), so
-a restart keeps its prefixes; `store_disk_mb` (`INFR_KV_STORE_DISK_MB`, default
-four times `store_mb`, `0` for no limit) caps it. `store_url` (`INFR_KV_STORE_URL`,
+(`INFR_KV_STORE_FILE`) pours what the RAM tier evicts into one redb database and
+loads its index at startup (not the rows), so a restart keeps its prefixes;
+`store_disk_mb` (`INFR_KV_STORE_DISK_MB`, default four times `store_mb`, `0` for
+no limit) caps it. Setting `store_file` without `store_mb` enables the store with
+a 256 MiB RAM tier in front of the disk. `store_url` (`INFR_KV_STORE_URL`,
 `redis://` / `rediss://` / `valkey://`) puts the same blocks in Redis or
 Valkey, so several servers can share one prefix cache; with both set the disk
 tier spills into Redis. Use TLS and a dedicated database, since these rows are
-model input.
+model input. A planar Q8_0 KV cache (Vulkan's auto-q8) has no packed rows for
+the store or the page pool to address, so both stay off and the session
+re-prefills.
 `paged`
 (`INFR_KV_PAGED`) turns on forward PagedAttention instead: the session's slots
 share one pool of physical pages, built with the session's KV in the cold init;

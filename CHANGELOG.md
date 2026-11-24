@@ -72,6 +72,22 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **The KV prefix store spills to disk and to Redis or Valkey.** `kv.store_file`
+  is now one redb database rather than an append-only journal: the host-RAM
+  tier evicts into it, it spills into `store_url` when both are set, and a
+  startup reloads the block index without reading the rows. `kv.store_disk_mb`
+  (`INFR_KV_STORE_DISK_MB`) caps the disk tier (default four times `store_mb`,
+  `0` for no limit). A `store_file` that names an old journal is opened as an
+  empty database, so the first start after upgrading loses the prefixes that file
+  held. `store_url` alone still works and no longer overrides `store_file`.
+
+- **A request that outgrows the page pool parks an idle conversation instead of
+  failing.** `infr serve` with `kv.paged` and a pool too small for every slot now
+  captures the least recently used idle slot's rows into the prefix store and
+  releases its pages, then retries; the parked conversation resumes from those
+  rows on its next turn. `400 kv_pool_exhausted` remains for a single request
+  larger than the whole pool.
+
 - **systemd socket activation accepts a Unix-domain socket.** Point
   `infr.socket`'s `ListenStream=` at a path (`%t/infr.sock` in a user unit) and
   `infr serve` serves the same routes over it; `serve --addr` is ignored, as with

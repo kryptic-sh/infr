@@ -94,6 +94,36 @@ fn weights_key(cfg: &Config, meta: &Metadata, tensors: &[TensorInfo]) -> u64 {
     ] {
         h.bytes(&(v as u64).to_le_bytes());
     }
+    // Rotary embedding. The same weights rope differently under another theta, scaling or
+    // section layout, and the cached keys carry those angles — while no tensor shape moves when
+    // only that metadata changes. Per layer, so an arch whose SWA and full layers differ is
+    // covered without knowing how that split is configured.
+    for l in 0..cfg.n_layer {
+        h.bytes(&cfg.layer_rope_theta(l).to_bits().to_le_bytes());
+        h.bytes(&(cfg.layer_rope_dim(l) as u64).to_le_bytes());
+    }
+    for f in [
+        cfg.compress_rope_theta,
+        cfg.rope_scaling_factor,
+        cfg.rope_yarn_beta_fast,
+        cfg.rope_yarn_beta_slow,
+        cfg.rope_yarn_log_mul,
+        cfg.rope_attn_factor,
+    ] {
+        h.bytes(&f.to_bits().to_le_bytes());
+    }
+    for v in [
+        cfg.rope_scaling_orig_ctx as u64,
+        cfg.qk_rope_dim as u64,
+        cfg.no_rope_step as u64,
+        u64::from(cfg.rope_scaling_yarn),
+        u64::from(cfg.rope_freq_factors),
+    ] {
+        h.bytes(&v.to_le_bytes());
+    }
+    for s in cfg.rope_sections {
+        h.bytes(&(s as u64).to_le_bytes());
+    }
     // A presence tag before each optional field keeps an absent key distinct from any value.
     for key in ["general.architecture", "general.name"] {
         match meta.str(key) {
@@ -1942,6 +1972,14 @@ mod tests {
 
         let mut c = cfg.clone();
         c.n_embd += 1;
+        assert_ne!(base, weights_key(&c, &meta, &tensors));
+
+        let mut c = cfg.clone();
+        c.rope_theta = 10_000.0;
+        assert_ne!(base, weights_key(&c, &meta, &tensors));
+
+        let mut c = cfg.clone();
+        c.rope_scaling_yarn = !c.rope_scaling_yarn;
         assert_ne!(base, weights_key(&c, &meta, &tensors));
 
         let mut m = meta.clone();

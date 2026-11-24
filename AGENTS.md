@@ -19,7 +19,6 @@
 - Pull the latest changes before continuing each slice of work, preserving local
   changes when integrating upstream work.
 - Commit and push each completed slice to `main`.
-<<<<<<< HEAD
 - Run what CI runs before pushing: `cargo fmt --all -- --check`,
   `cargo clippy --workspace --all-targets --locked -- -D warnings`,
   `cargo nextest run --workspace --locked`, and

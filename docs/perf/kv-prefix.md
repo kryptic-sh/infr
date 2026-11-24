@@ -94,15 +94,18 @@ into a shared page copies it. Restore becomes "fill the table", with uploads
 only for pages that are not resident. The host store survives as the cold tier
 under the pool instead of being the whole mechanism.
 
-## The cold tier
+## The lower tiers
 
-The store's blocks can outlive the process. `kv.store_file` journals them to one
-file; `kv.store_url` puts them in Redis or Valkey under a per-model prefix, which
-lets several servers share one prefix cache. The store keeps its RAM index and
-LRU in front either way: a tier is consulted at startup (one `SMEMBERS` plus
-chunked `MGET`s, not one round trip per block) and written through as captures
-arrive. Block ids are chained FNV hashes, not `DefaultHasher`, because a
-toolchain upgrade must not silently rename every stored block.
+The store's blocks can outlive the process. `kv.store_file` spills them to one
+redb database; `kv.store_url` puts them in Redis or Valkey under a per-model
+prefix, which lets several servers share one prefix cache. Both sit behind the
+same store trait as host RAM, so a block is read, written, demoted and promoted
+without the cache knowing where it landed: RAM evicts into the disk tier, disk
+into Redis, and a read falls through and promotes. A startup reads the extent
+ids and their metadata only (one `SMEMBERS` plus chunked `MGET`s for Redis, one
+table scan for redb), never the rows, so the index comes back in milliseconds
+whatever the cache holds. Block ids are chained FNV hashes, not `DefaultHasher`,
+because a toolchain upgrade must not silently rename every stored block.
 
 ## What the inversion costs
 

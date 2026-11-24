@@ -111,6 +111,14 @@ ring = true
 # prompt-derived data, so enabling it is a deliberate choice.
 # store_mb = 1024
 
+# Disk budget (MiB) for the redb tier behind `store_file`. Default: 4× store_mb,
+# only read when `store_file` is set; 0 means no limit.
+# store_disk_mb = 4096
+
+# Where the RAM tier spills, so prefixes survive a restart. It loads its index
+# at startup, and spills into `store_url` when both are set.
+# store_file = "/var/lib/infr/prefix.redb"
+
 # Decode-time inline KV write, and the coopmat/BDA KV path.
 inline_decode = false
 coopmat_bda = false

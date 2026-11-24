@@ -1192,6 +1192,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_KV_Q8",
         "INFR_KV_SLOTS",
         "INFR_KV_STORE_MB",
+        "INFR_KV_STORE_DISK_MB",
         "INFR_KV_PAGED",
         "INFR_KV_POOL_MB",
         "INFR_KV_STORE_FILE",

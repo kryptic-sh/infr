@@ -4,7 +4,7 @@
 //! any later request that starts with the same tokens — a new conversation, an evicted slot, or a
 //! different chat on the same model. The slot pool already reuses KV between its own slots
 //! (`ParallelSeam::checkout` seeds from a free slot); this store is the same idea with the rows in
-//! host RAM, so the reuse survives eviction and outlives the conversation that produced it.
+//! a tier of stores, so the reuse survives eviction and outlives the conversation that produced it.
 //!
 //! Rows are stored per 128-token block, chained: a block's id hashes its predecessor's id with its
 //! own tokens, so a block only matches at the position it was written at (rope makes rows
@@ -18,12 +18,13 @@ use anyhow::Result;
 use infr_core::backend::Backend;
 use infr_core::DType;
 use std::collections::HashMap;
-use std::io::{BufReader, BufWriter, Read, Write};
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use super::{
-    kv_tier::{DeviceKv, KvRows, KvStore},
+    kv_tier::{
+        decode_meta, encode_meta, Bounded, DeviceKv, DiskKv, Fnv, KvRows, KvStore, RedisKv, Tiered,
+        FORMATS_META_ID,
+    },
     weights::{RecurrentSnap, SeamKv},
 };
 
@@ -36,9 +37,9 @@ pub(crate) const MIN_PREFIX_TOKENS: usize = 256;
 
 /// Chain id of a block: the previous block's id mixed with this block's tokens.
 ///
-/// FNV-1a, not `DefaultHasher`: the ids are written to a cold tier, so they must not change
-/// with the toolchain. Every lookup also compares the token ids, so a collision costs a miss, and
-/// a capture under a colliding id replaces the older block.
+/// FNV-1a, not `DefaultHasher`: the ids are written to a tier, so they must not change with the
+/// toolchain. Every lookup also compares the token ids, so a collision costs a miss, and a
+/// capture under a colliding id replaces the older block.
 fn block_id(prev: u64, tokens: &[u32]) -> u64 {
     let mut h = Fnv::new();
     h.bytes(&prev.to_le_bytes());
@@ -48,10 +49,7 @@ fn block_id(prev: u64, tokens: &[u32]) -> u64 {
     h.0
 }
 
-const STORE_MAGIC: &[u8; 8] = b"INFRKV02";
-const STORE_VERSION: u32 = 2;
-
-/// Identity of the model a cold tier's blocks belong to: the geometry that shapes every row, plus
+/// Identity of the model a lower tier's blocks belong to: the geometry that shapes every row, plus
 /// the context and vocabulary. Blocks under another key are never loaded.
 pub(crate) fn store_key(cfg: &Config) -> u64 {
     let mut h = Fnv::new();
@@ -71,254 +69,62 @@ pub(crate) fn store_key(cfg: &Config) -> u64 {
     h.0
 }
 
-/// FNV-1a over the bytes the store writes, so a truncated or damaged file is discarded at load.
-struct Fnv(u64);
-
-impl Fnv {
-    fn new() -> Self {
-        Self(0xcbf2_9ce4_8422_2325)
-    }
-
-    fn bytes(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.0 ^= u64::from(b);
-            self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-    }
-}
-
-fn put_u32(w: &mut impl Write, h: &mut Fnv, v: u32) -> std::io::Result<()> {
-    let b = v.to_le_bytes();
-    w.write_all(&b)?;
-    h.bytes(&b);
-    Ok(())
-}
-
-fn put_u64(w: &mut impl Write, h: &mut Fnv, v: u64) -> std::io::Result<()> {
-    let b = v.to_le_bytes();
-    w.write_all(&b)?;
-    h.bytes(&b);
-    Ok(())
-}
-
-fn put_bytes(w: &mut impl Write, h: &mut Fnv, bytes: &[u8]) -> std::io::Result<()> {
-    put_u32(w, h, bytes.len() as u32)?;
-    w.write_all(bytes)?;
-    h.bytes(bytes);
-    Ok(())
-}
-
-fn get_u32(r: &mut impl Read, h: &mut Fnv) -> std::io::Result<u32> {
-    let mut b = [0u8; 4];
-    r.read_exact(&mut b)?;
-    h.bytes(&b);
-    Ok(u32::from_le_bytes(b))
-}
-
-fn get_u64(r: &mut impl Read, h: &mut Fnv) -> std::io::Result<u64> {
-    let mut b = [0u8; 8];
-    r.read_exact(&mut b)?;
-    h.bytes(&b);
-    Ok(u64::from_le_bytes(b))
-}
-
-fn get_bytes(r: &mut impl Read, h: &mut Fnv) -> std::io::Result<Vec<u8>> {
-    let n = get_u32(r, h)? as usize;
-    if n > (1 << 31) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "kv-prefix store claims a huge buffer",
-        ));
-    }
-    let mut b = vec![0u8; n];
-    r.read_exact(&mut b)?;
-    h.bytes(&b);
-    Ok(b)
-}
-
-fn dtype_name(d: DType) -> Option<&'static str> {
+/// A KV dtype's tag in the formats blob.
+fn fmt_tag(d: DType) -> Option<u8> {
     Some(match d {
-        DType::F32 => "f32",
-        DType::F16 => "f16",
-        DType::Bf16 => "bf16",
-        DType::Q8_0 => "q8_0",
-        DType::Q4_0 => "q4_0",
-        DType::Q4_1 => "q4_1",
-        DType::Q5_0 => "q5_0",
-        DType::Q5_1 => "q5_1",
-        DType::Iq4Nl => "iq4_nl",
-        DType::Turbo2 => "turbo2",
-        DType::Turbo3 => "turbo3",
-        DType::Turbo4 => "turbo4",
+        DType::F32 => 1,
+        DType::F16 => 2,
+        DType::Bf16 => 3,
+        DType::Q8_0 => 4,
+        DType::Q4_0 => 5,
+        DType::Q4_1 => 6,
+        DType::Q5_0 => 7,
+        DType::Q5_1 => 8,
+        DType::Iq4Nl => 9,
+        DType::Turbo2 => 10,
+        DType::Turbo3 => 11,
+        DType::Turbo4 => 12,
         _ => return None,
     })
 }
 
-fn put_name(w: &mut impl Write, h: &mut Fnv, d: DType) -> std::io::Result<()> {
-    let name = dtype_name(d).ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "kv-prefix store cannot name this KV dtype",
-        )
-    })?;
-    put_bytes(w, h, name.as_bytes())
-}
-
-fn get_name(r: &mut impl Read, h: &mut Fnv) -> Result<DType> {
-    let bytes = get_bytes(r, h)?;
-    let name = std::str::from_utf8(&bytes)?;
-    infr_core::budget::parse_kv_dtype(name)
-        .ok_or_else(|| anyhow::anyhow!("kv-prefix store names an unknown KV dtype {name:?}"))
-}
-
-fn write_header(w: &mut impl Write, key: u64, k_fmt: DType, v_fmt: DType) -> std::io::Result<()> {
-    w.write_all(STORE_MAGIC)?;
-    let mut h = Fnv::new();
-    put_u32(w, &mut h, STORE_VERSION)?;
-    put_u64(w, &mut h, key)?;
-    put_name(w, &mut h, k_fmt)?;
-    put_name(w, &mut h, v_fmt)
-}
-
-fn read_header(r: &mut impl Read) -> Result<(u64, DType, DType)> {
-    let mut magic = [0u8; 8];
-    r.read_exact(&mut magic)?;
-    if &magic != STORE_MAGIC {
-        anyhow::bail!("not a kv-prefix store file");
-    }
-    let mut h = Fnv::new();
-    if get_u32(r, &mut h)? != STORE_VERSION {
-        anyhow::bail!("kv-prefix store version mismatch");
-    }
-    let key = get_u64(r, &mut h)?;
-    let k_fmt = get_name(r, &mut h)?;
-    let v_fmt = get_name(r, &mut h)?;
-    Ok((key, k_fmt, v_fmt))
-}
-
-fn write_block(w: &mut impl Write, h: &mut Fnv, b: &BlockRef<'_>) -> std::io::Result<()> {
-    put_u64(w, h, b.id)?;
-    put_u32(w, h, b.tokens.len() as u32)?;
-    for &t in b.tokens {
-        put_u32(w, h, t)?;
-    }
-    for side in 0..2 {
-        put_u32(w, h, b.rows.layers.len() as u32)?;
-        for l in 0..b.rows.layers.len() {
-            // A layer holding only some of the block's rows is stored as absent.
-            let bytes = b
-                .rows
-                .whole_layer(l)
-                .map_or(&[][..], |(k, v)| if side == 0 { k } else { v });
-            put_bytes(w, h, bytes)?;
-        }
-    }
-    match b.snap {
-        None => w.write_all(&[0])?,
-        Some(s) => {
-            w.write_all(&[1])?;
-            put_u32(w, h, s.pos as u32)?;
-            for side in [&s.k, &s.v] {
-                put_u32(w, h, side.len() as u32)?;
-                for (l, bytes) in side {
-                    put_u32(w, h, *l as u32)?;
-                    put_bytes(w, h, bytes)?;
-                }
-            }
-        }
-    }
-    put_u64(w, h, b.used)
-}
-
-fn read_block(r: &mut impl Read, h: &mut Fnv) -> Result<Block> {
-    let id = get_u64(r, h)?;
-    let len = get_u32(r, h)? as usize;
-    if len > BLOCK_TOKENS {
-        anyhow::bail!("kv-prefix block claims {len} tokens");
-    }
-    let mut tokens = Vec::with_capacity(len);
-    for _ in 0..len {
-        tokens.push(get_u32(r, h)?);
-    }
-    let mut sides = Vec::new();
-    for _ in 0..2 {
-        let layers = get_u32(r, h)? as usize;
-        if layers > 4096 {
-            anyhow::bail!("kv-prefix block claims {layers} layers");
-        }
-        let mut side = Vec::with_capacity(layers);
-        for _ in 0..layers {
-            side.push(get_bytes(r, h)?);
-        }
-        sides.push(side);
-    }
-    let mut present = [0u8; 1];
-    r.read_exact(&mut present)?;
-    let snap = if present[0] == 1 {
-        let pos = get_u32(r, h)? as usize;
-        let mut snap_sides = Vec::new();
-        let mut bytes = 0usize;
-        for _ in 0..2 {
-            let entries = get_u32(r, h)? as usize;
-            if entries > 4096 {
-                anyhow::bail!("kv-prefix snapshot claims {entries} layers");
-            }
-            let mut side = Vec::with_capacity(entries);
-            for _ in 0..entries {
-                let l = get_u32(r, h)? as usize;
-                let b = get_bytes(r, h)?;
-                bytes += b.len();
-                side.push((l, b));
-            }
-            snap_sides.push(side);
-        }
-        let v = snap_sides.pop().expect("two sides");
-        let k = snap_sides.pop().expect("two sides");
-        Some(RecurrentSnap { pos, k, v, bytes })
-    } else {
-        None
-    };
-    let used = get_u64(r, h)?;
-    let v = sides.pop().expect("two sides");
-    let k = sides.pop().expect("two sides");
-    Ok(Block {
-        id,
-        rows: KvRows::whole(len, k, v),
-        tokens,
-        snap,
-        used,
+fn fmt_from_tag(tag: u8) -> Option<DType> {
+    Some(match tag {
+        1 => DType::F32,
+        2 => DType::F16,
+        3 => DType::Bf16,
+        4 => DType::Q8_0,
+        5 => DType::Q4_0,
+        6 => DType::Q4_1,
+        7 => DType::Q5_0,
+        8 => DType::Q5_1,
+        9 => DType::Iq4Nl,
+        10 => DType::Turbo2,
+        11 => DType::Turbo3,
+        12 => DType::Turbo4,
+        _ => return None,
     })
 }
 
-/// A block as a cold tier hands it back: its token ids, rows and snapshot.
-pub(crate) struct Block {
-    id: u64,
-    tokens: Vec<u32>,
-    rows: KvRows,
-    snap: Option<RecurrentSnap>,
-    used: u64,
+/// The formats blob: the KV layouts every stored block was captured with.
+fn encode_formats(k_fmt: DType, v_fmt: DType) -> Option<Vec<u8>> {
+    let mut blob = vec![1, fmt_tag(k_fmt)?, fmt_tag(v_fmt)?];
+    let mut h = Fnv::new();
+    h.bytes(&blob);
+    blob.extend_from_slice(&h.0.to_le_bytes());
+    Some(blob)
 }
 
-impl Block {
-    #[cfg(test)]
-    fn as_ref(&self) -> BlockRef<'_> {
-        BlockRef {
-            id: self.id,
-            tokens: &self.tokens,
-            rows: &self.rows,
-            snap: self.snap.as_ref(),
-            used: self.used,
-        }
+fn decode_formats(blob: &[u8]) -> Option<(DType, DType)> {
+    if blob.len() != 11 || blob[0] != 1 {
+        return None;
     }
-}
-
-/// A block as a cold tier writes it, borrowed from the cache's index and store.
-pub(crate) struct BlockRef<'a> {
-    id: u64,
-    tokens: &'a [u32],
-    rows: &'a KvRows,
-    snap: Option<&'a RecurrentSnap>,
-    used: u64,
+    let mut h = Fnv::new();
+    h.bytes(&blob[..3]);
+    if blob[3..] != h.0.to_le_bytes() {
+        return None;
+    }
+    Some((fmt_from_tag(blob[1])?, fmt_from_tag(blob[2])?))
 }
 
 /// The index entry of one stored block: `tokens.len()` token ids whose rows are extent `id`.
@@ -327,18 +133,10 @@ pub(crate) struct BlockRef<'a> {
 /// short block only ever matches at the end of a prompt.
 struct Entry {
     tokens: Vec<u32>,
-    /// Rows plus snapshot, what the budget counts.
+    /// Rows plus snapshot, what `stats` reports.
     bytes: usize,
-    used: u64,
-    /// A recurrent-state snapshot at the block's end sits in extent [`snap_id`].
+    /// A recurrent-state snapshot rides at the block's end inside the same extent.
     snap: bool,
-    /// Changed since the last write to the cold tier.
-    dirty: bool,
-}
-
-/// The extent holding the snapshot at the end of block `id`.
-fn snap_id(id: u64) -> u64 {
-    !id
 }
 
 /// The prefix cache: a token index over content-addressed block extents in `S`.
@@ -346,545 +144,103 @@ fn snap_id(id: u64) -> u64 {
 /// Rows are kept per 128-token block, chained: a block's id hashes its predecessor's id with its
 /// own tokens, so a block only matches at the position it was written at (rope makes rows
 /// position-bound) and ten conversations sharing a system prompt keep one copy of it. A block's
-/// rows are extent `id` (rows `0..len`); a recurrent snapshot at its end is extent `snap_id(id)`.
-/// The cold tier reads extents through [`KvStore::host`].
+/// rows and its recurrent snapshot are one extent `id`, so an eviction moves or drops both.
 pub(crate) struct BlockCache<S: KvStore> {
     store: S,
     index: HashMap<u64, Entry>,
-    cap_bytes: usize,
-    /// Monotonic access counter (LRU order, not wall time — the cache never sleeps).
-    clock: u64,
+    /// Whether `kv.store_mb` configured a cache at all.
+    enabled: bool,
     /// The KV layouts the blocks were captured with; a dtype change invalidates every block.
     k_fmt: DType,
     v_fmt: DType,
     pub(crate) restores: u64,
     pub(crate) restored_tokens: u64,
     pub(crate) captures: u64,
-    /// Where blocks outlive this process, when one is configured.
-    tier: Option<Box<dyn KvColdTier>>,
-    /// Model identity the tier's blocks are keyed under.
-    key: u64,
-    /// Blocks changed since the last write to the tier.
-    dirty: bool,
-    /// The KV formats the tier last saw; a change forces a rewrite.
-    tier_fmt: Option<(DType, DType)>,
 }
-
-impl<S: KvStore> Drop for BlockCache<S> {
-    fn drop(&mut self) {
-        if self.dirty {
-            if let Err(e) = self.rewrite_tier() {
-                tracing::warn!(error = %e, "kv store: final save to the cold tier failed");
-            }
-        }
-    }
-}
-
-/// What a cold tier hands back at startup: the formats its blocks were captured with, and the
-/// blocks in the order they were written (a later copy of a block replaces an earlier one).
-pub(crate) struct TierContents {
-    k_fmt: DType,
-    v_fmt: DType,
-    blocks: Vec<Block>,
-}
-
-/// Where the host store's blocks live beyond this process: a local file today, and a shared
-/// key-value cache such as Redis or Valkey later. The store keeps its RAM index and LRU in front;
-/// a tier only persists blocks and hands them back at startup.
-pub(crate) trait KvColdTier: Send {
-    /// A name for logs: the path or the endpoint.
-    fn describe(&self) -> String;
-    /// The blocks stored under `key`, or `None` when the tier holds nothing for it.
-    fn load(&mut self, key: u64) -> Result<Option<TierContents>>;
-    /// Add `blocks` captured with `k_fmt`/`v_fmt`, which match what the tier already holds.
-    fn append(
-        &mut self,
-        key: u64,
-        k_fmt: DType,
-        v_fmt: DType,
-        blocks: &[BlockRef<'_>],
-    ) -> Result<()>;
-    /// Replace everything stored under `key` with `blocks`.
-    fn rewrite(
-        &mut self,
-        key: u64,
-        k_fmt: DType,
-        v_fmt: DType,
-        blocks: &[BlockRef<'_>],
-    ) -> Result<()>;
-}
-
-/// A [`KvColdTier`] in one local file: a header, then checksummed records appended as blocks are
-/// captured. A crash leaves the file valid up to its last whole record.
-pub(crate) struct FileTier {
-    path: PathBuf,
-}
-
-impl FileTier {
-    pub(crate) fn new(path: PathBuf) -> Self {
-        Self { path }
-    }
-
-    fn write_record(w: &mut impl Write, blocks: &[BlockRef<'_>]) -> std::io::Result<()> {
-        let mut h = Fnv::new();
-        put_u32(w, &mut h, blocks.len().min(u32::MAX as usize) as u32)?;
-        for b in blocks {
-            write_block(w, &mut h, b)?;
-        }
-        w.write_all(&h.0.to_le_bytes())
-    }
-
-    /// One appended record, or `None` at a clean end of file or a torn tail.
-    fn read_record(r: &mut impl Read) -> Option<Vec<Block>> {
-        let mut h = Fnv::new();
-        let count = get_u32(r, &mut h).ok()? as usize;
-        if count > (1 << 20) {
-            return None;
-        }
-        let mut record = Vec::with_capacity(count);
-        for _ in 0..count {
-            record.push(read_block(r, &mut h).ok()?);
-        }
-        let mut stored = [0u8; 8];
-        r.read_exact(&mut stored).ok()?;
-        (u64::from_le_bytes(stored) == h.0).then_some(record)
-    }
-}
-
-impl KvColdTier for FileTier {
-    fn describe(&self) -> String {
-        self.path.display().to_string()
-    }
-
-    fn load(&mut self, key: u64) -> Result<Option<TierContents>> {
-        let file = match std::fs::File::open(&self.path) {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(e.into()),
-        };
-        let len = file.metadata()?.len();
-        let mut r = BufReader::new(file);
-        let (file_key, k_fmt, v_fmt) = read_header(&mut r)?;
-        if file_key != key {
-            anyhow::bail!("the file holds another model's prefixes");
-        }
-        let mut blocks: Vec<Block> = Vec::new();
-        let mut read = 0u64;
-        loop {
-            if std::io::BufRead::fill_buf(&mut r)?.is_empty() {
-                break;
-            }
-            let Some(record) = Self::read_record(&mut r) else {
-                tracing::warn!(
-                    path = %self.path.display(),
-                    file_bytes = len,
-                    "kv store: the journal tail is torn; keeping the whole records before it"
-                );
-                break;
-            };
-            read += 1;
-            for b in record {
-                match blocks
-                    .iter_mut()
-                    .find(|old| old.id == b.id && old.tokens == b.tokens)
-                {
-                    Some(old) => *old = b,
-                    None => blocks.push(b),
-                }
-            }
-        }
-        tracing::debug!(
-            records = read,
-            blocks = blocks.len(),
-            "kv store: file tier read"
-        );
-        Ok(Some(TierContents {
-            k_fmt,
-            v_fmt,
-            blocks,
-        }))
-    }
-
-    fn append(
-        &mut self,
-        key: u64,
-        k_fmt: DType,
-        v_fmt: DType,
-        blocks: &[BlockRef<'_>],
-    ) -> Result<()> {
-        if let Some(dir) = self.path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
-        if f.metadata()?.len() == 0 {
-            write_header(&mut f, key, k_fmt, v_fmt)?;
-        }
-        let mut w = BufWriter::new(&mut f);
-        Self::write_record(&mut w, blocks)?;
-        w.flush()?;
-        drop(w);
-        f.sync_data()?;
-        Ok(())
-    }
-
-    fn rewrite(
-        &mut self,
-        key: u64,
-        k_fmt: DType,
-        v_fmt: DType,
-        blocks: &[BlockRef<'_>],
-    ) -> Result<()> {
-        if let Some(dir) = self.path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        let tmp = self
-            .path
-            .with_extension(format!("tmp.{}", std::process::id()));
-        let mut w = BufWriter::new(std::fs::File::create(&tmp)?);
-        write_header(&mut w, key, k_fmt, v_fmt)?;
-        Self::write_record(&mut w, blocks)?;
-        w.flush()?;
-        let f = w.into_inner().map_err(|e| e.into_error())?;
-        f.sync_all()?;
-        std::fs::rename(&tmp, &self.path)?;
-        Ok(())
-    }
-}
-
-/// A [`KvColdTier`] in Redis or Valkey: one hash-free key per block under a model prefix, an
-/// index set of the live block ids, and a meta key naming the KV formats. A shared server then
-/// serves every box pointed at it, and its own `maxmemory` policy trims what nobody asked for.
-pub(crate) struct RedisTier {
-    conn: redis::Connection,
-    endpoint: String,
-}
-
-impl RedisTier {
-    fn connect(url: &str) -> Result<Self> {
-        let client = redis::Client::open(url)?;
-        let conn = client.get_connection()?;
-        conn.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
-        conn.set_write_timeout(Some(std::time::Duration::from_secs(30)))?;
-        Ok(Self {
-            conn,
-            endpoint: redact(url),
-        })
-    }
-
-    fn prefix(key: u64) -> String {
-        format!("infr:kv:{key:016x}")
-    }
-
-    fn key_block(key: u64, id: u64) -> String {
-        format!("{}:b{id:016x}", Self::prefix(key))
-    }
-
-    fn key_index(key: u64) -> String {
-        format!("{}:idx", Self::prefix(key))
-    }
-
-    fn key_meta(key: u64) -> String {
-        format!("{}:meta", Self::prefix(key))
-    }
-
-    fn encode(b: &BlockRef<'_>) -> Vec<u8> {
-        let mut v = Vec::with_capacity(b.rows.bytes() + 16);
-        let mut h = Fnv::new();
-        write_block(&mut v, &mut h, b).expect("writing to a Vec cannot fail");
-        v.extend_from_slice(&h.0.to_le_bytes());
-        v
-    }
-
-    fn decode(v: &[u8]) -> Result<Block> {
-        if v.len() < 8 {
-            anyhow::bail!("kv store: a Redis block is too short");
-        }
-        let (payload, hash) = v.split_at(v.len() - 8);
-        let stored = u64::from_le_bytes(hash.try_into().expect("eight bytes"));
-        let mut r = payload;
-        let mut h = Fnv::new();
-        let b = read_block(&mut r, &mut h)?;
-        if !r.is_empty() || h.0 != stored {
-            anyhow::bail!("kv store: a Redis block failed its checksum");
-        }
-        Ok(b)
-    }
-
-    fn meta(k_fmt: DType, v_fmt: DType) -> String {
-        format!(
-            "{} {}",
-            dtype_name(k_fmt).unwrap_or("f16"),
-            dtype_name(v_fmt).unwrap_or("f16")
-        )
-    }
-}
-
-impl KvColdTier for RedisTier {
-    fn describe(&self) -> String {
-        self.endpoint.clone()
-    }
-
-    fn load(&mut self, key: u64) -> Result<Option<TierContents>> {
-        let Some(meta): Option<String> = redis::cmd("GET")
-            .arg(Self::key_meta(key))
-            .query(&mut self.conn)?
-        else {
-            return Ok(None);
-        };
-        let mut parts = meta.split_whitespace();
-        let k_fmt = parts
-            .next()
-            .and_then(infr_core::budget::parse_kv_dtype)
-            .ok_or_else(|| anyhow::anyhow!("kv store: Redis meta names no K format"))?;
-        let v_fmt = parts
-            .next()
-            .and_then(infr_core::budget::parse_kv_dtype)
-            .ok_or_else(|| anyhow::anyhow!("kv store: Redis meta names no V format"))?;
-        let ids: Vec<String> = redis::cmd("SMEMBERS")
-            .arg(Self::key_index(key))
-            .query(&mut self.conn)?;
-        let mut blocks: Vec<Block> = Vec::with_capacity(ids.len());
-        for chunk in ids.chunks(64) {
-            let keys: Vec<String> = chunk
-                .iter()
-                .filter_map(|id| u64::from_str_radix(id, 16).ok())
-                .map(|id| Self::key_block(key, id))
-                .collect();
-            if keys.is_empty() {
-                continue;
-            }
-            let vals: Vec<Option<Vec<u8>>> = redis::cmd("MGET").arg(&keys).query(&mut self.conn)?;
-            for v in vals.into_iter().flatten() {
-                match Self::decode(&v) {
-                    Ok(b) => match blocks
-                        .iter_mut()
-                        .find(|old| old.id == b.id && old.tokens == b.tokens)
-                    {
-                        Some(old) => *old = b,
-                        None => blocks.push(b),
-                    },
-                    Err(e) => {
-                        tracing::warn!(error = %e, "kv store: dropped an unreadable Redis block")
-                    }
-                }
-            }
-        }
-        Ok(Some(TierContents {
-            k_fmt,
-            v_fmt,
-            blocks,
-        }))
-    }
-
-    fn append(
-        &mut self,
-        key: u64,
-        k_fmt: DType,
-        v_fmt: DType,
-        blocks: &[BlockRef<'_>],
-    ) -> Result<()> {
-        if blocks.is_empty() {
-            return Ok(());
-        }
-        let mut pipe = redis::pipe();
-        pipe.cmd("SET")
-            .arg(Self::key_meta(key))
-            .arg(Self::meta(k_fmt, v_fmt))
-            .ignore();
-        let mut ids = Vec::with_capacity(blocks.len());
-        for b in blocks {
-            ids.push(format!("{:016x}", b.id));
-            pipe.cmd("SET")
-                .arg(Self::key_block(key, b.id))
-                .arg(Self::encode(b))
-                .ignore();
-        }
-        pipe.cmd("SADD").arg(Self::key_index(key)).arg(ids).ignore();
-        let _: () = pipe.query(&mut self.conn)?;
-        Ok(())
-    }
-
-    fn rewrite(
-        &mut self,
-        key: u64,
-        k_fmt: DType,
-        v_fmt: DType,
-        blocks: &[BlockRef<'_>],
-    ) -> Result<()> {
-        let old: Vec<String> = redis::cmd("SMEMBERS")
-            .arg(Self::key_index(key))
-            .query(&mut self.conn)?;
-        if !old.is_empty() {
-            let keys: Vec<String> = old
-                .iter()
-                .filter_map(|id| u64::from_str_radix(id, 16).ok())
-                .map(|id| Self::key_block(key, id))
-                .collect();
-            let mut pipe = redis::pipe();
-            pipe.cmd("DEL").arg(keys).ignore();
-            pipe.cmd("DEL")
-                .arg(Self::key_index(key))
-                .arg(Self::key_meta(key))
-                .ignore();
-            let _: () = pipe.query(&mut self.conn)?;
-        } else {
-            let mut pipe = redis::pipe();
-            pipe.cmd("DEL")
-                .arg(Self::key_index(key))
-                .arg(Self::key_meta(key))
-                .ignore();
-            let _: () = pipe.query(&mut self.conn)?;
-        }
-        if blocks.is_empty() {
-            return Ok(());
-        }
-        self.append(key, k_fmt, v_fmt, blocks)
-    }
-}
-
-/// Strip credentials from a URL before it reaches a log line.
-fn redact(url: &str) -> String {
-    match url.split_once("://") {
-        Some((scheme, rest)) => match rest.rsplit_once('@') {
-            Some((_, host)) => format!("{scheme}://{host}"),
-            None => url.to_string(),
-        },
-        None => url.to_string(),
-    }
-}
-
-/// The cold tier `kv.store_url` / `kv.store_file` select. A URL wins; an unreachable URL falls
-/// back to the file when one is set, and a missing/broken tier only costs persistence.
-pub(crate) fn cold_tier_for(kv: &crate::EngineConfig) -> Option<Box<dyn KvColdTier>> {
-    if let Some(url) = kv
-        .kv
-        .store_url
-        .as_deref()
-        .map(str::trim)
-        .filter(|u| !u.is_empty())
-    {
-        match RedisTier::connect(url) {
-            Ok(tier) => {
-                tracing::info!(endpoint = %tier.endpoint, "kv store: sharing the cold tier over Redis");
-                return Some(Box::new(tier));
-            }
-            Err(e) => tracing::warn!(
-                endpoint = %redact(url),
-                error = %e,
-                "kv store: cannot reach the Redis cold tier; falling back to the file"
-            ),
-        }
-    }
-    kv.kv
-        .store_file
-        .as_ref()
-        .map(|p| Box::new(FileTier::new(p.clone())) as Box<dyn KvColdTier>)
-}
-
-/// Borrow block `id` for a tier write; `None` when the store keeps it outside host memory.
-fn block_ref<'a, S: KvStore>(store: &'a S, id: u64, e: &'a Entry) -> Option<BlockRef<'a>> {
-    let rows = store.host(id)?;
-    let snap = if e.snap {
-        store.host(snap_id(id)).and_then(|r| r.snap.as_deref())
-    } else {
-        None
-    };
-    Some(BlockRef {
-        id,
-        tokens: &e.tokens,
-        rows,
-        snap,
-        used: e.used,
-    })
-}
-
-/// The device slot's extent id inside [`DeviceKv`] while the cache reads or writes it.
-const SLOT: u64 = 0;
 
 impl<S: KvStore> BlockCache<S> {
-    /// Build a cache with `cap_bytes` of budget over `store`. A zero cap is a disabled cache:
-    /// every call returns immediately, so the engine pays nothing for a feature nobody asked for.
-    #[cfg(test)]
-    pub(crate) fn new(store: S, cap_bytes: usize) -> Self {
-        Self::with_tier(store, cap_bytes, None, 0)
-    }
-
-    /// [`new`](Self::new), backed by a cold `tier`: the cache loads what the tier holds for `key`
-    /// now, writes each capture through to it, and compacts it on drop. `key` identifies the
-    /// model geometry the blocks belong to.
-    pub(crate) fn with_tier(
-        store: S,
-        cap_bytes: usize,
-        tier: Option<Box<dyn KvColdTier>>,
-        key: u64,
-    ) -> Self {
+    /// Build a cache over `store`. A disabled cache returns immediately from every call, so the
+    /// engine pays nothing for a feature nobody asked for. Loading reads the index only, never a
+    /// block's bytes.
+    pub(crate) fn new(store: S, enabled: bool) -> Self {
         let mut cache = Self {
             store,
             index: HashMap::new(),
-            cap_bytes,
-            clock: 0,
+            enabled,
             k_fmt: DType::F16,
             v_fmt: DType::F16,
             restores: 0,
             restored_tokens: 0,
             captures: 0,
-            tier: tier.filter(|_| cap_bytes > 0),
-            key,
-            dirty: false,
-            tier_fmt: None,
         };
-        cache.load_tier();
+        if enabled {
+            cache.load();
+        }
         cache
     }
 
-    /// Fill the index and store from the tier. A tier that fails or holds another model's blocks
-    /// leaves the cache empty; it never fails startup.
-    fn load_tier(&mut self) {
-        let Some(tier) = self.tier.as_mut() else {
+    /// Fill the index from the store's extent ids and their metadata. A missing or unreadable
+    /// formats blob leaves the cache empty; it never fails startup.
+    fn load(&mut self) {
+        let formats = match self.store.meta(FORMATS_META_ID) {
+            Ok(Some(blob)) => blob,
+            Ok(None) => return,
+            Err(e) => {
+                tracing::warn!(error = %e, "kv store: reading the saved formats failed");
+                return;
+            }
+        };
+        let Some((k_fmt, v_fmt)) = decode_formats(&formats) else {
+            tracing::warn!("kv store: the saved formats are unreadable; starting empty");
             return;
         };
-        let name = tier.describe();
-        let loaded = tier.load(self.key);
-        let loaded = loaded.and_then(|c| {
-            let Some(c) = c else { return Ok(false) };
-            self.k_fmt = c.k_fmt;
-            self.v_fmt = c.v_fmt;
-            self.tier_fmt = Some((c.k_fmt, c.v_fmt));
-            self.clock = c.blocks.iter().map(|b| b.used).max().unwrap_or(0);
-            for b in c.blocks {
-                self.insert(b.id, b.tokens, b.rows, b.used, false)?;
-                if let Some(snap) = b.snap {
-                    self.attach(b.id, Arc::new(snap), false)?;
+        self.k_fmt = k_fmt;
+        self.v_fmt = v_fmt;
+        let ids = match self.store.extents() {
+            Ok(ids) => ids,
+            Err(e) => {
+                tracing::warn!(error = %e, "kv store: listing the saved extents failed");
+                return;
+            }
+        };
+        let ids: Vec<u64> = ids
+            .into_iter()
+            .filter(|id| *id != FORMATS_META_ID)
+            .collect();
+        let metas = match self.store.metas(&ids) {
+            Ok(metas) => metas,
+            Err(e) => {
+                tracing::warn!(error = %e, "kv store: reading the saved index entries failed");
+                return;
+            }
+        };
+        for (id, meta) in ids.into_iter().zip(metas) {
+            if let Some(blob) = meta {
+                match decode_meta(&blob) {
+                    Ok((tokens, snap, bytes)) => {
+                        self.index.insert(
+                            id,
+                            Entry {
+                                tokens,
+                                bytes,
+                                snap,
+                            },
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(id, error = %e, "kv store: dropped a block's bad index entry")
+                    }
                 }
             }
-            Ok(true)
-        });
-        match loaded {
-            Ok(true) => {
-                self.trim();
-                tracing::info!(
-                    tier = %name,
-                    blocks = self.index.len(),
-                    "kv store: loaded the saved prefixes"
-                );
-            }
-            Ok(false) => {}
-            Err(e) => {
-                self.clear();
-                tracing::warn!(
-                    tier = %name,
-                    error = %e,
-                    "kv store: the saved prefixes are unusable; starting empty"
-                );
-            }
         }
+        tracing::info!(
+            blocks = self.index.len(),
+            "kv store: loaded the saved prefix index"
+        );
     }
 
     pub(crate) fn enabled(&self) -> bool {
-        self.cap_bytes > 0
+        self.enabled
     }
 
     /// `(blocks, bytes)` currently resident, for the capture log.
@@ -893,53 +249,57 @@ impl<S: KvStore> BlockCache<S> {
     }
 
     /// Store block `id`'s rows and index it, replacing any block under the same id.
-    fn insert(
-        &mut self,
-        id: u64,
-        tokens: Vec<u32>,
-        rows: KvRows,
-        used: u64,
-        dirty: bool,
-    ) -> Result<()> {
-        self.drop_entry(id);
+    fn insert(&mut self, id: u64, tokens: Vec<u32>, rows: KvRows) -> Result<()> {
         let bytes = rows.bytes();
+        let snap = rows.snap.is_some();
         self.store.put(id, 0, rows)?;
-        let entry = Entry {
-            tokens,
-            bytes,
-            used,
-            snap: false,
-            dirty,
-        };
-        self.index.insert(id, entry);
-        Ok(())
+        self.index.insert(
+            id,
+            Entry {
+                tokens,
+                bytes,
+                snap,
+            },
+        );
+        self.write_meta(id)
     }
 
-    /// Store `snap` as the state at the end of indexed block `id`.
-    fn attach(&mut self, id: u64, snap: Arc<RecurrentSnap>, dirty: bool) -> Result<()> {
-        let bytes = snap.bytes;
-        let rows = KvRows {
-            snap: Some(snap),
-            ..KvRows::default()
+    /// Rewrite the block's extent with `snap` at its end, so the rows and their state evict
+    /// together.
+    fn attach(&mut self, id: u64, snap: Arc<RecurrentSnap>) -> Result<bool> {
+        let Some(len) = self.index.get(&id).map(|e| e.tokens.len()) else {
+            return Ok(false);
         };
-        self.store.put(snap_id(id), 0, rows)?;
-        let e = self.index.get_mut(&id).expect("attach to an indexed block");
-        e.snap = true;
-        e.bytes += bytes;
-        e.dirty |= dirty;
-        Ok(())
+        let mut rows = KvRows::default();
+        if !self.store.get(id, 0..len, &mut rows)? {
+            self.drop_entry(id);
+            return Ok(false);
+        }
+        rows.snap = Some(snap);
+        let bytes = rows.bytes();
+        self.store.put(id, 0, rows)?;
+        let entry = self.index.get_mut(&id).expect("an indexed block");
+        entry.bytes = bytes;
+        entry.snap = true;
+        self.write_meta(id)?;
+        Ok(true)
+    }
+
+    /// Persist the block's index entry beside its extent.
+    fn write_meta(&mut self, id: u64) -> Result<()> {
+        let Some(entry) = self.index.get(&id) else {
+            return Ok(());
+        };
+        let blob = encode_meta(&entry.tokens, entry.snap, entry.bytes);
+        self.store.set_meta(id, &blob)
     }
 
     fn drop_entry(&mut self, id: u64) {
-        let Some(e) = self.index.remove(&id) else {
+        if self.index.remove(&id).is_none() {
             return;
-        };
-        let mut removed = self.store.remove(id);
-        if e.snap {
-            removed = removed.and(self.store.remove(snap_id(id)));
         }
-        if let Err(e) = removed {
-            tracing::warn!(error = %e, "kv store: dropping a block's extents failed");
+        if let Err(e) = self.store.remove(id) {
+            tracing::warn!(error = %e, "kv store: dropping a block's extent failed");
         }
     }
 
@@ -948,54 +308,6 @@ impl<S: KvStore> BlockCache<S> {
         for id in ids {
             self.drop_entry(id);
         }
-    }
-
-    /// Replace the tier's contents with the cache's current blocks, which drops what the LRU
-    /// evicted and any superseded copies.
-    fn rewrite_tier(&mut self) -> Result<()> {
-        let Some(tier) = self.tier.as_mut() else {
-            self.dirty = false;
-            return Ok(());
-        };
-        let all: Vec<BlockRef<'_>> = self
-            .index
-            .iter()
-            .filter_map(|(&id, e)| block_ref(&self.store, id, e))
-            .collect();
-        tier.rewrite(self.key, self.k_fmt, self.v_fmt, &all)?;
-        for e in self.index.values_mut() {
-            e.dirty = false;
-        }
-        self.dirty = false;
-        self.tier_fmt = Some((self.k_fmt, self.v_fmt));
-        Ok(())
-    }
-
-    /// Write the blocks changed since the last write through to the tier, so a crash or a signal
-    /// exit still leaves the next start with them.
-    fn append_dirty(&mut self) -> Result<()> {
-        if self.tier.is_none() {
-            return Ok(());
-        }
-        if self.tier_fmt != Some((self.k_fmt, self.v_fmt)) {
-            return self.rewrite_tier();
-        }
-        let batch: Vec<BlockRef<'_>> = self
-            .index
-            .iter()
-            .filter(|(_, e)| e.dirty)
-            .filter_map(|(&id, e)| block_ref(&self.store, id, e))
-            .collect();
-        if batch.is_empty() {
-            return Ok(());
-        }
-        let tier = self.tier.as_mut().expect("checked above");
-        tier.append(self.key, self.k_fmt, self.v_fmt, &batch)?;
-        for e in self.index.values_mut() {
-            e.dirty = false;
-        }
-        self.dirty = false;
-        Ok(())
     }
 
     fn find(&self, id: u64, tokens: &[u32]) -> bool {
@@ -1012,11 +324,16 @@ impl<S: KvStore> BlockCache<S> {
             let len = BLOCK_TOKENS.min(prompt.len() - n);
             let block = &prompt[n..n + len];
             id = block_id(id, block);
-            let Some(e) = self.index.get_mut(&id).filter(|e| e.tokens == block) else {
+            if !self.store.contains(id) {
+                self.index.remove(&id);
+                break;
+            }
+            let Some(entry) = self.index.get_mut(&id) else {
                 break;
             };
-            self.clock += 1;
-            e.used = self.clock;
+            if entry.tokens != block {
+                break;
+            }
             hits.push(id);
             n += len;
             if len < BLOCK_TOKENS {
@@ -1079,17 +396,16 @@ impl<S: KvStore> BlockCache<S> {
         let mut rows = KvRows::default();
         for id in &keep {
             let len = self.index[id].tokens.len();
-            anyhow::ensure!(
-                self.store.get(*id, 0..len, &mut rows)?,
-                "kv store: block {id:x} is indexed but not stored"
-            );
-        }
-        if cfg.has_recurrent_state() {
-            let last = snap_id(*keep.last().expect("the snapshot block"));
-            anyhow::ensure!(
-                self.store.get(last, 0..0, &mut rows)?,
-                "kv store: a snapshot is indexed but not stored"
-            );
+            match self.store.get(*id, 0..len, &mut rows) {
+                Ok(true) => {}
+                Ok(false) => return Ok(0),
+                Err(e) => {
+                    // A damaged extent is a cache miss, never a failed request.
+                    tracing::warn!(id, error = %e, "kv store: dropping an unreadable block");
+                    self.drop_entry(*id);
+                    return Ok(0);
+                }
+            }
         }
         if let Some(p) = kv.paged.as_mut() {
             p.make_private(be, 0, n)?;
@@ -1145,6 +461,9 @@ impl<S: KvStore> BlockCache<S> {
             self.k_fmt = kv.k_fmt;
             self.v_fmt = kv.v_fmt;
         }
+        if let Some(blob) = encode_formats(self.k_fmt, self.v_fmt) {
+            self.store.set_meta(FORMATS_META_ID, &blob)?;
+        }
         let tokens = &kv.cached[..p];
         let mut id = 0u64;
         let mut start = 0usize;
@@ -1162,8 +481,6 @@ impl<S: KvStore> BlockCache<S> {
         }
         if missing.is_empty() {
             self.attach_snapshots(&kv.recurrent_snaps, &kv.cached, p, None)?;
-            self.trim();
-            self.persist();
             return Ok(0);
         }
         // One download per layer from the first new block; blocks already stored in between are
@@ -1175,27 +492,12 @@ impl<S: KvStore> BlockCache<S> {
             let mut rows = KvRows::default();
             rows.append(&all, start - from..start - from + len)?;
             rows.snap = None;
-            self.clock += 1;
             let block = tokens[*start..*start + *len].to_vec();
-            self.insert(*id, block, rows, self.clock, true)?;
+            self.insert(*id, block, rows)?;
         }
         self.attach_snapshots(&kv.recurrent_snaps, &kv.cached, p, all.snap.take())?;
         self.captures += 1;
-        self.trim();
-        self.persist();
         Ok(p)
-    }
-
-    /// Append the changed blocks to the configured tier; a failure keeps them dirty for the drop
-    /// compaction and never fails the request.
-    fn persist(&mut self) {
-        if self.tier.is_none() {
-            return;
-        }
-        if let Err(e) = self.append_dirty() {
-            self.dirty = true;
-            tracing::warn!(error = %e, "kv store: write-through to the cold tier failed");
-        }
     }
 
     /// Attach the slot's recurrent-state snapshots to the blocks that end at their positions.
@@ -1224,7 +526,7 @@ impl<S: KvStore> BlockCache<S> {
                         Arc::new(snap.clone())
                     }
                 };
-                self.attach(id, shared, true)?;
+                self.attach(id, shared)?;
                 tracing::debug!(pos = snap.pos, "kv store: attached a recurrent snapshot");
             }
         }
@@ -1246,26 +548,79 @@ impl<S: KvStore> BlockCache<S> {
         self.find(id, &tokens[pos - BLOCK_TOKENS..pos])
             .then_some(id)
     }
+}
 
-    /// Drop least-recently-used blocks until the cache fits its budget.
-    fn trim(&mut self) {
-        let mut total: usize = self.index.values().map(|e| e.bytes).sum();
-        while total > self.cap_bytes {
-            let lru = self.index.iter().min_by_key(|(_, e)| e.used);
-            let Some((id, bytes)) = lru.map(|(&id, e)| (id, e.bytes)) else {
-                break;
-            };
-            total -= bytes;
-            self.drop_entry(id);
-        }
+/// Strip credentials from a URL before it reaches a log line.
+pub(crate) fn redact(url: &str) -> String {
+    match url.split_once("://") {
+        Some((scheme, rest)) => match rest.rsplit_once('@') {
+            Some((_, host)) => format!("{scheme}://{host}"),
+            None => url.to_string(),
+        },
+        None => url.to_string(),
     }
 }
+
+/// The tier below RAM that `kv.store_url` / `kv.store_file` select, nested disk-then-Redis when
+/// both are set. A missing or broken tier only costs persistence: log and keep the RAM tier.
+pub(crate) fn lower_tier_for(kv: &crate::EngineConfig, key: u64) -> Option<Box<dyn KvStore>> {
+    let redis = kv
+        .kv
+        .store_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+        .and_then(|url| match RedisKv::connect(url, key) {
+            Ok(r) => {
+                tracing::info!(endpoint = %r.describe(), "kv store: sharing the lower tier over Redis");
+                Some(r)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    endpoint = %redact(url),
+                    error = %e,
+                    "kv store: cannot reach the Redis tier"
+                );
+                None
+            }
+        });
+    let disk = kv.kv.store_file.as_ref().and_then(|path| {
+        let cap_mb = kv
+            .kv
+            .store_disk_mb
+            .or_else(|| kv.kv.store_mb.map(|mb| mb.saturating_mul(4)))
+            .unwrap_or(0);
+        let cap = (cap_mb as usize).saturating_mul(1024 * 1024);
+        match DiskKv::open(path, key, cap) {
+            Ok(d) => Some(d),
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "kv store: cannot open the disk tier; keeping the RAM tier only"
+                );
+                None
+            }
+        }
+    });
+    match (disk, redis) {
+        (Some(disk), Some(redis)) => Some(Box::new(Tiered::new(disk, redis))),
+        (Some(disk), None) => Some(Box::new(Bounded::new(disk))),
+        (None, Some(redis)) => Some(Box::new(redis)),
+        (None, None) => None,
+    }
+}
+
+/// The device slot's extent id inside [`DeviceKv`] while the cache reads or writes it.
+const SLOT: u64 = 0;
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::seam::kv_tier::RamKv;
+    use crate::seam::kv_tier::{decode_rows, encode_rows, BudgetedStore, LayerRows};
     use crate::seam::rows::{read_rows, write_rows};
+    use std::path::Path;
 
     type Cache = BlockCache<RamKv>;
 
@@ -1283,13 +638,13 @@ mod tests {
             let len = BLOCK_TOKENS.min(tokens.len() - n);
             let block = &tokens[n..n + len];
             id = block_id(id, block);
-            s.clock += 1;
             let rows = KvRows {
                 rows: len,
                 ..KvRows::default()
             };
-            s.insert(id, block.to_vec(), rows, s.clock, false).unwrap();
+            s.insert(id, block.to_vec(), rows).unwrap();
             s.index.get_mut(&id).unwrap().bytes = bytes;
+            s.write_meta(id).unwrap();
             ids.push(id);
             n += len;
         }
@@ -1306,7 +661,7 @@ mod tests {
     #[test]
     fn matched_walks_the_chain_and_stops_at_a_gap() {
         let a = tokens(1, 300);
-        let mut s = Cache::new(RamKv::default(), 1 << 20);
+        let mut s = Cache::new(RamKv::default(), true);
         seed(&mut s, &a, 1);
         assert_eq!(s.matched(&a).0, 300);
         let mut extended = a.clone();
@@ -1319,11 +674,21 @@ mod tests {
     }
 
     #[test]
+    fn a_gone_extent_forgets_its_entry_and_stops_the_walk() {
+        let a = tokens(1, 300);
+        let mut s = Cache::new(RamKv::default(), true);
+        let ids = seed(&mut s, &a, 1);
+        s.store.remove(ids[1]).unwrap();
+        assert_eq!(s.matched(&a).0, BLOCK_TOKENS);
+        assert!(!s.index.contains_key(&ids[1]));
+    }
+
+    #[test]
     fn shared_blocks_are_stored_once() {
         let a = tokens(1, 300);
         let mut b = a[..256].to_vec();
         b.extend(tokens(2, 200));
-        let mut s = Cache::new(RamKv::default(), 1 << 20);
+        let mut s = Cache::new(RamKv::default(), true);
         seed(&mut s, &a, 1);
         assert_eq!(s.index.len(), 3);
         // The second prompt shares two blocks and adds two of its own.
@@ -1334,25 +699,9 @@ mod tests {
     }
 
     #[test]
-    fn trim_drops_the_least_recently_used() {
-        let mut s = Cache::new(RamKv::default(), 10);
-        let first = seed(&mut s, &tokens(1, 300), 6);
-        seed(&mut s, &tokens(2, 300), 6);
-        assert_eq!(s.index.len(), 6);
-        s.trim();
-        // One block fits; it is the most recently used, i.e. the second prompt's tail.
-        assert_eq!(s.index.len(), 1);
-        assert_eq!(entry(&s, &tokens(2, 300)[256..]).bytes, 6);
-        assert!(
-            !s.store.contains(first[0]),
-            "the store dropped the extent too"
-        );
-    }
-
-    #[test]
     fn block_at_names_only_a_complete_chain_position() {
         let a = tokens(1, 300);
-        let mut s = Cache::new(RamKv::default(), 1 << 20);
+        let mut s = Cache::new(RamKv::default(), true);
         seed(&mut s, &a, 1);
         assert!(s.block_at(&a, 0).is_none());
         assert!(s.block_at(&a, 128).is_some());
@@ -1377,161 +726,251 @@ mod tests {
     #[test]
     fn a_snapshot_rides_the_block_that_ends_at_it() {
         let a = tokens(1, 512);
-        let mut s = Cache::new(RamKv::default(), 1 << 20);
+        let mut s = Cache::new(RamKv::default(), true);
         seed(&mut s, &a, 1);
         s.attach_snapshots(&[snap(512)], &a, 512, None).unwrap();
         let id = s.block_at(&a, 512).expect("block at 512");
-        assert_eq!(s.index[&id].bytes, 1 + 96);
+        assert_eq!(s.index[&id].bytes, 96);
         assert!(s.index[&id].snap);
-        let held = s.store.host(snap_id(id)).and_then(|r| r.snap.clone());
-        assert_eq!(held.expect("the snapshot extent").pos, 512);
-
-        // A row-only budget fits the blocks; counting the snapshot pushes them over.
-        let mut tight = Cache::new(RamKv::default(), 96);
-        seed(&mut tight, &a, 1);
-        tight.trim();
-        assert_eq!(tight.index.len(), 4);
-        tight.attach_snapshots(&[snap(512)], &a, 512, None).unwrap();
-        tight.trim();
-        assert!(tight.index.is_empty());
-        assert!(!tight.store.contains(snap_id(id)));
+        let held = s.store.host(id).and_then(|r| r.snap.clone());
+        assert_eq!(held.expect("the snapshot in the block extent").pos, 512);
+        // The stored metadata names the snapshot, so a reload rebuilds the index.
+        let (_, snap_flag, bytes) = decode_meta(&s.store.meta(id).unwrap().unwrap()).unwrap();
+        assert!(snap_flag);
+        assert_eq!(bytes, 96);
     }
 
-    /// The chain id must not move with the toolchain: it is the key of every block in a cold
+    #[test]
+    fn formats_load_from_the_store() {
+        let mut store = RamKv::default();
+        let blob = encode_formats(DType::Q8_0, DType::F16).unwrap();
+        store.set_meta(FORMATS_META_ID, &blob).unwrap();
+        assert_eq!(decode_formats(&blob), Some((DType::Q8_0, DType::F16)));
+        let cache = BlockCache::new(store, true);
+        assert_eq!((cache.k_fmt, cache.v_fmt), (DType::Q8_0, DType::F16));
+    }
+
+    /// The chain id must not move with the toolchain: it is the key of every block in a lower
     /// tier, so a hash change would silently turn every stored prefix into a miss.
     #[test]
     fn block_ids_are_stable_across_releases() {
         assert_eq!(block_id(0, &[1, 2, 3]), 0x973d_5966_9a25_a835);
     }
 
-    fn mk_block(id: u64, tokens: Vec<u32>) -> Block {
-        let len = tokens.len();
-        Block {
-            id,
-            rows: KvRows::whole(len, vec![vec![1, 2, 3]], vec![vec![4, 5]]),
-            tokens,
-            snap: None,
-            used: 1,
-        }
-    }
-
     #[test]
     #[ignore = "needs a throwaway Redis/Valkey in INFR_TEST_REDIS_URL"]
-    fn a_redis_tier_round_trips_blocks_and_snapshots() {
+    fn a_redis_store_round_trips_extents_and_metas() {
         let url = std::env::var("INFR_TEST_REDIS_URL").expect("set INFR_TEST_REDIS_URL");
         let key = 0x1234_5678_9abc_def0 ^ u64::from(std::process::id());
-        let mut tier = RedisTier::connect(&url).expect("connect");
-        tier.rewrite(key, DType::F16, DType::F16, &[])
-            .expect("clear");
-        let a = mk_block(11, vec![1, 2, 3]);
-        let mut b = mk_block(22, vec![4, 5, 6]);
-        b.snap = Some(RecurrentSnap {
+        let mut store = RedisKv::connect(&url, key).expect("connect");
+        for id in store.extents().expect("list") {
+            store.remove(id).expect("clear");
+        }
+        let a = KvRows::whole(3, vec![vec![1; 6]], vec![vec![4; 3]]);
+        let mut b = KvRows::whole(6, vec![vec![6; 12]], vec![vec![8; 6]]);
+        b.snap = Some(Arc::new(RecurrentSnap {
             pos: 6,
             k: vec![(0, vec![7; 8])],
             v: vec![(1, vec![9; 4])],
             bytes: 12,
-        });
-        tier.append(key, DType::F16, DType::F16, &[a.as_ref(), b.as_ref()])
-            .expect("append");
-        let loaded = tier.load(key).expect("load").expect("meta");
-        assert_eq!((loaded.k_fmt, loaded.v_fmt), (DType::F16, DType::F16));
-        assert_eq!(loaded.blocks.len(), 2);
-        let got = loaded
-            .blocks
-            .iter()
-            .find(|x| x.id == 22)
-            .expect("the snapshot block");
-        assert_eq!(got.tokens, vec![4, 5, 6]);
-        assert_eq!(got.snap.as_ref().expect("snapshot").pos, 6);
+        }));
+        store.put(11, 0, a.clone()).unwrap();
+        store.put(22, 0, b.clone()).unwrap();
+        store.set_meta(11, b"three").unwrap();
+        store.set_meta(22, b"six").unwrap();
+        assert_eq!(store.extents().unwrap(), vec![11, 22]);
+        assert_eq!(store.meta(11).unwrap().as_deref(), Some(&b"three"[..]));
 
-        // A rewrite drops what the LRU no longer holds.
-        tier.rewrite(key, DType::F16, DType::F16, &[a.as_ref()])
-            .expect("rewrite");
-        let loaded = tier.load(key).expect("load").expect("meta");
-        assert_eq!(loaded.blocks.len(), 1);
-        assert_eq!(loaded.blocks[0].id, 11);
+        let mut got = KvRows::default();
+        assert!(store.get(22, 0..6, &mut got).unwrap());
+        assert_eq!(got.layers, b.layers);
+        let snap = got.snap.expect("the snapshot");
+        assert_eq!((snap.pos, snap.k[0].1.len()), (6, 8));
 
-        tier.rewrite(key, DType::F16, DType::F16, &[])
-            .expect("clear");
-        assert!(tier.load(key).expect("load").is_none(), "nothing left");
-    }
-
-    fn temp_path(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("infr-kv-{}-{name}.bin", std::process::id()))
+        store.remove(11).unwrap();
+        assert_eq!(store.extents().unwrap(), vec![22]);
+        assert!(!store.contains(11));
+        let mut gone = KvRows::default();
+        assert!(!store.get(11, 0..3, &mut gone).unwrap());
+        store.remove(22).unwrap();
+        assert!(store.extents().unwrap().is_empty());
     }
 
     #[test]
-    fn a_saved_store_loads_its_blocks_and_snapshots() {
-        let path = temp_path("roundtrip");
-        std::fs::remove_file(&path).ok();
-        let key = 42u64;
-        let file = |p: &std::path::PathBuf| -> Option<Box<dyn KvColdTier>> {
-            Some(Box::new(FileTier::new(p.clone())))
-        };
-        let open = |p| Cache::with_tier(RamKv::default(), 1 << 20, file(p), key);
-        {
-            let mut s = open(&path);
-            let ids = seed(&mut s, &tokens(1, 300), 7);
-            s.attach(ids[2], Arc::new(snap(300)), true).unwrap();
-            for e in s.index.values_mut() {
-                e.dirty = true;
-            }
-            s.tier_fmt = Some((s.k_fmt, s.v_fmt));
-            s.persist();
-            assert!(!s.dirty, "the append went through");
-        }
-        let journal_one = std::fs::metadata(&path).expect("journal").len();
-        {
-            // A second conversation appends a record of its own.
-            let mut s = open(&path);
-            let ids = seed(&mut s, &tokens(2, 128), 5);
-            s.index.get_mut(&ids[0]).expect("seeded").dirty = true;
-            s.persist();
-            s.dirty = false;
-        }
-        let loaded = open(&path);
-        assert_eq!(loaded.index.len(), 4, "both records came back");
-        drop(loaded);
-
-        // A torn second record keeps the first record whole.
-        let bytes = std::fs::read(&path).expect("read");
-        std::fs::write(&path, &bytes[..bytes.len() - 3]).expect("write torn");
-        assert!(bytes.len() as u64 > journal_one);
-        let loaded = open(&path);
-        assert_eq!(loaded.index.len(), 3);
-        let tail = &tokens(1, 300)[256..];
+    fn the_rows_codec_keeps_partial_layers_and_the_snapshot() {
+        let mut split = KvRows::whole(3, vec![vec![1; 6]], vec![vec![2; 3]]);
+        split.layers.push(LayerRows {
+            k: vec![3; 4],
+            v: vec![4; 2],
+            runs: vec![0..1, 2..3],
+        });
+        split.snap = Some(Arc::new(RecurrentSnap {
+            pos: 3,
+            k: vec![(1, vec![5; 3])],
+            v: vec![(2, vec![6; 2])],
+            bytes: 5,
+        }));
+        let blob = encode_rows(0, &split);
+        let (first, got) = decode_rows(&blob).unwrap();
+        assert_eq!(first, 0);
+        assert_eq!(got.rows, 3);
+        assert_eq!(got.layers[1].runs, vec![0..1, 2..3]);
+        assert_eq!(got.layers[1].k, split.layers[1].k);
+        let snap = got.snap.expect("snapshot");
         assert_eq!(
-            entry(&loaded, tail).bytes,
-            96,
-            "the snapshot's bytes, recomputed"
+            (snap.pos, snap.k.clone(), snap.bytes),
+            (3, vec![(1, vec![5; 3])], 5)
         );
-        let tail_id = *loaded
-            .index
-            .iter()
-            .find(|(_, e)| e.tokens == tail)
-            .expect("the tail")
-            .0;
-        let snap = loaded
-            .store
-            .host(snap_id(tail_id))
-            .and_then(|r| r.snap.clone())
-            .expect("the snapshot survived");
-        assert_eq!((snap.pos, snap.k[0].1.len()), (300, 64));
+    }
 
-        drop(loaded);
+    fn temp_dir() -> tempfile::TempDir {
+        tempfile::tempdir().expect("a temporary directory")
+    }
 
-        // Another model's key discards the file whole.
-        let wrong = Cache::with_tier(RamKv::default(), 1 << 20, file(&path), key + 1);
-        assert!(wrong.index.is_empty());
-        drop(wrong);
+    #[test]
+    fn a_disk_store_round_trips_and_survives_a_reopen() {
+        let dir = temp_dir();
+        let path = dir.path().join("kv.redb");
+        let key = 0x55u64;
+        {
+            let mut d = DiskKv::open(&path, key, 1 << 20).unwrap();
+            let a = KvRows::whole(2, vec![vec![1; 8]], vec![vec![2; 4]]);
+            d.put(1, 0, a.clone()).unwrap();
+            d.set_meta(1, b"one").unwrap();
+            d.put(2, 0, KvRows::whole(3, vec![vec![3; 12]], vec![vec![4; 6]]))
+                .unwrap();
+            d.set_meta(2, b"two").unwrap();
+            assert!(d.contains(1));
+            let mut out = KvRows::default();
+            assert!(d.get(1, 0..2, &mut out).unwrap());
+            assert_eq!(out.layers, a.layers);
+            assert_eq!(d.meta(1).unwrap().as_deref(), Some(&b"one"[..]));
+            let mut ids = d.extents().unwrap();
+            ids.sort_unstable();
+            assert_eq!(ids, vec![1, 2]);
+            d.remove(2).unwrap();
+            assert!(!d.contains(2));
+        }
+        {
+            let mut d = DiskKv::open(&path, key, 1 << 20).unwrap();
+            assert!(d.contains(1));
+            assert_eq!(d.meta(1).unwrap().as_deref(), Some(&b"one"[..]));
+            let mut out = KvRows::default();
+            assert!(d.get(1, 0..2, &mut out).unwrap());
+            assert_eq!(out.layers[0].k, vec![1; 8]);
+            assert_eq!(d.extents().unwrap(), vec![1]);
+        }
+        // Another model's key sees none of it.
+        let mut other = DiskKv::open(&path, key + 1, 1 << 20).unwrap();
+        assert!(other.extents().unwrap().is_empty());
+    }
 
-        // A first record torn mid-way leaves nothing to load, and never a half-read block.
-        let bytes = std::fs::read(&path).expect("read");
-        std::fs::write(&path, &bytes[..journal_one as usize - 3]).expect("write torn");
-        let broken = open(&path);
-        assert!(broken.index.is_empty());
-        drop(broken);
-        std::fs::remove_file(path).ok();
+    #[test]
+    fn a_journal_file_is_not_mistaken_for_a_database() {
+        let dir = temp_dir();
+        let path = dir.path().join("kv.journal");
+        std::fs::write(&path, b"INFRKV02 not a redb database").unwrap();
+        assert!(DiskKv::open(&path, 1, 1 << 20).is_err());
+    }
+
+    #[test]
+    fn a_disk_store_takes_its_lru_in_order() {
+        let dir = temp_dir();
+        let path = dir.path().join("kv.redb");
+        let mut d = DiskKv::open(&path, 1, 1 << 20).unwrap();
+        d.put(1, 0, KvRows::whole(1, vec![vec![1]], vec![vec![2]]))
+            .unwrap();
+        d.put(2, 0, KvRows::whole(1, vec![vec![3]], vec![vec![4]]))
+            .unwrap();
+        let mut out = KvRows::default();
+        d.get(1, 0..1, &mut out).unwrap();
+        let taken = d.take_lru().expect("an extent");
+        assert_eq!((taken.id, taken.first, taken.rows.rows), (2, 0, 1));
+        assert!(!d.contains(2));
+        assert!(d.contains(1));
+    }
+
+    #[test]
+    fn tiered_demotes_on_overflow_and_promotes_on_read() {
+        let mut t = Tiered::new(RamKv::new(8), RamKv::default());
+        let a = KvRows::whole(1, vec![vec![1; 4]], vec![vec![2; 2]]);
+        let b = KvRows::whole(1, vec![vec![3; 4]], vec![vec![4; 2]]);
+        t.put(1, 0, a.clone()).unwrap();
+        t.put(2, 0, b.clone()).unwrap();
+        assert!(!t.fast().contains(1), "the older extent left RAM");
+        assert!(t.slow().contains(1), "and landed in the slow tier");
+        assert!(t.fast().contains(2));
+        assert_eq!(t.fast().host(2).unwrap().layers, b.layers);
+        assert_eq!(t.slow().host(1).unwrap().layers, a.layers);
+
+        let mut got = KvRows::default();
+        assert!(t.get(1, 0..1, &mut got).unwrap());
+        assert_eq!(got.layers, a.layers);
+        assert!(t.fast().contains(1), "a read promotes the extent");
+        assert!(t.slow().contains(1), "the slow copy stays");
+        assert_eq!(t.fast().host(1).unwrap().layers, a.layers);
+        assert_eq!(t.slow().host(1).unwrap().layers, a.layers);
+    }
+
+    #[test]
+    fn tiered_keeps_the_only_extent_even_over_budget() {
+        let mut t = Tiered::new(RamKv::new(4), RamKv::default());
+        let a = KvRows::whole(1, vec![vec![1; 4]], vec![vec![2; 2]]);
+        t.put(1, 0, a.clone()).unwrap();
+        assert!(t.fast().contains(1));
+        assert!(!t.slow().contains(1));
+    }
+
+    /// A promotion must not leave the fast tier over budget: the read that just happened stays,
+    /// and whatever became least recently used goes down.
+    #[test]
+    fn a_promotion_settles_the_fast_tier() {
+        let mut t = Tiered::new(RamKv::new(8), RamKv::default());
+        t.put(1, 0, KvRows::whole(1, vec![vec![1; 4]], vec![vec![2; 2]]))
+            .unwrap();
+        t.put(2, 0, KvRows::whole(1, vec![vec![3; 4]], vec![vec![4; 2]]))
+            .unwrap();
+        assert!(t.slow().contains(1) && t.fast().contains(2));
+
+        let mut got = KvRows::default();
+        assert!(t.get(1, 0..1, &mut got).unwrap());
+        assert!(t.fast().contains(1), "the read stays in RAM");
+        assert!(!t.fast().contains(2), "the other block went down");
+        assert!(t.slow().contains(2));
+        assert!(t.fast().used() <= t.fast().capacity());
+    }
+
+    /// A block rewritten while an older copy sits below it must not leave that copy behind: the
+    /// next start would load the stale rows, snapshot flag and all.
+    #[test]
+    fn a_rewritten_extent_drops_the_stale_copy_below_it() {
+        let mut t = Tiered::new(RamKv::new(8), RamKv::default());
+        t.put(1, 0, KvRows::whole(1, vec![vec![1; 4]], vec![vec![2; 2]]))
+            .unwrap();
+        t.put(2, 0, KvRows::whole(1, vec![vec![3; 4]], vec![vec![4; 2]]))
+            .unwrap();
+        assert!(t.slow().contains(1));
+        t.set_meta(1, b"old").unwrap();
+
+        let newer = KvRows::whole(1, vec![vec![9; 4]], vec![vec![9; 2]]);
+        t.put(1, 0, newer.clone()).unwrap();
+        assert!(!t.slow().contains(1), "the stale copy is gone");
+        assert!(t.fast().contains(1));
+        let mut got = KvRows::default();
+        assert!(t.get(1, 0..1, &mut got).unwrap());
+        assert_eq!(got.layers, newer.layers);
+    }
+
+    /// A budgeted store with nothing below it drops its own LRU instead of growing past the cap.
+    #[test]
+    fn a_bounded_store_drops_its_own_lru() {
+        let mut b = Bounded::new(RamKv::new(8));
+        b.put(1, 0, KvRows::whole(1, vec![vec![1; 4]], vec![vec![2; 2]]))
+            .unwrap();
+        b.put(2, 0, KvRows::whole(1, vec![vec![3; 4]], vec![vec![4; 2]]))
+            .unwrap();
+        assert!(!b.contains(1), "the older extent was dropped");
+        assert!(b.contains(2));
     }
 
     const ROW: usize = 32;
@@ -1598,7 +1037,7 @@ mod tests {
         let be = infr_cpu::CpuBackend::new();
         let cfg = slot_cfg(0);
         let src = filled_slot(&be, &cfg, false, 300);
-        let mut s = Cache::new(RamKv::default(), 1 << 20);
+        let mut s = Cache::new(RamKv::default(), true);
         assert_eq!(s.capture(&be, &cfg, &src, 300).unwrap(), 300);
         assert_eq!(s.index.len(), 3);
         // Capturing the same prefix again stores nothing new.
@@ -1631,7 +1070,7 @@ mod tests {
         let src = filled_slot(&be, &cfg, true, n);
         let ring = src.window_ring_rows(&be, &cfg).expect("a ring");
         assert_eq!(ring, 256);
-        let mut s = Cache::new(RamKv::default(), 1 << 20);
+        let mut s = Cache::new(RamKv::default(), true);
         assert_eq!(s.capture(&be, &cfg, &src, n).unwrap(), n);
         let ids = s.matched(&src.cached).1;
         assert_eq!(ids.len(), 6);
@@ -1673,7 +1112,7 @@ mod tests {
         let src_cfg = slot_cfg(200);
         let n = 700;
         let src = filled_slot(&be, &src_cfg, true, n);
-        let mut s = Cache::new(RamKv::default(), 1 << 20);
+        let mut s = Cache::new(RamKv::default(), true);
         s.capture(&be, &src_cfg, &src, n).unwrap();
 
         let dst_cfg = slot_cfg(400);
@@ -1691,12 +1130,158 @@ mod tests {
         let cfg = slot_cfg(200);
         let mut src = filled_slot(&be, &cfg, true, 600);
         src.written_end = 800;
-        let mut s = Cache::new(RamKv::default(), 1 << 20);
+        let mut s = Cache::new(RamKv::default(), true);
         assert_eq!(s.capture(&be, &cfg, &src, 600).unwrap(), 600);
         let ids = s.matched(&src.cached).1;
         assert_eq!(ids.len(), 5);
         // Rows below 544 are gone: the block over 512..640 keeps only 544..600.
         let rows = s.store.host(ids[4]).unwrap();
         assert_eq!(rows.layers[0].runs, vec![32..88]);
+    }
+
+    /// One block of the two-layer test slot, in bytes.
+    fn block_bytes(cfg: &Config) -> usize {
+        cfg.n_layer * BLOCK_TOKENS * ROW * 2 * 2
+    }
+
+    type DiskCache = BlockCache<Tiered<RamKv, DiskKv>>;
+
+    fn disk_cache(path: &Path, cap: usize, key: u64) -> DiskCache {
+        let disk = DiskKv::open(path, key, 1 << 20).unwrap();
+        BlockCache::new(Tiered::new(RamKv::new(cap), disk), true)
+    }
+
+    fn assert_slot_rows(be: &dyn Backend, cfg: &Config, kv: &SeamKv, n: usize) {
+        for l in 0..cfg.n_layer {
+            for side in 0..2 {
+                let want: Vec<u8> = (0..n).flat_map(|r| row_data(l, side, r)).collect();
+                assert_eq!(
+                    read_side(be, cfg, kv, l, side, 0..n),
+                    want,
+                    "layer {l} side {side}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_block_evicted_from_ram_restores_from_disk_across_a_restart() {
+        let be = infr_cpu::CpuBackend::new();
+        let cfg = slot_cfg(0);
+        let dir = temp_dir();
+        let path = dir.path().join("kv.redb");
+        let key = 0x99u64;
+        let src = filled_slot(&be, &cfg, false, 300);
+        let cap = block_bytes(&cfg);
+        {
+            let mut s = disk_cache(&path, cap, key);
+            assert_eq!(s.capture(&be, &cfg, &src, 300).unwrap(), 300);
+            let ids = s.matched(&src.cached).1;
+            assert_eq!(ids.len(), 3);
+            assert!(
+                !s.store.fast().contains(ids[0]),
+                "RAM dropped the first block"
+            );
+            assert!(
+                s.store.slow().contains(ids[0]),
+                "disk holds the first block"
+            );
+            assert!(s.store.fast().contains(ids[2]), "RAM kept the tail");
+
+            let mut dst = SeamKv::for_test(&be, &cfg, 1024, false, 56, DType::F16).unwrap();
+            assert_eq!(s.restore(&be, &cfg, &mut dst, &src.cached).unwrap(), 300);
+            assert_slot_rows(&be, &cfg, &dst, 300);
+        }
+        {
+            // The restart path: the index comes back from extents and metas alone, and the
+            // restore above moved every block through disk, so all three are there.
+            let mut s = disk_cache(&path, cap, key);
+            assert_eq!(s.index.len(), 3);
+            assert_eq!(
+                s.store.slow().block_reads(),
+                0,
+                "index loaded without block reads"
+            );
+            assert_eq!((s.k_fmt, s.v_fmt), (DType::F16, DType::F16));
+            let mut dst = SeamKv::for_test(&be, &cfg, 1024, false, 56, DType::F16).unwrap();
+            assert_eq!(s.restore(&be, &cfg, &mut dst, &src.cached).unwrap(), 300);
+            assert_slot_rows(&be, &cfg, &dst, 300);
+        }
+    }
+
+    /// A damaged extent is a cache miss, never a failed request: the block is dropped and the
+    /// prompt re-prefills.
+    #[test]
+    fn a_damaged_disk_extent_is_a_miss() {
+        use crate::seam::kv_tier::DISK_EXTENTS;
+
+        let be = infr_cpu::CpuBackend::new();
+        let cfg = slot_cfg(0);
+        let dir = temp_dir();
+        let path = dir.path().join("kv.redb");
+        let key = 0x77u64;
+        let src = filled_slot(&be, &cfg, false, 300);
+        let cap = block_bytes(&cfg);
+        let first = {
+            let mut s = disk_cache(&path, cap, key);
+            s.capture(&be, &cfg, &src, 300).unwrap();
+            let ids = s.matched(&src.cached).1;
+            assert!(
+                !s.store.fast().contains(ids[0]),
+                "the oldest block went to disk"
+            );
+            ids[0]
+        };
+        {
+            let db = redb::Database::create(&path).unwrap();
+            let txn = db.begin_write().unwrap();
+            {
+                let mut table = txn.open_table(DISK_EXTENTS).unwrap();
+                table.insert((key, first), b"not rows".as_slice()).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+
+        let mut s = disk_cache(&path, cap, key);
+        assert!(s.index.contains_key(&first), "the index still names it");
+        let mut dst = SeamKv::for_test(&be, &cfg, 1024, false, 56, DType::F16).unwrap();
+        assert_eq!(s.restore(&be, &cfg, &mut dst, &src.cached).unwrap(), 0);
+        assert!(dst.cached.is_empty());
+        assert!(!s.store.contains(first), "the damaged extent was dropped");
+        assert!(!s.index.contains_key(&first));
+    }
+
+    #[test]
+    fn a_ram_cache_with_a_tiny_budget_keeps_and_misses_the_right_blocks() {
+        let be = infr_cpu::CpuBackend::new();
+        let cfg = slot_cfg(0);
+        let a = filled_slot(&be, &cfg, false, 300);
+        let mut b = filled_slot(&be, &cfg, false, 300);
+        b.cached = tokens(4, 300);
+        let cap = block_bytes(&cfg);
+        let mut s: BlockCache<Tiered<RamKv, RamKv>> =
+            BlockCache::new(Tiered::new(RamKv::new(cap), RamKv::default()), true);
+        assert_eq!(s.capture(&be, &cfg, &a, 300).unwrap(), 300);
+        assert_eq!(s.capture(&be, &cfg, &b, 300).unwrap(), 300);
+        let a_ids = s.matched(&a.cached).1;
+        assert_eq!(a_ids.len(), 3);
+        assert!(
+            !s.store.fast().contains(a_ids[0]),
+            "the RAM tier dropped the first block"
+        );
+        assert!(s.store.slow().contains(a_ids[0]));
+
+        // What the tiers still hold restores, rows and all.
+        let mut dst = SeamKv::for_test(&be, &cfg, 1024, false, 56, DType::F16).unwrap();
+        assert_eq!(s.restore(&be, &cfg, &mut dst, &b.cached).unwrap(), 300);
+        assert_slot_rows(&be, &cfg, &dst, 300);
+
+        // A block gone from both tiers is a miss, not a half restore.
+        for id in a_ids {
+            s.store.remove(id).unwrap();
+        }
+        let mut dst = SeamKv::for_test(&be, &cfg, 1024, false, 56, DType::F16).unwrap();
+        assert_eq!(s.restore(&be, &cfg, &mut dst, &a.cached).unwrap(), 0);
+        assert!(dst.cached.is_empty());
     }
 }

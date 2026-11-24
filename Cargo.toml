@@ -80,10 +80,13 @@ base64 = "0.22"
 # under tokio and indicatif/console — a direct dep here costs nothing new.
 libc = "0.2"
 tokio = { version = "1", features = ["full"] }
-# The shared KV-prefix cold tier (`kv.store_url`): a sync client because the store's capture path
+# The shared KV-prefix lower tier (`kv.store_url`): a sync client because the store's capture path
 # runs on a blocking engine thread, where GLIDE's blocking layer (a shared Tokio runtime) would
-# panic. The `KvColdTier` trait keeps a GLIDE actor backend a drop-in later.
+# panic. `KvStore` keeps a GLIDE actor backend a drop-in later.
 redis = { version = "1.8", default-features = false, features = ["tls-rustls"] }
+# The disk tier behind `kv.store_file`: one embedded B-tree database whose pages a
+# budgeted, evicting cache can reuse.
+redb = "5.0"
 # Constant-time equality for the `serve` bearer-token check (`infr_server::authorize`). `str`'s
 # `==` bails on the first differing byte, which over a network is a byte-at-a-time timing oracle on
 # `INFR_API_KEY`; `subtle::ConstantTimeEq` is the purpose-built primitive (no_std, no deps, and its

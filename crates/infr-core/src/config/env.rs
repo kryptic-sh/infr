@@ -198,6 +198,7 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     p.kv.overflow_vram_mb = opt_mib(get, "INFR_KV_OVERFLOW_VRAM_MB");
     p.kv.overflow_reserve_mb = opt_mib(get, "INFR_KV_OVERFLOW_RESERVE_MB");
     p.kv.store_mb = opt_mib(get, "INFR_KV_STORE_MB");
+    p.kv.store_disk_mb = opt_mib(get, "INFR_KV_STORE_DISK_MB");
     p.kv.pool_mb = opt_mib(get, "INFR_KV_POOL_MB");
     p.kv.store_file = opt_path(get, "INFR_KV_STORE_FILE");
     p.kv.store_url = opt_text(get, "INFR_KV_STORE_URL");

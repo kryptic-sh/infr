@@ -30,8 +30,8 @@ mod sc;
 mod weights;
 mod wshape;
 
-pub(crate) use kv_store::{cold_tier_for, store_key, BlockCache};
-pub(crate) use kv_tier::RamKv;
+pub(crate) use kv_store::{lower_tier_for, store_key, BlockCache};
+pub(crate) use kv_tier::{Bounded, KvStore, RamKv, Tiered};
 pub(crate) use pool::{paged_layer, KvPool, PagedSlot, POOL_BLOCKS};
 pub use routing::Routing;
 pub(crate) use runner::generate_dense_backend;

@@ -154,6 +154,7 @@ knobs! {
     "INFR_KV_OVERFLOW_VRAM_MB"  => "kv.overflow_vram_mb",    Mib,         Ignored, "512",  migrated;
     "INFR_KV_OVERFLOW_RESERVE_MB" => "kv.overflow_reserve_mb", Mib,       Ignored, "128",  migrated;
     "INFR_KV_STORE_MB"          => "kv.store_mb",           Mib,         Ignored, "1024", migrated;
+    "INFR_KV_STORE_DISK_MB"     => "kv.store_disk_mb",      Mib,         Ignored, "4096", migrated;
     "INFR_KV_POOL_MB"           => "kv.pool_mb",            Mib,         Ignored, "1024", migrated;
     "INFR_KV_STORE_FILE"        => "kv.store_file",         Path,        Ignored, "",     migrated;
     "INFR_KV_STORE_URL"         => "kv.store_url",          Text,        Ignored, "",     migrated;

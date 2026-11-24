@@ -46,11 +46,13 @@ extent.
 
 **Capability traits** extend it where a store can do more:
 
-- `DeviceStore: KvStore` exposes its backend and buffers, which gives `copy` a
-  device-to-device path, so `seed_from`, `import_linear` and `copy_tail` keep their
-  `copy_buffer_at` speed;
 - `BudgetedStore: KvStore` reports bytes used and evicts the least-recently-used extent,
   which is what the tiering below needs.
+
+A `DeviceStore`/`copy` pair was proposed for the same slot and is not built: `DeviceKv` is the only
+device store, and the three prefix copies that could have used it keep their own because `seed_from`
+must go through Vulkan's planar-aware `copy_kv_prefix`, while `import_linear` and `copy_tail` move
+pool pages and have no `SeamKv` to wrap.
 
 **Combinators** wrap stores and implement `KvStore` themselves:
 
@@ -88,10 +90,11 @@ from a hole.
 - **P1** (done, `959b0864`) `RowLayout` and the generic row copies; rewrite the store and pool callers. No
   behavior change. Row ops refuse a format whose rows do not pack back to back (`row_bytes`). Test: ring and page span splits, a CPU round trip through a wrapped ring, a
   linear-to-pages copy.
-- **P2** (done, `f7ef217a`) `KvStore`, `KvRows`, `DeviceStore`, `copy`, `DeviceKv` and `RamKv`;
-  `BlockCache` replaces `KvPrefixStore`. Fixed with it: a wrapped ring kept no rows for the block
-  straddling its window, so a restore left the rows attention reads unwritten, and residency came
-  from `cached.len()` rather than the rows a chain wrote past it.
+- **P2** (done, `f7ef217a`) `KvStore`, `KvRows`, `DeviceKv` and `RamKv`; `BlockCache` replaces
+  `KvPrefixStore`. Fixed with it: a wrapped ring kept no rows for the block straddling its window,
+  so a restore left the rows attention reads unwritten, and residency came from `cached.len()`
+  rather than the rows a chain wrote past it. The `DeviceStore`/`copy` pair was dropped once
+  `Paged<S>` was: it had no second implementor.
 - **P3** (done, `7d471b44`) `BudgetedStore`, `Tiered`, `Bounded`, `DiskKv` (redb, `Durability::None`
   plus one flush on drop) and `RedisKv` replace `KvColdTier` and the journal file; the index moves
   into per-extent metas. Test: demote and promote through two stores; a block evicted from RAM

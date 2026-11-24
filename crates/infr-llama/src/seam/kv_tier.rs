@@ -17,7 +17,7 @@ use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinitio
 
 use super::{
     kv_row_elems,
-    rows::{copy_rows, read_rows, row_bytes, write_rows, RowLayout},
+    rows::{read_rows, row_bytes, write_rows, RowLayout},
     weights::{RecurrentSnap, SeamKv},
 };
 use crate::Config;
@@ -449,11 +449,6 @@ pub(crate) trait KvStore: Send {
         let _ = id;
         None
     }
-
-    /// This store as a device store, which lets [`copy`] stay on the device.
-    fn as_device(&self) -> Option<&dyn DeviceStore> {
-        None
-    }
 }
 
 /// The formats blob's meta entry. No extent may use this id.
@@ -498,10 +493,6 @@ impl<S: KvStore + ?Sized> KvStore for Box<S> {
     fn host(&self, id: u64) -> Option<&KvRows> {
         (**self).host(id)
     }
-
-    fn as_device(&self) -> Option<&dyn DeviceStore> {
-        (**self).as_device()
-    }
 }
 
 /// An extent taken out of a budgeted store, with the side metadata that belonged to it.
@@ -522,7 +513,7 @@ pub(crate) trait BudgetedStore: KvStore {
     fn take_lru(&mut self) -> Option<Taken>;
 }
 
-/// One layer of a device store: its buffers, formats and where its rows sit.
+/// One layer of a device slot: its buffers, formats and where its rows sit.
 pub(crate) struct DeviceLayer<'a> {
     pub(crate) k: &'a dyn Buffer,
     pub(crate) v: &'a dyn Buffer,
@@ -534,85 +525,6 @@ pub(crate) struct DeviceLayer<'a> {
     pub(crate) layout: Box<dyn RowLayout + 'a>,
     /// The oldest row still resident; older rows were recycled by a ring.
     pub(crate) oldest: usize,
-}
-
-/// A store whose rows live in device buffers.
-pub(crate) trait DeviceStore: KvStore {
-    fn backend(&self) -> &dyn Backend;
-    fn n_layer(&self) -> usize;
-    /// Layer `l`, or `None` for a layer whose state travels in the snapshot.
-    fn layer(&self, l: usize) -> Option<DeviceLayer<'_>>;
-}
-
-/// Copy extent `src_id`'s rows `rows` into extent `dst_id` at the same rows. Two device stores on
-/// one backend copy on the device; anything else goes through host memory. `Ok(false)` when `src`
-/// lacks the extent. A paged destination must own the pages it receives.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn copy(
-    src: &mut dyn KvStore,
-    src_id: u64,
-    dst: &mut dyn KvStore,
-    dst_id: u64,
-    rows: Range<usize>,
-) -> Result<bool> {
-    if !src.contains(src_id) {
-        return Ok(false);
-    }
-    if let (Some(s), Some(d)) = (src.as_device(), dst.as_device()) {
-        if std::ptr::addr_eq(s.backend(), d.backend()) {
-            copy_on_device(s, d, rows.clone())?;
-            let mut state = KvRows::default();
-            src.get(src_id, rows.end..rows.end, &mut state)?;
-            if state.snap.is_some() {
-                dst.put(dst_id, rows.end, state)?;
-            }
-            return Ok(true);
-        }
-    }
-    let mut buf = KvRows::default();
-    if !src.get(src_id, rows.clone(), &mut buf)? {
-        return Ok(false);
-    }
-    dst.put(dst_id, rows.start, buf)?;
-    Ok(true)
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-fn copy_on_device(s: &dyn DeviceStore, d: &dyn DeviceStore, rows: Range<usize>) -> Result<()> {
-    ensure!(
-        s.n_layer() == d.n_layer(),
-        "kv copy between {} and {} layers",
-        s.n_layer(),
-        d.n_layer()
-    );
-    let be = s.backend();
-    for l in 0..s.n_layer() {
-        let (a, b) = match (s.layer(l), d.layer(l)) {
-            (Some(a), Some(b)) => (a, b),
-            (None, None) => continue,
-            _ => bail!("kv copy: layer {l} keeps rows on one side only"),
-        };
-        ensure!(
-            (a.k_fmt, a.v_fmt, a.k_row, a.v_row) == (b.k_fmt, b.v_fmt, b.k_row, b.v_row),
-            "kv copy: layer {l} formats differ"
-        );
-        let from = rows.start.max(a.oldest).min(rows.end);
-        let span = from..rows.end;
-        copy_rows(
-            be,
-            a.k,
-            &*a.layout,
-            b.k,
-            &*b.layout,
-            a.k_fmt,
-            a.k_row,
-            span.clone(),
-        )?;
-        if a.v_row > 0 {
-            copy_rows(be, a.v, &*a.layout, b.v, &*b.layout, a.v_fmt, a.v_row, span)?;
-        }
-    }
-    Ok(())
 }
 
 /// One slot's KV buffers as a store holding the single extent `id`, whose rows are the slot's
@@ -747,20 +659,14 @@ impl KvStore for DeviceKv<'_> {
         id == self.id
     }
 
-    fn as_device(&self) -> Option<&dyn DeviceStore> {
-        Some(self)
+    fn host(&self, id: u64) -> Option<&KvRows> {
+        let _ = id;
+        None
     }
 }
 
-impl DeviceStore for DeviceKv<'_> {
-    fn backend(&self) -> &dyn Backend {
-        self.be
-    }
-
-    fn n_layer(&self) -> usize {
-        self.cfg.n_layer
-    }
-
+impl DeviceKv<'_> {
+    /// Layer `l`'s buffers and layout, or `None` for a layer whose state travels in the snapshot.
     fn layer(&self, l: usize) -> Option<DeviceLayer<'_>> {
         if self.cfg.is_recurrent_layer(l) {
             return None;
@@ -1093,10 +999,6 @@ impl<S: BudgetedStore> KvStore for Bounded<S> {
 
     fn host(&self, id: u64) -> Option<&KvRows> {
         self.inner.host(id)
-    }
-
-    fn as_device(&self) -> Option<&dyn DeviceStore> {
-        self.inner.as_device()
     }
 }
 
@@ -1664,8 +1566,10 @@ mod tests {
         kv
     }
 
+    /// A whole extent moves into a slot and back out unchanged, which is what a restore and a
+    /// capture do to it.
     #[test]
-    fn copy_stays_on_the_device_or_goes_through_the_host() {
+    fn a_device_slot_round_trips_an_extent() {
         let be = infr_cpu::CpuBackend::new();
         let cfg = cfg();
         let src = slot(&be, &cfg, 100);
@@ -1674,24 +1578,17 @@ mod tests {
             DeviceKv::new(1, &be, &cfg, &src),
             DeviceKv::new(2, &be, &cfg, &dst),
         );
-        assert!(!copy(&mut a, 9, &mut b, 2, 0..10).unwrap());
-        assert!(copy(&mut a, 1, &mut b, 2, 10..60).unwrap());
         let mut want = KvRows::default();
-        a.get(1, 10..60, &mut want).unwrap();
+        assert!(a.get(1, 10..60, &mut want).unwrap());
+        b.put(2, 10, want.clone()).unwrap();
         let mut got = KvRows::default();
-        b.get(2, 10..60, &mut got).unwrap();
+        assert!(b.get(2, 10..60, &mut got).unwrap());
         assert_eq!(got.layers, want.layers);
         let mut head = KvRows::default();
         b.get(2, 0..10, &mut head).unwrap();
         assert!(
             head.layers[0].k.iter().all(|&x| x == 0),
-            "rows before the copy"
+            "rows before the write"
         );
-
-        let mut ram = RamKv::default();
-        assert!(copy(&mut a, 1, &mut ram, 5, 10..60).unwrap());
-        let mut back = KvRows::default();
-        assert!(ram.get(5, 10..60, &mut back).unwrap());
-        assert_eq!(back.layers, want.layers);
     }
 }

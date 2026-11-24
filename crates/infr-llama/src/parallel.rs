@@ -285,7 +285,7 @@ impl ParallelSeam {
         let scope = crate::seam::PlacementScope::enter(pins.clone());
         let max_ctx = model.vulkan_slot_ctx(&vk, n_slots, want_ctx)?;
         // One store per `[[kv.tiers]]` entry, fastest first, with Redis above it when asked for.
-        let store_key = crate::seam::store_key(model.config());
+        let store_key = crate::seam::store_key(&model);
         let store = crate::seam::prefix_store_for(model.cfg(), store_key);
         let enabled = store.is_some();
         let store: Box<dyn crate::seam::KvStore> =

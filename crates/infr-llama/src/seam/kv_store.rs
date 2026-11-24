@@ -16,7 +16,7 @@
 use crate::Config;
 use anyhow::{anyhow, Result};
 use infr_core::backend::Backend;
-use infr_core::DType;
+use infr_core::{DType, Metadata, TensorInfo};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -66,10 +66,21 @@ fn block_id(prev: u64, tokens: &[u32]) -> u64 {
     h.0
 }
 
-/// Identity of the model a store's blocks belong to: the geometry that shapes every row, plus the
-/// context and vocabulary. Blocks under another key are never loaded.
-pub(crate) fn store_key(cfg: &Config) -> u64 {
+/// Version of the [`store_key`] derivation; bump it so blocks keyed the old way become unreachable.
+const KEY_NAMESPACE_VERSION: u64 = 2;
+
+/// Namespace of a model's blocks: geometry, name, quantization and every tensor's name/dtype/shape;
+/// two files agreeing on all of those yet holding different weights still collide.
+pub(crate) fn store_key(model: &super::model::SeamModel) -> u64 {
+    let w = model.weights();
+    weights_key(model.config(), w.metadata(), w.tensors())
+}
+
+/// The pure part of [`store_key`]: only file metadata and the tensor table, nothing host-specific,
+/// so byte-identical files on two hosts share one namespace.
+fn weights_key(cfg: &Config, meta: &Metadata, tensors: &[TensorInfo]) -> u64 {
     let mut h = Fnv::new();
+    h.bytes(&KEY_NAMESPACE_VERSION.to_le_bytes());
     for v in [
         cfg.n_layer,
         cfg.n_embd,
@@ -83,7 +94,42 @@ pub(crate) fn store_key(cfg: &Config) -> u64 {
     ] {
         h.bytes(&(v as u64).to_le_bytes());
     }
+    // A presence tag before each optional field keeps an absent key distinct from any value.
+    for key in ["general.architecture", "general.name"] {
+        match meta.str(key) {
+            Some(s) => {
+                h.bytes(&[1]);
+                hash_str(&mut h, s);
+            }
+            None => h.bytes(&[0]),
+        }
+    }
+    for key in ["general.file_type", "general.quantization_version"] {
+        match meta.u64(key) {
+            Some(v) => {
+                h.bytes(&[1]);
+                h.bytes(&v.to_le_bytes());
+            }
+            None => h.bytes(&[0]),
+        }
+    }
+    h.bytes(&(tensors.len() as u64).to_le_bytes());
+    for t in tensors {
+        hash_str(&mut h, &t.name);
+        // The variant name, not its discriminant: inserting a new DType must not move every key.
+        hash_str(&mut h, &format!("{:?}", t.dtype));
+        h.bytes(&(t.shape.len() as u64).to_le_bytes());
+        for d in &t.shape {
+            h.bytes(&(*d as u64).to_le_bytes());
+        }
+    }
     h.0
+}
+
+/// A length-prefixed string, so adjacent fields can't run into each other.
+fn hash_str(h: &mut Fnv, s: &str) {
+    h.bytes(&(s.len() as u64).to_le_bytes());
+    h.bytes(s.as_bytes());
 }
 
 /// A KV dtype's tag in the formats blob.
@@ -913,6 +959,7 @@ mod tests {
     use super::*;
     use crate::seam::kv_tier::{decode_rows, encode_rows, BudgetedStore, LayerRows};
     use crate::seam::rows::{read_rows, write_rows};
+    use infr_core::MetaValue;
     use std::path::Path;
 
     type Cache = BlockCache<RedbKv>;
@@ -1859,5 +1906,69 @@ mod tests {
         let mut dst = SeamKv::for_test(&be, &cfg, 1024, false, 56, DType::F16).unwrap();
         assert_eq!(s.restore(&be, &cfg, &mut dst, &a.cached).unwrap(), 0);
         assert!(dst.cached.is_empty());
+    }
+
+    /// A small model's file metadata and tensor table.
+    fn key_inputs() -> (Config, Metadata, Vec<TensorInfo>) {
+        let mut meta = Metadata::default();
+        let kv = &mut meta.kv;
+        kv.insert(
+            "general.architecture".into(),
+            MetaValue::Str("llama".into()),
+        );
+        kv.insert("general.name".into(), MetaValue::Str("base".into()));
+        kv.insert("general.file_type".into(), MetaValue::U64(7));
+        kv.insert("general.quantization_version".into(), MetaValue::U64(2));
+        let tensor = |name: &str, dtype, shape: &[usize]| TensorInfo {
+            name: name.into(),
+            shape: shape.to_vec(),
+            dtype,
+            offset: 0,
+            nbytes: 0,
+        };
+        let tensors = vec![
+            tensor("token_embd.weight", DType::Q8_0, &[64, 256]),
+            tensor("blk.0.attn_q.weight", DType::Q8_0, &[64, 64]),
+            tensor("output_norm.weight", DType::F32, &[64]),
+        ];
+        (slot_cfg(0), meta, tensors)
+    }
+
+    #[test]
+    fn weights_key_tracks_the_weights_not_just_the_geometry() {
+        let (cfg, meta, tensors) = key_inputs();
+        let base = weights_key(&cfg, &meta, &tensors);
+        assert_eq!(base, weights_key(&cfg, &meta.clone(), &tensors.clone()));
+
+        let mut c = cfg.clone();
+        c.n_embd += 1;
+        assert_ne!(base, weights_key(&c, &meta, &tensors));
+
+        let mut m = meta.clone();
+        m.kv.insert("general.name".into(), MetaValue::Str("finetune".into()));
+        assert_ne!(base, weights_key(&cfg, &m, &tensors));
+
+        let mut m = meta.clone();
+        m.kv.insert("general.file_type".into(), MetaValue::U64(15));
+        assert_ne!(base, weights_key(&cfg, &m, &tensors));
+
+        let mut t = tensors.clone();
+        t[1].dtype = DType::Q4K;
+        assert_ne!(base, weights_key(&cfg, &meta, &t));
+
+        let mut t = tensors.clone();
+        t[1].shape = vec![64, 128];
+        assert_ne!(base, weights_key(&cfg, &meta, &t));
+    }
+
+    #[test]
+    fn weights_key_without_optional_metadata() {
+        let (cfg, meta, tensors) = key_inputs();
+        let mut m = meta.clone();
+        m.kv.remove("general.name");
+        m.kv.remove("general.quantization_version");
+        let bare = weights_key(&cfg, &m, &tensors);
+        assert_ne!(bare, weights_key(&cfg, &meta, &tensors));
+        assert_eq!(bare, weights_key(&cfg, &m, &tensors));
     }
 }

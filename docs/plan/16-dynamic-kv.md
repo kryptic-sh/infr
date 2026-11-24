@@ -64,10 +64,10 @@ downloads through that map.
 
 **Status (2026-11-24):** P1–P6 shipped. A paged session advertises the pool's token
 fit as its window instead of `fit / slots`, the pool is sized from that fit (or
-`kv.pool_mb`), and slots hold only the pages they use. `kv.store_file` journals
-captured blocks to disk and `kv.store_url` shares them through Redis/Valkey (the
-`KvColdTier` trait), so a restart restores a thread's prefix and prefills only
-its tail. The activation reserve still prices the whole window, so a short request preflights at the window's chunk height rather than a
+`kv.pool_mb`), and slots hold only the pages they use. The prefix store behind it is
+the `[[kv.tiers]]` list ([plan 18](18-kv-tiers.md)): a redb file or memory tier and,
+optionally, a shared Redis/Valkey tier, so a restart restores a thread's prefix and
+prefills only its tail. The activation reserve still prices the whole window, so a short request preflights at the window's chunk height rather than a
 taller one.
 
 - **P1 — Table-resolved stores.** Remove the `row_base` assumption from the

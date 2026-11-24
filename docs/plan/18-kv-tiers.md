@@ -111,10 +111,12 @@ from a hole.
 - **P4** (done, `39d89c19`) capture the whole slot after a generation, not only the prompt. A
   recurrent model keeps its prompt only: it resumes from a snapshot, and prefill takes those at
   prompt boundaries.
-- **P5** `Paged<S>` is dropped (see above). Parked slots ship as they are: the retry loop around
-  restore and the runner, and `park_idle` capturing the victim before `reset`. Test: two
-  conversations in a one-conversation pool both resume with `cached_tokens > 0`, plus the
-  panic-safety of the park reservation.
+- **P5** (done, `1b608629` and `47f07c7f`) `Paged<S>` is dropped (see above). Parked slots ship as
+  they are: the retry loop around restore and the runner, and `park_idle` capturing the victim
+  before `reset`; the second commit keeps the page map honest when a reservation is refused, so a
+  retry does not see pages the device table never got. Test: two conversations in a
+  one-conversation pool both resume with `cached_tokens > 0`, plus the panic-safety of the park
+  reservation.
 - **P6** (done, `06246237`) the store list: `[[kv.tiers]]` entries replace `kv.store_mb` /
   `kv.store_path` / `kv.store_url`, `DiskKv` becomes `RedbKv` with a file or in-memory database, and
   `RamKv` goes — one store with a location instead of a RAM tier in front of a disk tier. Fixed

@@ -32,6 +32,15 @@ The standing goal: any model size on any hardware, disk to DRAM to VRAM.
 | 06    | [Pager eviction: cost and policy](06-pager-eviction.md)                               | steps 1–2 done |
 | 08    | [A streamed model that fits runs at resident speed](08-streamed-at-resident-speed.md) | steps 0–4 done |
 
+## KV cache and serving
+
+| Phase | What                                                                               | Status                                                                  |
+| ----- | ---------------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
+| 14    | [Allocate the `kv.paged` pool in the cold KV init](14-kv-paged-boot.md)             | done                                                                    |
+| 15    | [`/v1/models` reports the served context window](15-models-context.md)              | done                                                                    |
+| 16    | [Dynamic KV: one page pool, allocated per request](16-dynamic-kv.md)                | P1–P6 done; the activation reserve still prices the whole window (B238) |
+| 18    | [KV tiers behind traits](18-kv-tiers.md)                                           | shipped                                                                  |
+
 ## Numerics
 
 Priority: phase 11 goes ahead of the rest of phase 10, which needs the fixed CPU
@@ -47,6 +56,7 @@ reference to judge tuned values against.
 | ----- | ----------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
 | 10    | [Kernels with per-device tunable parameters](10-tunable-kernels.md), one tuning table           | S1 done                                                                                                                                             |
 | 12    | [Vulkan devices without matrix units or fast int8 dot (GCN class)](12-low-capability-vulkan.md) | S0 answered by the reporter; S1 and S2 done; the fork's PRs 105 to 107 (the subjects of S5, S3 and S7) merged, their review pending; S4 and S6 open |
+| 17    | [Wave64 prefill attention for GCN](17-wave64-prefill-attention.md)                               | P0 and P1 done; P2 (the register-tiled `attn_fa_w64`) and P3 open                                                                                  |
 
 ## Caps, refusals and open decisions
 

@@ -835,7 +835,8 @@ fn scan_file_for_keys(path: &Path, out: &mut Vec<String>) {
 ///   when it is read.
 /// * `INFR_TEST_GGUF` / `INFR_TEST_MODEL` / `INFR_LLAMA_DIFFUSION_CLI` — test/dev fixtures that
 ///   point at files on disk, deliberately left on the environment; `INFR_TEST_REQUIRE_MODELS`,
-///   which makes a test whose model is missing fail instead of skip (CI's golden jobs).
+///   which makes a test whose model is missing fail instead of skip (CI's golden jobs);
+///   `INFR_TEST_REDIS_URL`, the server an ignored Redis cold-tier test talks to.
 ///
 /// `RAYON_NUM_THREADS` is not an `INFR_*` knob and is not in scope: `infr-cli` still PUBLISHES it,
 /// because rayon's global pool has no other input.
@@ -846,6 +847,7 @@ fn no_infr_env_reads_outside_the_config_layer() {
         "INFR_TEST_GGUF",
         "INFR_TEST_MODEL",
         "INFR_TEST_REQUIRE_MODELS",
+        "INFR_TEST_REDIS_URL",
         "INFR_LLAMA_DIFFUSION_CLI",
     ];
 
@@ -1191,6 +1193,9 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_KV_SLOTS",
         "INFR_KV_STORE_MB",
         "INFR_KV_PAGED",
+        "INFR_KV_POOL_MB",
+        "INFR_KV_STORE_FILE",
+        "INFR_KV_STORE_URL",
         "INFR_KV_TYPE_K",
         "INFR_KV_TYPE_V",
         "INFR_MTP",

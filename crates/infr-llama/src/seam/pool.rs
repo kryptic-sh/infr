@@ -323,22 +323,49 @@ impl SlotMap {
 
     /// Share the first `pages` logical pages of `src`: the prefix both slots hold. Callers only
     /// pass whole pages; a prefix under one page is re-prefilled instead of shared.
+    ///
+    /// Needs no free page: each logical page takes a reference on the source's page and gives
+    /// back whatever page this map held there. All or nothing — a source shorter than `pages`
+    /// refuses before anything changes.
     pub(crate) fn share_prefix(&mut self, src: &SlotMap, pages: usize) -> AResult<()> {
-        let pages = pages.min(src.len()).min(self.pool.pps);
-        self.grow(pages)?;
+        let pages = pages.min(self.pool.pps);
+        if src.len() < pages {
+            return Err(anyhow!(
+                "a {pages}-page prefix shared from a map holding {} pages",
+                src.len()
+            ));
+        }
         let mut ledger = self.pool.ledger().lock().expect("page-pool lock");
-        for j in 0..pages {
-            let p = src.map[j];
-            if self.map[j] == p {
-                continue;
+        for (j, &p) in src.map[..pages].iter().enumerate() {
+            match self.map.get_mut(j) {
+                Some(own) if *own == p => {}
+                Some(own) => {
+                    ledger.share(p);
+                    if *own != 0 {
+                        ledger.release(*own);
+                    }
+                    *own = p;
+                }
+                None => {
+                    ledger.share(p);
+                    self.map.push(p);
+                }
             }
-            ledger.share(p);
-            if self.map[j] != 0 {
-                ledger.release(self.map[j]);
-            }
-            self.map[j] = p;
         }
         Ok(())
+    }
+
+    /// Give back every page from logical page `pages` on, keeping the prefix before it.
+    pub(crate) fn truncate(&mut self, pages: usize) {
+        if self.map.len() <= pages {
+            return;
+        }
+        let mut ledger = self.pool.ledger().lock().expect("page-pool lock");
+        for p in self.map.drain(pages..) {
+            if p != 0 {
+                ledger.release(p);
+            }
+        }
     }
 
     /// Release every page and start over empty. The rows are left alone — a caller that resets
@@ -529,6 +556,14 @@ impl PagedSlot {
         Ok(())
     }
 
+    /// Move the page map out, references and all, and leave this slot an empty one. The device
+    /// table is refreshed on the next forward.
+    pub(crate) fn take_map(&mut self) -> SlotMap {
+        let empty = SlotMap::take(self.map.pool());
+        self.stale = true;
+        std::mem::replace(&mut self.map, empty)
+    }
+
     /// Drop every page without a device copy; the table is refreshed on the next forward.
     pub(crate) fn release_pages(&mut self) {
         self.map.unshare_all();
@@ -560,6 +595,8 @@ impl PagedSlot {
         let mut split = 0;
         for j in first_page..=last_page {
             if !self.map.is_private(j) {
+                // A refusal on a later page leaves the map ahead of the device table.
+                self.stale = true;
                 self.map.cow_page(be, j)?;
                 split += 1;
             }
@@ -667,6 +704,57 @@ mod tests {
         );
         src.unshare_all();
         assert_eq!(pool.pages.lock().unwrap().refs(src_page), 0);
+    }
+
+    /// Adopting a prefix takes references, not pages: it succeeds with one page free, hands back
+    /// the page the adopter held, and dropping the adopter releases only its own shares.
+    #[test]
+    fn adopting_a_prefix_needs_no_free_page() {
+        let be = cpu();
+        let c = cfg();
+        let pool = KvPool::new(&be, &c, 1536, DType::F16, DType::F16, 4).unwrap();
+        let mut src = SlotMap::take(&pool);
+        src.grow(2).unwrap();
+        let (a, b) = (src.page(0), src.page(1));
+        assert_eq!(
+            pool.free_pages(),
+            1,
+            "zero page, two source pages, one free"
+        );
+
+        let mut dst = SlotMap::take(&pool);
+        dst.grow(1).unwrap();
+        let own = dst.page(0);
+        assert_eq!(pool.free_pages(), 0);
+        dst.share_prefix(&src, 2).unwrap();
+        assert_eq!((dst.page(0), dst.page(1)), (a, b));
+        let refs = |p| pool.pages.lock().unwrap().refs(p);
+        assert_eq!((refs(a), refs(b), refs(own)), (2, 2, 0));
+        assert_eq!(pool.free_pages(), 1, "the adopter's own page went back");
+
+        let mut empty = SlotMap::take(&pool);
+        empty.share_prefix(&src, 2).unwrap();
+        assert_eq!((refs(a), refs(b)), (3, 3));
+        assert!(
+            empty.share_prefix(&src, 3).is_err(),
+            "a source shorter than the prefix must refuse"
+        );
+        assert_eq!(
+            (refs(a), refs(b), empty.len()),
+            (3, 3, 2),
+            "a refusal changes nothing"
+        );
+
+        drop(dst);
+        drop(empty);
+        assert_eq!(
+            (refs(a), refs(b)),
+            (1, 1),
+            "only the adopters' shares were released"
+        );
+        assert_eq!(pool.free_pages(), 1);
+        drop(src);
+        assert_eq!(pool.free_pages(), 3);
     }
 
     /// `make_private` splits exactly the pages covering `[start, end)` — the range a forward is

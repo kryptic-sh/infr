@@ -318,10 +318,22 @@ impl ParallelSeam {
             .map(|p| (p.used_pages(), p.free_pages()))
     }
 
-    /// The prefix cache's `(restores, restored tokens, captures)`.
+    /// The prefix cache's `(restores, restored tokens, captures)`. A restore counts here only when
+    /// it read rows out of the store.
     pub fn kv_store_stats(&self) -> (u64, u64, u64) {
         let store = self.store.lock().expect("kv store lock");
         (store.restores, store.restored_tokens, store.captures)
+    }
+
+    /// Parked page maps: `(resumes that adopted resident pages, tokens those pages held, residents
+    /// spilled under page pressure)`. Zero unless `kv.paged` built a pool.
+    pub fn kv_resident_stats(&self) -> (u64, u64, u64) {
+        let store = self.store.lock().expect("kv store lock");
+        (
+            store.resident_hits,
+            store.resident_tokens,
+            store.resident_spills,
+        )
     }
 
     /// Materialize slot 0 (weights + KV + pipelines) with a throwaway generation, then fork the
@@ -557,10 +569,11 @@ impl ParallelSeam {
         self.model.render_chat_messages(messages)
     }
 
-    /// Give one idle slot's pages back to the pool, capturing what it held first, so a request that
-    /// hit the page budget can retry. Picks the least recently used idle slot with pages and never
-    /// waits on a busy one: two requests that each hold pages would wait on each other forever.
-    /// `false` when no idle slot has pages left to give.
+    /// Park one idle slot so a request that hit the page budget can retry: capture what it held,
+    /// then keep its whole pages as a resident the retry can adopt or spill, and reset the slot.
+    /// Picks the least recently used idle slot with pages and never waits on a busy one: two
+    /// requests that each hold pages would wait on each other forever. `false` when no idle slot
+    /// has pages left to give.
     fn park_idle(&self, exclude: usize, req: &RequestCtx) -> Result<bool> {
         let p = self.pool.lock().expect("pool poisoned");
         let victim = (0..p.slots.len())
@@ -588,19 +601,20 @@ impl ParallelSeam {
         drop(p);
 
         // The capture outlives no lock but the store's, and it takes a turn on the baton like any
-        // other submit. A failed capture costs only the resume, so the pages go back either way.
+        // other submit. A failed capture costs only the resume: the slot is parked either way.
         let _gp = req.gate_pass();
-        let captured = res.kv.as_ref().map_or(Ok(0), |kv| {
-            let upto = crate::seam::capture_upto(self.model.config(), kv, kv.cached_len());
-            self.store
-                .lock()
-                .map_err(|_| anyhow!("kv store lock poisoned"))?
-                .capture(&self.vk, self.model.config(), kv, upto)
-        });
-        if let Err(e) = &captured {
-            tracing::warn!(error = %e, "kv slots: park capture failed; the slot re-prefills");
-        }
         if let Some(kv) = res.kv.as_mut() {
+            let cfg = self.model.config();
+            let mut store = self
+                .store
+                .lock()
+                .map_err(|_| anyhow!("kv store lock poisoned"))?;
+            let upto = crate::seam::capture_upto(cfg, kv, kv.cached_len());
+            if let Err(e) = store.capture(&self.vk, cfg, kv, upto) {
+                tracing::warn!(error = %e, "kv slots: park capture failed; the slot re-prefills");
+            }
+            store.retain(cfg, kv);
+            drop(store);
             kv.reset();
         }
         let mut p = self.pool.lock().expect("pool poisoned");
@@ -626,6 +640,36 @@ impl ParallelSeam {
         if let Some(kv) = guard.kv.as_mut() {
             kv.reset();
         }
+        Ok(true)
+    }
+
+    /// Make room for a request the page pool refused: park an idle slot, or failing that spill
+    /// resident pages until the refused allocation would fit. `false` when nothing was left to
+    /// give, and the request fails with `e`.
+    fn relieve(
+        &self,
+        guard: &mut SlotGuard<'_>,
+        req: &RequestCtx,
+        parks: &mut usize,
+        e: &anyhow::Error,
+    ) -> Result<bool> {
+        if self.park_for_retry(guard, req, parks)? {
+            return Ok(true);
+        }
+        let short = e
+            .downcast_ref::<infr_core::paging::KvPagesExhausted>()
+            .map_or(1, |x| {
+                x.need.saturating_sub(x.allocated).saturating_sub(x.free)
+            });
+        let spilled = self
+            .store
+            .lock()
+            .map_err(|_| anyhow!("kv store lock poisoned"))?
+            .spill(short.max(1));
+        if spilled == 0 {
+            return Ok(false);
+        }
+        reset_slot(guard);
         Ok(true)
     }
 
@@ -668,7 +712,7 @@ impl ParallelSeam {
                     Ok(0) => {}
                     Ok(n) => tracing::debug!(tokens = n, "kv store: restored a stored prefix"),
                     Err(e) if out_of_pages(&e) => {
-                        if !self.park_for_retry(&mut guard, req, &mut parks)? {
+                        if !self.relieve(&mut guard, req, &mut parks, &e)? {
                             reset_slot(&mut guard);
                             return Err(e);
                         }
@@ -676,6 +720,12 @@ impl ParallelSeam {
                     }
                     Err(e) => return Err(e),
                 }
+                // The run reserves its prompt and reply up front; pages residents hold for a
+                // parked conversation give way to it before it is refused.
+                self.store
+                    .lock()
+                    .map_err(|_| anyhow!("kv store lock poisoned"))?
+                    .make_room(kv, prompt_tokens.len().saturating_add(budget));
             }
             let run = crate::seam::generate_dense_vulkan_session(
                 &self.vk,
@@ -707,7 +757,7 @@ impl ParallelSeam {
                 // The pool ran out of pages before the first token: park an idle conversation and
                 // start again on what its pages freed.
                 Err(e) if out_of_pages(&e) && acc.is_empty() => {
-                    if !self.park_for_retry(&mut guard, req, &mut parks)? {
+                    if !self.relieve(&mut guard, req, &mut parks, &e)? {
                         reset_slot(&mut guard);
                         return Err(e);
                     }

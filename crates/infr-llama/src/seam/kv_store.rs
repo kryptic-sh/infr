@@ -25,8 +25,10 @@ use super::{
         decode_meta, encode_meta, Bounded, BudgetedStore, DeviceKv, Fnv, KvRows, KvStore, RedbKv,
         RedisKv, Tiered, FORMATS_META_ID,
     },
+    pool::{PagedSlot, SlotMap},
     weights::{RecurrentSnap, SeamKv},
 };
+use infr_vulkan::paged::PAGE_ROWS;
 
 /// Tokens per stored block. Smaller blocks share more (a 600-token system prompt with two
 /// different tails stores each half once) at the price of one download per new block.
@@ -34,6 +36,10 @@ pub(crate) const BLOCK_TOKENS: usize = 128;
 
 /// Below this many shared tokens the upload costs more than re-prefilling them.
 pub(crate) const MIN_PREFIX_TOKENS: usize = 256;
+
+/// Whole blocks in one KV page: a retained page covers exactly this many chained blocks.
+const BLOCKS_PER_PAGE: usize = PAGE_ROWS / BLOCK_TOKENS;
+const _: () = assert!(PAGE_ROWS.is_multiple_of(BLOCK_TOKENS));
 
 /// Rows a capture keeps: every row the slot wrote, so the reply is reusable too. A recurrent model
 /// resumes only from a snapshot, which prefill takes at prompt boundaries, so its reply rows would
@@ -148,6 +154,19 @@ struct Entry {
     bytes: usize,
     /// A recurrent-state snapshot rides at the block's end inside the same extent.
     snap: bool,
+    /// The store holds the block's extent. `false` for a block only a resident page map holds.
+    stored: bool,
+}
+
+/// A parked conversation's pages, kept in the pool instead of copied out: the first
+/// `map.len()` whole pages of the chain `blocks` names. A restore adopts them by reference.
+struct Resident {
+    map: SlotMap,
+    /// Chained ids of the full blocks the pages hold, from token 0.
+    blocks: Vec<u64>,
+    tokens: Vec<u32>,
+    /// LRU stamp; the oldest resident is spilled first.
+    tick: u64,
 }
 
 /// The prefix cache: a token index over content-addressed block extents in `S`.
@@ -164,9 +183,18 @@ pub(crate) struct BlockCache<S: KvStore> {
     /// The KV layouts the blocks were captured with; a dtype change invalidates every block.
     k_fmt: DType,
     v_fmt: DType,
+    /// Parked page maps, held in the pool until a restore adopts them or pressure spills them.
+    resident: Vec<Resident>,
+    tick: u64,
+    /// Restores that read rows from the store, and the tokens they read.
     pub(crate) restores: u64,
     pub(crate) restored_tokens: u64,
     pub(crate) captures: u64,
+    /// Restores that adopted a resident's pages, and the tokens those pages held.
+    pub(crate) resident_hits: u64,
+    pub(crate) resident_tokens: u64,
+    /// Residents given back to the pool under page pressure.
+    pub(crate) resident_spills: u64,
 }
 
 impl<S: KvStore> BlockCache<S> {
@@ -180,9 +208,14 @@ impl<S: KvStore> BlockCache<S> {
             enabled,
             k_fmt: DType::F16,
             v_fmt: DType::F16,
+            resident: Vec::new(),
+            tick: 0,
             restores: 0,
             restored_tokens: 0,
             captures: 0,
+            resident_hits: 0,
+            resident_tokens: 0,
+            resident_spills: 0,
         };
         if enabled {
             cache.load();
@@ -235,6 +268,7 @@ impl<S: KvStore> BlockCache<S> {
                                 tokens,
                                 bytes,
                                 snap,
+                                stored: true,
                             },
                         );
                     }
@@ -270,6 +304,7 @@ impl<S: KvStore> BlockCache<S> {
                 tokens,
                 bytes,
                 snap,
+                stored: true,
             },
         );
         self.write_meta(id)
@@ -306,7 +341,10 @@ impl<S: KvStore> BlockCache<S> {
     }
 
     fn drop_entry(&mut self, id: u64) {
-        if self.index.remove(&id).is_none() {
+        let Some(entry) = self.index.remove(&id) else {
+            return;
+        };
+        if !entry.stored {
             return;
         }
         if let Err(e) = self.store.remove(id) {
@@ -315,14 +353,23 @@ impl<S: KvStore> BlockCache<S> {
     }
 
     fn clear(&mut self) {
+        self.resident.clear();
         let ids: Vec<u64> = self.index.keys().copied().collect();
         for id in ids {
             self.drop_entry(id);
         }
     }
 
+    /// Whether the store holds block `id` with exactly `tokens`.
     fn find(&self, id: u64, tokens: &[u32]) -> bool {
-        self.index.get(&id).is_some_and(|e| e.tokens == tokens)
+        self.index
+            .get(&id)
+            .is_some_and(|e| e.stored && e.tokens == tokens)
+    }
+
+    /// Whether a resident page map holds block `id`.
+    fn resident_covers(&self, id: u64) -> bool {
+        self.resident.iter().any(|r| r.blocks.contains(&id))
     }
 
     /// Walk `prompt` block by block; return the tokens covered by the leading stored run and the
@@ -335,13 +382,16 @@ impl<S: KvStore> BlockCache<S> {
             let len = BLOCK_TOKENS.min(prompt.len() - n);
             let block = &prompt[n..n + len];
             id = block_id(id, block);
-            if !self.store.contains(id) {
+            let stored = self.store.contains(id);
+            if !stored && !self.resident_covers(id) {
                 self.index.remove(&id);
                 break;
             }
             let Some(entry) = self.index.get_mut(&id) else {
                 break;
             };
+            // The store evicted it while a resident kept its rows: the next capture stores it again.
+            entry.stored &= stored;
             if entry.tokens != block {
                 break;
             }
@@ -368,7 +418,7 @@ impl<S: KvStore> BlockCache<S> {
         kv: &mut SeamKv,
         prompt: &[u32],
     ) -> Result<usize> {
-        if !self.enabled() {
+        if !self.enabled() && self.resident.is_empty() {
             return Ok(0);
         }
         let (mut p, hits) = self.matched(prompt);
@@ -404,11 +454,19 @@ impl<S: KvStore> BlockCache<S> {
         if n < MIN_PREFIX_TOKENS {
             return Ok(0);
         }
+        // Whole pages a resident already holds are adopted in place; only the blocks past them
+        // are read from the store.
+        let adopt = self.resident_for(kv, prompt, &keep);
+        let first = adopt.map_or(0, |(_, pages)| pages * PAGE_ROWS);
+        let tail = adopt.map_or(0, |(_, pages)| pages * BLOCKS_PER_PAGE);
         let mut rows = KvRows::default();
-        for id in &keep {
+        let mut n = first;
+        for id in &keep[tail..] {
             let len = self.index[id].tokens.len();
             match self.store.get(*id, 0..len, &mut rows) {
-                Ok(true) => {}
+                Ok(true) => n += len,
+                // Adopted pages are a prefix on their own; the rest prefills.
+                Ok(false) if adopt.is_some() => break,
                 Ok(false) => return Ok(0),
                 Err(e) => {
                     // A damaged extent is a cache miss, never a failed request.
@@ -418,27 +476,179 @@ impl<S: KvStore> BlockCache<S> {
                 }
             }
         }
-        if let Some(p) = kv.paged.as_mut() {
-            p.make_private(be, 0, n)?;
-        }
         // Every row attention will read must be there: a window layer keeps only the newest rows
         // it has, and a restore that cannot fill that window must re-prefill instead.
         for l in 0..cfg.n_layer {
             if cfg.is_recurrent_layer(l) {
                 continue;
             }
-            let need = kv.row_layout(be, cfg, l).oldest_resident(n)..n;
-            if !need.is_empty() && !rows.layers.get(l).is_some_and(|r| r.covers(need.clone())) {
+            let need = kv.row_layout(be, cfg, l).oldest_resident(n).max(first)..n;
+            let held = need.start - first..need.end - first;
+            if !need.is_empty() && !rows.layers.get(l).is_some_and(|r| r.covers(held)) {
                 tracing::debug!(layer = l, need = ?need, "kv store: the stored blocks miss the window");
                 return Ok(0);
             }
         }
-        DeviceKv::new(SLOT, be, cfg, kv).put(SLOT, 0, rows)?;
+        if let (Some((i, pages)), Some(p)) = (adopt, kv.paged.as_mut()) {
+            p.map.share_prefix(&self.resident[i].map, pages)?;
+            p.stale = true;
+            self.tick += 1;
+            self.resident[i].tick = self.tick;
+            // The tail's pages may be the ones another resident holds.
+            self.spill(page_deficit(p, n));
+        }
+        if n > first {
+            if let Some(p) = kv.paged.as_mut() {
+                p.make_private(be, first, n)?;
+            }
+            DeviceKv::new(SLOT, be, cfg, kv).put(SLOT, first, rows)?;
+            self.restores += 1;
+            self.restored_tokens += (n - first) as u64;
+        }
+        if adopt.is_some() {
+            self.resident_hits += 1;
+            self.resident_tokens += first as u64;
+            tracing::debug!(
+                adopted = first,
+                read = n - first,
+                "kv store: resumed from resident pages"
+            );
+        }
         kv.written_end = n;
         kv.cached = prompt[..n].to_vec();
-        self.restores += 1;
-        self.restored_tokens += n as u64;
         Ok(n)
+    }
+
+    /// The resident holding the most whole pages of `keep`'s chain, and that page count. Only a
+    /// paged slot on the same pool can adopt.
+    fn resident_for(&self, kv: &SeamKv, prompt: &[u32], keep: &[u64]) -> Option<(usize, usize)> {
+        let pool = kv.paged.as_ref()?.map.pool();
+        self.resident
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| Arc::ptr_eq(r.map.pool(), pool))
+            .map(|(i, r)| {
+                let blocks = r.blocks.iter().zip(keep).take_while(|(a, b)| a == b);
+                (i, (blocks.count() / BLOCKS_PER_PAGE).min(r.map.len()))
+            })
+            .filter(|&(i, pages)| {
+                let rows = pages * PAGE_ROWS;
+                pages > 0 && self.resident[i].tokens.get(..rows) == prompt.get(..rows)
+            })
+            .max_by_key(|&(_, pages)| pages)
+    }
+
+    /// Keep a parked slot's pages in the pool instead of copying them out: its map moves into a
+    /// resident entry over the whole pages its tokens fill, and the slot is left with none.
+    /// `false` when the slot cannot be retained — linear, a layer outside the pool (a window
+    /// ring, a recurrent state, a compressed cache), or under one page of tokens — so the caller
+    /// resets it as before.
+    pub(crate) fn retain(&mut self, cfg: &Config, kv: &mut SeamKv) -> bool {
+        let Some(p) = kv.paged.as_mut() else {
+            return false;
+        };
+        // A page holds every pooled layer's rows; a layer outside the pool would come back empty.
+        if cfg.has_recurrent_state() || !(0..cfg.n_layer).all(|l| super::paged_layer(cfg, l)) {
+            return false;
+        }
+        let pages = (kv.cached.len().min(kv.max_ctx) / PAGE_ROWS).min(p.map.len());
+        if pages == 0 {
+            return false;
+        }
+        if self.k_fmt != kv.k_fmt || self.v_fmt != kv.v_fmt {
+            self.clear();
+            self.k_fmt = kv.k_fmt;
+            self.v_fmt = kv.v_fmt;
+        }
+        let tokens = kv.cached[..pages * PAGE_ROWS].to_vec();
+        let mut blocks = Vec::with_capacity(pages * BLOCKS_PER_PAGE);
+        let mut id = 0u64;
+        for block in tokens.chunks(BLOCK_TOKENS) {
+            id = block_id(id, block);
+            match self.index.get(&id) {
+                Some(e) if e.tokens == block => {}
+                // Colliding ids: the stored block keeps the id and these pages are not kept.
+                Some(_) => return false,
+                None => {
+                    self.index.insert(
+                        id,
+                        Entry {
+                            tokens: block.to_vec(),
+                            bytes: 0,
+                            snap: false,
+                            stored: false,
+                        },
+                    );
+                }
+            }
+            blocks.push(id);
+        }
+        let mut map = p.take_map();
+        map.truncate(pages);
+        // A shorter resident on the same chain holds nothing this one does not.
+        self.resident
+            .retain(|r| !(r.blocks.len() <= blocks.len() && blocks.starts_with(&r.blocks)));
+        self.tick += 1;
+        self.resident.push(Resident {
+            map,
+            blocks,
+            tokens,
+            tick: self.tick,
+        });
+        tracing::debug!(
+            pages,
+            residents = self.resident.len(),
+            "kv store: kept a parked slot's pages"
+        );
+        true
+    }
+
+    /// Give residents' pages back to the pool, least recently used first, until `pages` more are
+    /// free or none is left. A block only a resident held is forgotten with it. Returns how many
+    /// residents went.
+    pub(crate) fn spill(&mut self, pages: usize) -> usize {
+        let Some(pool) = self.resident.first().map(|r| Arc::clone(r.map.pool())) else {
+            return 0;
+        };
+        let want = pool.free_pages() + pages;
+        let mut spilled = 0;
+        while pool.free_pages() < want {
+            let Some(i) = (0..self.resident.len()).min_by_key(|&i| self.resident[i].tick) else {
+                break;
+            };
+            let gone = self.resident.swap_remove(i);
+            for id in &gone.blocks {
+                let only_here = self.index.get(id).is_some_and(|e| !e.stored);
+                if only_here && !self.resident_covers(*id) {
+                    self.index.remove(id);
+                }
+            }
+            drop(gone);
+            spilled += 1;
+        }
+        self.resident_spills += spilled as u64;
+        if spilled > 0 {
+            tracing::debug!(
+                spilled,
+                free = pool.free_pages(),
+                "kv store: spilled resident pages"
+            );
+        }
+        spilled
+    }
+
+    /// Spill residents until `kv` can hold `rows` rows: the pages it still has to allocate, plus
+    /// one for the copy-on-write of a shared page its prefill writes into. Returns how many
+    /// residents went.
+    pub(crate) fn make_room(&mut self, kv: &SeamKv, rows: usize) -> usize {
+        let Some(p) = kv.paged.as_ref() else {
+            return 0;
+        };
+        if self.resident.is_empty() {
+            return 0;
+        }
+        let cow = usize::from((0..p.map.len()).any(|j| !p.map.is_private(j)));
+        self.spill(page_deficit(p, rows.min(kv.max_ctx)) + cow)
     }
 
     /// Capture `kv`'s first `upto` rows as reusable blocks. Returns the token count kept.
@@ -669,6 +879,15 @@ fn open_tier(tier: &infr_core::config::KvTier, key: u64) -> anyhow::Result<Opene
 
 /// The device slot's extent id inside [`DeviceKv`] while the cache reads or writes it.
 const SLOT: u64 = 0;
+
+/// Pages `p` still has to allocate to hold `rows` rows that the pool does not have free.
+fn page_deficit(p: &PagedSlot, rows: usize) -> usize {
+    let pool = p.map.pool();
+    rows.min(pool.slot_rows())
+        .div_ceil(PAGE_ROWS)
+        .saturating_sub(p.map.len())
+        .saturating_sub(pool.free_pages())
+}
 
 #[cfg(test)]
 mod tests {
@@ -1290,6 +1509,122 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A paged slot of `n` written rows over `pool`, its pages reserved through `n`.
+    fn paged_slot(
+        be: &dyn Backend,
+        cfg: &Config,
+        pool: &Arc<crate::seam::KvPool>,
+        n: usize,
+    ) -> SeamKv {
+        let mut kv = SeamKv::for_test(be, cfg, 1024, false, 56, DType::F16).unwrap();
+        kv.attach_paged(be, cfg, pool).unwrap();
+        kv.paged.as_mut().unwrap().reserve_rows(be, n).unwrap();
+        for l in 0..cfg.n_layer {
+            let layout = kv.row_layout(be, cfg, l);
+            for (side, buf) in [(0, &kv.kbufs[l]), (1, &kv.vbufs[l])] {
+                let data: Vec<u8> = (0..n).flat_map(|r| row_data(l, side, r)).collect();
+                write_rows(be, buf.as_ref(), DType::F16, ROW, &*layout, 0..n, &data).unwrap();
+            }
+        }
+        kv.cached = tokens(3, n);
+        kv.written_end = n;
+        kv
+    }
+
+    fn assert_rows(be: &dyn Backend, cfg: &Config, kv: &SeamKv, rows: std::ops::Range<usize>) {
+        for l in 0..cfg.n_layer {
+            for side in 0..2 {
+                let want: Vec<u8> = rows.clone().flat_map(|r| row_data(l, side, r)).collect();
+                let got = read_side(be, cfg, kv, l, side, rows.clone());
+                assert_eq!(got, want, "layer {l} side {side}");
+            }
+        }
+    }
+
+    /// A parked paged slot keeps its whole pages; resuming adopts them by reference, so only the
+    /// partial page past them is read from the store, and the adopter's write into a shared page
+    /// splits it instead of touching the resident's copy.
+    #[test]
+    fn a_parked_paged_slot_resumes_from_its_pages() {
+        let be = infr_cpu::CpuBackend::new();
+        let cfg = slot_cfg(0);
+        let pool = crate::seam::KvPool::new(&be, &cfg, 1024, DType::F16, DType::F16, 5).unwrap();
+        let n = 600;
+        let mut src = paged_slot(&be, &cfg, &pool, n);
+        let mut s = cache();
+        assert_eq!(s.capture(&be, &cfg, &src, n).unwrap(), n);
+        assert!(
+            s.retain(&cfg, &mut src),
+            "a paged slot with a whole page is kept"
+        );
+        src.reset();
+        assert_eq!(
+            pool.used_pages(),
+            1,
+            "the partial page went back, the whole one stayed"
+        );
+        let page = s.resident[0].map.page(0);
+
+        let mut dst = SeamKv::for_test(&be, &cfg, 1024, false, 56, DType::F16).unwrap();
+        dst.attach_paged(&be, &cfg, &pool).unwrap();
+        // The short tail block only matches at the end of a prompt: a resend of the same tokens.
+        let prompt = tokens(3, n);
+        assert_eq!(s.restore(&be, &cfg, &mut dst, &prompt).unwrap(), n);
+        let p = dst.paged.as_ref().unwrap();
+        assert_eq!(p.map.page(0), page, "the first page is the resident's");
+        assert!(!p.map.is_private(0));
+        assert_eq!((s.resident_hits, s.resident_tokens), (1, 512));
+        assert_eq!(
+            (s.restores, s.restored_tokens),
+            (1, 88),
+            "only the partial page came from the store"
+        );
+        assert_eq!(dst.cached, prompt[..n]);
+        assert_rows(&be, &cfg, &dst, 0..n);
+
+        dst.paged
+            .as_mut()
+            .unwrap()
+            .make_private(&be, 500, 520)
+            .unwrap();
+        assert_ne!(dst.paged.as_ref().unwrap().map.page(0), page);
+        assert_eq!(s.resident[0].map.page(0), page);
+        assert_rows(&be, &cfg, &dst, 0..n);
+    }
+
+    /// Without a store, a resident is still adopted; spilling it forgets its blocks and gives
+    /// its pages back.
+    #[test]
+    fn residents_work_without_a_store_and_spill_their_pages() {
+        let be = infr_cpu::CpuBackend::new();
+        let cfg = slot_cfg(0);
+        let pool = crate::seam::KvPool::new(&be, &cfg, 1024, DType::F16, DType::F16, 5).unwrap();
+        let mut s = Cache::new(RedbKv::open_memory(0, 1 << 20).unwrap(), false);
+        let mut src = paged_slot(&be, &cfg, &pool, 1100);
+        assert_eq!(s.capture(&be, &cfg, &src, 1100).unwrap(), 0);
+        assert!(s.retain(&cfg, &mut src));
+        src.reset();
+        assert_eq!(pool.used_pages(), 2);
+        assert_eq!(s.index.len(), 8, "two pages of four blocks each");
+
+        let mut dst = SeamKv::for_test(&be, &cfg, 1024, false, 56, DType::F16).unwrap();
+        dst.attach_paged(&be, &cfg, &pool).unwrap();
+        let prompt = tokens(3, 1100);
+        assert_eq!(s.restore(&be, &cfg, &mut dst, &prompt).unwrap(), 1024);
+        assert_eq!((s.resident_hits, s.restores), (1, 0));
+        assert_rows(&be, &cfg, &dst, 0..1024);
+        dst.reset();
+
+        assert_eq!(s.spill(1), 1);
+        assert_eq!(s.resident_spills, 1);
+        assert!(
+            s.index.is_empty(),
+            "blocks only the resident held are forgotten"
+        );
+        assert_eq!(pool.used_pages(), 0);
+        assert_eq!(s.restore(&be, &cfg, &mut dst, &prompt).unwrap(), 0);
     }
 
     /// A restore whose blocks cannot fill the destination's window re-prefills instead of leaving

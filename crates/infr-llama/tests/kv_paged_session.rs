@@ -246,8 +246,9 @@ fn q8_kv_keeps_its_rows_through_pages_and_the_store() {
     );
 }
 
-/// Two conversations in a pool that holds one: the second parks the first, and the first resumes
-/// from the store with its prefix cached instead of re-prefilling it.
+/// Two conversations in a pool that holds one: the second parks the first, and each resumes by
+/// adopting the pages the parked one left in the pool, with no upload from the store, and answers
+/// as a cold run does.
 ///
 /// Run: `cargo test -p infr-llama --test kv_paged_session -- --ignored --nocapture`
 #[test]
@@ -307,17 +308,59 @@ fn parked_slots_resume_two_conversations_in_a_one_conversation_pool() {
 
     let (a, _) = run(&format!("{sys}Name the three places the log is kept."));
     let (b, _) = run(&format!("{sys}Which copy rides the train?"));
-    // Both conversations return: each one's rows were captured when the other took its pages.
-    let (_, again_a) = run(&format!(
-        "{sys}Name the three places the log is kept.{a} And the fourth?"
-    ));
-    let (_, again_b) = run(&format!(
-        "{sys}Which copy rides the train?{b} Who reads it?"
-    ));
+    // Both conversations return. Each one parked the other, whose whole pages stayed in the pool
+    // as a resident, so the shared prefix is adopted in place rather than read from the store.
+    let resume_a = format!("{sys}Name the three places the log is kept.{a} And the fourth?");
+    let resume_b = format!("{sys}Which copy rides the train?{b} Who reads it?");
+    let (store0, (hits0, ..)) = (seam.kv_store_stats(), seam.kv_resident_stats());
+    let (text_a, again_a) = run(&resume_a);
+    let (store1, (hits1, ..)) = (seam.kv_store_stats(), seam.kv_resident_stats());
+    let (text_b, again_b) = run(&resume_b);
+    let (store2, (hits2, ..)) = (seam.kv_store_stats(), seam.kv_resident_stats());
     assert!(
         again_a.n_cached > 0 && again_b.n_cached > 0,
         "a parked conversation re-prefilled instead of resuming (cached {} and {} tokens)",
         again_a.n_cached,
         again_b.n_cached
+    );
+    for (name, before, after, hits) in [
+        ("first", store0, store1, hits1 - hits0),
+        ("second", store1, store2, hits2 - hits1),
+    ] {
+        assert!(hits >= 1, "the {name} resume did not adopt resident pages");
+        assert_eq!(
+            (before.0, before.1),
+            (after.0, after.1),
+            "the {name} resume uploaded rows from the store"
+        );
+    }
+    drop(seam);
+
+    // A fresh engine runs each resumed prompt cold: the adopted pages must not change the answer.
+    let model =
+        infr_llama::SeamModel::load_with(&path, None, Arc::new(engine(true))).expect("load fresh");
+    let fresh = infr_llama::parallel::ParallelSeam::new(
+        model,
+        2,
+        Some(infr_core::SizeSpec::Bytes(ctx as u64)),
+    )
+    .expect("fresh engine");
+    let cold = |prompt: &str| {
+        let req = fresh.request_ctx(greedy.clone());
+        let mut text = String::new();
+        fresh
+            .generate(prompt, 8, None, &req, |p| text.push_str(p))
+            .expect("fresh generation");
+        text
+    };
+    assert_eq!(
+        text_a,
+        cold(&resume_a),
+        "the first resume changed the answer"
+    );
+    assert_eq!(
+        text_b,
+        cold(&resume_b),
+        "the second resume changed the answer"
     );
 }

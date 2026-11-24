@@ -101,7 +101,9 @@ pub(super) struct MoeSharedW {
 /// per-layer embeddings) stays on [`LayerW`].
 pub(super) struct AttnW {
     pub(super) wq: TensorId,
-    pub(super) wk: TensorId,
+    /// `None` on a gemma4 shared-KV layer: it has no K projection and attends an earlier
+    /// layer's cache.
+    pub(super) wk: Option<TensorId>,
     pub(super) wv: Option<TensorId>,
     // q/k/v projection biases (`Config::qkv_bias`, e.g. Qwen2/2.5); `None` on a bias-free file.
     pub(super) qb: Option<TensorId>,

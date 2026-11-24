@@ -1192,6 +1192,9 @@ pub(crate) fn generate_dense_backend_bound(
                 // output projection, attention sinks, hyper-connections and up to two compressor blocks
                 // per layer. `false` for every other arch. See docs/deepseek.md § Stage 4.
                 let is_dsv4 = c.deepseek4;
+                // gemma4 E2B/E4B KV sharing: a shared layer has no `attn_k`/`attn_v`/`attn_k_norm`
+                // tensors and attends an earlier layer's cache instead (`Config::has_own_kv`).
+                let own_kv = c.has_own_kv(l);
                 wload(&[&p("attn_norm.weight")])?;
                 if is_mla {
                     // MLA: wq_a → q_a_norm → wq_b (or wq for lite), wkv_a_mqa, kv_a_norm, wk_b, wv_b, wo.
@@ -1301,9 +1304,11 @@ pub(crate) fn generate_dense_backend_bound(
                     ])?;
                 } else {
                     wload(&[&p("attn_q.weight")])?;
-                    wload(&[&p("attn_k.weight")])?;
-                    if has_wv[l] {
-                        wload(&[&p("attn_v.weight")])?;
+                    if own_kv {
+                        wload(&[&p("attn_k.weight")])?;
+                        if has_wv[l] {
+                            wload(&[&p("attn_v.weight")])?;
+                        }
                     }
                 }
                 // Qwen2/2.5 q/k/v projection biases (small f32 [out_f] vectors). Loaded AFTER the q/k/v
@@ -1315,7 +1320,9 @@ pub(crate) fn generate_dense_backend_bound(
                 }
                 if qk_norm && !is_delta && !is_sc && !is_mla {
                     wload(&[&p("attn_q_norm.weight")])?;
-                    wload(&[&p("attn_k_norm.weight")])?;
+                    if own_kv {
+                        wload(&[&p("attn_k_norm.weight")])?;
+                    }
                 }
                 // V4's output projection is the low-rank `attn_output_a`/`_b` pair loaded above; it has
                 // no single `attn_output` tensor, so it is excluded here alongside MLA and DeltaNet.
@@ -2443,6 +2450,8 @@ pub(crate) fn generate_dense_backend_bound(
             let is_delta = c.qwen35 && !c.is_qwen35_attn_layer(l);
             let is_sc = c.is_shortconv_layer(l);
             let is_mla = c.deepseek2;
+            // Mirrors `wload`: a gemma4 shared-KV layer pushes no k/v weights.
+            let own_kv = c.has_own_kv(l);
             let mut mixer = if c.deepseek4 {
                 // EXACT order of `wload`'s `is_dsv4` arm — `wpush` consumes `wspecs` sequentially,
                 // so one handle out of place binds every later weight in the model one buffer off,
@@ -2530,11 +2539,11 @@ pub(crate) fn generate_dense_backend_bound(
                 // projection's `w_off` slice); split form declares three.
                 let (wq, wk, wv) = if fuse_qkv {
                     let wqkv = wpush(&mut g, &mut weights);
-                    (wqkv, wqkv, Some(wqkv))
+                    (wqkv, Some(wqkv), Some(wqkv))
                 } else {
                     let wq = wpush(&mut g, &mut weights);
-                    let wk = wpush(&mut g, &mut weights);
-                    let wv = if has_wv[l] {
+                    let wk = own_kv.then(|| wpush(&mut g, &mut weights));
+                    let wv = if own_kv && has_wv[l] {
                         Some(wpush(&mut g, &mut weights))
                     } else {
                         None
@@ -2553,14 +2562,8 @@ pub(crate) fn generate_dense_backend_bound(
                 } else {
                     (None, None, None)
                 };
-                let (q_norm, k_norm) = if qk_norm {
-                    (
-                        Some(wpush(&mut g, &mut weights)),
-                        Some(wpush(&mut g, &mut weights)),
-                    )
-                } else {
-                    (None, None)
-                };
+                let q_norm = qk_norm.then(|| wpush(&mut g, &mut weights));
+                let k_norm = (qk_norm && own_kv).then(|| wpush(&mut g, &mut weights));
                 let wo = wpush(&mut g, &mut weights);
                 // LFM3's `attn_gate`, loaded right after `attn_output`.
                 let head_gate = c.lfm3.then(|| wpush(&mut g, &mut weights));
@@ -4267,9 +4270,13 @@ pub(crate) fn generate_dense_backend_bound(
                 }
                 if own_kv {
                     if !fuse_qkv {
+                        let Some(wk) = aw.wk else {
+                            // `wpush` pairs `wk: None` with `own_kv == false`, always.
+                            unreachable!("layer {l} owns its KV but pushed no attn_k handle")
+                        };
                         g.push(Op::Linear {
                             x: hn,
-                            weight: aw.wk,
+                            weight: wk,
                             dst: k,
                             m: batch as u32,
                             in_f: ne as u32,

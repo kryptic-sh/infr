@@ -8694,3 +8694,22 @@ before the chunk, which the block-boundary recurrent snapshot already captures.
 
 Scope: single node. No RDMA, no cluster, no second GPU — those stay out until there is hardware to
 measure them on.
+
+### B243 — no fixture covers a KV-sharing model (2026-11-24)
+
+**Tag:** llama · seam · loader · tests · **Plan:** none
+
+`Config::has_own_kv` is load-bearing and untested. A layer past `n_layer_kv_from_start` has no
+`attn_k`/`attn_v`/`attn_k_norm` tensor at all — it attends an earlier layer's cache — and the only
+model in the tree that declares `gemma4.attention.shared_kv_layers` is a real 4B file nobody has in
+CI. The weights loader asked for `blk.24.attn_k.weight` on such a layer for exactly that reason:
+E2B sets no `shared_kv_layers`, so every test and golden ran with `own_kv` true everywhere and the
+missing gate went unnoticed until `unsloth/gemma-4-E4B-it-qat-GGUF:UD-Q4_K_XL` (24 of 42 layers own
+their KV) failed to load.
+
+The loader and `wpush` now gate on `has_own_kv` (`crates/infr-llama/src/seam/runner.rs`), verified by
+loading that file and generating a coherent reply. The test that can fail: a `gemma4_gguf(shared)`
+builder beside `qwen35_gguf` in `seam/runner.rs`'s test module — `gemma4.attention.shared_kv_layers`
+set, per-layer tensor lists that omit k/v/k-norm on the shared layers — assert `Config::from_gguf` and
+the seam build succeed, and that a shared layer's attention reads the source layer's cache rows rather
+than its own. Worth folding `n_embd_per_layer` (the PLE gather) into the same builder.

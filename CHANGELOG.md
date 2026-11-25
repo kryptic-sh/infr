@@ -1474,6 +1474,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   is refused. GigaChat3 and 3.1 (`.items()` on a tool's parameters) and
   muse-glimmer and muse-spark (the inline `if`) were refused for every
   conversation with tools, and every conversation, respectively, and now render.
+- **The Vulkan rope kernel runs one thread per rotated pair**, not one per
+  (token, head), and sizes its grid in workgroups (`rope.comp`). A decode
+  dispatch had as many live lanes as heads and each walked the whole rotation
+  serially: on an RX 580 under RADV, decode 128 tokens of Qwen2.5-0.5B Q4_K_M
+  went from 174.4 to 181.0 t/s and of Qwen2.5-Coder-3B from 77.7 to 81.9, with
+  prefill unchanged. The bytes are the same as before; the work is spread over
+  pairs.
 
 ### Fixed
 

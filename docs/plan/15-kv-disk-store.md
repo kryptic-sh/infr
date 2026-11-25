@@ -26,8 +26,13 @@ Nothing here is built or measured yet. Every figure marked **guess** is one.
   share blocks; other hardware misses, predictably.
 - **Off by default** until measured; the owner picks the default from the
   numbers.
-- **How weights and KV share system RAM** is being researched; this file's RAM
-  rules below are provisional until that is decided.
+- **How weights and KV share system RAM** was researched at the owner's request;
+  "Sharing system RAM" below is the recommendation, not yet confirmed by the
+  owner.
+- **"Idle" means whole conversations, not rows of an active one** (the plan's
+  reading of the first decision, put to the owner): in a full-attention model
+  every row of an active window is read on every token, so only parked
+  conversations and rows a sliding window no longer reads are cheap on disk.
 
 ## The tiers
 
@@ -47,11 +52,58 @@ Rules that hold across them:
   fork's own figures: 5 to 13 times slower). So the live window reaches disk
   only when VRAM and RAM are both full (S13). `kv_spill_split` and the spill
   reserve are unchanged until then, and the disk tier has its own byte budget.
-- **One host budget.** Anything this plan keeps in host memory (staging, the
-  later RAM block cache) is charged where `refuse_unhostable_kv` charges the
-  weights' host tier.
+- **One host budget** ("Sharing system RAM" below). Anything this plan keeps in
+  host memory (staging, the later RAM block cache) is charged where
+  `refuse_unhostable_kv` charges the weights' host tier.
 - **A block is reused only at the position it was computed at.** No re-roping,
   so backlog B-MLA-KV-SHIFT does not apply.
+
+## Sharing system RAM
+
+Weights already stream disk → RAM → VRAM. With this plan system RAM serves three
+consumers, and what a gigabyte is worth to each sets the order:
+
+| Consumer                                  | What a gigabyte saves                                                                                                                                  | Class                                   |
+| ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------- |
+| Live KV spill                             | without it the context is refused, clamped, or read from disk every token                                                                              | mandatory, sized at load, never shrinks |
+| Weights' host tier (streamed models only) | about a gigabyte of disk reads every token for a dense model; measured on Qwen3-30B-A3B, `paging.dram=12g` took decode from 11.7 to 19.8 t/s (plan 06) | elastic                                 |
+| Cached KV blocks                          | the gap between a disk read and a RAM read, once per request                                                                                           | elastic, lowest                         |
+
+Per-token value against per-request value differ by about the tokens in a
+request, so the order between classes is fixed, not measured at run time.
+
+- **One ledger.** A `HostLedger` in `infr-core` replaces the separate arithmetic
+  in `hostmem::spare_bytes`, `streaming_arena_plan`, `host_tier_bytes` and
+  `refuse_unhostable_kv`: mandatory entries first, the elastic ones share what
+  is left.
+- **The page cache is the first RAM tier for KV blocks.** Restores read
+  buffered, so a block read back stays in memory the OS can reclaim under
+  pressure and that survives a restart; captures write uncached (direct I/O, or
+  `RWF_DONTCACHE` where the kernel has it, else a buffered write and
+  `posix_fadvise(DONTNEED)`) so they do not push the weight mapping out. A block
+  cache of our own (S10) only if S6 shows the page cache does not keep blocks.
+- **That needs the weights' streamed reads off the page cache.** `HostPager`
+  fills its arena through buffered reads today, so every block may be held twice
+  (plan 05 item C4) and a streamed dense model pushes gigabytes per token
+  through the page cache, which would flush the KV blocks (inferred, not
+  measured). Direct reads for the weight tier fix both.
+- **The weight tier gives memory back.** Its arena is one allocation that cannot
+  shrink today. It becomes an anonymous mapping whose slots can be retired and
+  released, and a probe at token boundaries (not more than about once a second)
+  reads the OS pressure signal: PSI on Linux, the memory resource notification
+  on Windows, the pressure level on macOS, all reachable with the dependencies
+  already present. Give back in reverse priority; grow back only after a
+  sustained quiet period.
+- **Unified memory:** the weight tier stays stream-only and the spill stays
+  unarmed there, as today; a restore reads straight into the mapped KV buffer.
+
+**Probable bug found on the way, not confirmed by a run.** The seam sizes the
+weights' host tier before pricing the KV spill, and the arena is untouched
+memory the live probe does not see yet, so with an automatic arena the spill's
+room comes out as nothing and a spilled KV cache is refused at load whenever the
+weights stream. That ranks weights above the live window, the reverse of the
+order above. Slice R0 confirms it with a run (a model forced to stream with
+`kv.overflow` on) and fixes the order.
 
 ## What is stored
 
@@ -237,6 +289,21 @@ Each ships alone through coder then reviewer.
 | S13 | Live window paging to disk when VRAM and RAM are full: page map for the cold part of the window, eviction between tiers, loud log, refusals for layouts it cannot page                        | L    | a context past VRAM plus RAM runs and matches the in-memory run within tolerance; decode t/s recorded |
 | S12 | Adapter to a host-bytes store interface                                                                                                                                                       | S    | only if one is adopted                                                                                |
 
+### RAM slices
+
+These touch the weight tier as much as the KV cache and run alongside the table
+above.
+
+| #   | Slice                                                                                       | Gate                                                          |
+| --- | ------------------------------------------------------------------------------------------- | ------------------------------------------------------------- |
+| R0  | Price the live KV spill before the weights' host tier; confirm the refusal with a run first | an automatic arena plus a spill that fits loads               |
+| R1  | `HostLedger`: mandatory and elastic classes, replacing the separate calculations            | unit tests on the arithmetic                                  |
+| R2  | Direct reads for the weight host tier (with S1)                                             | t/s and rereads against buffered at three `paging.dram` sizes |
+| R3  | Pressure probe and a shrinkable weight arena                                                | time to give memory back under a memory hog; t/s after        |
+| R4  | Split between the elastic pair from eviction counters, only if both are seen competing      | measure first                                                 |
+
+Order: R0, R1, S0 to S3, R2, S4 to S7, R3, then the rest.
+
 ## Tests that can fail
 
 - **Store (CI):** round trip; one flipped bit in a payload piece, the header or
@@ -262,6 +329,11 @@ B-PP-SLOW-RUNS):
   f16 and q8_0 KV, one window model, both GPUs, cold and warm page cache;
 - decode t/s and time to first token with capture on and off, and with one slot
   capturing while another decodes.
+
+To confirm the RAM order: t/s against `paging.dram` for a dense and a MoE model;
+the hit rate of KV blocks in the page cache while weights stream, buffered
+against direct weight reads; whether capture writes shrink the weight mapping's
+resident bytes; direct and buffered read rates on Windows.
 
 ## Open
 

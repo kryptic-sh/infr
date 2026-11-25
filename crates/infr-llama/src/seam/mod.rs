@@ -1223,19 +1223,10 @@ fn pin_moe_chunk_cap(pins: &PlacementPins, cfg: &Config) {
 /// keep the smaller.
 fn lower_moe_chunk_cap(pins: &PlacementPins, cap: usize) {
     use std::sync::atomic::Ordering::Relaxed;
-    // A compare-exchange loop rather than the std helper for it, whose name differs between the
-    // toolchains this builds on.
-    let mut cur = pins.moe_chunk_cap.load(Relaxed);
-    loop {
-        let new = if cur == 0 { cap } else { cur.min(cap) };
-        match pins
-            .moe_chunk_cap
-            .compare_exchange_weak(cur, new, Relaxed, Relaxed)
-        {
-            Ok(_) => break,
-            Err(seen) => cur = seen,
-        }
-    }
+    // The closure always returns `Some`, so the update cannot fail.
+    let _ = pins.moe_chunk_cap.try_update(Relaxed, Relaxed, |cur| {
+        Some(if cur == 0 { cap } else { cur.min(cap) })
+    });
 }
 
 /// Did the user PIN a prefill chunk height? The PRESENCE half of `INFR_UBATCH` — the dense

@@ -35,13 +35,19 @@ line when its slice ships.
 Queue order (the owner's): MoE routing first, then the rest in the order below.
 (Item 1, the download fan-out, shipped; see B-FANOUT for what it left.)
 
-2. **MoE routing, int8 against float (B207).** Accuracy measured 2026-11-25 on
-   both models and both GPUs (`docs/gpu-tolerance.md`, "MoE routing, int8
-   against float"): the router already runs on float activations, so the gap is
-   upstream int8 error in the hidden state. Left: the decode and prefill timing
-   of the float alternatives in a quiet window (commands in that section), then
-   the owner's decision on the default and on the real MoE rows (B207 has the
-   recommendation and the near ties each option needs). No default changed.
+2. **MoE routing: keep int8, fix the GPU activation quantizer (B207).** Measured
+   2026-11-25 (`docs/gpu-tolerance.md`, "MoE routing, int8 against float"): the
+   router already runs on float activations, so the gap is upstream int8 error
+   in the hidden state; Float decodes at the shipped speed and prefills about
+   5.6 times slower on Qwen3-30B-A3B on the RX 7900 XTX. **Decided by the owner,
+   2026-11-25:** the default stays int8. Next slice: outlier handling in
+   `quant_q8.comp` for the activations feeding the expert kernels (and f32 block
+   scales and sums as a second variant), measured with the same harness on both
+   models and both GPUs plus a decode and prefill A/B; if it does not close most
+   of the gap, back to the owner with the numbers. To measure in the same slice
+   because it looked free: the dense decode GEMVs on float for MoE models only
+   (decode read the same speed with them float). The real MoE rows of the
+   tolerance table wait for that result.
 3. **`kv.overflow` without `VK_EXT_memory_budget`.** Stays off there
    (`kv_spill_armed`). Add a one-line load warning that the flag has no effect
    on this driver and why.

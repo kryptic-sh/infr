@@ -1668,10 +1668,17 @@ What the numbers say:
   (above). So the shipped GPU's routing error is not out of line with what the
   CPU already ships; the CPU's own distance is a finding of its own (B207).
 
-**Cost.** Not timed (timings need a quiet window). Structurally: one router GEMV
-per routed layer per token, F32 weights read in full each time, ERNIE 27 of 64 ×
-2560 (655,360 bytes each) and Qwen3-30B-A3B 48 of 128 × 2048 (1,048,576 bytes),
-on `linear_f32r_v4` for a decode row (`linear_f32_mo` under `gemv.kq_fma`) and
+**Cost.** The Float alternative was timed on Qwen3-30B-A3B Q4_K_M, RX 7900 XTX,
+2026-11-25, the shipped run and the Float run (the flags below) alternated three
+times each, `-r 3`, load average 8 to 13 with a desktop session in use, so not a
+quiet window: decode `tg128` 216.8 to 217.4 t/s shipped against 216.9 to 217.2
+Float, no difference; prefill `pp512` 3915.8 to 4021.1 t/s shipped against 711.1
+to 716.4 Float, about 5.6 times slower, which is the batched expert GEMM not
+being taken. Not timed: ERNIE, the integrated GPU, and the routed-experts-float
+configuration on its own. Structurally: one router GEMV per routed layer per
+token, F32 weights read in full each time, ERNIE 27 of 64 × 2560 (655,360 bytes
+each) and Qwen3-30B-A3B 48 of 128 × 2048 (1,048,576 bytes), on `linear_f32r_v4`
+for a decode row (`linear_f32_mo` under `gemv.kq_fma`) and
 `linear_f32r_mrow8_v4` for a prefill chunk, in every configuration: no extra
 activation pass (the router reads `hn` as it is), and nothing in the replayed or
 chained decode or the batched prefill changes for it. The alternatives that do
@@ -1679,7 +1686,9 @@ move routing cost elsewhere: Float turns the dense decode GEMVs from
 `native_mmv_mrow_*` to the float `native_*_rm2`/`sg2` builds, and with `i8_dot`
 off the routed experts' batched prefill GEMM is not taken at all (its gate is
 `i8_dot`), so every prefill chunk goes through the per-row small-batch path. The
-A/B for the Float alternative, interleaved and in a quiet window:
+A/B for the Float alternative (decode and prefill as separate runs,
+`-p 0 -n 128` and `-p 512 -n 0`; one run given both prints the decode figure
+only):
 
 ```text
 INFR_DEV=Vulkan0 infr bench -p 512 -n 128 -r 5 <model.gguf>

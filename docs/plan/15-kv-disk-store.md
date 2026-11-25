@@ -26,13 +26,20 @@ Nothing here is built or measured yet. Every figure marked **guess** is one.
   share blocks; other hardware misses, predictably.
 - **Off by default** until measured; the owner picks the default from the
   numbers.
-- **How weights and KV share system RAM** was researched at the owner's request;
-  "Sharing system RAM" below is the recommendation, not yet confirmed by the
-  owner.
-- **"Idle" means whole conversations, not rows of an active one** (the plan's
-  reading of the first decision, put to the owner): in a full-attention model
-  every row of an active window is read on every token, so only parked
-  conversations and rows a sliding window no longer reads are cheap on disk.
+- **System RAM is one ledger with a fixed order:** live KV spill, then the
+  weights' host tier, then cached KV blocks ("Sharing system RAM" below). The
+  first version of the disk store uses the page cache as its RAM step; **our own
+  KV block cache is the end state and a committed slice** (S10), built after the
+  pressure response (R3) and before the live-window disk rung (S13), which needs
+  it.
+- **"Idle" means whole conversations and dead window rows:** parked
+  conversations, stored prefix blocks, and rows a sliding-window layer has moved
+  past. Any part of an active full-attention window on disk is the slow last
+  rung only.
+- **Swapping active conversations under load** (pausing the one that has waited
+  longest for its turn and giving its slot to a queued request) is deferred: it
+  buys responsiveness, not throughput, and reuses capture and restore. Decide it
+  from server measurements of queue wait against swap cost (S14).
 
 ## The tiers
 
@@ -42,7 +49,7 @@ Nothing here is built or measured yet. Every figure marked **guess** is one.
 | System RAM      | the part of a live window that VRAM cannot hold (`kv_spill_split`, `kv_spill_reserve`, `refuse_unhostable_kv`, `reclamp_ctx_to_live_room`) | shipped; arms only with a live memory budget (`kv_spill_armed`) |
 | Slot reuse      | a prefix already in another slot (`ParallelSeam::checkout`, `SlotPool::pick`, `SeamKv::seed_from`)                                         | shipped; device to device                                       |
 | Disk            | prefix blocks nothing reads every token                                                                                                    | this plan                                                       |
-| RAM block cache | disk blocks kept warm in host memory                                                                                                       | slice S10, only if measured worth it                            |
+| RAM block cache | disk blocks kept warm in host memory                                                                                                       | slice S10, committed                                            |
 | Remote          | —                                                                                                                                          | not planned                                                     |
 
 Rules that hold across them:
@@ -81,7 +88,9 @@ request, so the order between classes is fixed, not measured at run time.
   pressure and that survives a restart; captures write uncached (direct I/O, or
   `RWF_DONTCACHE` where the kernel has it, else a buffered write and
   `posix_fadvise(DONTNEED)`) so they do not push the weight mapping out. A block
-  cache of our own (S10) only if S6 shows the page cache does not keep blocks.
+  cache of our own (S10) follows as the end state: slots we manage, direct reads
+  into them, trunk-keeping eviction, and the same pool holds a live window's
+  paged rows for S13.
 - **That needs the weights' streamed reads off the page cache.** `HostPager`
   fills its arena through buffered reads today, so every block may be held twice
   (plan 05 item C4) and a streamed dense model pushes gigabytes per token
@@ -284,9 +293,10 @@ Each ships alone through coder then reviewer.
 | S7  | `/status`, metrics, `tune show`                                                                                                                                                               | S    | serialisation test                                                                                    |
 | S8  | Capture during prefill for window models                                                                                                                                                      | M    | a shared gemma prefix restores                                                                        |
 | S9  | Recurrent snapshot at a block boundary                                                                                                                                                        | M–L  | bit-identical continuation after restore                                                              |
-| S10 | RAM block cache under the host budget                                                                                                                                                         | M    | only if S6 shows the disk is the floor                                                                |
+| S10 | RAM block cache under the host budget                                                                                                                                                         | M    | after R3, before S13                                                                                  |
 | S11 | Read-ahead while queued; restore overlapping the suffix prefill                                                                                                                               | L    | measure first                                                                                         |
 | S13 | Live window paging to disk when VRAM and RAM are full: page map for the cold part of the window, eviction between tiers, loud log, refusals for layouts it cannot page                        | L    | a context past VRAM plus RAM runs and matches the in-memory run within tolerance; decode t/s recorded |
+| S14 | Swap an active conversation out under load (optional)                                                                                                                                         | M    | decided from queue wait against swap cost on a loaded server                                          |
 | S12 | Adapter to a host-bytes store interface                                                                                                                                                       | S    | only if one is adopted                                                                                |
 
 ### RAM slices
@@ -302,7 +312,8 @@ above.
 | R3  | Pressure probe and a shrinkable weight arena                                                | time to give memory back under a memory hog; t/s after        |
 | R4  | Split between the elastic pair from eviction counters, only if both are seen competing      | measure first                                                 |
 
-Order: R0, R1, S0 to S3, R2, S4 to S7, R3, then the rest.
+Order: R0, R1, S0 to S3, R2, S4 to S7, R3, S10, then the rest, with S13 after
+S10.
 
 ## Tests that can fail
 

@@ -315,6 +315,55 @@ above.
 Order: R0, R1, S0 to S3, R2, S4 to S7, R3, S10, then the rest, with S13 after
 S10.
 
+## Corrections from the #109 fork
+
+The fork `KessokuNet/infr` built a KV tiering series (issue #109). It was
+declined as a series on 2026-11-26 (host-copy store interface, database
+dependencies, a key without weight content or device, capture under a global
+lock before the request returns, and a config that removed the spill
+guarantees), but its implementation showed where this plan was wrong or thin.
+Credit them in the changelog entries of the slices that use these.
+
+- **Window layers: store the write position, not a flag.** A per-block "rows
+  were resident" flag marks a block that straddles the capture floor as absent
+  even when the window at P is whole. Each block records the write position at
+  capture (their `captured_end`); a window layer at P needs rows
+  `[P − window, P)` with `P − window` not below that position minus the ring's
+  rows. Demanding the whole ring, as their check does, is stricter than
+  attention needs.
+- **The reply moves the ring.** `written_end` includes the decoded reply, so a
+  capture at the end of a request has already recycled window rows below the
+  prompt's end; the ring's slack over the window is one ubatch. A regenerate
+  after a long reply misses. S8 (capture during prefill) does not cover decode:
+  capture of window rows has to follow the write position through decode too, or
+  the miss is documented.
+- **Recurrent state couples S8 and S9.** A restore can land only at a snapshot
+  position, and a model with both recurrent and window layers needs its window
+  rows captured at the snapshot, before the ring moves on.
+- **S4 format cases to name in the gate:** a Q8_0 buffer's bytes round up
+  (`kv_fmt_bytes`), so rows pack only at an even number of blocks per row; turbo
+  blocks are wider than some rows; planar capacity comes from `kv_rows_at`,
+  never from the buffer's length.
+- **S4 backend primitives:** CPU and Metal need real offset reads and writes (a
+  default that copies the whole buffer is too slow for the reference path);
+  Vulkan needs every region of a block in one submit, and the poison check
+  `upload` already makes.
+- **S13 pages per layer.** Ring, recurrent and MLA layers stay linear while the
+  rest page (on Gemma 4 E4B most layers are rings); a refusal per model would
+  refuse those models whole. Reserve pages for the prompt plus `max_tokens`
+  before the first token so a pool cannot run out mid-answer. Planar Q8_0
+  against page rows needs an answer, since the automatic q8 step makes it
+  common.
+- **Their figures worth repeating on our hardware** (RX 580, Qwen2.5-0.5B, one
+  run each): a window wholly in host RAM cost 15% of decode at 2k tokens and 28%
+  at 8k; a restore took 43 ms against about 860 ms of prefill at 2k and 593 ms
+  against 38.5 s at about 32k.
+
+Considered from the fork and declined: variable-length tail blocks (one hash per
+possible length on every lookup; this plan prefills the tail again), a lossy
+cold format (a restored row must equal the captured one), paged KV in VRAM as a
+default, and remote stores.
+
 ## Tests that can fail
 
 - **Store (CI):** round trip; one flipped bit in a payload piece, the header or

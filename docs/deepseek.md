@@ -627,6 +627,20 @@ that do declare `deepseek32` are far larger than this box can run.
   the restricted run's logits. It is a REGRESSION lock blessed from this
   implementation, not an independent oracle; what it buys is that the indexer's
   NEOX pairing and its `[rope | nope]` head order cannot change silently.
+  **Re-blessed 2026-11-25 for the YaRN attention factor, not the indexer.** The
+  fixture declares V2-Lite's YaRN multiplier, and `llama-context.cpp` sets
+  `mscale = mscale_all_dims` for `LLM_ARCH_DEEPSEEK2` only. The old values were
+  blessed under that `deepseek2` rule, which infr applied to `deepseek32` too
+  (with a load warning): rope magnitude 1, score scale from
+  `get_mscale(f, mscale_all_dims)`. The new ones are blessed under the
+  reference's own `deepseek32` rule (`config::yarn_mscale_ratio`): magnitude
+  `get_mscale(f, 1) / get_mscale(f, mscale_all_dims)`, score scale from
+  `get_mscale(f, 1)`. `synthetic_deepseek32_yarn_rule_matches_the_reference`
+  checks that rule independently of the lock: the fixture against a twin at
+  V3.2's multiplier (magnitude 1, same score scale) whose MLA and indexer query
+  rotary rows are scaled by the square of the magnitude computed in f64 from the
+  formula. llama.cpp does not load the synthetic V3.2 file, so the rule is
+  checked against the formula, not the engine.
 
 Each of the three traps was applied as a perturbation, seen to fail, and
 reverted (2026-08-10, CPU, `--test synthetic_deepseek2`; the lock's own scale is

@@ -2830,6 +2830,7 @@ impl CpuBackend {
                     scale,
                     offset,
                 } => {
+                    op_tap::record(op_tap::TappedOp::AttnTemp { rows, pos });
                     if floor_scale == 0 {
                         return Err(infr_core::error::Error::backend(
                             "cpu backend: Op::AttnTemp with floor_scale 0".to_string(),

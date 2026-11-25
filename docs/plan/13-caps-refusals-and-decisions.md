@@ -116,20 +116,39 @@ pins in force were made for its backend's class (`debug_assert_pins_for`) rather
 than that a scope is active; the Vulkan-only functions (placement, a session's
 generation, the `SeamModel` fit helpers) check both (`debug_assert_scope_for`).
 
-### S5 — position temperature and the MLA magnitude (M) — first half done 2026-11-25
+### S5 — position temperature and the MLA magnitude (M) — done 2026-11-25
 
-The first two bullets shipped; what they left is backlog B-ATTN-TEMP. The last
-two (Mistral-Large-3's temperature and the deepseek32 rule) are still to do.
+Shipped in two halves; what they left is backlog B-ATTN-TEMP.
 
-Departs from the slice as planned in three places. `Op::AttnTemp`'s `offset` is
-a whole number, where the reference's is a float: every builder that sets one
-passes 0 or 1, and it makes the floor an exact integer division. Metal's two
-decode-loop gates refuse the op as Vulkan's `decode_eligible` does
-(`replay_shape`, `static_walk_live_positions`), since its position is baked in.
-And the magnitude reaches deepseek32's lightning indexer too: the reference
-ropes the indexer's query and key with the same magnitude, so its query's rotary
-columns take the same gain, or a deepseek32 file at a magnitude other than 1
-would select different keys.
+The second half departs from the slice as planned in four places. The runner
+emits `Op::AttnTemp` only for a batch whose last position has reached
+`attention.temperature_length`: every factor before it is exactly 1, so the
+context the file used to be capped at builds the graph it always did. Because
+the record-once decode plan is built at position 0 and so never holds the op,
+the runner keeps a model with a temperature off that plan itself
+(`replay_plan_covers_every_step`) rather than relying on the backends' replay
+refusals. The check against the reference is llama.cpp itself on a synthetic
+Mistral-Large-3-shaped file (`synthetic_mistral_large3_cpu_matches_llama_cpp`,
+f32 KV cache and flash attention off on llama.cpp's side), but only one row at a
+time: that file's f32 experts have no batched MoE kernel, and with quantized
+experts the two engines' int8 activation rounding is wider than the effect of a
+wrong row mapping, so a chunk straddling the length is held to the one-row path
+instead (`synthetic_mistral_large3_straddling_chunk_matches_one_row_at_a_time`).
+And the deepseek32 rule is checked by a whole-model twin built from the
+reference's formula in f64
+(`synthetic_deepseek32_yarn_rule_matches_the_reference`), not by an f64 host
+computation of one MLA layer: llama.cpp does not load the synthetic V3.2 file,
+so the decision's independent check is the formula, not the engine.
+
+The first half departs from the slice as planned in three places.
+`Op::AttnTemp`'s `offset` is a whole number, where the reference's is a float:
+every builder that sets one passes 0 or 1, and it makes the floor an exact
+integer division. Metal's two decode-loop gates refuse the op as Vulkan's
+`decode_eligible` does (`replay_shape`, `static_walk_live_positions`), since its
+position is baked in. And the magnitude reaches deepseek32's lightning indexer
+too: the reference ropes the indexer's query and key with the same magnitude, so
+its query's rotary columns take the same gain, or a deepseek32 file at a
+magnitude other than 1 would select different keys.
 
 - New `Op::AttnTemp { x, dst, rows, n, pos, floor_scale, scale, offset }`:
   `dst[r,:] = x[r,:] * (ln(floor((pos+r+offset)/floor_scale)+1)*scale + 1)`

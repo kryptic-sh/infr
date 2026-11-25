@@ -3960,8 +3960,9 @@ pub(crate) fn generate_dense_backend_bound(
                 // interpolated frequencies soften the attention, so the score is boosted by
                 // `mscale²` where `mscale = attn_factor_org * (1 + 0.1*log_mul*ln(1/freq_scale))`
                 // and `attn_factor_org = yarn_attn_factor * (1 + 0.1*ln(1/freq_scale))` with
-                // `yarn_attn_factor = 1/(1 + 0.1*ln(1/freq_scale))` when log_mul != 0 (so
-                // attn_factor_org = 1.0 for the GGUF's log_mul = 0.707). ggml's rope ALSO scales
+                // `yarn_attn_factor = ratio/(1 + 0.1*ln(1/freq_scale))` when log_mul != 0
+                // (`config::yarn_mscale_ratio`; on deepseek2 the ratio is 1, so attn_factor_org =
+                // 1.0 for V2-Lite's log_mul = 0.707). ggml's rope ALSO scales
                 // the q_pe/k_pe vectors themselves by `attn_factor_org` (`rope_yarn`'s `mscale`);
                 // that reaches only the rotary half of the score, so it cannot be folded into this
                 // whole-score scale — the `mla_q_gain` multiply below applies it, and the kernels
@@ -3974,8 +3975,15 @@ pub(crate) fn generate_dense_backend_bound(
                     // fs_inv = ln(1/freq_scale) = ln(factor) — NOT ln(1/factor) (that is the
                     // negative; the GGUF's factor=40 gives +ln 40 = +3.6889).
                     let fs_inv = infr_core::math::ln(c.rope_scaling_factor);
+                    // `yarn_mscale_ratio` is exactly 1 on deepseek2, and differs from it on
+                    // deepseek32 with a multiplier other than 1 (the reference keys that rule on
+                    // the arch string).
                     let yarn_attn_factor = if c.rope_yarn_log_mul != 0.0 {
-                        1.0 / (1.0 + 0.1 * fs_inv)
+                        crate::config::yarn_mscale_ratio(
+                            c.deepseek32,
+                            c.rope_scaling_factor,
+                            c.rope_yarn_log_mul,
+                        ) * (1.0 / (1.0 + 0.1 * fs_inv))
                     } else {
                         1.0
                     };
@@ -3997,6 +4005,26 @@ pub(crate) fn generate_dense_backend_bound(
                         dst: mla_q,
                         rows: (batch * c.n_head) as u32,
                         n: q_head_dim,
+                    });
+                }
+                // Mistral-Large-3's attention temperature (`Config::attn_temp_scale`). The
+                // reference multiplies each row of the absorbed query `[q_nope·wk_b | rope(q_pe)]`
+                // by its position's factor; absorption and rope are linear in the query, so
+                // scaling the query before the kernel does both gives the same scores. Every
+                // factor is exactly 1 until a row's position reaches the floor scale, so a batch
+                // wholly before it emits nothing and builds the graph it always did.
+                if c.attn_temp_scale != 0.0 && start_pos + batch > c.attn_temp_floor_scale as usize
+                {
+                    g.push(Op::AttnTemp {
+                        x: mla_q,
+                        dst: mla_q,
+                        rows: batch as u32,
+                        n: qrow,
+                        pos: start_pos as u32,
+                        floor_scale: c.attn_temp_floor_scale,
+                        scale: c.attn_temp_scale,
+                        // `deepseek2.cpp`'s `f_attn_temp_offset`.
+                        offset: 0,
                     });
                 }
                 g.push(Op::Mla {
@@ -6427,6 +6455,8 @@ pub(crate) fn generate_dense_backend_bound(
             .all(|l| c.layer_head_dim(l).is_multiple_of(4) && c.layer_head_dim(l) <= 512);
     let dyn_replay = caps.decode_replay
         && (mirror_admits || replay_mirror_bypassed())
+        // Not a mirror of a backend refusal, so the test bypass above does not lift it.
+        && replay_plan_covers_every_step(c)
         // MTP h-tap (Phase 1, issue #33): the replay tape binds a FIXED set of tensors once: an
         // h-tap request changes the graph shape (an extra Output + Copy) per-call based on
         // whether THIS position is the one being sampled, which the static replay tape can't
@@ -7077,6 +7107,16 @@ pub(crate) fn generate_dense_backend_bound(
     Ok((out, stats))
 }
 
+/// Whether `c`'s record-once decode plan, built at position 0 with one row, holds every op its
+/// later steps run, so that a backend asked to replay it can judge them all. A model with an
+/// attention temperature (`Config::attn_temp_scale`) fails this: the runner emits `Op::AttnTemp`
+/// only once a position reaches `Config::attn_temp_floor_scale`, so the position-0 plan never holds
+/// it, and the replay refusals Vulkan and Metal have for that op (its position is baked in) would
+/// never see it. Such a model decodes on the per-token rebuild, which bakes each step's position.
+fn replay_plan_covers_every_step(c: &Config) -> bool {
+    c.attn_temp_scale == 0.0
+}
+
 /// Test hook: lets `generate_dense_backend` build a replay plan its mirror gate would skip
 /// (`mirror_admits`), so a test can show the backend's own `decode_replay_ready` is what keeps a
 /// plan the backend will not replay off the decode loop. Always `false` outside this crate's
@@ -7118,6 +7158,20 @@ mod tests {
         /// reach a generation another test runs at the same time.
         pub(super) static REPLAY_MIRROR_BYPASS: std::cell::Cell<bool> =
             const { std::cell::Cell::new(false) };
+    }
+
+    /// A model with an attention temperature never takes the record-once decode: its position-0
+    /// plan holds no `Op::AttnTemp` for the backends' replay refusals to see.
+    #[test]
+    fn a_temperature_keeps_decode_off_the_replay_plan() {
+        let plain = Config::default();
+        assert!(super::replay_plan_covers_every_step(&plain));
+        let temp = Config {
+            attn_temp_scale: 0.1,
+            attn_temp_floor_scale: 8192,
+            ..Config::default()
+        };
+        assert!(!super::replay_plan_covers_every_step(&temp));
     }
 
     /// B125: the runner cannot tell whether the backend replays its plan (sampler reads slot

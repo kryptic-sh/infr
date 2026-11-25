@@ -26,6 +26,69 @@ Provenance tags point at the finding that opened the item:
 
 ## Open
 
+### B-DECISIONS-2026-11-25 — owner's decisions, and the slices they queue (2026-11-25)
+
+**Kind:** decisions taken by the owner on 2026-11-25, one question at a time.
+Each is a slice to run through the usual coder, reviewer and gate flow; delete a
+line when its slice ships.
+
+Queue order (the owner's): the download fan-out first, then MoE routing, then
+the rest in the order below.
+
+1. **Download fan-out (`crates/infr-hub`).** A multi-chunk file starts in ranged
+   mode on one connection whenever the server serves ranges, so it can take
+   connections freed later (`fetch_ranged` no longer returns a stream when
+   `budget.available() == 0`); stream mode stays for `hub.pull_jobs` of 0 or 1.
+   Files that start together split the spare connections fairly rather than the
+   first taking all of them (`ranged::run`'s `acquire_up_to`). Measure a real
+   multi-shard pull before and after.
+2. **MoE routing, int8 against float (B207).** Unparked: run the investigation
+   next. Router fed int8 against float activations on ERNIE-4.5-21B-A3B and
+   Qwen3-30B-A3B, both GPUs, quiet window: selections differing, KL against the
+   reference, decode speed. No default changes until the owner sees the numbers.
+   The `route_near_tie` floor for a real MoE row follows from the result.
+3. **`kv.overflow` without `VK_EXT_memory_budget`.** Stays off there
+   (`kv_spill_armed`). Add a one-line load warning that the flag has no effect
+   on this driver and why.
+4. **Breaking API changes in `[Unreleased]`.** Accepted as they are; the next
+   cut is a minor bump. No shims.
+5. **Spill ordering and the spilled session's chunk.** Measure decode and
+   prefill for spill-before-stream against stream-before-spill, and a short
+   against a tall prefill chunk on a spilled session (RX 7900 XTX under
+   `INFR_VRAM_LIMIT`, quiet window). Change the defaults where the result is
+   clear; bring a real trade-off back to the owner.
+6. **`sample_topk` exact ties (B120).** Make the tie-break deterministic and
+   equal to the host sampler's, with a test that plants more than k tied logits,
+   then a decode A/B. A measurable slowdown goes back to the owner before it
+   ships.
+7. **CPU single-row Q5_0 and `cpu_golden_gemma3`.** Approved with evidence:
+   route the single row through `vec_dot_q5_0_32_batch`, show the new output is
+   at least as close to the f64 reference as the old and that decode and prefill
+   rows agree bit for bit, then re-bless. Otherwise back to the owner.
+8. **A bare model reference always means the default quant** (`store.rs`
+   `fallback_quant`): `infr run org/repo` fetches the default quant when it is
+   not cached, as `llama-cli -hf` does, rather than running whichever quant is
+   cached. Fix in the same slice, no decision needed: `Match::Exact` returning
+   before the `is_mmproj` exclusion, and `is_mmproj` missing the
+   `name.mmproj-Q8_0.gguf` form.
+9. **Sampler order: match llama.cpp.** Top-p on the raw probabilities,
+   temperature last, in `sampling.rs`, `infr-cpu`'s `sample_token`,
+   `sample_topk.comp` and the Metal sampler together; a test at logits
+   `[2, 0, 0]`, temperature 0.6, top_p 0.9; decode speed check.
+10. **Penalties, split by the API that defines each.** `repeat_penalty` follows
+    llama.cpp: seeded from the prompt, windowed to `repeat_last_n`, and
+    `repeat_last_n` accepted as a request field. `presence_penalty` and
+    `frequency_penalty` keep the OpenAI definition. Fix
+    `RequestSampling::default`'s doc.
+11. **`gpu_seam_tolerance_float_runs_build_no_int8_kernel` on a device with no
+    int8 kernel.** Approved: when the shipped run builds no int8 kernel the test
+    says so and asserts the Int8 and Float kernel lists are equal, as
+    `gpu_seam_tolerance_nocoopmat_runs_build_no_coopmat_gemm` does for its tier.
+12. **`/status` and `infr tune show` under `INFR_VRAM_LIMIT`.** Additive: keep
+    total and free as the budget in force, add the configured limit and the
+    device's real total; `infr tune show` gains a memory line with the same
+    figures.
+
 ### B-DSV2-NONYARN-SCALE — deepseek2 ignores a non-YaRN `rope.scaling.factor` (2026-11-16)
 
 **Tag:** deepseek · **Kind:** suspected divergence, unverified
@@ -4822,28 +4885,85 @@ cache dtype). Left:
 
 ### B-ATTN-TEMP — what `Op::AttnTemp` and the MLA magnitude left (2026-11-25)
 
-Plan 13 S5's first half added `Op::AttnTemp` (CPU, Vulkan `attn_temp.comp`,
-Metal `attn_temp_f32`) and applies a DeepSeek MLA model's YaRN magnitude
+Plan 13 S5 added `Op::AttnTemp` (CPU, Vulkan `attn_temp.comp`, Metal
+`attn_temp_f32`), emitted on the MLA query for Mistral-Large-3's attention
+temperature (`Config::attn_temp_scale`) once a batch reaches its
+`temperature_length`; applies a DeepSeek MLA model's YaRN magnitude
 (`Config::mla_rope_magnitude`) as an `Op::MulVec` on the MLA query and, on
-deepseek32, the indexer query. Nothing emits `Op::AttnTemp` yet: the
-Mistral-Large-3 temperature and the deepseek32 YaRN rule are the slice's second
-half (plan 13 S5).
+deepseek32, the indexer query; and gives deepseek32 the reference's own YaRN
+attention-factor rule (`config::yarn_mscale_ratio`).
 
 - **The Metal kernel has only been compiled for `aarch64-apple-darwin`, never
   run.** `attn_temp_matches_the_reference_factor` in
   `infr-metal/tests/parity.rs` runs it in CI's macOS Metal job; the MSL source
-  itself is compiled only at run time on a Mac.
+  itself is compiled only at run time on a Mac. Nothing runs a Mistral-Large-3
+  graph on Metal anywhere.
 - **A graph holding `Op::AttnTemp` loses the decode replay** on Vulkan
   (`decode_refusal`, `NoDynKernel`) and on Metal (`replay_shape`,
-  `static_walk_live_positions`), because the op's position is baked in. Neither
-  model it is for replays on Vulkan today (Mistral-Large-3's `Op::Mla` and
-  llama4's standalone f16 `WriteKv` refuse first), so nothing is lost yet. A
-  `_dyn` build reading the position from the replay params, as `rope_f16_dyn`
-  does, would be needed once one of them could otherwise replay.
+  `static_walk_live_positions`), because the op's position is baked in. Those
+  refusals can never fire for a decode: the record-once plan is built at
+  position 0 with one row, and the runner emits no `Op::AttnTemp` there. So the
+  runner keeps any model with a temperature off the replay plan itself
+  (`replay_plan_covers_every_step`, tested by
+  `a_temperature_keeps_decode_off_the_replay_plan`); the test bypass of
+  `mirror_admits` does not lift it. Mistral-Large-3 lost nothing by it: its
+  decode was already the per-token rebuild (`mirror_admits` excludes every
+  `deepseek2` model, and both backends refuse `Op::Mla`), which bakes each
+  step's position into the op. llama4 is capped before its temperature would
+  emit. A `_dyn` build reading the position from the replay params, as
+  `rope_f16_dyn` does, plus a plan that holds the op from position 0, would be
+  needed once MLA (or llama4's f16 K write) could otherwise replay.
+- **Not done: fold the decode temperature into `Op::Mla`'s scale.** For a
+  single-row decode the factor is one scalar, so past the length it could
+  multiply the MLA score scale instead of running an `Op::AttnTemp` dispatch,
+  saving one dispatch per layer per token. Not measured.
 - **Tensor parallelism refuses `Op::AttnTemp`** through the catch-all arm of
   `TensorParallelBackend`'s lowering in `infr-vulkan/src/tp.rs`. The op is a
-  per-row scale, so a sharded input only needs its `n` divided by the world;
-  nothing runs it under TP today (MLA refuses TP already), so it was left.
+  per-row scale, so a sharded input only needs its `n` divided by the world. A
+  Mistral-Large-3 run under `INFR_TENSOR_PARALLEL` is refused before any
+  lowering, as it was before this slice, by `dense_multi_gpu_guard` (it is MoE);
+  a dense `deepseek2` file with a temperature (none is known) would now be
+  refused at the `AttnTemp` op where it was refused at `Op::Mla`.
+- **The expert-parallel and pipeline wrappers have not run `Op::AttnTemp`.**
+  Both pass the op through unchanged (read); no test runs a Mistral-Large-3
+  graph through `INFR_EXPERT_PARALLEL` or `INFR_PIPELINE`, though the expert-
+  parallel path is the one a model of its size would take.
+- **The llama.cpp oracle checks the temperature one row at a time only.** The
+  oracle file's f32 expert banks have no batched MoE kernel, so every token
+  there is a one-row graph. A chunk straddling the length is checked against
+  that one-row path instead
+  (`synthetic_mistral_large3_straddling_chunk_matches_one_row_at_a_time`, CPU
+  bit-exact; Vulkan at chunks of 5). Quantizing the oracle file's experts to
+  Q8_0 so llama.cpp sees the batched chunk was tried and left: infr's CPU then
+  missed llama.cpp by 2.08e-2 / 1.31e-2 / 7.5e-4 at 16 / 17 / 40 tokens (f32 KV,
+  flash attention off), with the temperature off as far apart at 16 tokens, so
+  the gap is the expert activations' int8 rounding (infr's float reference
+  backend was 4.3e-2 to 5.2e-2 away), not the temperature, and too wide to judge
+  a row mapping (the per-head red moved the f32 oracle by 5.9e-3). Measured
+  2026-11-25.
+- **No real Mistral-Large-3 file has been run.** The temperature is checked
+  against llama.cpp only on the synthetic file
+  (`synthetic_mistral_large3_cpu_matches_llama_cpp`); the real one is about
+  675B.
+- **The synthetic deepseek32 file does not load in llama.cpp** (`030ebb5`), so
+  the deepseek32 YaRN rule is checked against the reference's formula in f64
+  (`synthetic_deepseek32_yarn_rule_matches_the_reference`), not against the
+  engine. With the MLA cache keys added (`attention.head_count_kv` 1,
+  `key_length`, `value_length`) it fails `GGML_ASSERT(ggml_can_mul_mat(a, b))`;
+  with the indexer widened to 64 it fails a view-size assert instead. Not
+  investigated further.
+- **The `deepseek2` rule without a multiplier rounds differently from the
+  reference.** With YaRN and no `yarn_log_multiplier`, `llama-context.cpp` sets
+  `yarn_attn_factor = get_mscale(f, 1) · (1 / (1 + 0.1·ln f))`, which infr's MLA
+  score scale takes as exactly 1 (and the rope magnitude as `get_mscale(f, 1)`):
+  equal for `f ≥ 1` up to the rounding of that product, but for a YaRN factor
+  below 1 the reference's factor is `1 / (1 + 0.1·ln f)` and infr's is 1. Read,
+  not run; no file declares YaRN without a multiplier or with a factor below 1.
+- **llama.cpp's CPU flash-attention path rounds the query to f16**, which put it
+  4e-3 (max logit difference) from infr on the synthetic Mistral-Large-3 file at
+  an f32 KV cache; with `--flash-attn off` the two are 4e-6 apart (measured
+  2026-11-25, `030ebb5`). An oracle fixture that should judge differences below
+  that needs the flag, as `synthetic_mistral_large3_*` does.
 - **The MLA magnitude gain rows are synthetic weights**
   (`mla_q_rope_gain_rows`), uploaded after the ones-vectors the same way. Not
   run with a magnitude other than 1: the pipeline and expert-parallel wrappers,
@@ -4863,6 +4983,21 @@ half (plan 13 S5).
   dispatch refuse with an error and drops its recorder without `finish` (read,
   likely the cause, not confirmed); this slice's diff leaves those tests and the
   methods they call untouched. Not run on HEAD.
+
+### B-DSV2-Q8-VK-NAN — Vulkan batched MoE gives NaN on the synthetic deepseek2 with Q8_0 experts (2026-11-25)
+
+**Kind:** bug seen in a run, not diagnosed.
+
+The synthetic `deepseek2` model (`grouped_model` in
+`tests/synthetic_deepseek2.rs`) with its three expert banks in Q8_0
+(`Fill::Quant`) prefills to NaN logits on Vulkan once a batched prefill chunk
+reaches 9 rows (prompt of 10 tokens; 9 tokens, an 8-row chunk, is finite), on
+both GPUs; the CPU is finite throughout. The attention temperature is not
+involved (the same with it off, and on the plain deepseek2 model). The file's
+dims are toy-sized (`n_embd` 64, `n_ff_exp` 32, 16 experts top 2), so a kernel
+tiling assumption a real model meets is a candidate; not investigated. The
+Mistral-Large-3 straddle test runs Vulkan at chunks of 5
+(`ML3_VULKAN_STRADDLE_UBATCH`) to stay under it.
 
 ### B-MLA-KV-SHIFT — a KV shift re-ropes cached K with the magnitude (2026-11-25)
 
@@ -4910,23 +5045,12 @@ of implemented:
   its attention chunk). Past it the reference uses chunked attention
   (`LLAMA_SWA_TYPE_CHUNKED`) and a position-dependent temperature on the NoPE
   layers; the mask needs a new attention-mask kind in the CPU, Vulkan and Metal
-  kernels. Mistral-Large-3 (`deepseek2.attention.temperature_scale`) is capped
-  at its `temperature_length` the same way. Implementing either lifts the cap.
+  kernels. Implementing both lifts the cap (plan 13 S6).
 - **A `.scale` tensor the reference applies and infr does not is refused at
   load** (`applied_weight_scales`, one row per llama.cpp builder; scales the
   builder ignores load as before). This is the NVFP4 / ModelOpt case. Applying
   the scales would lift the refusal. The diffusion-gemma row copies gemma4's:
   the checkout has no builder for it.
-- **Needs a decision — deepseek32 with an unusual YaRN multiplier.** llama.cpp
-  applies its `mscale_all_dims` special case to `deepseek2` only, so a
-  deepseek32 file with stretching and a multiplier that is neither 0 nor 1 gets
-  a different attention factor there than the deepseek2 rule infr uses. Real
-  V3.2 declares 1 and is unaffected. The synthetic deepseek32 fixture uses
-  V2-Lite's multiplier and IS in that case, so refusing it fails the fixture's
-  locked-logit tests. Today such a file loads with one warning
-  (`deepseek32_yarn_rules_agree`). Options: change the fixture to the real
-  file's multiplier, re-bless its logits and refuse the case; or keep the
-  warning.
 - A qwen35 file whose `attention.recurrent_layers` is not the periodic layout is
   refused; no converter writes one.
 

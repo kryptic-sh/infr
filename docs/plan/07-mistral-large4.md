@@ -24,9 +24,9 @@ against it.** Not read: the MLA and indexer shaders and Metal kernels, the
    (`indexer.ssmax`), applied before its ReLU — the factor can be negative, so
    the order matters. `n` is the count of causally visible keys by position, not
    the number of keys the top-k kept. **This is the new op** (CPU, Vulkan,
-   Metal): infr has no attention temperature of any kind today, and the
-   context-cap trick used for Mistral-Large-3 cannot work here because the
-   factor differs from 1 at position 0.
+   Metal): infr's one attention temperature, `Op::AttnTemp` (Mistral-Large-3's,
+   plan 13 S5), takes one factor per position shared by every head, from a
+   floored logarithm, so it cannot carry a learned per-head scale and bias.
 2. **A per-layer RoPE pattern** (`attention.rope_pattern`, a bool array): NoPE
    layers use the whole head width without rotation. The reference keeps the
    cache layout uniform by zero-padding the rope tail, and mirroring that needs

@@ -1,5 +1,6 @@
 //! A test tap on the shape of the graphs the CPU executes: the row count of every
-//! `Op::Attention` and `Op::Mla`, the shape of every `Op::MulVec`, and the row count and table
+//! `Op::Attention` and `Op::Mla`, the shape of every `Op::MulVec`, the rows and first position of
+//! every `Op::AttnTemp`, and the row count and table
 //! dtype of every `Op::EmbedGather`. Off unless a test starts it on the thread that executes the
 //! graphs, and then it only copies what the ops carry anyway. It exists so a test can see how a
 //! prompt was cut into graphs (one row per graph, or chunks of several), whether the embedding was
@@ -20,6 +21,8 @@ pub enum TappedOp {
     Mla { rows: u32 },
     /// An `Op::MulVec` scaling `rows` rows of `n`.
     MulVec { rows: u32, n: u32 },
+    /// An `Op::AttnTemp` over `rows` rows, the first at position `pos`.
+    AttnTemp { rows: u32, pos: u32 },
 }
 
 thread_local! {

@@ -2814,9 +2814,9 @@ fn warn_ctx_cap(cfg: &Config, ecfg: &crate::EngineConfig) {
             format!("{w} {ctx}")
         });
         tracing::warn!(
-            "ctx cap: {what} -> at most {limit} tokens: past that this model's reference changes \
-             its attention (a position-dependent temperature; on llama4 also chunking) in a way \
-             infr does not implement"
+            "ctx cap: {what} -> at most {limit} tokens: past that llama4's reference chunks its \
+             attention and scales its NoPE layers' queries by a position-dependent temperature, \
+             neither of which infr applies to llama4 yet"
         );
     }
 }

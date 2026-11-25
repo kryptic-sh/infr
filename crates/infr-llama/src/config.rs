@@ -218,6 +218,15 @@ pub struct Config {
     pub no_rope_step: usize,
     /// See [`Config::faithful_ctx_limit`], which reads it.
     pub ctx_limit: Option<usize>,
+    /// llama.cpp's attention temperature on a `deepseek2` file (Mistral-Large-3):
+    /// `attention.temperature_scale`, the reference's `f_attn_temp_scale`. Every layer's query at
+    /// position `p` is multiplied by `ln(floor(p / attn_temp_floor_scale) + 1) * scale + 1`
+    /// (`llm_graph_input_attn_temp`, with `deepseek2.cpp`'s offset of 0), which the runner emits as
+    /// `Op::AttnTemp`. `0.0` is the reference's "off" and every other model's value.
+    pub attn_temp_scale: f32,
+    /// `attention.temperature_length`, the reference's `n_attn_temp_floor_scale`: nonzero whenever
+    /// [`Config::attn_temp_scale`] is, `0` otherwise.
+    pub attn_temp_floor_scale: u32,
     /// llama4 `Llama4TextL2Norm`: a WEIGHTLESS per-head RMS/L2-norm applied to Q and K AFTER rope,
     /// on the rope (non-NoPE) layers only. `use_kq_norm = n_expert != 128` in the reference (`true`
     /// for Scout 16E). `false` for every non-llama4 model.
@@ -628,18 +637,13 @@ impl Config {
     /// resolved (`SeamModel::session_ctx`), and the runner caps a one-shot `want_ctx` the same
     /// way.
     ///
-    /// Both cases are llama.cpp's attention temperature (`llm_graph_input_attn_temp`), which
-    /// multiplies Q at position `p` by `log(floor((p + offset) / floor_scale) + 1) * scale + 1` —
-    /// exactly 1 until `p + offset` reaches `floor_scale`:
-    ///
-    /// * llama4's iRoPE branch (`no_rope_step > 0`): `llama4.cpp` hardcodes the temperature on
-    ///   its NoPE layers with `offset = 1`, `floor_scale = LLAMA4_ATTN_CHUNK`, and also gives its
-    ///   rope layers CHUNKED attention (`LLAMA_SWA_TYPE_CHUNKED`: a query at `p` sees only keys
-    ///   from `(p / LLAMA4_ATTN_CHUNK) * LLAMA4_ATTN_CHUNK` on). The temperature diverges first,
-    ///   at `p = LLAMA4_ATTN_CHUNK - 1`, so the limit is `LLAMA4_ATTN_CHUNK - 1` tokens.
-    /// * deepseek2 with a non-zero `attention.temperature_scale` (Mistral-Large-3): `deepseek2.cpp`
-    ///   applies it to Q on every layer with `offset = 0` and `floor_scale =
-    ///   attention.temperature_length`, so the limit is `temperature_length` tokens.
+    /// The one case is llama4's iRoPE branch (`no_rope_step > 0`): `llama4.cpp` hardcodes
+    /// llama.cpp's attention temperature (`llm_graph_input_attn_temp`) on its NoPE layers, which
+    /// multiplies Q at position `p` by `log(floor((p + 1) / LLAMA4_ATTN_CHUNK) + 1) * scale + 1`
+    /// (exactly 1 until `p + 1` reaches `LLAMA4_ATTN_CHUNK`), and also gives its rope layers
+    /// CHUNKED attention (`LLAMA_SWA_TYPE_CHUNKED`: a query at `p` sees only keys from
+    /// `(p / LLAMA4_ATTN_CHUNK) * LLAMA4_ATTN_CHUNK` on). The temperature diverges first, at
+    /// `p = LLAMA4_ATTN_CHUNK - 1`, so the limit is `LLAMA4_ATTN_CHUNK - 1` tokens.
     pub fn faithful_ctx_limit(&self) -> Option<usize> {
         self.ctx_limit
     }
@@ -654,6 +658,7 @@ impl Config {
             return 1.0;
         }
         mla_rope_mscale(
+            self.deepseek32,
             self.rope_scaling_yarn,
             self.rope_scaling_factor,
             self.rope_yarn_log_mul,
@@ -1016,31 +1021,9 @@ impl Config {
         } else {
             (false, 1.0, 0, 1.0, YARN_BETA_FAST, YARN_BETA_SLOW)
         };
-        // KNOWN DIVERGENCE, left for the owner to decide: on `deepseek32` a multiplier the two
-        // rules disagree on makes llama.cpp's attention factor differ from the `deepseek2` value
-        // infr uses (`deepseek32_yarn_rules_agree`), so the MLA score scale — and the q_pe/k_pe
-        // magnitude — may differ from the reference. The file still loads, as it always did; a
-        // later decision only has to turn this warning into a refusal.
-        if deepseek32
-            && !deepseek32_yarn_rules_agree(
-                rope_scaling_yarn,
-                rope_scaling_factor,
-                rope_yarn_log_mul,
-            )
-        {
-            tracing::warn!(
-                "{arch} YaRN: {} = {} (mscale_all_dim {rope_yarn_log_mul}) with {} = \
-                 {rope_scaling_factor}: llama.cpp gives deepseek32 a YaRN attention factor of \
-                 get_mscale(factor, 1) / get_mscale(factor, mscale_all_dim), without the deepseek2 \
-                 special case that makes it 1, and infr uses the deepseek2 value — the attention \
-                 scale may differ from the reference",
-                mk("rope.scaling.yarn_log_multiplier"),
-                rope_yarn_log_mul * 0.1,
-                mk("rope.scaling.factor"),
-            );
-        }
         if deepseek2 {
             let m = mla_rope_mscale(
+                deepseek32,
                 rope_scaling_yarn,
                 rope_scaling_factor,
                 rope_yarn_log_mul,
@@ -1831,28 +1814,32 @@ impl Config {
         };
         refuse_unapplied_weight_scales(g, &arch, gemma4_moe || diffusion_gemma)?;
         let qkv_bias = qkv_projection_biases(g, &arch, n_layer)?;
-        // See `Config::faithful_ctx_limit`. deepseek32's builder reads neither temperature key,
-        // so only the deepseek2 string is checked.
-        let ctx_limit = if llama4 && no_rope_step > 0 {
-            Some(LLAMA4_ATTN_CHUNK - 1)
-        } else if deepseek2 && !deepseek32 {
+        // See `Config::faithful_ctx_limit`.
+        let ctx_limit = (llama4 && no_rope_step > 0).then_some(LLAMA4_ATTN_CHUNK - 1);
+        // See `Config::attn_temp_scale`. deepseek32's builder reads neither temperature key, so
+        // only the deepseek2 string is checked.
+        let (attn_temp_scale, attn_temp_floor_scale) = if deepseek2 && !deepseek32 {
             let scale_key = mk("attention.temperature_scale");
             match meta_f64(g, &scale_key) {
                 Some(scale) if scale != 0.0 => {
                     let len_key = mk("attention.temperature_length");
-                    let len = meta_u64(g, &len_key).unwrap_or(0) as usize;
+                    // `llm_graph_input_attn_temp::set_input` asserts a nonzero floor scale.
+                    let len = meta_u64(g, &len_key).unwrap_or(0);
                     if len == 0 {
                         bail!(
                             "{scale_key} = {scale} needs a positive {len_key} (the position the \
                              attention temperature starts from); the file has none"
                         );
                     }
-                    Some(len)
+                    let Ok(len) = u32::try_from(len) else {
+                        bail!("{len_key} = {len} does not fit the reference's u32");
+                    };
+                    (scale as f32, len)
                 }
-                _ => None,
+                _ => (0.0, 0),
             }
         } else {
-            None
+            (0.0, 0)
         };
         let cfg = Config {
             n_layer,
@@ -1915,6 +1902,8 @@ impl Config {
             moe_interleave_step,
             no_rope_step,
             ctx_limit,
+            attn_temp_scale,
+            attn_temp_floor_scale,
             kq_l2norm,
             shexp_gated,
             sub_norm,
@@ -2077,11 +2066,29 @@ fn check_recurrent_layers(
     Ok(())
 }
 
-/// Whether `llama-context.cpp`'s YaRN `attn_factor` comes out the same for `deepseek32` as under
-/// the `deepseek2` rule [`mla_rope_mscale`] (and the runner's MLA score scale) implement: true
-/// unless YaRN stretches (`factor > 1`) with a multiplier that is neither absent nor 1.
-fn deepseek32_yarn_rules_agree(yarn: bool, factor: f32, log_mul: f32) -> bool {
-    !yarn || factor <= 1.0 || log_mul == 0.0 || log_mul == 1.0
+/// `get_mscale(f, mscale) / get_mscale(f, mscale_all_dims)`: what `llama-context.cpp` sets a
+/// YaRN file's `cparams.yarn_attn_factor` to when it declares a `yarn_log_multiplier` (`log_mul`,
+/// the `mscale_all_dims` there), before dividing it by `1 + 0.1·ln(f)` and multiplying in
+/// `rope.scaling.attn_factor`. `get_mscale(f, m) = 0.1·m·ln(f) + 1` for `f > 1`, else 1.
+///
+/// The rule is keyed on the arch string: `mscale` is 1, except on `deepseek2` with a multiplier
+/// other than 1, where it is the multiplier itself and the ratio is exactly 1. `deepseek32` has no
+/// such case, so there a multiplier other than 1 leaves a ratio, in the rope magnitude
+/// ([`mla_rope_mscale`]) and in the MLA score scale the runner derives from it both.
+pub(crate) fn yarn_mscale_ratio(deepseek32: bool, factor: f32, log_mul: f32) -> f32 {
+    let get_mscale = |m: f32| {
+        if factor <= 1.0 {
+            1.0
+        } else {
+            0.1 * m * infr_core::math::ln(factor) + 1.0
+        }
+    };
+    let mscale = if !deepseek32 && log_mul != 1.0 {
+        log_mul
+    } else {
+        1.0
+    };
+    get_mscale(mscale) / get_mscale(log_mul)
 }
 
 /// The magnitude ggml's rope gives a DeepSeek MLA model's `q_pe`/`k_pe` (and V3.2's indexer
@@ -2089,29 +2096,25 @@ fn deepseek32_yarn_rules_agree(yarn: bool, factor: f32, log_mul: f32) -> bool {
 ///
 /// `ggml_rope_ext` multiplies both `cos` and `sin` by `mscale = attn_factor`, times
 /// `1 + 0.1·ln(1/freq_scale)` when `ext_factor != 0` (`rope_yarn`). `llama-context.cpp` sets
-/// `attn_factor` (`cparams.yarn_attn_factor`) for YaRN to `get_mscale(f, mscale) /
-/// get_mscale(f, mscale_all_dims)` — `get_mscale(f, 1)` when there is no
-/// `yarn_log_multiplier` — divided by that same `1 + 0.1·ln(f)` and times
-/// `rope.scaling.attn_factor`; without YaRN it is `rope.scaling.attn_factor` alone. The two
-/// `1 + 0.1·ln(f)` cancel, leaving the ratio times `rope.scaling.attn_factor`.
-/// `get_mscale(f, m) = 1 + 0.1·m·ln(f)` for `f > 1`, else 1; `mscale_all_dims` is the
-/// multiplier, and on the `deepseek2` string `mscale` is set equal to it, so a multiplier makes
-/// the ratio exactly 1.
-///
-/// That `mscale = mscale_all_dims` special case is keyed on `LLM_ARCH_DEEPSEEK2` only, so on
-/// `deepseek32` a multiplier other than 1 leaves a ratio — in this magnitude AND in the MLA score
-/// scale the runner derives the same way. This computes the `deepseek2` rule, which is exact for
-/// `deepseek32` only where the two rules agree ([`deepseek32_yarn_rules_agree`]); where they do
-/// not, `from_gguf` loads the file anyway and warns — a known divergence left for the owner. V3.2
-/// itself declares `mscale_all_dim = 1.0`, where they agree.
+/// `attn_factor` (`cparams.yarn_attn_factor`) for YaRN to [`yarn_mscale_ratio`] —
+/// `get_mscale(f, 1)` when there is no `yarn_log_multiplier` — divided by that same
+/// `1 + 0.1·ln(f)` and times `rope.scaling.attn_factor`; without YaRN it is
+/// `rope.scaling.attn_factor` alone. The two `1 + 0.1·ln(f)` cancel, leaving the ratio times
+/// `rope.scaling.attn_factor`, which on `deepseek2` with a multiplier is that factor alone.
 ///
 /// [`Config::mla_rope_magnitude`] hands this to the runner, which applies it.
-fn mla_rope_mscale(yarn: bool, factor: f32, log_mul: f32, attn_factor: f32) -> f32 {
+fn mla_rope_mscale(
+    deepseek32: bool,
+    yarn: bool,
+    factor: f32,
+    log_mul: f32,
+    attn_factor: f32,
+) -> f32 {
     if !yarn {
         return attn_factor;
     }
     let ratio = if log_mul != 0.0 {
-        1.0
+        yarn_mscale_ratio(deepseek32, factor, log_mul)
     } else if factor > 1.0 {
         // `get_mscale(f, 1)`.
         0.1 * infr_core::math::ln(factor) + 1.0
@@ -2859,64 +2862,86 @@ mod tests {
             "{err}"
         );
 
-        assert_eq!(mla_rope_mscale(true, 40.0, 0.707, 1.0), 1.0);
+        assert_eq!(mla_rope_mscale(false, true, 40.0, 0.707, 1.0), 1.0);
         assert_eq!(
-            mla_rope_mscale(true, 1.0, 0.0, 1.0),
+            mla_rope_mscale(false, true, 1.0, 0.0, 1.0),
             1.0,
             "no stretch, no magnitude"
         );
-        assert_eq!(mla_rope_mscale(false, 40.0, 0.0, 2.0), 2.0);
+        assert_eq!(mla_rope_mscale(false, false, 40.0, 0.0, 2.0), 2.0);
+    }
 
-        // deepseek32 lacks the special case: only a multiplier of 1 (or none) agrees. V3.2's own
-        // `mscale_all_dim` (1.0, written as 0.1) gets no warning; the synthetic deepseek32
-        // fixture's V2-Lite values (0.707 at factor 40) do.
-        assert!(deepseek32_yarn_rules_agree(true, 40.0, 1.0), "V3.2");
+    /// `llama-context.cpp`'s YaRN attention factor is keyed on the arch string: its
+    /// `mscale = mscale_all_dims` special case is `LLM_ARCH_DEEPSEEK2`'s alone, so a `deepseek32`
+    /// file with a multiplier other than 1 keeps the ratio `get_mscale(f, 1) / get_mscale(f, m)`,
+    /// in the rope magnitude and in the score scale both. The expected values are that formula in
+    /// f64; V3.2's own multiplier (1) and the no-stretch case agree with `deepseek2` exactly.
+    #[test]
+    fn yarn_mscale_ratio_follows_the_reference_arch_rule() {
+        let get_mscale = |f: f64, m: f64| {
+            if f <= 1.0 {
+                1.0
+            } else {
+                0.1 * m * f.ln() + 1.0
+            }
+        };
+        let want = get_mscale(40.0, 1.0) / get_mscale(40.0, 0.707);
+        let got = yarn_mscale_ratio(true, 40.0, 0.707);
         assert!(
-            !deepseek32_yarn_rules_agree(true, 40.0, 0.707),
-            "the fixture"
+            ((f64::from(got) - want) / want).abs() < 1e-6,
+            "deepseek32 at 0.707: {got} against {want}"
         );
-        assert!(deepseek32_yarn_rules_agree(true, 40.0, 0.0));
-        assert!(deepseek32_yarn_rules_agree(true, 1.0, 0.707));
-        assert!(deepseek32_yarn_rules_agree(false, 40.0, 0.707));
+        assert!(want > 1.08, "the ratio must be one a test can see: {want}");
+        assert_eq!(
+            mla_rope_mscale(true, true, 40.0, 0.707, 2.0),
+            got * 2.0,
+            "the magnitude is the ratio times rope.scaling.attn_factor"
+        );
+
+        assert_eq!(yarn_mscale_ratio(false, 40.0, 0.707), 1.0, "deepseek2");
+        for deepseek32 in [false, true] {
+            assert_eq!(yarn_mscale_ratio(deepseek32, 40.0, 1.0), 1.0, "V3.2's 1");
+            assert_eq!(yarn_mscale_ratio(deepseek32, 1.0, 0.707), 1.0, "no stretch");
+        }
     }
 
     /// deepseek2's `attention.temperature_scale` (Mistral-Large-3) scales Q from
-    /// `attention.temperature_length` on; the context stops there. A zero scale is the
-    /// reference's "off", and a scale with no length is refused by name (llama.cpp asserts it).
+    /// `attention.temperature_length` on, which the runner applies, so the context is not capped.
+    /// A zero scale is the reference's "off", and a scale with no length is refused by name
+    /// (llama.cpp asserts it).
     #[test]
-    fn deepseek2_attention_temperature_caps_the_context() {
+    fn deepseek2_attention_temperature_is_read() {
         let with = |extra: &[(&'static str, u32)]| {
             let mut keys = DEEPSEEK2_BASE_KEYS.to_vec();
             keys.extend_from_slice(extra);
             keys
         };
+        let off = |cfg: &Config| {
+            assert_eq!(cfg.faithful_ctx_limit(), None);
+            assert_eq!((cfg.attn_temp_scale, cfg.attn_temp_floor_scale), (0.0, 0));
+        };
         let cfg = config_from_fixture("ds2-temp-none", &deepseek2_fixture(&with(&[])))
             .expect("base deepseek2 fixture must parse");
-        assert_eq!(cfg.faithful_ctx_limit(), None);
-        let base_ctx = cfg.n_ctx_train;
+        off(&cfg);
 
         let cfg = config_from_fixture(
             "ds2-temp-off",
             &deepseek2_fixture(&with(&[("attention.temperature_scale", 0)])),
         )
         .expect("a zero temperature scale must parse");
-        assert_eq!(cfg.faithful_ctx_limit(), None);
+        off(&cfg);
 
         let len = 4096;
-        assert!(len < base_ctx, "the fixture must have room to cap");
         let cfg = config_from_fixture(
             "ds2-temp-on",
             &deepseek2_fixture(&with(&[
-                ("attention.temperature_scale", 1),
-                ("attention.temperature_length", len as u32),
+                ("attention.temperature_scale", 3),
+                ("attention.temperature_length", len),
             ])),
         )
         .expect("a temperature with its length must parse");
-        assert_eq!(cfg.faithful_ctx_limit(), Some(len));
-        assert_eq!(
-            cfg.n_ctx_train, base_ctx,
-            "the file's context stays; sessions are capped"
-        );
+        assert_eq!(cfg.faithful_ctx_limit(), None, "the temperature is applied");
+        assert_eq!((cfg.attn_temp_scale, cfg.attn_temp_floor_scale), (3.0, len));
 
         let Err(err) = config_from_fixture(
             "ds2-temp-nolen",

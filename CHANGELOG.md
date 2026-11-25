@@ -10,8 +10,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - **`infr_core::graph::Op` gains `AttnTemp`**, the position-dependent attention
   temperature, so an exhaustive match on `Op` must handle it.
-- **`infr_cpu::op_tap::TappedOp` gains `Mla` and `MulVec`**, so an exhaustive
-  match on it must handle them.
+- **`infr_cpu::op_tap::TappedOp` gains `Mla`, `MulVec` and `AttnTemp`**, so an
+  exhaustive match on it must handle them.
+- **`infr_llama::Config` gains `attn_temp_scale` and `attn_temp_floor_scale`**
+  (Mistral-Large-3's attention temperature), so a struct literal of it must set
+  them or use `..Default::default()`.
 - **`infr_core::budget::reserve_bytes` takes only the override.** It returns
   `kv.overflow_reserve_mb` in bytes, `0` when unset, where it took the device's
   total memory and defaulted to max(12% of it, 2 GiB).
@@ -89,10 +92,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`Op::AttnTemp`** on the CPU, Vulkan and Metal backends: llama.cpp's
   position-dependent attention temperature (`llm_graph_input_attn_temp`), which
   scales each row by `ln(floor((pos + offset) / floor_scale) + 1) * scale + 1`.
-  No model emits it yet. A graph holding it does not take the Vulkan or Metal
-  decode replay, since its position is baked in. The Metal kernel has never been
-  compiled or run: MSL is compiled at run time on a Mac, and only the Rust side
-  of the Metal backend has been type-checked.
+  Mistral-Large-3 emits it (below). A graph holding it does not take the Vulkan
+  or Metal decode replay, since its position is baked in; a DeepSeek MLA model's
+  decode does not replay on either backend anyway. The Metal kernel has never
+  been compiled or run: MSL is compiled at run time on a Mac, and only the Rust
+  side of the Metal backend has been type-checked.
 - **DeepSeek-family files whose YaRN magnitude is not 1 load and run.** ggml's
   rope scales the rotary halves of the MLA query and key (and V3.2's indexer
   query and key) by that magnitude; infr now multiplies the query's rotary
@@ -570,6 +574,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **Mistral-Large-3's context is no longer capped at its
+  `attention.temperature_length`.** infr now applies the model's attention
+  temperature (`deepseek2.attention.temperature_scale`) the way llama.cpp does,
+  so a session can open past that length. Below it the factor is exactly 1 and
+  the graph is the one 0.3.0 built. Checked against llama.cpp on a synthetic
+  file of that shape; no real Mistral-Large-3 file has been run.
+- **A `deepseek32` file with a YaRN multiplier other than 1 gets llama.cpp's
+  `deepseek32` attention factor**, where it got the `deepseek2` one with a load
+  warning. llama.cpp keys that rule on the arch string, and only `deepseek2`
+  cancels the multiplier's ratio, so such a file now runs at a different score
+  scale and rope magnitude than in 0.3.0. DeepSeek V3.2 declares a multiplier of
+  1, where the two rules agree, and is unchanged.
 - **A batched-MoE prefill chunk whose expert GEMM grid passes the device's
   workgroup limit is refused by name.**
   `vulkan recorder: batched-MoE expert GEMM … needs N workgroups in one grid dimension, past this device's maxComputeWorkGroupCount[0] of L — run prefill in smaller batches (a smaller INFR_UBATCH)`.

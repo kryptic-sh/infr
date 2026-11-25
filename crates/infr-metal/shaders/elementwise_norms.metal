@@ -33,6 +33,21 @@ kernel void mul_vec_f32(device const float* x    [[buffer(0)]],
     if (gid < p.total) dst[gid] = x[gid] * vec_[gid % p.n];
 }
 
+// Position-dependent attention temperature (Op::AttnTemp, llama.cpp's llm_graph_input_attn_temp):
+// dst[r, c] = x[r, c] * (ln(floor((pos + r + offset) / floor_scale) + 1) * scale + 1) over
+// `total = rows*n` elements. The quotient is an integer division (see the op's doc); a quotient
+// of 0 is the factor 1 exactly, written out rather than left to `log(1.0f)` being exactly 0.
+struct AttnTempParams { uint n; uint total; uint pos; uint floor_scale; float scale; uint offset; };
+kernel void attn_temp_f32(device const float* x   [[buffer(0)]],
+                          device float*       dst [[buffer(1)]],
+                          constant AttnTempParams& p [[buffer(2)]],
+                          uint gid [[thread_position_in_grid]]) {
+    if (gid >= p.total) return;
+    uint k = (p.pos + gid / p.n + p.offset) / p.floor_scale;
+    float t = k == 0u ? 1.0f : log(float(k) + 1.0f) * p.scale + 1.0f;
+    dst[gid] = x[gid] * t;
+}
+
 // LFM3 attention output gate (Op::HeadGate): one sigmoid per (row, head), `g` holding one logit
 // per head, broadcast over the head's `head_dim` lanes.
 struct HeadGateParams { uint n; uint head_dim; };

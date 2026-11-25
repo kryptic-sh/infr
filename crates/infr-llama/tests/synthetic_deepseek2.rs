@@ -2551,6 +2551,325 @@ fn with_meta(mut m: SyntheticModel, key: &str, v: Meta) -> SyntheticModel {
     m
 }
 
+// ─── the MLA YaRN magnitude ──────────────────────────────────────────────────────
+//
+// ggml's rope multiplies `q_pe` and `k_pe` (and V3.2's indexer q/k) by the YaRN magnitude `m`
+// (`Config::mla_rope_magnitude`), so the reference's MLA score is
+// `kq_scale · (q_nope·k_nope + m²·q_pe·k_pe)`. The runner applies `m²` to the query's rotary
+// columns alone. Each case below checks that against a model with `m = 1` whose query projection
+// rows were scaled on the host so that the formula gives the same scores: with powers of two the
+// two runs are the same arithmetic up to exact scalings, so they agree to the bit.
+
+/// `m` with `key` added (it must not be there yet), kept in the sorted order `mla_model` writes.
+fn with_new_meta(mut m: SyntheticModel, key: &str, v: Meta) -> SyntheticModel {
+    assert!(
+        m.meta.iter().all(|(k, _)| k != key),
+        "{key} is already in the model"
+    );
+    m.meta.push((key.to_string(), v));
+    m.meta.sort_by(|a, b| a.0.cmp(&b.0));
+    m
+}
+
+/// `m` with every layer's query projection `blk.N.{role}` rescaled per output row: an output
+/// column `c` of a `head`-wide head takes `rope_gain` when `c` is in `rope`, `nope_gain` otherwise.
+/// Each output row is `in_f` values (the ggml shape's first dimension). The role is matched
+/// whole: `attn_q_b.weight` is a suffix of `indexer.attn_q_b.weight`.
+fn with_scaled_q_heads(
+    mut m: SyntheticModel,
+    role: &str,
+    in_f: usize,
+    head: usize,
+    rope: std::ops::Range<usize>,
+    (nope_gain, rope_gain): (f32, f32),
+) -> SyntheticModel {
+    let mut n = 0;
+    let is_role = |name: &str| {
+        name.strip_prefix("blk.")
+            .and_then(|r| r.split_once('.'))
+            .is_some_and(|(_, r)| r == role)
+    };
+    for t in m.tensors.iter_mut().filter(|t| is_role(&t.name)) {
+        let mut v = t.values();
+        for (j, row) in v.chunks_mut(in_f).enumerate() {
+            let gain = if rope.contains(&(j % head)) {
+                rope_gain
+            } else {
+                nope_gain
+            };
+            row.iter_mut().for_each(|x| *x *= gain);
+        }
+        t.fill = Fill::Exact(v);
+        n += 1;
+    }
+    assert!(n > 0, "{role} matched no tensor — nothing was scaled");
+    m
+}
+
+/// `m` with a YaRN magnitude of 2, from `rope.scaling.attn_factor`: the score scale is
+/// `kq_scale · 4` and the rotary dot `· 4` more. [`unit_magnitude_twin`] is the same model at a
+/// magnitude of 1 with its query rows scaled to reproduce those scores.
+fn magnitude_two(arch: &str, m: SyntheticModel) -> SyntheticModel {
+    with_new_meta(
+        m,
+        &format!("{arch}.rope.scaling.attn_factor"),
+        Meta::F32(2.0),
+    )
+}
+
+/// [`magnitude_two`]'s reference: magnitude 1, the MLA query's NOPE rows `× 4` (the score scale's
+/// factor) and its rotary rows `× 16` (`m²` on top), and, when `indexer` is set, the indexer
+/// query's rotary rows `× 4` (its score scale does not involve the magnitude).
+fn unit_magnitude_twin(
+    m: SyntheticModel,
+    d: &Ds2Dims,
+    indexer: Option<&IndexerDims>,
+) -> SyntheticModel {
+    let m = with_scaled_q_heads(
+        m,
+        "attn_q_b.weight",
+        d.q_lora_rank,
+        d.key_length_mla,
+        d.qk_nope()..d.key_length_mla,
+        (4.0, 16.0),
+    );
+    match indexer {
+        None => m,
+        Some(ix) => with_scaled_q_heads(
+            m,
+            "indexer.attn_q_b.weight",
+            d.q_lora_rank,
+            ix.head_size,
+            0..d.qk_rope_dim,
+            (1.0, 4.0),
+        ),
+    }
+}
+
+/// The MLA and MulVec ops a CPU prefill of `prompt` ran, in order.
+fn mla_and_gain_ops(tag: &str, model: &SyntheticModel) -> Vec<infr_cpu::op_tap::TappedOp> {
+    use infr_cpu::op_tap::{self, TappedOp};
+    let tmp = TempGguf::write(tag, model);
+    let m = load(&tmp);
+    op_tap::start();
+    let logits = m.prefill_logits_cpu(PROMPT);
+    let ops = op_tap::take();
+    logits.expect("cpu prefill");
+    ops.into_iter()
+        .filter(|o| matches!(o, TappedOp::Mla { .. } | TappedOp::MulVec { .. }))
+        .collect()
+}
+
+/// **A YaRN magnitude of 1 emits nothing new; any other one multiplies the query's rotary
+/// columns once per layer, right before the attention.** The canonical deepseek2 and deepseek32
+/// models have magnitude 1 (V2-Lite's YaRN multiplier) and must run no `MulVec` at all; at
+/// magnitude 2 every `Mla` over `r` rows comes right after one `MulVec` over the MLA query
+/// (`[r·n_head, key_length_mla]`) and, on deepseek32, one over the indexer query
+/// (`[r·indexer n_head, indexer head_size]`) before that. Both magnitudes run the same attentions.
+#[test]
+fn synthetic_deepseek2_mla_magnitude_emits_only_where_it_is_not_one() {
+    use infr_cpu::op_tap::TappedOp;
+    let d = ds2_dims(N_GROUPS, N_GROUPS_USED, Some(force_bias()));
+    let ix = ds32_indexer();
+    let mla_rows = |ops: &[TappedOp]| -> Vec<u32> {
+        ops.iter()
+            .filter_map(|o| match *o {
+                TappedOp::Mla { rows } => Some(rows),
+                _ => None,
+            })
+            .collect()
+    };
+    let with_gains = |rows: &[u32], indexer: bool| -> Vec<TappedOp> {
+        rows.iter()
+            .flat_map(|&r| {
+                let ix_gain = TappedOp::MulVec {
+                    rows: r * ix.n_head as u32,
+                    n: ix.head_size as u32,
+                };
+                let mla_gain = TappedOp::MulVec {
+                    rows: r * d.n_head as u32,
+                    n: d.key_length_mla as u32,
+                };
+                let mut v = if indexer { vec![ix_gain] } else { vec![] };
+                v.extend([mla_gain, TappedOp::Mla { rows: r }]);
+                v
+            })
+            .collect()
+    };
+    for (arch, unit_model) in [
+        (infr_llama::arch::DEEPSEEK2, grouped_model()),
+        (infr_llama::arch::DEEPSEEK32, deepseek32_model()),
+    ] {
+        let indexer = arch == infr_llama::arch::DEEPSEEK32;
+        let unit = mla_and_gain_ops(&format!("{arch}-mag1-ops"), &unit_model);
+        let rows = mla_rows(&unit);
+        assert!(
+            rows.len() >= d.n_layer,
+            "{arch}: the prefill ran {} Mla ops",
+            rows.len()
+        );
+        assert_eq!(
+            unit,
+            with_gains(&rows, indexer)
+                .into_iter()
+                .filter(|o| matches!(o, TappedOp::Mla { .. }))
+                .collect::<Vec<_>>(),
+            "{arch} at magnitude 1 ran a MulVec"
+        );
+        let two = mla_and_gain_ops(
+            &format!("{arch}-mag2-ops"),
+            &magnitude_two(arch, unit_model),
+        );
+        assert_eq!(
+            mla_rows(&two),
+            rows,
+            "{arch}: the two magnitudes attend alike"
+        );
+        assert_eq!(two, with_gains(&rows, indexer), "{arch} at magnitude 2");
+    }
+}
+
+/// **The magnitude reaches the rotary half of the score squared, and nothing else.** A deepseek2
+/// model at magnitude 2 must reproduce, to the bit, the magnitude-1 model whose query rows give
+/// the reference formula's scores (see [`unit_magnitude_twin`]), and must differ from the same
+/// file without the magnitude.
+#[test]
+fn synthetic_deepseek2_mla_magnitude_matches_the_reference_scores() {
+    let d = ds2_dims(N_GROUPS, N_GROUPS_USED, Some(force_bias()));
+    let two = cpu_logits(
+        "ds2-mag2",
+        &magnitude_two(infr_llama::arch::DEEPSEEK2, grouped_model()),
+    );
+    let twin = cpu_logits(
+        "ds2-mag2-twin",
+        &unit_magnitude_twin(grouped_model(), &d, None),
+    );
+    let dv = max_abs_diff(&two, &twin);
+    println!("deepseek2 magnitude 2 vs its unit twin: max|Δ| = {dv:e}");
+    assert_eq!(dv, 0.0, "deepseek2 magnitude 2 differs from its unit twin");
+    assert_moves(
+        "deepseek2 magnitude 2 vs 1",
+        &two,
+        &cpu_logits("ds2-mag1", &grouped_model()),
+        "the query rotary gain",
+    );
+}
+
+/// The bound, relative to the logit rms, within which
+/// [`synthetic_deepseek2_mla_magnitude_without_a_multiplier_matches_the_reference`]'s two runs
+/// must agree. Measured on that file: moving the twin's rotary gain by one f32 ulp either way moved
+/// its logits by up to 1.12e-4 of their rms, so a bound under that would fail on rounding alone;
+/// the gain itself moves them by about 0.6 of the rms.
+const NO_MULTIPLIER_TOL: f32 = 2e-4;
+
+/// YaRN WITHOUT a multiplier leaves the magnitude `1 + 0.1·ln(factor)`, from `get_mscale(factor,
+/// 1)` — the other branch of the rule. Its score scale is the one a multiplier of 1 gives, at
+/// magnitude 1, so the twin is that file with only its rotary query rows scaled by `m²`. `m` is
+/// not a power of two, so the two runs round differently and agree to [`NO_MULTIPLIER_TOL`].
+#[test]
+fn synthetic_deepseek2_mla_magnitude_without_a_multiplier_matches_the_reference() {
+    let d = ds2_dims(N_GROUPS, N_GROUPS_USED, Some(force_bias()));
+    let log_mul = "deepseek2.rope.scaling.yarn_log_multiplier";
+    let m = 1.0 + 0.1 * 40f64.ln();
+    let bare = cpu_logits("ds2-nolm", &without_meta(grouped_model(), log_mul));
+    let twin = with_meta(grouped_model(), log_mul, Meta::F32(0.1));
+    let twin = with_scaled_q_heads(
+        twin,
+        "attn_q_b.weight",
+        d.q_lora_rank,
+        d.key_length_mla,
+        d.qk_nope()..d.key_length_mla,
+        (1.0, (m * m) as f32),
+    );
+    let twin = cpu_logits("ds2-nolm-twin", &twin);
+    let dv = max_abs_diff(&bare, &twin);
+    let scale = rms(&bare);
+    println!("deepseek2 magnitude {m} vs its unit twin: max|Δ| = {dv:e} (rms {scale:e})");
+    assert!(
+        dv < NO_MULTIPLIER_TOL * scale,
+        "deepseek2 without a YaRN multiplier differs from its unit twin: max|Δ| = {dv:e}"
+    );
+    assert_moves(
+        &format!("deepseek2 magnitude {m} vs 1"),
+        &bare,
+        &cpu_logits("ds2-nolm-unit", &grouped_model()),
+        "the query rotary gain",
+    );
+}
+
+/// The deepseek32 case: the gain reaches the lightning indexer's query too, whose rotary half the
+/// reference ropes with the same magnitude — so the twin scales both queries, and the indexer must
+/// pick the same keys for the logits to agree to the bit. Both files declare V3.2's own YaRN
+/// multiplier (1), where the deepseek2 and deepseek32 attention-factor rules agree.
+#[test]
+fn synthetic_deepseek32_mla_magnitude_matches_the_reference_scores() {
+    let d = ds32_dims();
+    let ix = ds32_indexer();
+    let base = || {
+        with_meta(
+            deepseek32_model(),
+            "deepseek32.rope.scaling.yarn_log_multiplier",
+            Meta::F32(0.1),
+        )
+    };
+    let two = cpu_logits(
+        "ds32-mag2",
+        &magnitude_two(infr_llama::arch::DEEPSEEK32, base()),
+    );
+    let twin = cpu_logits(
+        "ds32-mag2-twin",
+        &unit_magnitude_twin(base(), &d, Some(&ix)),
+    );
+    let dv = max_abs_diff(&two, &twin);
+    println!("deepseek32 magnitude 2 vs its unit twin: max|Δ| = {dv:e}");
+    assert_eq!(dv, 0.0, "deepseek32 magnitude 2 differs from its unit twin");
+    assert_moves(
+        "deepseek32 magnitude 2 vs 1",
+        &two,
+        &cpu_logits("ds32-mag1", &base()),
+        "the query rotary gain",
+    );
+}
+
+/// [`synthetic_deepseek32_mla_magnitude_matches_the_reference_scores`] on Vulkan: the gain is an
+/// in-place `MulVec` on each query there too. The two runs round alike only up to the device's
+/// reassociation, so they agree to a tolerance.
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn vulkan_synthetic_deepseek32_mla_magnitude_matches_the_reference_scores() {
+    let _g = gpu_serial_lock();
+    let d = ds32_dims();
+    let ix = ds32_indexer();
+    let base = || {
+        with_meta(
+            deepseek32_model(),
+            "deepseek32.rope.scaling.yarn_log_multiplier",
+            Meta::F32(0.1),
+        )
+    };
+    let two = vulkan_logits(
+        "vk-ds32-mag2",
+        &magnitude_two(infr_llama::arch::DEEPSEEK32, base()),
+    );
+    let twin = vulkan_logits(
+        "vk-ds32-mag2-twin",
+        &unit_magnitude_twin(base(), &d, Some(&ix)),
+    );
+    let dv = max_abs_diff(&two, &twin);
+    let scale = rms(&two);
+    println!("vulkan deepseek32 magnitude 2 vs its unit twin: max|Δ| = {dv:e} (rms {scale:e})");
+    assert!(
+        dv < 1e-3 * scale,
+        "vulkan deepseek32 magnitude 2 differs from its unit twin: max|Δ| = {dv:e}"
+    );
+    assert_moves(
+        "vulkan deepseek32 magnitude 2 vs 1",
+        &two,
+        &vulkan_logits("vk-ds32-mag1", &base()),
+        "the query rotary gain",
+    );
+}
+
 // ─── deepseek4 hash-routed MoE ────────────────────────────────────────────────────
 //
 // A hash-routed layer takes its experts from `blk.N.ffn_gate_tid2eid` — an i32

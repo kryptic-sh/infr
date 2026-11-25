@@ -4785,6 +4785,79 @@ cache dtype). Left:
 - To measure in a quiet window: per-op decode time for `rmsnorm` /
   `rmsnorm_wide` and `deltanet_norm` after the added uniform branch.
 
+### B-ATTN-TEMP — what `Op::AttnTemp` and the MLA magnitude left (2026-11-25)
+
+Plan 13 S5's first half added `Op::AttnTemp` (CPU, Vulkan `attn_temp.comp`,
+Metal `attn_temp_f32`) and applies a DeepSeek MLA model's YaRN magnitude
+(`Config::mla_rope_magnitude`) as an `Op::MulVec` on the MLA query and, on
+deepseek32, the indexer query. Nothing emits `Op::AttnTemp` yet: the
+Mistral-Large-3 temperature and the deepseek32 YaRN rule are the slice's second
+half (plan 13 S5).
+
+- **The Metal kernel has only been compiled for `aarch64-apple-darwin`, never
+  run.** `attn_temp_matches_the_reference_factor` in
+  `infr-metal/tests/parity.rs` runs it in CI's macOS Metal job; the MSL source
+  itself is compiled only at run time on a Mac.
+- **A graph holding `Op::AttnTemp` loses the decode replay** on Vulkan
+  (`decode_refusal`, `NoDynKernel`) and on Metal (`replay_shape`,
+  `static_walk_live_positions`), because the op's position is baked in. Neither
+  model it is for replays on Vulkan today (Mistral-Large-3's `Op::Mla` and
+  llama4's standalone f16 `WriteKv` refuse first), so nothing is lost yet. A
+  `_dyn` build reading the position from the replay params, as `rope_f16_dyn`
+  does, would be needed once one of them could otherwise replay.
+- **Tensor parallelism refuses `Op::AttnTemp`** through the catch-all arm of
+  `TensorParallelBackend`'s lowering in `infr-vulkan/src/tp.rs`. The op is a
+  per-row scale, so a sharded input only needs its `n` divided by the world;
+  nothing runs it under TP today (MLA refuses TP already), so it was left.
+- **The MLA magnitude gain rows are synthetic weights**
+  (`mla_q_rope_gain_rows`), uploaded after the ones-vectors the same way. Not
+  run with a magnitude other than 1: the pipeline and expert-parallel wrappers,
+  and any real file (none has one).
+- **`synthetic_deepseek2_mla_magnitude_without_a_multiplier_matches_the_reference`
+  holds to `NO_MULTIPLIER_TOL` (2e-4) of the logit rms**, because moving the
+  twin's gain by one f32 ulp moved that file's logits by up to 1.12e-4 of their
+  rms (measured). The power-of-two cases agree to the bit.
+- **Validation finding, pre-existing and not introduced here:** under
+  `VK_LOADER_LAYERS_ENABLE=VK_LAYER_KHRONOS_validation`,
+  `cargo test -p infr-vulkan --lib -- --include-ignored` reports
+  `VUID-vkDestroyDevice-device-05137` (child objects alive at device destroy)
+  once each in
+  `recorder::tests::embed_gather_refuses_a_forced_fold_on_an_unaligned_row`,
+  `moe_topk_refuses_above_the_expert_ceiling` and
+  `moe_topk_refuses_groups_it_cannot_route`, on both GPUs. Each test makes a
+  dispatch refuse with an error and drops its recorder without `finish` (read,
+  likely the cause, not confirmed); this slice's diff leaves those tests and the
+  methods they call untouched. Not run on HEAD.
+
+### B-MLA-KV-SHIFT — a KV shift re-ropes cached K with the magnitude (2026-11-25)
+
+**Kind:** finding read from the reference, not verified by a run.
+
+llama.cpp's KV shift (`build_rope_shift` in `llama-kv-cache.cpp`) re-ropes the
+cached K with `ggml_rope_ext(…, yarn_ext_factor, yarn_attn_factor, …)`, so it
+puts the YaRN magnitude on the cached rotary half again. infr caches an MLA
+`k_pe` without the magnitude and puts `m²` on the query instead
+(`mla_q_rope_gain`), so a shift ported from the reference would have to leave
+the magnitude out (or account for it) to stay equal. It matters only if infr
+ever shifts an MLA cache of a file whose magnitude is not 1; infr has no KV
+shift today and no published file has such a magnitude.
+
+### B-DSV2-LINEAR-KQ-SCALE — a linearly scaled deepseek2 file runs with the wrong score scale (2026-11-25)
+
+**Kind:** finding read from the reference; infr's side checked by a load.
+
+For a `deepseek2` file with `rope.scaling.type = "linear"` and a factor `f`
+other than 1, the reference runs `ext_factor = 0`, so `llama-context.cpp` leaves
+`yarn_attn_factor = rope.scaling.attn_factor`, and `deepseek2.cpp` still
+multiplies it by `1 + 0.1·ln f` to form `attn_factor_org`, so its `kq_scale` is
+`(attn_factor·(1 + 0.1·ln f)·(1 + 0.1·log_mul·ln f))² / √head_k_mla`. infr's
+non-YaRN `mla_scale` is `rope_attn_factor² / √head_k_mla`. infr does not refuse
+or warn: a throwaway load of the config fixture with type `"linear"` and factor
+4 parsed with `rope_scaling_yarn = false`, factor 4, magnitude 1, and the runner
+then applies no frequency scaling either (B-DSV2-NONYARN-SCALE). The rope
+magnitude agrees (ggml adds `1 + 0.1·ln f` only when `ext_factor` is not 0). No
+published `deepseek2` file is known to declare a linear factor.
+
 ### B147 — seam emitters against llama.cpp, 2026-11-12: fixed, capped, refused and left (2026-11-12)
 
 Every graph emitter in `seam/runner.rs` was compared op by op with its llama.cpp
@@ -4809,9 +4882,6 @@ of implemented:
   builder ignores load as before). This is the NVFP4 / ModelOpt case. Applying
   the scales would lift the refusal. The diffusion-gemma row copies gemma4's:
   the checkout has no builder for it.
-- **An MLA model whose YaRN magnitude is not 1 is refused** (`mla_rope_mscale`):
-  infr's `Op::Mla` / `Op::Rope` take frequency divisors only. Every DeepSeek V2
-  / V3 / V3.2, Kimi K2 and Mistral-Large-3 file evaluates to exactly 1.
 - **Needs a decision — deepseek32 with an unusual YaRN multiplier.** llama.cpp
   applies its `mscale_all_dims` special case to `deepseek2` only, so a
   deepseek32 file with stretching and a multiplier that is neither 0 nor 1 gets

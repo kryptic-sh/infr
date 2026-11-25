@@ -1,8 +1,9 @@
 //! A test tap on the shape of the graphs the CPU executes: the row count of every
-//! `Op::Attention`, and the row count and table dtype of every `Op::EmbedGather`. Off unless a
-//! test starts it on the thread that executes the graphs, and then it only copies what the ops
-//! carry anyway. It exists so a test can see how a prompt was cut into graphs (one row per graph,
-//! or chunks of several) and whether the embedding was gathered in the graph, which the outputs
+//! `Op::Attention` and `Op::Mla`, the shape of every `Op::MulVec`, and the row count and table
+//! dtype of every `Op::EmbedGather`. Off unless a test starts it on the thread that executes the
+//! graphs, and then it only copies what the ops carry anyway. It exists so a test can see how a
+//! prompt was cut into graphs (one row per graph, or chunks of several), whether the embedding was
+//! gathered in the graph, and which ops a model emitted around its attention, which the outputs
 //! cannot show when the two ways are meant to compute the same bits.
 
 use infr_core::DType;
@@ -15,6 +16,10 @@ pub enum TappedOp {
     Attention { rows: u32 },
     /// An `Op::EmbedGather` of `rows` rows out of a table stored as `table`.
     EmbedGather { rows: u32, table: DType },
+    /// An `Op::Mla` over `rows` query rows.
+    Mla { rows: u32 },
+    /// An `Op::MulVec` scaling `rows` rows of `n`.
+    MulVec { rows: u32, n: u32 },
 }
 
 thread_local! {

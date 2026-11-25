@@ -1428,8 +1428,8 @@ fn replay_shape(g: &infr_core::graph::Graph, bindings: &Bindings, m: &MetalCfg) 
             }
             // MLA has no params-driven twin, and the lightning indexer bakes its causal bound from
             // the `pos` param at encode time — a replayed tape would select keys for the position
-            // it was recorded at.
-            Op::Mla { .. } | Op::LightningIndexer { .. } => return false,
+            // it was recorded at. The attention temperature bakes its position the same way.
+            Op::Mla { .. } | Op::LightningIndexer { .. } | Op::AttnTemp { .. } => return false,
             Op::Attention {
                 rows,
                 head_dim,
@@ -1536,6 +1536,7 @@ fn op_name(op: &Op) -> &'static str {
         Op::AddBias { .. } => "AddBias",
         Op::Scale { .. } => "Scale",
         Op::MulVec { .. } => "MulVec",
+        Op::AttnTemp { .. } => "AttnTemp",
         Op::Softcap { .. } => "Softcap",
         Op::Argmax { .. } => "Argmax",
         Op::ArgmaxProb { .. } => "ArgmaxProb",
@@ -3787,6 +3788,38 @@ impl MetalBackend {
                     &p,
                     total,
                 );
+                r.loc[dst.0 as usize] = Loc::Device;
+            }
+            Op::AttnTemp {
+                x,
+                dst,
+                rows,
+                n,
+                pos,
+                floor_scale,
+                scale,
+                offset,
+            } => {
+                if floor_scale == 0 {
+                    return Err(Error::Backend(
+                        "metal Op::AttnTemp: floor_scale 0".to_string(),
+                    ));
+                }
+                let total = rows as usize * n as usize;
+                let Ok(total32) = u32::try_from(total) else {
+                    return Err(Error::Backend(format!(
+                        "metal Op::AttnTemp: {rows} rows of {n} elements exceed attn_temp_f32's \
+                         uint element index"
+                    )));
+                };
+                let bx = self.ensure_device(r, x)?;
+                let bd = self.dev_dst(r, dst, total)?;
+                let pso = self.pipelines.get("attn_temp_f32")?;
+                let mut p = Vec::with_capacity(24);
+                for w in [n, total32, pos, floor_scale, scale.to_bits(), offset] {
+                    p.extend_from_slice(&w.to_ne_bytes());
+                }
+                self.encode_w(r, &pso, &[bx.as_ref(), bd.as_ref()], 1 << 1, &p, total);
                 r.loc[dst.0 as usize] = Loc::Device;
             }
             Op::Softcap { x, dst, cap, n } => {

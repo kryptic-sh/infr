@@ -10989,6 +10989,37 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Position-dependent attention temperature over `rows` rows of `n` (`Op::AttnTemp`); in
+    /// place allowed (`x` may equal `y`). Refuses an element count past the shader's `uint`
+    /// index rather than truncating it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_temp(
+        &self,
+        x: &dyn Buffer,
+        y: &dyn Buffer,
+        rows: usize,
+        n: usize,
+        pos: u32,
+        floor_scale: u32,
+        scale: f32,
+        offset: u32,
+    ) -> Result<()> {
+        let Some(total) = rows.checked_mul(n).and_then(|t| u32::try_from(t).ok()) else {
+            return Err(be(format!(
+                "attn_temp: {rows} rows of {n} elements exceed attn_temp.comp's u32 element index"
+            )));
+        };
+        let k = self
+            .be
+            .kernel("attn_temp", crate::gemm::attn_temp_spv(), 2, 24);
+        let mut pc = Vec::with_capacity(24);
+        for w in [n as u32, total, pos, floor_scale, scale.to_bits(), offset] {
+            pc.extend_from_slice(&w.to_ne_bytes());
+        }
+        self.dispatch_wide(k, &[Self::vkb(x), Self::vkb(y)], 1, &pc, total.div_ceil(64));
+        Ok(())
+    }
+
     /// qwen35moe shared-expert combine: `dst[r,c] = moe[r,c] + sigmoid(gate[r]) * shexp[r,c]` over
     /// `total = rows*n` elements — `gate` is a length-`rows` buffer (one raw pre-sigmoid logit per
     /// row), broadcast across each row's `n` columns (the row-broadcast twin of `mul_vec`'s
@@ -12350,6 +12381,11 @@ mod tests {
                 "mul_vec",
                 vec![f(N), f(W), f(N)],
                 Box::new(|r, b| r.mul_vec(b[0], b[1], b[2], ROWS, W)),
+            ),
+            (
+                "attn_temp",
+                vec![f(N), f(N)],
+                Box::new(|r, b| r.attn_temp(b[0], b[1], ROWS, W, 5, 2, 0.1, 1).unwrap()),
             ),
             (
                 "moe_shared_expert_add",
@@ -15884,6 +15920,26 @@ mod tests {
                 "the ceiling itself must not be refused: {e}"
             );
         }
+    }
+
+    /// `attn_temp` refuses an element count past its shader's `uint` index by name, before it
+    /// records anything, rather than truncating the count.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn attn_temp_refuses_an_element_count_past_u32() {
+        let be = be_with(|_| {});
+        let dummy = be.alloc(4, BufferUsage::Activations).unwrap();
+        let rec = be.recorder().unwrap();
+        let rows = (u32::MAX as usize).div_ceil(64) + 1;
+        let err = rec
+            .attn_temp(dummy.as_ref(), dummy.as_ref(), rows, 64, 0, 8, 0.1, 0)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("exceed attn_temp.comp's u32 element index"),
+            "expected the element-count refusal, got {err}"
+        );
+        rec.finish().unwrap();
     }
 
     /// MLA (DeepSeek V2/V3 absorbed form) on the REAL Vulkan path, vs a CPU reference — the

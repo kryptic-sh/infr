@@ -19,6 +19,7 @@ const KERNEL_PREFIXES: &[&str] = &[
     "add_",
     "argmax",
     "attention",
+    "attn_temp",
     "attnflash",
     "attnvec",
     "cast_",

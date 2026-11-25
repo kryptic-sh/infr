@@ -3864,6 +3864,18 @@ fn head_gate_parity() {
     assert_parity(&g, &bound, dst, rows * nh * hd, 1e-5);
 }
 
+/// `Op::AttnTemp` against an f64 reference of `llm_graph_input_attn_temp`'s factor (not against
+/// the CPU), out of place and in place, on every shared case. The device logarithm is MSL's
+/// `log`, a few f32 ulps from the reference's f64 one.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn attn_temp_matches_the_reference_factor() {
+    let be = MetalBackend::new().expect("metal");
+    for case in infr_testkit::attn_temp_cases() {
+        infr_testkit::check_attn_temp(&be, case, f64::ln, 4e-6);
+    }
+}
+
 #[test]
 #[ignore = "requires a Metal GPU"]
 fn deltanet_parity() {

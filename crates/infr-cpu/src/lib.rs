@@ -2803,6 +2803,7 @@ impl CpuBackend {
                     rows,
                     n,
                 } => {
+                    op_tap::record(op_tap::TappedOp::MulVec { rows, n });
                     let (rows, n) = (rows as usize, n as usize);
                     let xs = &vals[x.0 as usize];
                     let vv = weight(vecid); // vec is a bound weight, not an activation
@@ -2811,6 +2812,38 @@ impl CpuBackend {
                     self.pool().for_chunks_mut(&mut out, n, 1, &|r, orow| {
                         for (c, o) in orow.iter_mut().enumerate() {
                             *o = xs[r * n + c] * vv[c];
+                        }
+                    });
+                    rc.set(&mut vals, dst.0 as usize, out);
+                }
+                // Position-dependent attention temperature — see the `Op::AttnTemp` doc.
+                // `llm_graph_input_attn_temp::set_input` takes the logarithm in f64 and rounds the
+                // factor to f32 once; the logarithm here is the correctly rounded f32 one (the
+                // platform's is off limits, `infr_core::math`), and the rest is f64 like there.
+                Op::AttnTemp {
+                    x,
+                    dst,
+                    rows,
+                    n,
+                    pos,
+                    floor_scale,
+                    scale,
+                    offset,
+                } => {
+                    if floor_scale == 0 {
+                        return Err(infr_core::error::Error::backend(
+                            "cpu backend: Op::AttnTemp with floor_scale 0".to_string(),
+                        ));
+                    }
+                    let (rows, n) = (rows as usize, n as usize);
+                    let xs = &vals[x.0 as usize];
+                    let mut out = rc.zeroed(rows * n);
+                    self.pool().for_chunks_mut(&mut out, n, 1, &|r, orow| {
+                        let p = u64::from(pos) + r as u64 + u64::from(offset);
+                        let k = (p / u64::from(floor_scale)) as f32;
+                        let t = (f64::from(math::ln(k + 1.0)) * f64::from(scale) + 1.0) as f32;
+                        for (c, o) in orow.iter_mut().enumerate() {
+                            *o = xs[r * n + c] * t;
                         }
                     });
                     rc.set(&mut vals, dst.0 as usize, out);
@@ -3984,6 +4017,7 @@ impl CpuBackend {
                     freq_factors,
                     key_bias,
                 } => {
+                    op_tap::record(op_tap::TappedOp::Mla { rows });
                     if let Some(b) = key_bias {
                         if let Err(e) = infr_core::graph::check_score_bias(
                             g,
@@ -5070,6 +5104,17 @@ mod tests {
             buf[start + 4 * i..start + 4 * (i + 1)].copy_from_slice(&v.to_le_bytes());
         }
         assert_eq!(bytes_to_f32(&buf[start..end], DType::I32), [7.0, -1.0, 3.0]);
+    }
+
+    /// `Op::AttnTemp` against an f64 reference of `llm_graph_input_attn_temp`'s factor, out of
+    /// place and in place, on every shared case. Within a few f32 roundings: the factor and the
+    /// product are each rounded once, and the logarithm is the correctly rounded f32 one.
+    #[test]
+    fn attn_temp_matches_the_reference_factor() {
+        let be = CpuBackend::new();
+        for case in infr_testkit::attn_temp_cases() {
+            infr_testkit::check_attn_temp(&be, case, f64::ln, 5e-7);
+        }
     }
 
     // Naive serial reference: a byte-for-byte copy of the ORIGINAL shift-register conv loop. The

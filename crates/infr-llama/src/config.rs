@@ -644,6 +644,23 @@ impl Config {
         self.ctx_limit
     }
 
+    /// The magnitude ggml's rope gives a DeepSeek MLA model's rotary halves — `q_pe`, `k_pe` and
+    /// V3.2's indexer q/k (`mla_rope_mscale`); `1.0` for every non-MLA model. infr's ropes take
+    /// frequency divisors only, so the runner applies it itself: `m` on both the query's and the
+    /// key's rotary half is `m²` on the query's alone, because the key's rotary half reaches
+    /// nothing but its dot product with the query's.
+    pub fn mla_rope_magnitude(&self) -> f32 {
+        if !self.deepseek2 {
+            return 1.0;
+        }
+        mla_rope_mscale(
+            self.rope_scaling_yarn,
+            self.rope_scaling_factor,
+            self.rope_yarn_log_mul,
+            self.rope_attn_factor,
+        )
+    }
+
     /// qwen35: whether layer `il` is one of the FULL-attention layers (vs gated-DeltaNet linear
     /// attention). `false` for every non-qwen35 model. Mirrors the old seam's `Cfg::is_attn_layer`.
     pub fn is_qwen35_attn_layer(&self, il: usize) -> bool {
@@ -1029,12 +1046,13 @@ impl Config {
                 rope_yarn_log_mul,
                 rope_attn_factor,
             );
-            // NaN refuses too.
-            if (m - 1.0).abs() > 1e-6 || m.is_nan() {
+            // The runner applies the magnitude as its square (`Config::mla_rope_magnitude`,
+            // `mla_q_rope_gain`); a square that is not finite would put NaN or infinity into every
+            // score. NaN fails this too.
+            if !(m * m).is_finite() {
                 bail!(
                     "{arch} MLA rope: ggml_rope_ext would scale the rotary halves of Q and K by \
-                     {m} ({} = {rope_attn_factor}, {} = {}, {} = {rope_scaling_factor}, YaRN {}), \
-                     which infr's MLA rope does not apply",
+                     {m} ({} = {rope_attn_factor}, {} = {}, {} = {rope_scaling_factor}, YaRN {})",
                     mk("rope.scaling.attn_factor"),
                     mk("rope.scaling.yarn_log_multiplier"),
                     rope_yarn_log_mul * 0.1,
@@ -2059,6 +2077,13 @@ fn check_recurrent_layers(
     Ok(())
 }
 
+/// Whether `llama-context.cpp`'s YaRN `attn_factor` comes out the same for `deepseek32` as under
+/// the `deepseek2` rule [`mla_rope_mscale`] (and the runner's MLA score scale) implement: true
+/// unless YaRN stretches (`factor > 1`) with a multiplier that is neither absent nor 1.
+fn deepseek32_yarn_rules_agree(yarn: bool, factor: f32, log_mul: f32) -> bool {
+    !yarn || factor <= 1.0 || log_mul == 0.0 || log_mul == 1.0
+}
+
 /// The magnitude ggml's rope gives a DeepSeek MLA model's `q_pe`/`k_pe` (and V3.2's indexer
 /// q/k): llama.cpp's `attn_factor_org`.
 ///
@@ -2079,13 +2104,8 @@ fn check_recurrent_layers(
 /// `deepseek32` only where the two rules agree ([`deepseek32_yarn_rules_agree`]); where they do
 /// not, `from_gguf` loads the file anyway and warns — a known divergence left for the owner. V3.2
 /// itself declares `mscale_all_dim = 1.0`, where they agree.
-/// Whether `llama-context.cpp`'s YaRN `attn_factor` comes out the same for `deepseek32` as under
-/// the `deepseek2` rule [`mla_rope_mscale`] (and the runner's MLA score scale) implement: true
-/// unless YaRN stretches (`factor > 1`) with a multiplier that is neither absent nor 1.
-fn deepseek32_yarn_rules_agree(yarn: bool, factor: f32, log_mul: f32) -> bool {
-    !yarn || factor <= 1.0 || log_mul == 0.0 || log_mul == 1.0
-}
-
+///
+/// [`Config::mla_rope_magnitude`] hands this to the runner, which applies it.
 fn mla_rope_mscale(yarn: bool, factor: f32, log_mul: f32, attn_factor: f32) -> f32 {
     if !yarn {
         return attn_factor;
@@ -2115,8 +2135,9 @@ fn mla_rope_mscale(yarn: bool, factor: f32, log_mul: f32, attn_factor: f32) -> f
 /// ggml clamps only the start's floor and the end's ceiling; the two agree unless the corrected
 /// start lies past the last pair or the end before the first.
 ///
-/// This is only the ANGLE half of `rope_yarn`: its magnitude factor `mscale` is not represented,
-/// and each caller says why it is 1 for its arch.
+/// This is only the ANGLE half of `rope_yarn`: its magnitude factor `mscale` is not represented.
+/// Each caller says where it goes for its arch: the MLA runner applies it separately
+/// ([`Config::mla_rope_magnitude`]).
 pub(crate) fn yarn_freq_divisors(
     n_rot: usize,
     base: f32,
@@ -2784,25 +2805,20 @@ mod tests {
         }
 
         // A non-unit `rope.scaling.attn_factor` scales the rotary halves of Q and K
-        // (`deepseek2_mla_rope_magnitude_must_be_one`), so it is read only to be refused.
+        // (`deepseek2_mla_rope_magnitude_matches_the_reference`).
         keys.push(("rope.scaling.attn_factor", 3));
-        let Err(err) = config_from_fixture("ds2-yarn-af3", &deepseek2_fixture(&keys)) else {
-            panic!("rope.scaling.attn_factor = 3 must fail");
-        };
-        assert!(
-            err.to_string()
-                .contains("deepseek2.rope.scaling.attn_factor = 3"),
-            "{err}"
-        );
+        let cfg = config_from_fixture("ds2-yarn-af3", &deepseek2_fixture(&keys))
+            .expect("rope.scaling.attn_factor = 3 must parse");
+        assert_eq!(cfg.rope_attn_factor, 3.0);
+        assert_eq!(cfg.mla_rope_magnitude(), 3.0);
     }
 
     /// ggml's rope multiplies MLA's `q_pe`/`k_pe` by llama.cpp's `attn_factor_org`, which reaches
-    /// only the rotary half of the score — infr's MLA cannot fold it into the score scale, so a
-    /// file where it is not 1 is refused. Every DeepSeek conversion writes
-    /// `yarn_log_multiplier` with YaRN, which makes it exactly 1 on the `deepseek2` string; YaRN
-    /// WITHOUT the multiplier leaves `1 + 0.1·ln(factor)`.
+    /// only the rotary half of the score; the runner applies it (`Config::mla_rope_magnitude`).
+    /// Every DeepSeek conversion writes `yarn_log_multiplier` with YaRN, which makes it exactly 1
+    /// on the `deepseek2` string; YaRN WITHOUT the multiplier leaves `1 + 0.1·ln(factor)`.
     #[test]
-    fn deepseek2_mla_rope_magnitude_must_be_one() {
+    fn deepseek2_mla_rope_magnitude_matches_the_reference() {
         let yarn = |tag: &str, log_mul: Option<f32>| {
             let mut keys = DEEPSEEK2_BASE_KEYS.to_vec();
             keys.push(("rope.scaling.factor", 40));
@@ -2823,13 +2839,23 @@ mod tests {
         // V2-Lite's own metadata (`0.1 * mscale_all_dim`, mscale_all_dim 0.707).
         let cfg = yarn("ds2-yarn-v2lite", Some(0.0707)).expect("V2-Lite's YaRN must parse");
         assert!(cfg.rope_scaling_yarn && cfg.rope_yarn_log_mul != 0.0);
-        let Err(err) = yarn("ds2-yarn-nolm", None) else {
-            panic!("YaRN without yarn_log_multiplier must fail");
+        assert_eq!(cfg.mla_rope_magnitude(), 1.0);
+        let cfg = yarn("ds2-yarn-nolm", None).expect("YaRN without yarn_log_multiplier must parse");
+        assert_eq!(
+            cfg.mla_rope_magnitude(),
+            1.0 + 0.1 * infr_core::math::ln(40.0)
+        );
+
+        // The runner applies `m²`: a finite magnitude whose square overflows f32 is refused.
+        let mut m = deepseek2_fixture(DEEPSEEK2_BASE_KEYS);
+        m.meta
+            .push(("deepseek2.rope.scaling.attn_factor".into(), Meta::F32(1e20)));
+        let Err(err) = config_from_fixture("ds2-af-square-overflows", &m) else {
+            panic!("rope.scaling.attn_factor = 1e20 must fail: its square is not finite");
         };
-        let want = 1.0 + 0.1 * infr_core::math::ln(40.0);
         assert!(
             err.to_string()
-                .starts_with(&format!("deepseek2 MLA rope: ggml_rope_ext would scale the rotary halves of Q and K by {want}")),
+                .starts_with("deepseek2 MLA rope: ggml_rope_ext would scale the rotary halves"),
             "{err}"
         );
 

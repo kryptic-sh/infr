@@ -513,6 +513,146 @@ pub fn sweep_linear_on(
     }
 }
 
+// ─── Op::AttnTemp ────────────────────────────────────────────────────────────────────────────
+
+/// One `Op::AttnTemp` shape.
+#[derive(Clone, Copy, Debug)]
+pub struct AttnTempCase {
+    pub rows: usize,
+    pub n: usize,
+    pub pos: u32,
+    pub floor_scale: u32,
+    pub scale: f32,
+    pub offset: u32,
+}
+
+/// The `Op::AttnTemp` cases every backend runs. Each puts `pos + r + offset` across a multiple of
+/// `floor_scale` inside the batch. The first two have `offset` 1 (llama4's) and a factor of
+/// exactly 1 on their leading rows, the second at llama4's `floor_scale`; the third has `offset` 0
+/// (deepseek2's), lies past the first boundary and has a row width that is no multiple of a
+/// workgroup; the last crosses a boundary at a quotient past a hundred.
+pub fn attn_temp_cases() -> [AttnTempCase; 4] {
+    [
+        AttnTempCase {
+            rows: 6,
+            n: 40,
+            pos: 5,
+            floor_scale: 8,
+            scale: 0.1,
+            offset: 1,
+        },
+        AttnTempCase {
+            rows: 3,
+            n: 128,
+            pos: 8190,
+            floor_scale: 8192,
+            scale: 0.1,
+            offset: 1,
+        },
+        AttnTempCase {
+            rows: 5,
+            n: 199,
+            pos: 45,
+            floor_scale: 16,
+            scale: 0.75,
+            offset: 0,
+        },
+        AttnTempCase {
+            rows: 2,
+            n: 16,
+            pos: 1_007_614,
+            floor_scale: 8192,
+            scale: 0.1,
+            offset: 1,
+        },
+    ]
+}
+
+/// Run `case` on `be`, out of place and then in place on an internal tensor (`dst == x`, between
+/// two copies, the way a runner applies it), and score both against an f64 reference built from
+/// `ln` — the caller's `f64::ln`, which this crate's production source may not call (the
+/// `no_platform_libm` lint). A row whose factor is exactly 1 must come back bit-identical; every
+/// other element within `rel_tol` of the reference. Panics naming the case and element.
+pub fn check_attn_temp(be: &dyn Backend, case: AttnTempCase, ln: fn(f64) -> f64, rel_tol: f64) {
+    let AttnTempCase {
+        rows,
+        n,
+        pos,
+        floor_scale,
+        scale,
+        offset,
+    } = case;
+    let total = rows * n;
+    let x: Vec<f32> = (0..total)
+        .map(|i| (((i * 37 + 11) % 101) as f32 - 50.0) * 0.03125)
+        .collect();
+    let quotient =
+        |r: usize| (u64::from(pos) + r as u64 + u64::from(offset)) / u64::from(floor_scale);
+    let factor = |r: usize| ln(quotient(r) as f64 + 1.0) * f64::from(scale) + 1.0;
+    assert!(
+        quotient(0) != quotient(rows - 1),
+        "{case:?}: no floor_scale boundary inside the batch"
+    );
+    let op = |x, dst| Op::AttnTemp {
+        x,
+        dst,
+        rows: rows as u32,
+        n: n as u32,
+        pos,
+        floor_scale,
+        scale,
+        offset,
+    };
+    let desc = || TensorDesc::new(vec![rows, n], DType::F32);
+
+    let mut g = Graph::new();
+    let xi = g.input(desc());
+    let out = g.output(desc());
+    g.push(op(xi, out));
+    let direct = run_graph(be, &g, &[(xi, f32_bytes(&x))], out, total);
+
+    let mut g = Graph::new();
+    let xi = g.input(desc());
+    let t = g.internal(desc());
+    let out = g.output(desc());
+    let copy = |src, dst| Op::Copy {
+        src,
+        src_off: 0,
+        dst,
+        dst_off: 0,
+        n: total as u32,
+    };
+    g.push(copy(xi, t));
+    g.push(op(t, t));
+    g.push(copy(t, out));
+    let in_place = run_graph(be, &g, &[(xi, f32_bytes(&x))], out, total);
+
+    for (what, got) in [("out of place", &direct), ("in place", &in_place)] {
+        for i in 0..total {
+            let r = i / n;
+            let label = format!("{case:?} {what}, row {r} col {}", i % n);
+            if quotient(r) == 0 {
+                assert_eq!(
+                    got[i].to_bits(),
+                    x[i].to_bits(),
+                    "{label}: a factor of 1 changed {} to {}",
+                    x[i],
+                    got[i]
+                );
+            } else {
+                let want = f64::from(x[i]) * factor(r);
+                let err = (f64::from(got[i]) - want).abs();
+                assert!(
+                    err <= rel_tol * want.abs(),
+                    "{label}: got {} want {want} (factor {})",
+                    got[i],
+                    factor(r)
+                );
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

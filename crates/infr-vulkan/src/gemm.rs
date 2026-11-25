@@ -2515,6 +2515,13 @@ pub(crate) fn mul_vec_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
+/// SPIR-V for the position-dependent attention temperature (`Op::AttnTemp`).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn attn_temp_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_temp.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
 /// SPIR-V for the qwen35moe shared-expert combine (`dst[r,c] = moe[r,c] + sigmoid(gate[r]) *
 /// shexp[r,c]`; row-broadcast gate — the shared-expert twin of `mul_vec`'s column broadcast).
 #[cfg_attr(infr_profile, infr_prof::instrument)]

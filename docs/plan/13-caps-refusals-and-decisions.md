@@ -116,7 +116,20 @@ pins in force were made for its backend's class (`debug_assert_pins_for`) rather
 than that a scope is active; the Vulkan-only functions (placement, a session's
 generation, the `SeamModel` fit helpers) check both (`debug_assert_scope_for`).
 
-### S5 — position temperature and the MLA magnitude (M)
+### S5 — position temperature and the MLA magnitude (M) — first half done 2026-11-25
+
+The first two bullets shipped; what they left is backlog B-ATTN-TEMP. The last
+two (Mistral-Large-3's temperature and the deepseek32 rule) are still to do.
+
+Departs from the slice as planned in three places. `Op::AttnTemp`'s `offset` is
+a whole number, where the reference's is a float: every builder that sets one
+passes 0 or 1, and it makes the floor an exact integer division. Metal's two
+decode-loop gates refuse the op as Vulkan's `decode_eligible` does
+(`replay_shape`, `static_walk_live_positions`), since its position is baked in.
+And the magnitude reaches deepseek32's lightning indexer too: the reference
+ropes the indexer's query and key with the same magnitude, so its query's rotary
+columns take the same gain, or a deepseek32 file at a magnitude other than 1
+would select different keys.
 
 - New `Op::AttnTemp { x, dst, rows, n, pos, floor_scale, scale, offset }`:
   `dst[r,:] = x[r,:] * (ln(floor((pos+r+offset)/floor_scale)+1)*scale + 1)`

@@ -591,6 +591,7 @@ fn main() {
         ("add", "add", &[]),
         ("add_bias", "add_bias", &[]),
         ("mul_vec", "mul_vec", &[]),
+        ("attn_temp", "attn_temp", &[]),
         ("moe_shared_expert_add", "moe_shared_expert_add", &[]),
         ("add_scaled", "add_scaled", &[]),
         ("scale", "scale", &[]),

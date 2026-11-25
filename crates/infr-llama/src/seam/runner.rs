@@ -348,6 +348,38 @@ fn session_stable(
     })
 }
 
+/// The gain a DeepSeek MLA model's query rotary columns take for its YaRN magnitude `m`
+/// ([`Config::mla_rope_magnitude`]): `m²`, which stands for the `m` ggml's rope puts on the query's
+/// and the key's rotary halves both. `None` when `m` is 1, where nothing is emitted and the graph is
+/// the one it always was.
+fn mla_q_rope_gain(c: &Config) -> Option<f32> {
+    let m = c.mla_rope_magnitude();
+    (m != 1.0).then_some(m * m)
+}
+
+/// The `Op::MulVec` rows that apply [`mla_q_rope_gain`]: 1 on a head's NOPE columns and `gain` on
+/// its rotary ones. First the MLA query head (`[nope | rope]`), then, on deepseek32, the lightning
+/// indexer's (`[rope | nope]`), whose query and key the reference ropes with the same magnitude.
+/// Uploaded in this order after the other synthetic weights, and declared in it by `build`.
+fn mla_q_rope_gain_rows(c: &Config, gain: f32) -> Vec<Vec<f32>> {
+    let row = |lead: usize, lead_gain: f32, tail: usize, tail_gain: f32| {
+        let mut v = vec![lead_gain; lead];
+        v.resize(lead + tail, tail_gain);
+        v
+    };
+    let mut rows = vec![row(c.head_k_mla, 1.0, c.qk_rope_dim, gain)];
+    if c.deepseek32 {
+        // A head no wider than the rope is refused by the indexer emit, by name.
+        rows.push(row(
+            c.qk_rope_dim,
+            gain,
+            c.indexer_head_size.saturating_sub(c.qk_rope_dim),
+            1.0,
+        ));
+    }
+    rows
+}
+
 /// Handles into one freshly-built decode graph that the driver re-binds each step.
 pub(super) struct DecodeHandles {
     hidden: TensorId,
@@ -1407,6 +1439,20 @@ pub(crate) fn generate_dense_backend_bound(
                     .map_err(|e| anyhow!("{e}"))?;
                 wbufs.push(b);
                 wspecs.push((DType::F32, c.hc_mult * ne));
+            }
+            // DeepSeek MLA whose YaRN magnitude is not 1: the query rotary gain rows (see
+            // `mla_q_rope_gain_rows`, and the matching `mla_q_gain` / `ix_q_gain` handles in
+            // `build`).
+            if let Some(gain) = mla_q_rope_gain(c) {
+                for row in mla_q_rope_gain_rows(c, gain) {
+                    let b = be
+                        .alloc(row.len() * 4, BufferUsage::Weights)
+                        .map_err(|e| anyhow!("{e}"))?;
+                    be.upload(b.as_ref(), bytemuck::cast_slice(&row))
+                        .map_err(|e| anyhow!("{e}"))?;
+                    wbufs.push(b);
+                    wspecs.push((DType::F32, row.len()));
+                }
             }
             Some((wbufs, wspecs, layer_has_epb))
         };
@@ -2617,6 +2663,14 @@ pub(crate) fn generate_dense_backend_bound(
         } else {
             None
         };
+        // The MLA query rotary gain rows, when the YaRN magnitude is not 1 — upload order matches
+        // `mla_q_rope_gain_rows`: the MLA head's, then deepseek32's indexer head's.
+        let (mla_q_gain, ix_q_gain) = if mla_q_rope_gain(c).is_some() {
+            let mla = wpush(&mut g, &mut weights);
+            (Some(mla), c.deepseek32.then(|| wpush(&mut g, &mut weights)))
+        } else {
+            (None, None)
+        };
         // `logits_rows == 0` (task #27): a HEADLESS graph — the chunked batched-prefill path,
         // whose per-chunk logits nothing ever consumes (the sampler reads the decode loop's own
         // fresh logits for the LAST prompt token; earlier rows' logits were always discarded).
@@ -3759,6 +3813,17 @@ pub(crate) fn generate_dense_backend_bound(
                             neox: true,
                             backward: false,
                         });
+                        // The YaRN magnitude the reference's rope puts on this query and on the
+                        // cached key, applied to the query alone (`mla_q_rope_gain`).
+                        if let Some(gain) = ix_q_gain {
+                            g.push(Op::MulVec {
+                                x: ix_q,
+                                vec: gain,
+                                dst: ix_q,
+                                rows: batch as u32 * ix_nh,
+                                n: ix_hd,
+                            });
+                        }
                         // Per-head weights `w[t, h]`, UNSCALED — `Op::LightningIndexer` applies
                         // the `1/sqrt(head_dim * n_head)` normaliser to the WEIGHT, which is where
                         // llama.cpp folds it too ("pre-scale weights to avoid scaling operations
@@ -3899,8 +3964,8 @@ pub(crate) fn generate_dense_backend_bound(
                 // attn_factor_org = 1.0 for the GGUF's log_mul = 0.707). ggml's rope ALSO scales
                 // the q_pe/k_pe vectors themselves by `attn_factor_org` (`rope_yarn`'s `mscale`);
                 // that reaches only the rotary half of the score, so it cannot be folded into this
-                // whole-score scale — the loader refuses a file where it is not 1
-                // (`config::mla_rope_mscale`), and the kernels need only the frequency divisors.
+                // whole-score scale — the `mla_q_gain` multiply below applies it, and the kernels
+                // need only the frequency divisors.
                 // The GGUF's `rope.scaling.attn_factor` multiplies `attn_factor` BEFORE
                 // `attn_factor_org` is recovered from it, matching llama-context.cpp's
                 // `cparams.yarn_attn_factor *= hparams.rope_attn_factor`. Plain (non-yarn) MLA has
@@ -3922,6 +3987,18 @@ pub(crate) fn generate_dense_backend_bound(
                     let mscale = c.rope_attn_factor;
                     mscale * mscale / ((qk_nope + qk_rope) as f32).sqrt()
                 };
+                // ggml's rope also scales q_pe and k_pe by the YaRN magnitude; that is the query
+                // rotary gain here (`mla_q_rope_gain`). Rope is linear, so scaling before the
+                // kernel ropes q_pe is exact.
+                if let Some(gain) = mla_q_gain {
+                    g.push(Op::MulVec {
+                        x: mla_q,
+                        vec: gain,
+                        dst: mla_q,
+                        rows: (batch * c.n_head) as u32,
+                        n: q_head_dim,
+                    });
+                }
                 g.push(Op::Mla {
                     q: mla_q,
                     k_cache: k_cache[l],

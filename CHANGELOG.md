@@ -8,6 +8,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Breaking
 
+- **`infr_core::graph::Op` gains `AttnTemp`**, the position-dependent attention
+  temperature, so an exhaustive match on `Op` must handle it.
+- **`infr_cpu::op_tap::TappedOp` gains `Mla` and `MulVec`**, so an exhaustive
+  match on it must handle them.
 - **`infr_core::budget::reserve_bytes` takes only the override.** It returns
   `kv.overflow_reserve_mb` in bytes, `0` when unset, where it took the device's
   total memory and defaulted to max(12% of it, 2 GiB).
@@ -82,6 +86,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`Op::AttnTemp`** on the CPU, Vulkan and Metal backends: llama.cpp's
+  position-dependent attention temperature (`llm_graph_input_attn_temp`), which
+  scales each row by `ln(floor((pos + offset) / floor_scale) + 1) * scale + 1`.
+  No model emits it yet. A graph holding it does not take the Vulkan or Metal
+  decode replay, since its position is baked in. The Metal kernel has never been
+  compiled or run: MSL is compiled at run time on a Mac, and only the Rust side
+  of the Metal backend has been type-checked.
+- **DeepSeek-family files whose YaRN magnitude is not 1 load and run.** ggml's
+  rope scales the rotary halves of the MLA query and key (and V3.2's indexer
+  query and key) by that magnitude; infr now multiplies the query's rotary
+  columns by its square, which gives the same scores. 0.3.0 refused these files.
+  Every published DeepSeek V2, V3, V3.2, Kimi K2 and Mistral-Large-3 file has
+  magnitude 1 and builds the same graph as before.
 - **`Backend::set_kv_spill_reserve`** and **`Backend::kv_spill_armed`**; on
   Vulkan **`kv_spill_armed`**, **`kv_stays_in_vram`**, **`kv_vram_bytes`**,
   **`kv_overflow_vram_cap`** and **`VulkanBackend::kv_spill_counts`**; and

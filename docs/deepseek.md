@@ -424,9 +424,12 @@ mscale          = attn_factor_org * (1 + 0.1·rope_yarn_log_mul·ln(1/freq_scale
 kq_scale        = mscale² / sqrt(head_k_mla)
 ```
 
-The mscale² is folded into the **softmax scale**, not applied to Q, because
-ggml's rope already applies `attn_factor` to the rotated slice and the first
-line undoes it.
+The mscale² is folded into the **softmax scale**, not applied to Q. ggml's rope
+also multiplies the rotated slices of Q and K by `attn_factor_org` (the
+magnitude `m`); that reaches only the rotary half of the score, so infr applies
+it separately: when `m` is not 1 the runner multiplies the query's rotary
+columns by `m²` (`Op::MulVec`, see open question 6), and when `m` is 1 it emits
+nothing. Every published DeepSeek file has `m = 1`.
 
 For `infr`, the frequency ramp itself should fold into the existing
 `freq_factors` mechanism (`Op::Rope`'s optional per-pair divisor, already used
@@ -2016,8 +2019,12 @@ Ordered by how much damage a wrong assumption does.
    (`mscale = 1 + 0.1·log_mul·ln(factor)`, applied via
    `mla_scale = mscale²/√(qk_nope + qk_rope)` — note `qk_nope = head_k_mla` is
    128 for V2-Lite, so the denominator is √192, not √576). The rope vector
-   mscale cancels to `rope_attn_factor` for deepseek2, so no vector scaling is
-   needed in the kernels.
+   magnitude `m` (`Config::mla_rope_magnitude`, llama.cpp's `attn_factor_org`)
+   is a separate factor ggml's rope puts on `q_pe` and `k_pe` (and V3.2's
+   indexer q and k). It is 1 for every published file; when it is not, the
+   runner multiplies the query's rotary columns by `m²` with an `Op::MulVec`
+   before `Op::Mla` (and before `Op::LightningIndexer` on deepseek32), which
+   gives the same scores, and emits nothing when it is 1.
 7. **DeepSeek's EOS** — `add_chat_eos` appends a fixed list that does not
    include `<｜end▁of▁sentence｜>`. It is normally the GGUF's declared
    `tokenizer.ggml.eos_token_id` and therefore already in `eos_ids`, but check

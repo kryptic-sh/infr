@@ -921,6 +921,33 @@ pub enum Op {
         rows: u32,
         n: u32,
     },
+    /// Position-dependent attention temperature, llama.cpp's `llm_graph_input_attn_temp`: row `r`
+    /// of `x` sits at absolute position `p = pos + r` and is multiplied by
+    ///
+    /// ```text
+    /// ln(floor((p + offset) / floor_scale) + 1) * scale + 1
+    /// ```
+    ///
+    /// so `dst[r*n + c] = x[r*n + c] * factor(pos + r)` over `rows` rows of `n` columns. The
+    /// factor is exactly 1 until `p + offset` reaches `floor_scale`. The reference applies it to
+    /// a layer's whole Q (llama4's NoPE layers, `deepseek2`'s `attention.temperature_scale`).
+    ///
+    /// The reference forms `(p + offset) / floor_scale` in `f32` and takes the logarithm in
+    /// `f64`. Here `offset` is a whole number (every builder that sets it passes 0 or 1), so the
+    /// quotient is an exact integer division; below 2^24 the reference's `f32` quotient floors to
+    /// the same integer. `floor_scale` must be nonzero, which the reference asserts too. In place
+    /// when `dst == x`. The position is baked in, like [`Op::Attention::pos`], so a replayed
+    /// decode tape cannot carry it.
+    AttnTemp {
+        x: TensorId,
+        dst: TensorId,
+        rows: u32,
+        n: u32,
+        pos: u32,
+        floor_scale: u32,
+        scale: f32,
+        offset: u32,
+    },
     /// `dst[i] = cap * tanh(x[i] / cap)` (Gemma final-logit softcap).
     Softcap {
         x: TensorId,
@@ -1377,6 +1404,7 @@ impl Op {
             Op::AddBias { .. } => "AddBias",
             Op::Scale { .. } => "Scale",
             Op::MulVec { .. } => "MulVec",
+            Op::AttnTemp { .. } => "AttnTemp",
             Op::Softcap { .. } => "Softcap",
             Op::Argmax { .. } => "Argmax",
             Op::ArgmaxProb { .. } => "ArgmaxProb",
@@ -1539,6 +1567,7 @@ impl Op {
             Op::AddBias { x, bias, dst, .. } => (vec![x, bias], vec![dst]),
             Op::Scale { x, dst, .. } => (vec![x], vec![dst]),
             Op::MulVec { x, vec: v, dst, .. } => (vec![x, v], vec![dst]),
+            Op::AttnTemp { x, dst, .. } => (vec![x], vec![dst]),
             Op::Softcap { x, dst, .. } => (vec![x], vec![dst]),
             Op::Argmax { x, dst, .. } => (vec![x], vec![dst]),
             Op::ArgmaxProb {
@@ -2337,6 +2366,16 @@ mod tests {
                 rows: _,
                 n: _,
             } => vec![x, vec, dst],
+            Op::AttnTemp {
+                x,
+                dst,
+                rows: _,
+                n: _,
+                pos: _,
+                floor_scale: _,
+                scale: _,
+                offset: _,
+            } => vec![x, dst],
             Op::Softcap {
                 x,
                 dst,
@@ -2771,6 +2810,16 @@ mod tests {
                 dst: t(),
                 rows: 0,
                 n: 0,
+            },
+            Op::AttnTemp {
+                x: t(),
+                dst: t(),
+                rows: 0,
+                n: 0,
+                pos: 0,
+                floor_scale: 0,
+                scale: 0.0,
+                offset: 0,
             },
             Op::Softcap {
                 x: t(),

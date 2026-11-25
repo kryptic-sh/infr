@@ -1180,6 +1180,22 @@ fn elementwise_cases() -> Vec<Case> {
         n: 64,
     }));
 
+    // The rows sit at positions 5, 6 and 7, which with offset 1 straddle `floor_scale`: two
+    // factors of exactly 1 and one that is not are hashed.
+    let mut c = Case::new("AttnTemp");
+    let x = c.input_f32(vec![rows, 64], 99);
+    let dst = c.output(vec![rows, 64], DType::F32);
+    v.push(c.push(Op::AttnTemp {
+        x,
+        dst,
+        rows: rows as u32,
+        n: 64,
+        pos: 5,
+        floor_scale: 8,
+        scale: 0.1,
+        offset: 1,
+    }));
+
     let vocab = 1000usize;
     let mut c = Case::new("Argmax ArgmaxProb Sample");
     let x = c.input_f32(vec![3, vocab], 81);
@@ -1494,6 +1510,7 @@ fn op_name(op: &Op) -> &'static str {
         Op::AddBias { .. } => "AddBias",
         Op::Scale { .. } => "Scale",
         Op::MulVec { .. } => "MulVec",
+        Op::AttnTemp { .. } => "AttnTemp",
         Op::Softcap { .. } => "Softcap",
         Op::Argmax { .. } => "Argmax",
         Op::ArgmaxProb { .. } => "ArgmaxProb",
@@ -1515,7 +1532,7 @@ fn op_name(op: &Op) -> &'static str {
 
 /// The number of `Op` variants [`op_name`] names (keep in step with it: a variant named there
 /// but not counted here fails [`every_op_variant_has_a_case`]).
-const OP_VARIANTS: usize = 40;
+const OP_VARIANTS: usize = 41;
 
 #[test]
 fn every_op_variant_has_a_case() {
@@ -1675,6 +1692,7 @@ const EXPECTED: &[(&str, u64)] = &[
     ("GatedActFused Silu clamp Some(1.5)", 0x50676ff33695f14a),
     ("Add AddBias Scale MulVec Softcap", 0xdf94bc9ec1d50176),
     ("HeadGate MoeSharedExpertAdd", 0xe7739c400283a04b),
+    ("AttnTemp", 0x0f5b92be7fb74f97),
     ("Argmax ArgmaxProb Sample", 0xd1d986129922ec54),
     ("EmbedGather F32", 0x19fc8dbe6d6a31f0),
     ("EmbedGather Q4K", 0x92c4163a7ea78169),

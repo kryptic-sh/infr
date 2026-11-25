@@ -51,6 +51,7 @@ pub(crate) static SHADER_CLASSES: &[(&str, ShaderClass)] = &[
     ("attn_qk", C4),
     ("attn_qk_warp", C4),
     ("attn_softmax", C5b),
+    ("attn_temp", C5a),
     ("bw_scan", C5a),
     ("compress_pool", C5a),
     ("conv1d_shift", C5a),

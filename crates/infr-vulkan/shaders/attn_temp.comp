@@ -1,0 +1,32 @@
+#version 460
+// Position-dependent attention temperature (Op::AttnTemp, llama.cpp's llm_graph_input_attn_temp):
+//   y[r, c] = x[r, c] * (ln(floor((pos + r + offset) / floor_scale) + 1) * scale + 1)
+// over `total = rows*n` elements, one thread per element. In place safe (bind x == y): each
+// thread reads x[i] and writes y[i], no cross-thread dependency. The quotient is an integer
+// division (see the op's doc); a quotient of 0 is the factor 1 exactly, written out rather than
+// left to `log(1.0)` being exactly 0.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint n;
+    uint total;
+    uint pos;
+    uint floor_scale;
+    float scale;
+    uint offset;
+} pc;
+layout(binding = 0) readonly buffer XB { float x[]; };
+layout(binding = 1) buffer YB { float y[]; };
+
+void main() {
+    // Flat index across `Recorder::dispatch_wide`'s 2-D split of a grid wider than
+    // `maxComputeWorkGroupCount[0]`; equal to `gl_GlobalInvocationID.x` when unsplit.
+    uint i = (gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x) * gl_WorkGroupSize.x
+        + gl_LocalInvocationID.x;
+    if (i >= pc.total) {
+        return;
+    }
+    uint k = (pc.pos + i / pc.n + pc.offset) / pc.floor_scale;
+    float t = k == 0u ? 1.0 : log(float(k) + 1.0) * pc.scale + 1.0;
+    y[i] = x[i] * t;
+}

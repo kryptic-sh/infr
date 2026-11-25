@@ -322,6 +322,14 @@ fn decode_refusal(be_: &VulkanBackend, graph: &Graph) -> Option<DecodeRefusal> {
                     kind: "LightningIndexer",
                 });
             }
+            // The attention temperature's factor depends on the position baked into the op at
+            // record time; a replayed tape would scale every later token by the recorded one.
+            Op::AttnTemp { .. } => {
+                return Some(DecodeRefusal::NoDynKernel {
+                    op: i,
+                    kind: "AttnTemp",
+                });
+            }
             // Any mask (SWA windows ride push constants + the window-aware prologue) and any
             // scale (gemma4 uses 1.0) — both are baked per-layer into the recorded dispatch.
             // hd%4 ≤ 512 keeps every layer on the self-chunking split path or the scalar
@@ -1763,6 +1771,30 @@ fn lower_op(
             rows,
             n,
         } => rec.mul_vec(r(*x)?, r(*vec)?, r(*dst)?, *rows as usize, *n as usize),
+        Op::AttnTemp {
+            x,
+            dst,
+            rows,
+            n,
+            pos,
+            floor_scale,
+            scale,
+            offset,
+        } => {
+            if *floor_scale == 0 {
+                return Err(be("vulkan Op::AttnTemp: floor_scale 0".to_string()));
+            }
+            rec.attn_temp(
+                r(*x)?,
+                r(*dst)?,
+                *rows as usize,
+                *n as usize,
+                *pos,
+                *floor_scale,
+                *scale,
+                *offset,
+            )?;
+        }
         Op::MoeSharedExpertAdd {
             moe,
             shexp,
@@ -9076,6 +9108,49 @@ mod tests {
                 want[i]
             );
         }
+    }
+
+    /// `Op::AttnTemp` against an f64 reference of `llm_graph_input_attn_temp`'s factor, out of
+    /// place and in place, on every shared case. The device logarithm is the GLSL `log`, a few f32
+    /// ulps from the reference's f64 one, hence the looser bound than the CPU's.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn attn_temp_matches_the_reference_factor() {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
+            return; // no GPU — self-skip
+        };
+        for case in infr_testkit::attn_temp_cases() {
+            infr_testkit::check_attn_temp(&be_, case, f64::ln, 4e-6);
+        }
+    }
+
+    /// A graph holding an `Op::AttnTemp` never replays: the op's factor is computed from the
+    /// position baked into it at record time.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn attn_temp_refuses_decode_replay() {
+        let Some(be_) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
+            return; // no GPU — self-skip
+        };
+        let mut g = Graph::new();
+        let x = g.input(TensorDesc::new(vec![4], DType::F32));
+        g.push(Op::AttnTemp {
+            x,
+            dst: x,
+            rows: 1,
+            n: 4,
+            pos: 9,
+            floor_scale: 8,
+            scale: 0.1,
+            offset: 0,
+        });
+        assert!(matches!(
+            decode_refusal(&be_, &g),
+            Some(DecodeRefusal::NoDynKernel {
+                op: 0,
+                kind: "AttnTemp"
+            })
+        ));
     }
 
     /// A one-op `GatedRmsNorm` graph (fused per-head RMSNorm + SiLU gate, qwen35 DeltaNet z-gate)

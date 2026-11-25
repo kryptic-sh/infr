@@ -55,3 +55,62 @@
 - Streaming is a standing goal: disk to DRAM to VRAM, so that any model size
   runs on any hardware. That includes the cache eviction logic in every tier,
   which should be as fast as it can be made.
+
+## Before opening a pull request
+
+Outside contributions come as pull requests against `main`. Each of these was
+missed in a pull request we then had to correct by hand:
+
+**Shape**
+
+- One change per pull request, based on current `main`. A stacked pull request
+  names the one it is stacked on.
+- Describe behaviour as it is on `main`, not on a fork: check every claim about
+  which kernel or path a device takes against this tree.
+- A new dependency is agreed in an issue first and lands as an optional cargo
+  feature. `Cargo.lock` changes only by what the manifest change requires.
+- New model work goes through the seam, so it runs on CPU, Vulkan and Metal and
+  has a CPU reference. A separate forward pass beside the backends is not taken.
+
+**Commits**
+
+- Conventional Commits: `type(scope): subject`, at most 72 characters, then a
+  blank line and a body wrapped at 72 columns that says what changed and why.
+
+**Changelog and docs, in the same pull request**
+
+- A `CHANGELOG.md` entry under `[Unreleased]`, in the matching section, naming
+  the key, flag or behaviour that changed.
+- A changed public API is a `Breaking` entry: a new enum variant, a new public
+  struct field, a changed signature.
+- A new config key updates `docs/config.md` and `infr.example.toml`; a new
+  server route or request field updates the README's server section; a new
+  tuning parameter updates the tuning docs.
+- Markdown goes through `npx prettier --write`.
+
+**Tests**
+
+- A fix comes with a test that fails without it, and the test exercises the line
+  that changed. Say in the pull request that you saw it fail.
+- GPU tests are `#[ignore]`d and CI has no GPU, so a green run says nothing
+  about a shader or kernel change. Say which ignored tests you ran and on which
+  device.
+- Model math is compared with a reference: llama.cpp's embeddings or logits on
+  the same input. Output that reads well is not evidence.
+- A server feature has a test against a real small model, not only the stub
+  generator.
+
+**Code**
+
+- Fix every site with the same defect: grep for the pattern before opening the
+  pull request.
+- Reuse the shared path instead of copying it. A copied handler loses the error
+  mapping and cancellation the original has.
+- Comments say why. Measurements and history go in the pull request's
+  description and the changelog, never in code or shader comments.
+
+**Performance claims**
+
+- State the device, the driver, the exact command and the number of runs, with
+  the two builds alternated. Say which kernels and device classes the change
+  reaches, and which you could not measure.

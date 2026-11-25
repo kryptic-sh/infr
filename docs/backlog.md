@@ -35,11 +35,13 @@ line when its slice ships.
 Queue order (the owner's): MoE routing first, then the rest in the order below.
 (Item 1, the download fan-out, shipped; see B-FANOUT for what it left.)
 
-2. **MoE routing, int8 against float (B207).** Unparked: run the investigation
-   next. Router fed int8 against float activations on ERNIE-4.5-21B-A3B and
-   Qwen3-30B-A3B, both GPUs, quiet window: selections differing, KL against the
-   reference, decode speed. No default changes until the owner sees the numbers.
-   The `route_near_tie` floor for a real MoE row follows from the result.
+2. **MoE routing, int8 against float (B207).** Accuracy measured 2026-11-25 on
+   both models and both GPUs (`docs/gpu-tolerance.md`, "MoE routing, int8
+   against float"): the router already runs on float activations, so the gap is
+   upstream int8 error in the hidden state. Left: the decode and prefill timing
+   of the float alternatives in a quiet window (commands in that section), then
+   the owner's decision on the default and on the real MoE rows (B207 has the
+   recommendation and the near ties each option needs). No default changed.
 3. **`kv.overflow` without `VK_EXT_memory_budget`.** Stays off there
    (`kv_spill_armed`). Add a one-line load warning that the flag has no effect
    on this driver and why.
@@ -7777,32 +7779,100 @@ values. What it leaves:
   (`tolerance::metrics::RouteScore`); the synthetic MoE has a row and a gate
   test (`gpu_seam_tolerance_synthetic_moe`), and `docs/gpu-tolerance.md` has the
   mechanism, the measurements and the planted bugs. Open:
-  - **No real MoE model has a row or a gate test.** ERNIE-4.5-21B-A3B Q4_K_M was
-    measured on both RADV GPUs (`measure_gpu_tolerance`, key `ernie-21b-moe`;
-    the table in `docs/gpu-tolerance.md`, "Mutations"): forced along the
-    reference's routing its int8-free runs measure a worst KL of 6.1e-6 on the
-    RX 7900 XTX and 3.8e-6 on the integrated GPU (6.8e-3 unforced on the RX 7900
-    XTX), with at most 18 of 8802 selections differing, at margins up to 2.7e-5;
-    its shipped int8 runs measure 3.6e-3 and 1.3e-2, with up to 434 selections
-    differing at margins up to 3.2e-2, where a uniform share among its 64
-    experts is 1.6e-2. So an Int8 routing near tie set by the rule would hold
-    almost nothing there: either the Int8 class of a real MoE model gets no
-    routing check (its Float runs carry it), or the int8 activation error at the
-    router is looked into first. **Decided 2026-11-24 (owner): investigate
-    first, not started.** Measure ERNIE's routing both ways before its rows are
-    set: (a) int8 routing made more accurate (for example a finer quantisation
-    of the router projection's input alone), and (b) the router projection run
-    on the float path while everything else stays int8. For each: selections
-    differing and their largest margin against the CPU reference, forced and
-    unforced KL, and decode and prefill speed against today's int8 path, on both
-    GPUs; Qwen3-30B-A3B as a second model, since everything above rests on
-    ERNIE. That the int8 activation rounding at the router is the cause is
-    inferred from the figures above, not traced in code, so the first step is
-    confirming it. What to do next is decided from those results. Qwen3-30B-A3B
-    is cached and was not run. Adding a row is a measurement on both GPUs plus a
-    `gpu_seam_tolerance_*` test; whether the gate should carry a 13 GB model is
-    the owner's call (on the integrated GPU the test's memory rule needs about
-    39 GB of free host memory for it).
+  - **No real MoE model has a row or a gate test; the routing investigation is
+    done, the decision is the owner's** (2026-11-25, `docs/gpu-tolerance.md`,
+    "MoE routing, int8 against float", which has the tables and commands).
+    ERNIE-4.5-21B-A3B and Qwen3-30B-A3B Q4_K_M (`measure_gpu_tolerance`, keys
+    `ernie-21b-moe` and `qwen3-30b-moe`) on both RADV GPUs, forced and unforced.
+    Verified in code: no router dispatch in `adapter.rs` reaches an int8 tier,
+    whatever the router's dtype, and the router reads the f32 `hn` before the
+    experts quantize theirs. Both files ship `ffn_gate_inp` as F32, which takes
+    `linear_f32r_*` in the shipped and the Float runs alike (kernel lists read
+    for both models). So "the router fed float activations" is what ships; no
+    switch was built (it would select no other kernel), and the int8 error
+    reaches the routers through the hidden state. Forced, shipped runs select
+    differently at 242 to 574 selections (margins up to 3.2e-2 on ERNIE, 1.7e-2
+    on Qwen3-30B-A3B), Float runs at 8 to 23 (up to 2.7e-5 and 3.4e-4). The
+    upstream share is per device: on the RX 7900 XTX the routed experts' int8
+    batched prefill GEMM is the larger part and the dense decode GEMVs the rest;
+    on the integrated GPU the dense prefill GEMM (the int8 `mmq` tile of
+    `nc_gemm_choice` whenever `i8_dot` is on and `mmq_fallback` is not off)
+    carries most of it: with the other two float 353 (ERNIE) and 389
+    (Qwen3-30B-A3B) selections still differ, and with `mmq_fallback` off as well
+    13 and 14, the Float run's figures exactly
+    (`gpu-ub32-both-float-nofallback`, measured directly). The decomposition is
+    closed on both devices. **Recommended: keep the default as shipped; give the
+    Int8 class of a real MoE row no routing check (its near tie would have to be
+    4.9e-2 on ERNIE and 2.5e-2 on Qwen3-30B-A3B, about three times a uniform
+    share, which holds nothing) and let its Float rows carry the routing, at
+    4.0e-5 (ERNIE) and 5.1e-4 (Qwen3-30B-A3B) by the 1.5x rule.** That needs
+    `route_near_tie` to be settable per class to "not checked", which `Entry`
+    cannot say today (`None` means "no router"). The owner may prefer instead to
+    move MoE models to float kernels, or to take the next item's upstream fix
+    first; what either costs is unmeasured. Adding a row is a measurement plus a
+    `gpu_seam_tolerance_*` test; whether the gate should carry a 13 to 19 GB
+    model is the owner's call (on the integrated GPU the test's memory rule
+    needs about 39 GB of free host memory for ERNIE, about 50 GB for
+    Qwen3-30B-A3B).
+  - **Candidate next slice: a more accurate `quant_q8` on the GPU, for the
+    steady-state routing gap and the first rows alike.** Every int8 family the
+    decomposition names quantizes through `quant_q8.comp` (one scale per 32
+    activations, `amax/127`, the scale and block sum stored as f16, no outlier
+    split). Options, none tried: (a) the CPU's outlier split
+    (`docs/cpu-activations.md`) in `quant_q8` and the kernels that read it; (b)
+    f32 block scales and sums in place of f16; (c) a finer activation format for
+    the routed experts' batched GEMM alone, the larger share on the RX 7900 XTX.
+    Each needs its accuracy measured by this harness (forced selections
+    differing and their widest margin, forced KL, the first rows, both GPUs,
+    both models) and its decode and prefill speed against today's in a quiet
+    window. Which kernel families an option touches decides the work: (a) and
+    (b) change every int8 GEMV and GEMM that reads the quantized activations.
+  - **Decode and prefill cost of the float alternatives: not timed.** Needs a
+    quiet window; the A/B commands are in `docs/gpu-tolerance.md`. The router
+    itself costs the same in every configuration (one F32 GEMV per routed layer
+    per token, no activation pass). Float loses the int8 dense decode GEMVs and,
+    with `i8_dot` off, the routed experts' batched prefill GEMM altogether
+    (every chunk then takes the per-row small-batch path), so its prefill cost
+    may be large.
+  - **Qwen3-30B-A3B's first rows are far off on the shipped GPU path**: 3.8e-2
+    (RX 7900 XTX) and 3.9e-2 (integrated GPU) worst KL in the first two
+    positions (`gpu-ub32`; position 0 on every prompt), three times the CPU
+    production's 1.1e-2; with the routed experts on float 1.8e-5 and 1.2e-3.
+    Candidate causes, untried: no outlier split in `quant_q8`, and its f16
+    `dact`/`sact`; the fix is the previous item's.
+  - **The CPU production path is far from the reference on both MoE models**:
+    forced along the reference's routing, 1003 (ERNIE) and 1135 (Qwen3-30B-A3B)
+    selections differ, at margins up to 1.5e-2 and 1.8e-2, and the worst KL from
+    position 2 on is 3.3e-2 and 5.2e-2, against at most 1.3e-2 and 3.4e-3 on the
+    shipped GPU. Candidate causes, inferred: `quantize_q8` takes one scale per
+    256 activations where `quant_q8.comp` takes one per 32; the outlier split
+    acts only above `HI_RATIO`; and the CPU quantizes every K-quant `Linear`,
+    the prefill's attention projections included, where the RX 7900 XTX keeps
+    its dense prefill on f16 cooperative-matrix GEMMs. **Partly tested**
+    (`cpu_act_quant`'s `per_position_against_the_reference`, its own four chat
+    prompts and 8 decoded tokens, routing forced, the simulation on dense
+    `Linear`s only, the expert banks and the router left float): the CPU
+    reference with its dense activations round-tripped through production's rule
+    (`256:2:16:127:1`) measures a mean KL from position 2 on of 1.8e-3, 1.9e-3,
+    4.2e-3 and 8.5e-4 on Qwen3-30B-A3B's four prompts (production: 4.0e-3,
+    2.6e-3, 4.9e-3, 1.9e-3), and through 32-element blocks (`32:0:0:127`)
+    3.9e-4, 4.2e-4, 7.6e-4 and 2.7e-4; on ERNIE 2.8e-3, 2.9e-3, 3.7e-3, 7.8e-4
+    (production 4.5e-3, 3.7e-3, 3.8e-3, 1.05e-3) against 6.3e-4, 4.5e-4,
+    6.25e-4, 1.4e-4. So the dense `Linear`s' 256-element blocks carry much of
+    production's distance and 32-element blocks would cut that part three to
+    seven times; the rest is the expert banks, which the simulation does not
+    reach (`linear_tap::simulated` is read in `Op::Linear` only). Routing
+    selections were not counted in the simulation. Next: the same with the
+    expert banks simulated, then a decision on the CPU block size with its speed
+    measured.
+  - **Unforced KL is a poor measure on a routed-expert model**: Float runs left
+    on their own routers measure up to 5.0e-2 (Qwen3-30B-A3B, integrated GPU),
+    worse than the shipped run's 2.2e-2 there. At that row (prompt 2, prefill
+    position 163) the routers first part from the reference's at layer 16 on a
+    4.1e-6 margin and nine later layers of the position follow; that the KL
+    comes from those differences is inferred, not shown by flipping one
+    selection. Any user-facing comparison of the two classes should use top-1
+    agreement or a forced run.
   - **The routing near tie has no rule for a model that never selects
     differently.** The synthetic row's is 1.5 times the one legitimate
     difference seen. A row whose legitimate runs show none would get 0 by that

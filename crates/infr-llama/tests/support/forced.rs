@@ -111,6 +111,11 @@ pub const MODELS: &[(&str, &str, &str)] = &[
         "unsloth--ERNIE-4.5-21B-A3B-PT-GGUF",
         "ERNIE-4.5-21B-A3B-PT-Q4_K_M.gguf",
     ),
+    (
+        "qwen3-30b-moe",
+        "unsloth--Qwen3-30B-A3B-GGUF",
+        "Qwen3-30B-A3B-Q4_K_M.gguf",
+    ),
 ];
 
 /// A [`gate::Case`] the tests opened, with what only they need of it.
@@ -384,7 +389,62 @@ pub const DIAGNOSIS_CONFIGS: &[GpuConfig] = &[
         edit: |c| c.kernels.vulkan.dp4a_kq = false,
         reference_kv: None,
     },
+    // Where the int8 error a routed-expert model's routers see comes from
+    // (`docs/gpu-tolerance.md`, "MoE routing, int8 against float"). The router's own GEMV is
+    // float in every configuration (no router dispatch of the Vulkan adapter reaches an int8
+    // tier, whatever the router's dtype), so these split the int8 kernels upstream of it, at `SMALL_UBATCH` so every prefill chunk fits the small-batch MoE path. With
+    // `moe.small_m` at the chunk height the routed experts take the per-row float GEMVs at every
+    // row (decode already does) and every dense `Linear` keeps its int8 kernels.
+    GpuConfig {
+        name: "gpu-ub32-moe-float",
+        edit: |c| {
+            c.device.ubatch = Some(SMALL_UBATCH);
+            c.kernels.vulkan.moe_small_m = SMALL_UBATCH;
+        },
+        reference_kv: None,
+    },
+    // The other half: the dense `Linear`s (attention, shared expert, dense FFN) off the int8
+    // kernels their own switches name, the routed experts' batched prefill GEMM on int8 (it is
+    // gated on `i8_dot` alone). A device without cooperative matrices keeps its dense prefill
+    // GEMM on int8 here too: `nc_gemm_choice` picks the int8 `mmq` tile on `i8_dot` and ignores
+    // `kernels.vulkan.mmq`; only `mmq_fallback` off takes that GEMM away (the last entry).
+    GpuConfig {
+        name: "gpu-ub32-dense-float",
+        edit: dense_float_ub32,
+        reference_kv: None,
+    },
+    // Both halves: on a device without cooperative matrices, the dense prefill GEMM is the one
+    // int8 kernel left; on one with them, nothing int8 runs.
+    GpuConfig {
+        name: "gpu-ub32-both-float",
+        edit: both_float_ub32,
+        reference_kv: None,
+    },
+    // Both halves with the non-coopmat tiled GEMM off (`mmq_fallback`), so a device without
+    // cooperative matrices runs its dense prefill on the float GEMVs: `i8_dot` on, no int8 kernel
+    // dispatched on the routed path.
+    GpuConfig {
+        name: "gpu-ub32-both-float-nofallback",
+        edit: |c| {
+            both_float_ub32(c);
+            c.kernels.vulkan.mmq_fallback = false;
+        },
+        reference_kv: None,
+    },
 ];
+
+/// `gpu-ub32-both-float`'s edit: [`dense_float_ub32`] with every row on the small-batch MoE path.
+fn both_float_ub32(c: &mut EngineConfig) {
+    dense_float_ub32(c);
+    c.kernels.vulkan.moe_small_m = SMALL_UBATCH;
+}
+
+/// `gpu-ub32-dense-float`'s edit: [`vulkan_float`] with `i8_dot` left on, at [`SMALL_UBATCH`].
+fn dense_float_ub32(c: &mut EngineConfig) {
+    vulkan_float(c);
+    c.kernels.vulkan.i8_dot = true;
+    c.device.ubatch = Some(SMALL_UBATCH);
+}
 
 /// The three-way measurement on one model: CPU production against the CPU reference, then each
 /// [`GPU_CONFIGS`] entry against the CPU reference (run with the configuration's KV format) and
@@ -396,9 +456,10 @@ pub const DIAGNOSIS_CONFIGS: &[GpuConfig] = &[
 /// check at the top of `seam::forced_run`). `INFR_TOL_ROWS` adds a [`rows_line`] per comparison and
 /// the kernels the run built. On a routed-expert model every run is forced along the reference's
 /// expert selections and a [`route_line`] per comparison gives its own; `INFR_TOL_OWN_ROUTING`
-/// leaves the Vulkan runs on their own routers' selections instead, the comparison a router near
-/// tie throws off (`docs/gpu-tolerance.md`), for telling a routing difference from an arithmetic
-/// one.
+/// leaves the CPU production and Vulkan runs on their own routers' selections instead (what a user
+/// gets), the comparison a router near tie throws off (`docs/gpu-tolerance.md`), for telling a
+/// routing difference from an arithmetic one. The `{name}-cpuprod` lines then compare two runs that
+/// each followed their own routers, not one routing.
 pub fn measure(key: &str) {
     let Some(case) = open_case(key) else {
         eprintln!("skip: {key} not in the HF cache");
@@ -453,7 +514,14 @@ pub fn measure(key: &str) {
         }
         let t_ref = t0.elapsed();
         let t0 = std::time::Instant::now();
-        let prod = forced(model, ForcedOn::Cpu, |_| {}, &r);
+        let prod = forced_along(
+            model,
+            ForcedOn::Cpu,
+            |_| {},
+            PrefillHead::All,
+            &r,
+            r.routing.as_ref().filter(|_| !own_routing),
+        );
         let t_prod = t0.elapsed();
         let tag = |what: &str| format!("model={key} prompt={pi} len={} {what}", ids.len());
         println!(

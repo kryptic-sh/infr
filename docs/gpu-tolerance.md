@@ -656,11 +656,12 @@ of magnitude: unforced, prompt 1's decode row at position 54 measures 6.83e-3
 with four of that position's routers selecting otherwise (layers 14, 22, 23 and
 24, margins up to 2.6e-4), and forced the same row's phase measures 2.4e-6 with
 one selection of the prompt differing, at a margin of 3.8e-6. The int8 runs keep
-their own activation quantization, and it reaches the routers: on the integrated
-GPU a selection differs at a margin of 3.2e-2, twice a uniform share, so a
-routing near tie set from the int8 runs of this model would hold almost nothing.
-What its rows should be is open (B207). The whole measurement took 64 s on
-`Vulkan0` and 343 s on `Vulkan1`.
+their own activation quantization, and it reaches the routers through the hidden
+state they are given ("MoE routing, int8 against float" below traces it): on the
+integrated GPU a selection differs at a margin of 3.2e-2, twice a uniform share,
+so a routing near tie set from the int8 runs of this model would hold almost
+nothing. What its rows should be is open (B207). The whole measurement took 64 s
+on `Vulkan0` and 343 s on `Vulkan1`.
 
 The CPU demonstration (synthetic llama, CPU reference, against the clean model's
 CPU reference, where the clean distance is exactly 0) catches every dense bug
@@ -1425,6 +1426,284 @@ which bound a logit difference on a fixture rather than hash, token or cosine.
 `mtp_spec_matches_target_only_greedy` is parked and fails on `Vulkan1` as its
 doc comment says; it was not touched.
 
+## MoE routing, int8 against float
+
+Measured 2026-11-25 (B207, B-DECISIONS-2026-11-25 item 2): on ERNIE-4.5-21B-A3B
+the shipped int8 runs select other experts than the CPU reference at margins up
+to twice a uniform share, the int8-free ones at margins a thousand times
+smaller. The question was whether routing on float activations, with everything
+else as shipped, closes that gap.
+
+**The router already runs on float activations; nothing int8 touches it.** Read
+in the code:
+
+- **The router's GEMV is never an int8 kernel on Vulkan.** Every site that
+  dispatches it (the `Op::MoeRoute` arm of `lower_op`, the batched and the
+  small-m branches of the `Op::MoeFfn` arm, and `execute_paged_moe`, all in
+  `crates/infr-vulkan/src/adapter.rs`) chooses by the router weight's dtype
+  between `Recorder::linear_native` (the SG, RM and plain dequantizing GEMVs, on
+  f32 activations), `linear_f32` and `linear` (f16 weight). None of them goes
+  through `quant_q8` or an int8 tier (`quant_linear`'s), whatever the router's
+  dtype.
+- **Both models ship the router as F32** (`ffn_gate_inp.weight`: `[2560, 64]` on
+  ERNIE, `[2048, 128]` on Qwen3-30B-A3B, read off the files' headers).
+  llama.cpp's quantizer leaves that tensor in whatever type it had
+  (`llama-quant.cpp`: "do not quantize expert gating tensors"); it does not make
+  it F32. The F32 router takes `linear_f32r_v4` for a decode row and
+  `linear_f32r_mrow8_v4` (`linear_f32r_mrow4_v4` up to four rows) for a prefill
+  chunk, in the shipped and the Float configurations alike: the kernel lists
+  `INFR_TOL_ROWS=1` prints have the same router kernels in both (`linear_f32_mo`
+  takes the decode row where `gemv.kq_fma` is on). The dtype is not why it is
+  float: a quantized router would take `linear_native`, float activations too.
+  Kernel lists were read for both models: ERNIE on both GPUs, Qwen3-30B-A3B on
+  the integrated GPU (the second round's runs, below).
+- **Its input is the float hidden state.** `router_x` is `hn`, the f32 RMSNorm
+  output of the residual stream the routed experts read too (the MoE arm of
+  `crates/infr-llama/src/seam/runner.rs`). The experts quantize their own copy
+  of it afterwards (`quant_q8_gather`, the batched prefill path); the router
+  reads it before that. So "the router on the pre-quantization hidden state" is
+  what ships as well.
+- **The CPU production path routes in float on these files too.**
+  `infr_cpu::moe::router_logits` takes its activation form from
+  `expert_acts_kind`: an F32 router is `ActsKind::Raw`, f32 activations. A Q4_K,
+  Q5_K, Q6_K or Q8_0 router would route on int8 activations there
+  (`ActsKind::Super`; a Q5_0 one, or a Q8_0 one whose width is not a multiple of
+  256, on `ActsKind::Blk32`) and on float ones on Vulkan: read in the code, not
+  run, since neither file has one.
+
+So the candidate change, the router's GEMV on a float-activation kernel with
+everything else int8, is the shipped behaviour, and a switch for it would select
+no other kernel on either model; none was built. The int8 error reaches the
+routers through the hidden state, from the int8 kernels upstream of them. Which
+ones those are differs by device (the kernel lists of the shipped against the
+Float runs, ERNIE):
+
+- **RX 7900 XTX**: the dense decode GEMVs (`native_mmv_mrow_q4k_*`,
+  `native_mmv_mrow_q6k_*`: the attention projections, the shared expert, ERNIE's
+  dense first layer; prefill chunks up to 16 rows take them too) and the routed
+  experts' batched prefill GEMM (`native_gemm_mmq_q4k_xp32w`,
+  `native_gemm_mmq_q6k_xp32w` on `quant_q8_gather`). Taller dense prefill chunks
+  take the f16 cooperative-matrix GEMMs (`native_gemm_warp_*`) in both classes,
+  and the routed experts' decode GEMVs (`native_idm_q4k`, `native_idm_q6k_sg2`)
+  are float in both.
+- **The integrated GPU**: the same, plus the dense prefill GEMM
+  (`native_gemm_mmq_q4k_streamed`, `native_gemm_mmq_q5k`,
+  `native_gemm_mmq_q6k_streamed`). `nc_gemm_choice` gives it the int8 `mmq` tile
+  whenever `i8_dot` is on, whatever `kernels.vulkan.mmq` says; with
+  `kernels.vulkan.mmq_fallback` off it returns no tile and the dense prefill
+  takes the float GEMVs (`linear_native_routed_at`).
+
+**The configurations measured** (`measure_gpu_tolerance`; the last four are
+`DIAGNOSIS_CONFIGS` in `crates/infr-llama/tests/support/forced.rs`, scored by no
+gate, all at the 32-row prefill chunk so every chunk fits the small-batch MoE
+path):
+
+- `gpu`, `gpu-ub32`: shipped, int8 (the router float, as above).
+- `gpu-float`, `gpu-float-ub32`: every int8 kernel off (the Float class).
+- `gpu-ub32-moe-float`: the routed experts on their float per-row GEMVs at every
+  row (`moe.small_m` at the chunk height), every dense `Linear` on int8.
+- `gpu-ub32-dense-float`: the dense `Linear`s off the int8 kernels their own
+  switches name, `i8_dot` on, so the routed experts keep the int8 batched GEMM
+  (and the integrated GPU its int8 dense prefill GEMM).
+- `gpu-ub32-both-float`: both of those. On the RX 7900 XTX that runs no int8
+  kernel and measures what `gpu-float-ub32` does, figure for figure; on the
+  integrated GPU it leaves the dense prefill GEMM on int8 alone.
+- `gpu-ub32-both-float-nofallback`: `gpu-ub32-both-float` with
+  `kernels.vulkan.mmq_fallback` off, so the integrated GPU's dense prefill takes
+  the float GEMVs; `i8_dot` stays on. Run on the integrated GPU only (a second
+  round the same day): its kernel list is the Float run's, kernel for kernel, on
+  both models, and no int8 kernel is built.
+
+That a configuration runs the kernels it names was read off its kernel list
+(`INFR_TOL_ROWS=1`: ERNIE, one prompt, each device; the second round, both
+models, the integrated GPU), not asserted by a test.
+
+**Measured 2026-11-25**, Linux 7.3.5-arch1-1, Mesa RADV 26.3.1, headless, both
+GPUs of the Linux machine (`Vulkan0` RX 7900 XTX, `Vulkan1` the integrated GPU),
+native lanes, tuning rows on, no knob but `INFR_DEV` and the harness's own; the
+gate's three prompts and `N_DECODE` forced decode steps, every logit row scored
+(326 positions on ERNIE, 319 on Qwen3-30B-A3B) and every router of every fed
+position compared (8802 selections on ERNIE's 27 routed layers, 15312 on
+Qwen3-30B-A3B's 48). A uniform share is 1.6e-2 of selection probability among
+ERNIE's 64 experts and 7.8e-3 among Qwen3-30B-A3B's 128.
+
+- **Forced**: tokens and expert selections the reference's
+  (`Op::MoeFfn::expert_ids`); "differ" counts the run's own routers
+  (`Op::MoeRoute`) selecting another set, with the widest reference margin among
+  them, and the KL is the arithmetic alone: worst and mean from position 2 on,
+  then the worst of the first two positions.
+- **Unforced** (`INFR_TOL_OWN_ROUTING=1`): the run follows its own routers, as a
+  user's does, still on the reference's tokens; its KL and top-1 agreement
+  (argmax equal to the reference's, over every position, no near-tie exclusion)
+  are what that routing costs on top.
+- **CPU production** is scored the same way on the same rows (`cpuprod`), forced
+  and unforced; it runs on the CPU, so its row is the same in both device
+  tables.
+
+Commands (one GPU process at a time; `INFR_DEV=Vulkan1` for the second device,
+`INFR_TOL_MODELS=qwen3-30b-moe` for the second model, and
+`INFR_TOL_OWN_ROUTING=1` for the unforced half):
+
+```text
+INFR_DEV=Vulkan0 INFR_TOL_MODELS=ernie-21b-moe \
+  INFR_TOL_ONLY=gpu,gpu-ub32,gpu-float,gpu-float-ub32,gpu-ub32-moe-float,gpu-ub32-dense-float,gpu-ub32-both-float \
+  cargo nextest run -p infr-llama --release --test gpu_tolerance --run-ignored all \
+  --no-capture -E 'test(measure_gpu_tolerance)'
+```
+
+The second round (`Vulkan1`, both models, forced and unforced) ran
+`INFR_TOL_ONLY=gpu-ub32,gpu-float-ub32,gpu-ub32-both-float,gpu-ub32-both-float-nofallback`
+with `INFR_TOL_ROWS=1`; the three configurations it shares with the first round
+measured the same figures in both.
+
+Each cell sums the three prompts (selections) or takes their worst (widest
+margin, worst KL); the mean is over every position from 2 on.
+
+ERNIE-4.5-21B-A3B, `Vulkan0` (8802 selections):
+
+| Configuration            | Forced: differ (widest) | Forced KL, worst / mean | First rows | Unforced: differ (widest) | Unforced KL, worst / mean | Unforced top-1 |
+| ------------------------ | ----------------------- | ----------------------- | ---------- | ------------------------- | ------------------------- | -------------- |
+| CPU production           | 1003 (1.5e-2)           | 3.3e-2 / 2.1e-3         | 1.1e-2     | 1300 (1.6e-1)             | 1.1e-1 / 4.1e-3           | 315/326        |
+| `gpu` (int8)             | 242 (1.7e-3)            | 3.6e-3 / 1.4e-4         | 1.2e-3     | 417 (6.5e-3)              | 1.4e-2 / 6.5e-4           | 324/326        |
+| `gpu-ub32` (int8)        | 247 (1.7e-3)            | 3.6e-3 / 1.3e-4         | 1.1e-3     | 429 (6.5e-3)              | 1.4e-2 / 6.2e-4           | 322/326        |
+| `gpu-float` (Float)      | 12 (1.5e-5)             | 4.6e-6 / 5.1e-7         | 1.1e-6     | 56 (3.2e-3)               | 6.8e-3 / 7.8e-5           | 324/326        |
+| `gpu-float-ub32` (Float) | 18 (2.7e-5)             | 6.1e-6 / 5.9e-7         | 1.1e-6     | 61 (4.6e-3)               | 6.8e-3 / 7.5e-5           | 326/326        |
+| `gpu-ub32-moe-float`     | 88 (1.7e-3)             | 9.9e-4 / 3.2e-5         | 2.0e-6     | 193 (9.1e-3)              | 6.7e-3 / 1.7e-4           | 326/326        |
+| `gpu-ub32-dense-float`   | 192 (7.2e-4)            | 3.6e-3 / 1.0e-4         | 1.1e-3     | 353 (4.6e-3)              | 1.5e-2 / 6.3e-4           | 323/326        |
+| `gpu-ub32-both-float`    | 18 (2.7e-5)             | 6.1e-6 / 5.9e-7         | 1.1e-6     | 61 (4.6e-3)               | 6.8e-3 / 7.5e-5           | 326/326        |
+
+ERNIE-4.5-21B-A3B, `Vulkan1` (8802 selections):
+
+| Configuration                    | Forced: differ (widest) | Forced KL, worst / mean | First rows | Unforced: differ (widest) | Unforced KL, worst / mean | Unforced top-1 |
+| -------------------------------- | ----------------------- | ----------------------- | ---------- | ------------------------- | ------------------------- | -------------- |
+| CPU production                   | 1003 (1.5e-2)           | 3.3e-2 / 2.1e-3         | 1.1e-2     | 1300 (1.6e-1)             | 1.1e-1 / 4.1e-3           | 315/326        |
+| `gpu` (int8)                     | 425 (3.2e-2)            | 1.3e-2 / 4.3e-4         | 1.7e-3     | 674 (5.2e-2)              | 3.1e-2 / 1.2e-3           | 322/326        |
+| `gpu-ub32` (int8)                | 434 (1.3e-2)            | 1.3e-2 / 4.6e-4         | 1.7e-3     | 680 (2.1e-2)              | 3.1e-2 / 1.3e-3           | 322/326        |
+| `gpu-float` (Float)              | 8 (5.7e-6)              | 3.8e-6 / 1.6e-7         | 1.5e-7     | 49 (1.5e-3)               | 2.7e-3 / 3.4e-5           | 324/326        |
+| `gpu-float-ub32` (Float)         | 13 (1.1e-5)             | 3.8e-6 / 1.7e-7         | 1.5e-7     | 57 (3.2e-3)               | 2.7e-3 / 3.7e-5           | 324/326        |
+| `gpu-ub32-moe-float`             | 375 (3.2e-2)            | 4.3e-3 / 3.7e-4         | 1.6e-3     | 679 (1.4e-1)              | 1.6e-2 / 1.2e-3           | 324/326        |
+| `gpu-ub32-dense-float`           | 413 (1.3e-2)            | 1.3e-2 / 4.4e-4         | 1.7e-3     | 699 (2.1e-2)              | 3.1e-2 / 1.4e-3           | 322/326        |
+| `gpu-ub32-both-float`            | 353 (3.2e-2)            | 4.3e-3 / 3.5e-4         | 1.6e-3     | 669 (1.4e-1)              | 1.0e-2 / 1.2e-3           | 325/326        |
+| `gpu-ub32-both-float-nofallback` | 13 (1.1e-5)             | 3.8e-6 / 1.7e-7         | 1.5e-7     | 57 (3.2e-3)               | 2.7e-3 / 3.7e-5           | 324/326        |
+
+Qwen3-30B-A3B, `Vulkan0` (15312 selections):
+
+| Configuration            | Forced: differ (widest) | Forced KL, worst / mean | First rows | Unforced: differ (widest) | Unforced KL, worst / mean | Unforced top-1 |
+| ------------------------ | ----------------------- | ----------------------- | ---------- | ------------------------- | ------------------------- | -------------- |
+| CPU production           | 1135 (1.8e-2)           | 5.2e-2 / 2.9e-3         | 1.1e-2     | 1957 (4.7e-2)             | 1.0e-1 / 4.7e-3           | 307/319        |
+| `gpu` (int8)             | 339 (6.0e-4)            | 2.2e-3 / 1.8e-4         | 3.8e-2     | 974 (1.7e-2)              | 1.4e-2 / 9.1e-4           | 318/319        |
+| `gpu-ub32` (int8)        | 344 (5.8e-3)            | 2.0e-3 / 1.8e-4         | 3.8e-2     | 1135 (4.1e-2)             | 2.1e-2 / 1.1e-3           | 312/319        |
+| `gpu-float` (Float)      | 23 (3.4e-4)             | 5.8e-6 / 4.4e-7         | 1.2e-5     | 377 (2.2e-2)              | 8.7e-3 / 2.6e-4           | 319/319        |
+| `gpu-float-ub32` (Float) | 20 (3.4e-4)             | 5.8e-6 / 4.5e-7         | 1.2e-5     | 304 (2.2e-2)              | 1.7e-2 / 2.3e-4           | 319/319        |
+| `gpu-ub32-moe-float`     | 124 (6.0e-4)            | 1.7e-3 / 8.4e-5         | 1.8e-5     | 549 (2.2e-2)              | 1.7e-2 / 4.5e-4           | 319/319        |
+| `gpu-ub32-dense-float`   | 280 (5.8e-3)            | 2.0e-3 / 9.6e-5         | 3.8e-2     | 1132 (4.1e-2)             | 2.1e-2 / 1.1e-3           | 313/319        |
+| `gpu-ub32-both-float`    | 20 (3.4e-4)             | 5.8e-6 / 4.5e-7         | 1.2e-5     | 304 (2.2e-2)              | 1.7e-2 / 2.3e-4           | 319/319        |
+
+Qwen3-30B-A3B, `Vulkan1` (15312 selections):
+
+| Configuration                    | Forced: differ (widest) | Forced KL, worst / mean | First rows | Unforced: differ (widest) | Unforced KL, worst / mean | Unforced top-1 |
+| -------------------------------- | ----------------------- | ----------------------- | ---------- | ------------------------- | ------------------------- | -------------- |
+| CPU production                   | 1135 (1.8e-2)           | 5.2e-2 / 2.9e-3         | 1.1e-2     | 1957 (4.7e-2)             | 1.0e-1 / 4.7e-3           | 307/319        |
+| `gpu` (int8)                     | 564 (1.7e-2)            | 3.3e-3 / 4.4e-4         | 3.8e-2     | 1341 (4.1e-2)             | 2.2e-2 / 1.6e-3           | 313/319        |
+| `gpu-ub32` (int8)                | 574 (1.7e-2)            | 3.4e-3 / 4.1e-4         | 3.9e-2     | 1447 (2.2e-2)             | 1.6e-2 / 1.6e-3           | 313/319        |
+| `gpu-float` (Float)              | 11 (2.4e-5)             | 2.9e-6 / 1.5e-7         | 6.7e-8     | 317 (2.2e-2)              | 5.0e-2 / 3.9e-4           | 319/319        |
+| `gpu-float-ub32` (Float)         | 14 (2.4e-5)             | 4.0e-6 / 1.5e-7         | 6.7e-8     | 315 (2.2e-2)              | 5.0e-2 / 4.4e-4           | 319/319        |
+| `gpu-ub32-moe-float`             | 434 (1.4e-2)            | 4.7e-3 / 3.5e-4         | 1.2e-3     | 1248 (3.7e-2)             | 1.6e-2 / 1.3e-3           | 315/319        |
+| `gpu-ub32-dense-float`           | 534 (5.8e-3)            | 3.4e-3 / 3.3e-4         | 3.9e-2     | 1407 (2.2e-2)             | 1.6e-2 / 1.5e-3           | 315/319        |
+| `gpu-ub32-both-float`            | 389 (1.6e-3)            | 4.7e-3 / 2.7e-4         | 1.0e-3     | 1200 (3.4e-2)             | 1.4e-2 / 1.2e-3           | 316/319        |
+| `gpu-ub32-both-float-nofallback` | 14 (2.4e-5)             | 4.0e-6 / 1.5e-7         | 6.7e-8     | 315 (2.2e-2)              | 5.0e-2 / 4.4e-4           | 319/319        |
+
+What the numbers say:
+
+- **Routing on float activations is already what ships, so it closes nothing.**
+  The gap between the shipped and the Float runs is the hidden state the router
+  is given. Forced along the reference's routing, Float runs select differently
+  at 8 to 23 selections, at margins up to 2.7e-5 (ERNIE) and 3.4e-4
+  (Qwen3-30B-A3B, `Vulkan0`); shipped runs at 242 to 574, at margins up to
+  3.2e-2 (ERNIE, `Vulkan1`), twice a uniform share.
+- **Which upstream kernels matter depends on the device.** On the RX 7900 XTX
+  the routed experts' int8 batched prefill GEMM is the larger share (ERNIE 247
+  differing selections to 88 without it, Qwen3-30B-A3B 344 to 124) and the dense
+  decode GEMVs the rest (to 192 and 280 without them); without both the run is
+  the Float run. On the integrated GPU the dense prefill GEMM (the int8 `mmq`
+  tile `nc_gemm_choice` picks while `i8_dot` is on) carries most of it: with the
+  other two float, 353 and 389 selections still differ (434 and 574 shipped),
+  and with that GEMM off as well (`gpu-ub32-both-float-nofallback`) 13 and 14
+  do, the Float run's figures in every column of both tables. The decomposition
+  is closed on both devices: those three families are the whole int8 gap. No
+  single family is "the router input"; a fix would be per family and per device.
+- **Qwen3-30B-A3B's first rows are mostly the routed experts' int8 GEMM.**
+  Shipped (`gpu-ub32`), the first two positions measure 3.8e-2 on the RX 7900
+  XTX and 3.9e-2 on the integrated GPU (position 0 worst on every prompt, both
+  GPUs), three times the CPU production's 1.1e-2; with the routed experts float
+  (`gpu-ub32-moe-float`), 1.8e-5 and 1.2e-3. Two candidate causes, neither
+  tried: the massive-activation case `docs/cpu-activations.md` fixed on the CPU
+  with the outlier split, here in the GPU's `quant_q8` (one scale per 32
+  activations, `amax/127`, no split); and `quant_q8.comp` storing each block's
+  scale and sum (`dact`, `sact`) as f16.
+- **Unforced, a router near tie goes either way even on the Float path**, and
+  every later router and row inherits it: Float runs select differently at 49 to
+  377 selections and score a worst KL of 2.7e-3 to 5.0e-2 (Qwen3-30B-A3B on
+  `Vulkan1`: 5.0e-2 Float against 2.2e-2 shipped). That worst row is prompt 2's
+  prefill row at position 163 (`gpu-float`); there the run's routers first part
+  from the reference's at layer 16, on a reference margin of 4.1e-6, and nine
+  later layers of the same position then select otherwise at margins up to
+  2.1e-3, with 194 differing selections at earlier positions of the prompt
+  feeding it through the KV. That the row's KL comes from those differences, and
+  not from the arithmetic, is inferred (the forced Float runs' worst on that GPU
+  is 4.0e-6); no single selection was flipped to show it. Unforced KL measures
+  where the near ties fell, not the arithmetic; it is why the gate forces the
+  routing. What the user sees is in the top-1 column: shipped 312 to 324 of the
+  reference's tokens, Float 319 to 326, CPU production 307 to 315.
+- **The CPU production path is further from the reference than the shipped GPU
+  on most measures, on both devices**: selections differing, forced (1003 and
+  1135 against at most 434 and 574) and unforced (1300 and 1957 against at most
+  680 and 1447); worst and mean KL from position 2 on, forced (3.3e-2 and 5.2e-2
+  against at most 1.3e-2 and 3.4e-3) and unforced; unforced top-1 (315 and 307
+  against at least 322 and 312). Not on every one: the widest forced margin is
+  wider on the shipped integrated GPU for ERNIE (3.2e-2 against the CPU's
+  1.5e-2) and about level there for Qwen3-30B-A3B (1.7e-2 against 1.8e-2), the
+  widest unforced margin is about level for Qwen3-30B-A3B on both GPUs (4.1e-2
+  against 4.7e-2), and Qwen3-30B-A3B's first rows are worse on both GPUs
+  (above). So the shipped GPU's routing error is not out of line with what the
+  CPU already ships; the CPU's own distance is a finding of its own (B207).
+
+**Cost.** Not timed (timings need a quiet window). Structurally: one router GEMV
+per routed layer per token, F32 weights read in full each time, ERNIE 27 of 64 ×
+2560 (655,360 bytes each) and Qwen3-30B-A3B 48 of 128 × 2048 (1,048,576 bytes),
+on `linear_f32r_v4` for a decode row (`linear_f32_mo` under `gemv.kq_fma`) and
+`linear_f32r_mrow8_v4` for a prefill chunk, in every configuration: no extra
+activation pass (the router reads `hn` as it is), and nothing in the replayed or
+chained decode or the batched prefill changes for it. The alternatives that do
+move routing cost elsewhere: Float turns the dense decode GEMVs from
+`native_mmv_mrow_*` to the float `native_*_rm2`/`sg2` builds, and with `i8_dot`
+off the routed experts' batched prefill GEMM is not taken at all (its gate is
+`i8_dot`), so every prefill chunk goes through the per-row small-batch path. The
+A/B for the Float alternative, interleaved and in a quiet window:
+
+```text
+INFR_DEV=Vulkan0 infr bench -p 512 -n 128 -r 5 <model.gguf>
+INFR_DEV=Vulkan0 infr bench -p 512 -n 128 -r 5 <model.gguf> \
+  --set kernels.vulkan.i8_dot=false --set kernels.vulkan.i8cm_kq=false \
+  --set kernels.vulkan.dp4a_kq=false --set kernels.vulkan.mmq=false \
+  --set kernels.vulkan.mmv_mw=false --set kernels.vulkan.mrow=false
+```
+
+**The routing near tie each option would need** (the table's rule: 1.5 times the
+widest margin at which a legitimate run's own router selected otherwise, both
+GPUs and both chunk heights, forced runs):
+
+| Model             | Float class              | Int8 class, as shipped   | Int8, routed experts float |
+| ----------------- | ------------------------ | ------------------------ | -------------------------- |
+| ERNIE-4.5-21B-A3B | 4.0e-5 (1.5 × 2.6703e-5) | 4.9e-2 (1.5 × 3.2436e-2) | 4.9e-2 (1.5 × 3.2436e-2)   |
+| Qwen3-30B-A3B     | 5.1e-4 (1.5 × 3.4305e-4) | 2.5e-2 (1.5 × 1.6739e-2) | 2.1e-2 (1.5 × 1.3964e-2)   |
+
+An Int8 near tie of three times a uniform share holds almost nothing, and the
+cheapest partial fix leaves it where it is (the integrated GPU sets it). The
+Float rows' near ties are of the order the synthetic row has and would hold a
+router bug (bug (i) under "Mutations" moved selections at margins up to 0.37).
+B207 records the recommendation and what stays open.
+
 ## Not measured
 
 - **Metal.** Nothing here ran on Apple hardware; the harness drives the CPU and
@@ -1435,8 +1714,8 @@ doc comment says; it was not touched.
   that arm also needs `Op::MoeRoute` on Metal, which refuses it by name today.
 - **Windows, for everything routed-expert**: the synthetic MoE's row, its gate
   test, the own-routing check and its planted bugs ran under RADV only.
-- **Real MoE models** in the gate (one is measured above, none has a row), paged
-  MoE models (a forced run of one is refused), quantized KV caches below 8 bits,
-  and what the greedy check leaves of the chained and the replayed decode (the
-  chained sampler, other chain lengths, Windows): see B207 in
+- **Real MoE models** in the gate (two are measured above, none has a row),
+  paged MoE models (a forced run of one is refused), quantized KV caches below 8
+  bits, and what the greedy check leaves of the chained and the replayed decode
+  (the chained sampler, other chain lengths, Windows): see B207 in
   [`backlog.md`](backlog.md).

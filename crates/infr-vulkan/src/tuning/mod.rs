@@ -267,6 +267,9 @@ pub(crate) struct Tuning {
     pub gemv_sg_max_out: usize,
     /// `mmv_mw.warps@<format>`, in [`MMV_MW_DTYPES`] order.
     pub mmv_mw_warps: [u32; MMV_MW_DTYPES.len()],
+    /// `mmv_mw.moe_float`: a graph with routed experts keeps every one-row `Linear` off the int8
+    /// decode GEMVs, exactly as `kernels.vulkan.mmv_mw = false` does (`adapter::moe_decode_float`).
+    pub mmv_mw_moe_float: bool,
     /// `mmv_mrow.*`: when the int8 multi-row GEMV takes its four-outputs-per-workgroup build.
     pub mmv_o4_max_in_f: usize,
     pub mmv_o4_all_widths: bool,

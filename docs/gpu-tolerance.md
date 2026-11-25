@@ -1813,14 +1813,18 @@ default): `--set kernels.vulkan.tune.quant_q8.experts_hi=true`,
   (16) times every other one quantizes the rest on their own scale, rounded up
   to a value f16 holds exactly; the outlier keeps a code clamped to ±127 and its
   remainder in f32 goes to a fourth output, `hres` (one `vec2` per block: the
-  remainder and the lane, `(0, 0)` where the block does not split). A block that
-  does not split gets the plain build's bits.
+  remainder and the lane, written by the outlier's own lane and only for a block
+  that splits). Such a block is marked by the sign bit of its f16 scale (a scale
+  is never negative, so the bit is free). A block that does not split gets the
+  plain build's bits.
 - **`native_gemm_mmq_q4k` and `native_gemm_mmq_q6k` `-DACT_HI`** (the four
   resident expert tiles of each, `_xp_hi`, `_xp128_hi`, `_xp32_hi`,
-  `_xp32w_hi`): after each block's integer dot and epilogue, a row whose block
-  carries a remainder adds remainder × the weight at its lane, read from the
-  weight tile already in shared memory (`dl·q4 − mm` for Q4_K, `d·sc·(q6 − 32)`
-  for Q6_K).
+  `_xp32w_hi`): each row reads its block's scale as the absolute value and, only
+  where the sign bit marks the block split, loads its remainder and adds
+  remainder × the weight at its lane after the block's integer dot and epilogue,
+  read from the weight tile already in shared memory (`dl·q4 − mm` for Q4_K,
+  `d·sc·(q6 − 32)` for Q6_K). A thread none of whose rows is marked takes a
+  single branch per block.
 - **The lowering** (`Op::MoeFfn`'s resident batched arm in `adapter.rs`): with
   the parameter on, a stage whose expert GEMMs all have an `ACT_HI` build (gate
   and up for the gate/up input, down for the down input) quantizes on the HI
@@ -1847,7 +1851,8 @@ devices and both models, forced and unforced.
 clean): `quant_q8_hi_follows_its_rule` drives blocks with one massive value, two
 in different blocks, a largest value exactly 16 times the next (does not split)
 and just over it (splits), an all-zero block, a single non-zero value and two
-equal largest values, through the plain, the HI and the gathered HI builds;
+equal largest values, through the plain, the HI and the gathered HI builds, and
+asserts the split mark is set exactly on the blocks the rule splits;
 `expert_gemm_hi_matches_its_decomposition` holds every Q4_K and Q6_K `ACT_HI`
 tile to the f64 sum of its decomposition (asserted within 1e-5 of the absolute
 term sum; the worst measured is 5.1e-7), with the carried lanes covering every
@@ -1855,7 +1860,13 @@ byte position of a packed word, and each row with a massive activation closer to
 the f64 dot of the f32 activations than the plain GEMM by at least 10 times
 (asserted; the least measured is 42 times). A row without an outlier is held to
 the plain GEMM's output within the same 1e-5 of the term sum, not bit for bit:
-the two builds may contract the epilogue differently.
+the two builds may contract the epilogue differently. Every `hres` entry starts
+as a stale value no block carries, so a GEMM that read an unmarked block's
+remainder fails the decomposition. Red runs (2026-11-25, `Vulkan0`): with the
+quantizer never setting the mark, all three tests fail (the rule test on the
+mark, the decomposition and the adapter's switch test on the massive rows); with
+the GEMMs reading every block's remainder, the decomposition test fails on the
+stale value and the adapter test's massive rows come out NaN.
 
 ### Accuracy
 
@@ -1875,6 +1886,13 @@ it names: `quant_q8_gather`, `native_gemm_mmq_q4k_xp32w` and
 Each cell sums the three prompts (selections) or takes their worst; the CPU
 production and Float rows are this run's and repeat the first measurement's.
 
+Rerun 2026-11-25 after the remainder load changed (Speed below), with
+`INFR_TOL_ONLY=gpu,gpu-experts-hi,gpu-ub32-experts-hi,gpu-dense-decode-float,gpu-moe-decode-float`,
+forced and unforced, both devices, both models: the CPU production, `gpu`, the
+two `experts-hi` and `gpu-dense-decode-float` rows reproduce the figures below
+exactly, and `gpu-moe-decode-float` (the tuning parameter `mmv_mw.moe_float`,
+(d) below) is added; it equals `gpu-dense-decode-float` in every cell.
+
 ERNIE-4.5-21B-A3B, `Vulkan0` (8802 selections):
 
 | Configuration                       | Forced: differ (widest) | Forced KL, worst / mean | First rows | Unforced: differ (widest) | Unforced KL, worst / mean | Unforced top-1 |
@@ -1887,6 +1905,7 @@ ERNIE-4.5-21B-A3B, `Vulkan0` (8802 selections):
 | `gpu-ub32-experts-hi`               | 203 (7.5e-4)            | 6.0e-4 / 9.6e-5         | 2.4e-4     | 313 (5.8e-3)              | 8.7e-3 / 3.9e-4           | 326/326        |
 | `gpu-dense-decode-float`            | 195 (8.7e-4)            | 3.6e-3 / 1.2e-4         | 1.2e-3     | 385 (9.1e-3)              | 1.5e-2 / 6.4e-4           | 324/326        |
 | `gpu-experts-hi-dense-decode-float` | 126 (8.4e-4)            | 8.8e-4 / 6.4e-5         | 2.4e-4     | 281 (9.1e-3)              | 8.7e-3 / 3.1e-4           | 325/326        |
+| `gpu-moe-decode-float`              | 195 (8.7e-4)            | 3.6e-3 / 1.2e-4         | 1.2e-3     | 385 (9.1e-3)              | 1.5e-2 / 6.4e-4           | 324/326        |
 
 ERNIE-4.5-21B-A3B, `Vulkan1` (8802 selections):
 
@@ -1900,6 +1919,7 @@ ERNIE-4.5-21B-A3B, `Vulkan1` (8802 selections):
 | `gpu-ub32-experts-hi`               | 393 (5.2e-2)            | 5.2e-3 / 4.0e-4         | 2.3e-3     | 659 (5.2e-2)              | 1.8e-2 / 1.3e-3           | 321/326        |
 | `gpu-dense-decode-float`            | 397 (3.2e-2)            | 1.3e-2 / 4.1e-4         | 1.7e-3     | 689 (5.2e-2)              | 3.1e-2 / 1.2e-3           | 323/326        |
 | `gpu-experts-hi-dense-decode-float` | 405 (3.2e-2)            | 6.8e-3 / 4.5e-4         | 2.3e-3     | 668 (1.4e-1)              | 1.8e-2 / 1.3e-3           | 323/326        |
+| `gpu-moe-decode-float`              | 397 (3.2e-2)            | 1.3e-2 / 4.1e-4         | 1.7e-3     | 689 (5.2e-2)              | 3.1e-2 / 1.2e-3           | 323/326        |
 
 Qwen3-30B-A3B, `Vulkan0` (15312 selections):
 
@@ -1913,6 +1933,7 @@ Qwen3-30B-A3B, `Vulkan0` (15312 selections):
 | `gpu-ub32-experts-hi`               | 326 (6.3e-4)            | 1.6e-3 / 1.6e-4         | 2.5e-4     | 1033 (4.1e-2)             | 4.0e-2 / 1.1e-3           | 314/319        |
 | `gpu-dense-decode-float`            | 276 (5.3e-4)            | 1.9e-3 / 1.0e-4         | 3.8e-2     | 960 (3.7e-2)              | 1.4e-2 / 8.6e-4           | 319/319        |
 | `gpu-experts-hi-dense-decode-float` | 262 (1.7e-3)            | 1.8e-3 / 7.8e-5         | 2.5e-4     | 1075 (2.2e-2)             | 1.3e-2 / 1.0e-3           | 314/319        |
+| `gpu-moe-decode-float`              | 276 (5.3e-4)            | 1.9e-3 / 1.0e-4         | 3.8e-2     | 960 (3.7e-2)              | 1.4e-2 / 8.6e-4           | 319/319        |
 
 Qwen3-30B-A3B, `Vulkan1` (15312 selections):
 
@@ -1926,6 +1947,7 @@ Qwen3-30B-A3B, `Vulkan1` (15312 selections):
 | `gpu-ub32-experts-hi`               | 505 (1.7e-2)            | 4.1e-3 / 4.0e-4         | 1.3e-3     | 1375 (4.1e-2)             | 2.7e-2 / 1.6e-3           | 311/319        |
 | `gpu-dense-decode-float`            | 518 (5.8e-3)            | 3.3e-3 / 3.5e-4         | 3.8e-2     | 1311 (4.1e-2)             | 2.2e-2 / 1.5e-3           | 315/319        |
 | `gpu-experts-hi-dense-decode-float` | 467 (6.4e-3)            | 2.5e-3 / 2.9e-4         | 1.3e-3     | 1280 (2.7e-2)             | 3.8e-2 / 1.4e-3           | 312/319        |
+| `gpu-moe-decode-float`              | 518 (5.8e-3)            | 3.3e-3 / 3.5e-4         | 3.8e-2     | 1311 (4.1e-2)             | 2.2e-2 / 1.5e-3           | 315/319        |
 
 What the numbers say:
 
@@ -1980,62 +2002,115 @@ dequantizing GEMVs, everything else shipped):
   and 467 (564).
 
 Decode speed with the dense GEMVs float is under Speed below (the same on
-Qwen3-30B-A3B, 3.4% slower on ERNIE). What this configuration sets,
-`kernels.vulkan.mmv_mw = false`, takes the int8 decode GEMVs off for every
-model; a MoE-only form of it does not exist and was not built (the switch would
-have to key on the graph having routed experts, in the decode `Linear` lowering
-of `adapter.rs`).
+Qwen3-30B-A3B, 3.3% slower on ERNIE on the RX 7900 XTX, 18% slower on ERNIE on
+the integrated GPU). `kernels.vulkan.mmv_mw = false` takes the int8 decode GEMVs
+off for every model; its MoE-only form is the tuning parameter
+**`mmv_mw.moe_float`** (experimental, off by default:
+`--set kernels.vulkan.tune.mmv_mw.moe_float=true`). With it on, a graph that
+runs an `Op::MoeFfn` lowers every one-row `Linear`, and an MTP verify batch's
+(which must score as one row does), exactly as `mmv_mw = false` does
+(`moe_decode_float` in `adapter.rs`); a graph without routed experts is
+untouched. A part of a forward compiled on its own (a multi-GPU segment, a
+layer-major prefill's layer span) answers for the whole forward
+(`Graph::part_of_routed`), so a part without an `Op::MoeFfn` follows the model.
+Its harness configuration is `gpu-moe-decode-float`, whose rows are in the
+tables above; on both MoE models and both GPUs they equal
+`gpu-dense-decode-float`'s figure for figure.
+
+Tests: `moe_decode_float_switch` (adapter, both GPUs) builds two one-row decode
+graphs with two Q4_K `Linear`s at int8-GEMV size, one fused with its residual
+`Add`, one graph also running a `MoeFfn`: with the parameter on, the MoE graph
+builds exactly the kernels of `mmv_mw = false` and gets its output bits, the
+dense graph the default's; set off, both are the default.
+`gpu_seam_tolerance_moe_decode_float_reaches_moe_models_only` does the same on
+the real models (ERNIE-4.5-21B-A3B against Qwen3-0.6B), on whole forced runs'
+logits bits. Red runs (2026-11-25, `Vulkan0`): with the switch never taking
+effect, both fail on the MoE side; with it taking effect on every graph, both
+fail on the dense side.
 
 ### Speed
 
-Timed on the RX 7900 XTX (`Vulkan0`), Q4_K_M files, `infr bench -r 3`, runs
-alternated, nothing else building or testing on the machine (load average 1.1 to
-5.5, the bench's own threads included), commit `8004eefe`:
+**Where the first build's cost was.** `INFR_PROF_OPS=1` per-op device time of
+one Qwen3-30B-A3B pp512 forward (`infr bench -p 512 -n 0 -r 3`, `Vulkan0`, the
+mean over the reps' forwards; load not recorded for these runs), the shipped
+configuration against the parameter on:
 
-| pp512, t/s    | shipped        | `quant_q8.experts_hi` on | change |
-| ------------- | -------------- | ------------------------ | ------ |
-| Qwen3-30B-A3B | 4040.5, 4064.0 | 3689.5, 3691.2, 3713.0   | -8.7%  |
-| ERNIE-21B-A3B | 4197.2, 4167.8 | 3863.7, 3831.7           | -8.0%  |
+| ms per forward                | shipped | `experts_hi`, `8004eefe` | `experts_hi`, now |
+| ----------------------------- | ------- | ------------------------ | ----------------- |
+| all dispatches                | 123.9   | 137.4                    | 125.1             |
+| expert gate/up GEMMs          | 53.7    | 62.4                     | 53.9              |
+| expert down GEMMs             | 28.5    | 31.8                     | 28.7              |
+| gate/up quantizer (`_gather`) | 2.7     | 3.8                      | 3.3               |
+| down quantizer                | 1.1     | 1.5                      | 1.3               |
 
-| tg128, t/s    | shipped (int8 dense GEMVs) | `mmv_mw = false`    | change |
-| ------------- | -------------------------- | ------------------- | ------ |
-| Qwen3-30B-A3B | 217.5, 217.6               | 218.6, 218.6, 218.4 | +0.4%  |
-| ERNIE-21B-A3B | 218.2, 218.2, 218.0        | 210.9, 210.7, 210.3 | -3.4%  |
+(the shipped column is the `8004eefe` run's; the run beside the new build read
+123.7 in all and the same per-kernel figures within 0.2 ms.) Nine tenths of the
+first build's cost was in the expert GEMMs, which loaded every row's remainder
+after every block (four more global loads per thread per block, and a branch per
+row) to use it on 0.001% to 0.1% of blocks; the quantizer's extra reductions and
+writes were the rest. The RADV shader statistics agree: the tiles these models
+run (`_xp32w`) kept the plain builds' register counts (72 VGPRs for Q4_K, 96 for
+Q6_K) and added the loads inside the block loop.
 
-Each figure is one process's mean of three reps (spreads 0.1% to 4.9%). Two
-shipped runs are left out of the table: a third Qwen3-30B-A3B prefill run read
-848.5 t/s and a third decode run 36.2 t/s, each tight across its three reps (the
-whole-process slow state of backlog B-PP-SLOW-RUNS, now seen in decode too).
-Decode with the parameter on was not timed: its kernels are the shipped ones.
+**What changed.** A block that splits is now marked by the sign bit of its f16
+scale, which the GEMM loads anyway; a row reads `hres` only when its block is
+marked, and a thread with no marked row takes one branch per block. The
+quantizer writes `hres` from the outlier's own lane, for split blocks only, and
+drops the reduction that carried the remainder to lane 0. Output with the
+parameter on is bit-identical to `8004eefe`'s: the logits of a 300-token forced
+run (prefill rows and eight decode rows) hash the same on both models, at the
+shipped chunk height and at 32 rows, on both GPUs; with the parameter off on
+both models on the RX 7900 XTX as well. Every SPIR-V module but the ten `_hi`
+builds is byte-identical to `8004eefe`'s (923 compared by SHA-256).
 
-Structurally, with the parameter on:
+Timed on the RX 7900 XTX (`Vulkan0`), Q4_K_M files, `infr bench -r 3`, shipped
+and parameter-on runs alternated with 2 s between processes, no run's log
+reporting paged experts (load average 1.2 to 2.5 over the prefill runs, 0.5 to
+2.0 over the decode runs, the bench's own threads included):
+
+| pp512, t/s    | shipped                        | `quant_q8.experts_hi` on       | change |
+| ------------- | ------------------------------ | ------------------------------ | ------ |
+| Qwen3-30B-A3B | 4058.2, 4065.5, 4057.3, 4070.0 | 4023.5, 4015.7, 4006.9, 4019.7 | -1.1%  |
+| ERNIE-21B-A3B | 4188.6, 4195.2, 4192.1, 4194.4 | 4131.4, 4140.3, 4123.6, 4133.3 | -1.4%  |
+
+The first build measured -8.7% and -8.0% the same way (commit `8004eefe`).
+
+| tg128, t/s    | shipped (int8 dense GEMVs) | `mmv_mw.moe_float` on      | change |
+| ------------- | -------------------------- | -------------------------- | ------ |
+| Qwen3-30B-A3B | 218.3, 218.2, 218.1, 218.2 | 218.5, 218.9, 218.1, 218.9 | +0.2%  |
+| ERNIE-21B-A3B | 218.3, 218.3, 218.1, 218.2 | 211.0, 211.1, 210.9, 210.9 | -3.3%  |
+
+On the integrated GPU (`Vulkan1`, the same method, load average 0.0 to 0.2),
+ERNIE-21B-A3B only; Qwen3-30B-A3B was not timed there:
+
+| tg128, t/s    | shipped       | `mmv_mw.moe_float` on | change |
+| ------------- | ------------- | --------------------- | ------ |
+| ERNIE-21B-A3B | 5.2, 5.3, 5.3 | 4.3, 4.3, 4.3         | -18.4% |
+
+Each figure is one process's mean of three reps (spreads 0.0% to 4.3%). The
+`mmv_mw.moe_float` figures match `mmv_mw = false`'s from the first timing (+0.4%
+and -3.4%), as they must: on these models the two build the same kernels.
+
+Structurally, with `quant_q8.experts_hi` on:
 
 - **No extra dispatch or pass.** The quantizer and the expert GEMMs are the same
-  dispatches; the HI quantizer adds three subgroup reductions per block and
-  writes 8 more bytes per 32 activations (36 to 44 bytes per block with the
-  codes, scale and sum).
-- **Each expert GEMM reads 8 more bytes per activation row per 32-element
-  block** (Q4_K 36 to 44, Q6_K 34 to 42): every column thread of a tile loads
-  its rows' remainders after each block, from the same few cache lines (the
-  added traffic is not measured), and runs a per-row branch after each block's
-  epilogue that is taken only where the block split (0.001% of the gate/up
-  blocks and 0.10% of the down blocks from position 2 on, on Qwen3-30B-A3B); a
-  taken branch adds `TN` shared-memory reads and fused multiply-adds per row.
+  dispatches; the HI quantizer adds two subgroup reductions per block, and a
+  block that splits writes 8 more bytes (its `hres` entry).
+- **The expert GEMMs read nothing more for a block that does not split**: the
+  mark rides in the scale they load. A marked block costs each of its rows'
+  threads one 8-byte load and `TN` shared-memory reads and fused multiply-adds.
 - **Two pooled scratch buffers** of `npad × k/32 × 8` bytes (gate/up and down;
   at a 512-token chunk on Qwen3-30B-A3B about 2.1 and 0.8 MB).
 - Decode does not change: its routed experts take the float per-row GEMVs.
 
-The A/B, decode and prefill as separate runs, the shipped against the parameter
-on:
+The A/B, decode and prefill as separate runs:
 
 ```text
-INFR_DEV=Vulkan0 infr bench -p 0 -n 128 -r 5 <model.gguf>
-INFR_DEV=Vulkan0 infr bench -p 0 -n 128 -r 5 <model.gguf> --set kernels.vulkan.tune.quant_q8.experts_hi=true
-INFR_DEV=Vulkan0 infr bench -p 512 -n 0 -r 5 <model.gguf>
-INFR_DEV=Vulkan0 infr bench -p 512 -n 0 -r 5 <model.gguf> --set kernels.vulkan.tune.quant_q8.experts_hi=true
+INFR_DEV=Vulkan0 infr bench -p 512 -n 0 -r 3 <model.gguf>
+INFR_DEV=Vulkan0 infr bench -p 512 -n 0 -r 3 <model.gguf> --set kernels.vulkan.tune.quant_q8.experts_hi=true
+INFR_DEV=Vulkan0 infr bench -p 0 -n 128 -r 3 <model.gguf>
+INFR_DEV=Vulkan0 infr bench -p 0 -n 128 -r 3 <model.gguf> --set kernels.vulkan.tune.mmv_mw.moe_float=true
 ```
-
-and for (d), `--set kernels.vulkan.mmv_mw=false` in place of the tuning key.
 
 ### Not covered
 

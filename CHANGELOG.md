@@ -99,10 +99,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   format keeps the shipped quantizer for its stage. On Qwen3-30B-A3B it takes
   the first two positions' KL against the CPU reference from 3.8e-2 to 2.5e-4 on
   the RX 7900 XTX and to 1.3e-3 on the integrated GPU (`docs/gpu-tolerance.md`,
-  "The routed experts' outlier quantizer"). Decode is unchanged; prefill is
-  about 8% slower with it on (RX 7900 XTX). `Recorder::quant_q8_with`,
+  "The routed experts' outlier quantizer"). Decode is unchanged; pp512 is 1.1%
+  (Qwen3-30B-A3B) and 1.4% (ERNIE-4.5-21B-A3B) slower with it on (RX 7900 XTX):
+  a block that splits is marked by the sign bit of its f16 scale, so the expert
+  GEMMs read a remainder only for those blocks. `Recorder::quant_q8_with`,
   `quant_q8_gather_with` and `matmul_mmq_experts_with` take the carried
   remainders as an `Option`.
+- **Experimental: the Vulkan tuning parameter `mmv_mw.moe_float`** (off by
+  default; `--set kernels.vulkan.tune.mmv_mw.moe_float=true`). With it on, a
+  model with routed experts runs every one-row `Linear` (attention, shared
+  expert, LM head) on the dequantizing float GEMVs instead of the int8 ones,
+  exactly as `kernels.vulkan.mmv_mw = false` does for every model; a dense model
+  is unchanged. It brings a MoE model's decode closer to the CPU reference
+  (`docs/gpu-tolerance.md`, "(d) The dense decode GEMVs on float"); tg128 on the
+  RX 7900 XTX is unchanged on Qwen3-30B-A3B and 3.3% slower on
+  ERNIE-4.5-21B-A3B, and 18% slower on ERNIE-4.5-21B-A3B on the integrated GPU.
 - **`Op::AttnTemp`** on the CPU, Vulkan and Metal backends: llama.cpp's
   position-dependent attention temperature (`llm_graph_input_attn_temp`), which
   scales each row by `ln(floor((pos + offset) / floor_scale) + 1) * scale + 1`.

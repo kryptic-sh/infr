@@ -369,20 +369,9 @@ impl PipelineBackend {
             while end < n_ops && op_dev[end] == d {
                 end += 1;
             }
-            // Sub-graph for this segment: the SAME tensor decls (so TensorIds match the bindings),
-            // this segment's ops, and only the outputs it actually writes.
-            let mut sub = graph.clone();
-            sub.ops = graph.ops[start..end].to_vec();
-            let written: std::collections::HashSet<TensorId> =
-                sub.ops.iter().flat_map(|op| op.io().1).collect();
-            sub.outputs = graph
-                .outputs
-                .iter()
-                .copied()
-                .filter(|t| written.contains(t))
-                .collect();
-            // The static per-execute path (no record-once replay) — pipeline forces it via caps.
-            sub.no_decode_replay = true;
+            // Sub-graph for this segment, on the static per-execute path (no record-once replay)
+            // — pipeline forces it via caps.
+            let sub = crate::multi::segment(graph, start..end);
             let plan = self.backends[d].compile(&sub)?;
 
             // ── cut tensors into this segment ────────────────────────────────────────────────

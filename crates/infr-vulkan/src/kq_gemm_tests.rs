@@ -388,6 +388,9 @@ mod tests {
         b
     }
 
+    /// A remainder and lane no real block carries ([`Quantized::new`]).
+    const HRES_STALE: [f32; 2] = [1000.0, 5.0];
+
     /// One quantization's outputs: codes, f16 scales, f16 sums, and (the `-DHI` builds) the
     /// carried remainders.
     struct Quantized {
@@ -398,6 +401,9 @@ mod tests {
     }
 
     impl Quantized {
+        /// `hres` starts as [`HRES_STALE`] in every block, standing for what a pooled buffer
+        /// holds from an earlier layer: the quantizer writes only the blocks that split, so a
+        /// consumer that read an unmarked block would pick it up.
         fn new(be: &VulkanBackend, rows: usize, k: usize) -> Self {
             let nblk = k / 32;
             let a = |n: usize| be.alloc(n, BufferUsage::Activations).unwrap();
@@ -405,7 +411,7 @@ mod tests {
                 qa: a(rows * k),
                 dact: a(rows * nblk * 2),
                 sact: a(rows * nblk * 2),
-                hres: a(rows * nblk * 8),
+                hres: upload_f32(be, &HRES_STALE.repeat(rows * nblk)),
             }
         }
 
@@ -415,10 +421,11 @@ mod tests {
     }
 
     /// The outlier quantizer against its rule, block by block: a block that does not split gets
-    /// the plain build's bits and a zero remainder; one that splits takes the scale of the rest
-    /// (each other element within half a step of it), keeps a ±127 code at its outlier, and the
-    /// code times the f16 scale plus the remainder is the outlier again. The gather build gives
-    /// the same bits as the plain one for the row each slot reads.
+    /// the plain build's bits, its scale's sign bit clear; one that splits has the sign bit of its
+    /// scale set (the mark the GEMMs read `hres` on), takes the scale of the rest (each other
+    /// element within half a step of it), keeps a ±127 code at its outlier, and the code times the
+    /// f16 scale plus the remainder is the outlier again. The gather build gives the same bits as
+    /// the plain one for the row each slot reads, and the same remainder for each split block.
     #[test]
     #[ignore = "requires a Vulkan GPU"]
     fn quant_q8_hi_follows_its_rule() {
@@ -480,7 +487,8 @@ mod tests {
                 let blk = &x[r * K_HI + b * 32..r * K_HI + (b + 1) * 32];
                 let codes = |qa: &[u8]| qa[r * K_HI + b * 32..r * K_HI + (b + 1) * 32].to_vec();
                 let (top, split) = hi_split(blk);
-                let (rem, lane) = vec2_at(&h1, i);
+                let marked = da1[2 * i + 1] & 0x80 != 0;
+                assert_eq!(marked, split, "row {r} block {b}: the split mark");
                 if !split {
                     whole_blocks += 1;
                     assert_eq!(codes(&qa1), codes(&qa0), "row {r} block {b}: codes");
@@ -494,14 +502,14 @@ mod tests {
                         sa0[2 * i..2 * i + 2],
                         "row {r} block {b}"
                     );
-                    assert_eq!((rem, lane), (0.0, 0.0), "row {r} block {b}: remainder");
                     continue;
                 }
                 split_blocks += 1;
+                let (rem, lane) = vec2_at(&h1, i);
                 let next = (0..32)
                     .filter(|&l| l != top)
                     .fold(0f32, |m, l| m.max(blk[l].abs()));
-                let d = f16_at(&da1, i);
+                let d = f16_at(&da1, i).abs();
                 let want_d = next as f64 / 127.0;
                 assert!(
                     (d - want_d).abs() <= want_d * 2f64.powi(-10),
@@ -547,9 +555,16 @@ mod tests {
                 (&qa2, &qa1, K_HI),
                 (&da2, &da1, nblk * 2),
                 (&sa2, &sa1, nblk * 2),
-                (&h2, &h1, nblk * 8),
             ] {
                 assert_eq!(row(got, w), src_row(want, w), "gather slot {j} (row {s})");
+            }
+            // `hres` holds a value only where a block split (the mark checked above).
+            for b in (0..nblk).filter(|&b| da1[2 * (s * nblk + b) + 1] & 0x80 != 0) {
+                assert_eq!(
+                    vec2_at(&h2, j * nblk + b),
+                    vec2_at(&h1, s * nblk + b),
+                    "gather slot {j} (row {s}) block {b}: remainder"
+                );
             }
         }
         eprintln!("quant_q8_hi: {split_blocks} blocks split, {whole_blocks} whole");
@@ -698,7 +713,8 @@ mod tests {
                     let (mut want, mut mag) = (0f64, 0f64);
                     for b in 0..nblk {
                         let i = r * nblk + b;
-                        let (d, s) = (f16_at(&da_h, i), f16_at(&sa_h, i));
+                        // A split block's scale carries the mark in its sign bit.
+                        let (d, s) = (f16_at(&da_h, i).abs(), f16_at(&sa_h, i));
                         let min = mins[e][o * nblk + b] as f64;
                         let mut dot = 0f64;
                         for l in b * 32..(b + 1) * 32 {
@@ -706,7 +722,9 @@ mod tests {
                             dot += t;
                             mag += (t * d).abs();
                         }
-                        let (rem, lane) = vec2_at(&h_h, i);
+                        // `hres` is written for split blocks only (the rule, not the mark).
+                        let split = hi_split(&x[r * k + b * 32..r * k + (b + 1) * 32]).1;
+                        let (rem, lane) = if split { vec2_at(&h_h, i) } else { (0.0, 0.0) };
                         if rem != 0.0 {
                             lanes_seen[lane as usize % 4] = true;
                         }

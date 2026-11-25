@@ -1842,30 +1842,31 @@ pub fn comp_visible(abs: u32, ratio: u32, len: u32) -> u32 {
     ((abs + 1) / ratio).min(len)
 }
 
-/// A set of handles memoized from a [`Graph`]'s `ops`, filled on its first query.
+/// A fact (a set of handles, a flag) memoized from a [`Graph`]'s `ops`, filled on its first query.
 ///
 /// It must never answer for other ops than it was computed from. [`Graph::push`] resets it; a
 /// clone starts empty (a clone's `ops` is commonly replaced by a slice of them, as the Vulkan
-/// pipeline and expert-parallel executors do); and a query after `ops` changed length behind the
+/// multi-device executors' segments are); and a query after `ops` changed length behind the
 /// memo's back (it is a public field) panics instead of answering stale. An in-place edit of an op
 /// that keeps the count is not caught: a graph's ops are not to be edited once it has been
 /// queried; the in-tree edits (the executors' sub-graphs, the Metal policy tests) edit a fresh
 /// clone or a graph not yet queried.
-#[derive(Default)]
-struct OpsMemo(std::sync::OnceLock<(usize, std::collections::HashSet<TensorId>)>);
+struct OpsMemo<T>(std::sync::OnceLock<(usize, T)>);
 
-impl Clone for OpsMemo {
+impl<T> Default for OpsMemo<T> {
+    fn default() -> Self {
+        Self(std::sync::OnceLock::new())
+    }
+}
+
+impl<T> Clone for OpsMemo<T> {
     fn clone(&self) -> Self {
         Self::default()
     }
 }
 
-impl OpsMemo {
-    fn get(
-        &self,
-        ops: &[Op],
-        compute: impl FnOnce() -> std::collections::HashSet<TensorId>,
-    ) -> &std::collections::HashSet<TensorId> {
+impl<T> OpsMemo<T> {
+    fn get(&self, ops: &[Op], compute: impl FnOnce() -> T) -> &T {
         let (n, set) = self.0.get_or_init(|| (ops.len(), compute()));
         assert_eq!(
             *n,
@@ -1931,15 +1932,23 @@ pub struct Graph {
     /// without this it re-scanned every op and re-allocated a `HashSet` each call. Interior-mutable
     /// (`OnceLock`) so it fills through a shared `&Graph` (the plan holds the graph immutably).
     /// Not part of the graph's identity: see [`OpsMemo`] for when it is refilled.
-    in_place_cache: OpsMemo,
+    in_place_cache: OpsMemo<std::collections::HashSet<TensorId>>,
     /// Memoized [`Self::touched`], on the same terms as `in_place_cache`.
-    touched_cache: OpsMemo,
+    touched_cache: OpsMemo<std::collections::HashSet<TensorId>>,
+    /// Memoized [`Self::has_routed_experts`], on the same terms as `in_place_cache`.
+    routed_cache: OpsMemo<bool>,
     /// How the weights this graph reads will be read next: a residency hint for a backend that
     /// keeps weights in a cache smaller than the model (the CPU's host arena). A backend without
     /// such a cache ignores it, and so may one that has its own schedule; it never changes what a
     /// graph computes. [`WeightReuse::Sweep`] (the default) is every graph but a layer-major
     /// prefill's.
     pub weight_reuse: WeightReuse,
+    /// This graph is a part of a larger forward that runs routed experts in some other part: a
+    /// multi-GPU stage cut from the model's graph, or a layer span. Whoever cuts or builds the
+    /// part sets it, so [`Self::has_routed_experts`] answers for the forward and a backend's
+    /// per-model choices (the Vulkan tuning parameter `mmv_mw.moe_float`) do not differ between
+    /// the parts of one model. A whole graph leaves it `false`: its own ops answer.
+    pub part_of_routed: bool,
 }
 
 /// [`Graph::weight_reuse`]: what the producer knows about the next reads of a graph's weights.
@@ -2024,6 +2033,17 @@ impl Graph {
         })
     }
 
+    /// Whether the forward this graph belongs to runs routed experts: some op of it is an
+    /// [`Op::MoeFfn`], or it is a part of a forward that has one ([`Self::part_of_routed`]). The
+    /// scan is memoized like [`Self::in_place_inputs`]: a backend asks it while lowering each op,
+    /// per token on a path that records every step.
+    pub fn has_routed_experts(&self) -> bool {
+        self.part_of_routed
+            || *self.routed_cache.get(&self.ops, || {
+                self.ops.iter().any(|op| matches!(op, Op::MoeFfn { .. }))
+            })
+    }
+
     fn decl(&mut self, desc: TensorDesc, kind: TensorKind) -> TensorId {
         let id = TensorId(self.tensors.len() as u32);
         self.tensors.push(TensorDecl {
@@ -2071,6 +2091,7 @@ impl Graph {
         self.ops.push(op);
         self.in_place_cache = OpsMemo::default();
         self.touched_cache = OpsMemo::default();
+        self.routed_cache = OpsMemo::default();
     }
 
     pub fn desc(&self, id: TensorId) -> &TensorDesc {
@@ -3029,6 +3050,37 @@ mod tests {
             g.touched().len()
         }));
         assert!(stale.is_err(), "a query after the ops shrank answered");
+    }
+
+    /// **`has_routed_experts` follows the ops** as the memoized sets do: false before an
+    /// `Op::MoeFfn` is pushed, true after, false again on a clone cut back before it, and true
+    /// once that cut says it is a part of a routed forward (`part_of_routed`).
+    #[test]
+    fn has_routed_experts_follows_the_ops() {
+        let ops = every_op();
+        let moe = ops
+            .iter()
+            .find(|op| matches!(op, Op::MoeFfn { .. }))
+            .expect("every_op lists MoeFfn")
+            .clone();
+        let other = ops
+            .iter()
+            .find(|op| !matches!(op, Op::MoeFfn { .. }))
+            .expect("every_op lists another op")
+            .clone();
+        let mut g = Graph::new();
+        g.push(other);
+        assert!(!g.has_routed_experts());
+        g.push(moe);
+        assert!(g.has_routed_experts());
+        let mut sub = g.clone();
+        sub.ops.truncate(1);
+        assert!(!sub.has_routed_experts());
+        sub.part_of_routed = true;
+        assert!(
+            sub.has_routed_experts(),
+            "a part of a routed forward answers for the forward"
+        );
     }
 
     /// **`Op::io` names every tensor an op holds.** The interpreters (the CPU's and Metal's) load

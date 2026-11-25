@@ -905,6 +905,20 @@ fn kq_fma_gemv(
     )
 }
 
+/// The tuning parameter `mmv_mw.moe_float` on a graph with routed experts (an `Op::MoeFfn`): every
+/// one-row `Linear` of it, and an MTP verify batch's (which must score as one row does), then skips
+/// the int8 decode GEMVs, exactly as `kernels.vulkan.mmv_mw = false` makes every graph do. Off,
+/// the graph is not asked; on, the answer is memoized on the graph
+/// (`Graph::has_routed_experts`), so a path that lowers every token does not rescan its ops.
+///
+/// The graph asked is the one compiled into the plan, which is not always the whole forward: the
+/// multi-GPU wrappers compile segments of it (`crate::multi::segment`) and the seam's
+/// layer-major prefill builds layer spans. Each sets `Graph::part_of_routed` from the whole, so a
+/// part without an `Op::MoeFfn` still answers for the model.
+fn moe_decode_float(be_: &VulkanBackend, graph: &Graph) -> bool {
+    be_.tuning().mmv_mw_moe_float && graph.has_routed_experts()
+}
+
 fn mmv_mw_choice(
     caps: &infr_core::backend::Capabilities,
     vk: &infr_core::config::VulkanCfg,
@@ -1613,15 +1627,20 @@ fn lower_op(
                     }
                     // Multi-warp dp4a decode GEMV (wave32-native GPUs) takes precedence — see
                     // `mmv_mw_choice`. AMD returns None here and falls to the scalar/old-mmv path.
-                    if let Some(warps) = mmv_mw_choice(
-                        be_.caps(),
-                        &be_.cfg().kernels.vulkan,
-                        be_.tuning(),
-                        dt,
-                        in_f,
-                        out_f,
-                        true,
-                    ) {
+                    let mw = if moe_decode_float(be_, graph) {
+                        None
+                    } else {
+                        mmv_mw_choice(
+                            be_.caps(),
+                            &be_.cfg().kernels.vulkan,
+                            be_.tuning(),
+                            dt,
+                            in_f,
+                            out_f,
+                            true,
+                        )
+                    };
+                    if let Some(warps) = mw {
                         // FUSE_QUANT opt-in: inline activation quantization, skip the
                         // separate quant_q8 dispatch. Only some dtypes have that build.
                         if be_.cfg().kernels.vulkan.mmv_fuse_quant
@@ -6314,6 +6333,7 @@ fn quant_linear(
         && out_f < 65536
         && crate::gemm::native_mmv_mrow_kernel_name(dt).is_some()
         && mrow_int8_dtype_ok(be_.caps(), &be_.cfg().kernels.vulkan, dt, graph.mtp_verify)
+        && !(graph.mtp_verify && moe_decode_float(be_, graph))
         && be_.cfg().kernels.vulkan.mmv;
     // rows 9..=16 int8 mrow tier (INFR_NO_MROW16 A/B escape): the MTP spec-verify batch
     // once its rollback window carries a few committed rows on top of the n_max drafts.
@@ -6790,6 +6810,7 @@ fn quant_linear(
         // only for a 256k-vocab model's single vocab GEMV.
         let mw = if m == 1
             && !crate::recorder::bda_weight_breaches(dt, in_f, out_f, &be_.cfg().kernels.vulkan)
+            && !moe_decode_float(be_, graph)
         {
             mmv_mw_choice(
                 be_.caps(),
@@ -12710,6 +12731,208 @@ mod tests {
                     "row {t} carries a massive activation: {on:.3e} on, {def:.3e} off"
                 );
             }
+        }
+    }
+
+    /// The tuning parameter `mmv_mw.moe_float` on two decode graphs (one row, two Q4_K `Linear`s
+    /// at int8-GEMV size, one with its residual `Add` fused in): one also running a routed-expert
+    /// `MoeFfn`, one without, and the MoE graph cut as the multi-GPU wrappers cut it
+    /// (`crate::multi::segment`) to a segment holding the `Linear`s and not the `MoeFfn`. On, the
+    /// MoE graph and its segment build exactly the kernels of `kernels.vulkan.mmv_mw = false` (no
+    /// int8 GEMV) and get its output bits; the dense graph builds the default's kernels and gets
+    /// its bits. Set off, every graph is the default.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn moe_decode_float_switch() {
+        // `None`: the default configuration; `Some(on)`: the parameter set; `mmv_mw = false`
+        // when `off_everywhere`.
+        let backend = |moe_float: Option<bool>, off_everywhere: bool| {
+            let mut cfg = crate::test_config();
+            if let Some(on) = moe_float {
+                cfg.kernels
+                    .vulkan
+                    .tune
+                    .entries
+                    .push(infr_core::config::TuneEntry {
+                        key: "mmv_mw.moe_float".into(),
+                        value: on.to_string(),
+                        level: infr_core::config::TuneLevel::Cli,
+                    });
+            }
+            if off_everywhere {
+                cfg.kernels.vulkan.mmv_mw = Some(false);
+            }
+            infr_testkit::gpu_or_skip_noted(VulkanBackend::new_with(std::sync::Arc::new(cfg)))
+        };
+        let Some(probe) = backend(None, false) else {
+            return; // no GPU — self-skip
+        };
+        if !probe.caps().i8_dot {
+            eprintln!("moe_decode_float_switch: no int8 dot here — skipped");
+            return;
+        }
+        drop(probe);
+        let (ne, out2, n_expert, n_used, nff) = (2048usize, 1024usize, 4usize, 2usize, 256usize);
+        let f = |i: usize, s: f32| (i as f32 * s).sin() * 0.5;
+        let x: Vec<f32> = (0..ne).map(|i| f(i, 0.11) * 0.2 + 0.01).collect();
+        let w1 = q4k(&(0..ne * ne).map(|i| f(i, 0.013) * 0.3).collect::<Vec<_>>());
+        let w2 = q4k(&(0..out2 * ne)
+            .map(|i| f(i, 0.019) * 0.3)
+            .collect::<Vec<_>>());
+        let router = q8_0(
+            &(0..n_expert * ne)
+                .map(|i| f(i, 0.037) + (i / ne) as f32 * 0.15)
+                .collect::<Vec<_>>(),
+        );
+        let bank = |s: f32| {
+            q4k(&(0..n_expert * nff * ne)
+                .map(|i| f(i, s) * 0.3)
+                .collect::<Vec<_>>())
+        };
+        let (gq, uq, dq) = (bank(0.017), bank(0.023), bank(0.029));
+        let int8_gemv = |k: &str| k.starts_with("native_mmv_");
+
+        // `cut`: run only the segment of the first three ops (the `Linear`s and the `Add`).
+        let run = |be_: &VulkanBackend, moe: bool, cut: bool| -> (Vec<u32>, Vec<&'static str>) {
+            let mut g = Graph::new();
+            let xi = g.input(TensorDesc::new(vec![1, ne], DType::F32));
+            let w1i = g.weight(TensorDesc::new(vec![ne, ne], DType::Q4K));
+            let w2i = g.weight(TensorDesc::new(vec![out2, ne], DType::Q4K));
+            let hi = g.internal(TensorDesc::new(vec![1, ne], DType::F32));
+            let ri = g.output(TensorDesc::new(vec![1, ne], DType::F32));
+            let y2i = g.output(TensorDesc::new(vec![1, out2], DType::F32));
+            g.push(Op::Linear {
+                x: xi,
+                weight: w1i,
+                dst: hi,
+                m: 1,
+                in_f: ne as u32,
+                out_f: ne as u32,
+                w_off: 0,
+            });
+            g.push(Op::Add {
+                a: hi,
+                b: xi,
+                dst: ri,
+                n: ne as u32,
+            });
+            g.push(Op::Linear {
+                x: xi,
+                weight: w2i,
+                dst: y2i,
+                m: 1,
+                in_f: ne as u32,
+                out_f: out2 as u32,
+                w_off: 0,
+            });
+            let mut outs = vec![(ri, ne), (y2i, out2)];
+            let mut weights = vec![(w1i, &w1), (w2i, &w2)];
+            if moe {
+                let rti = g.weight(TensorDesc::new(vec![n_expert, ne], DType::Q8_0));
+                let gi = g.weight(TensorDesc::new(vec![n_expert, nff, ne], DType::Q4K));
+                let ui = g.weight(TensorDesc::new(vec![n_expert, nff, ne], DType::Q4K));
+                let di = g.weight(TensorDesc::new(vec![n_expert, ne, nff], DType::Q4K));
+                let y3i = g.output(TensorDesc::new(vec![1, ne], DType::F32));
+                g.push(Op::MoeFfn {
+                    x: xi,
+                    router_x: xi,
+                    router: rti,
+                    gate_exps: gi,
+                    up_exps: ui,
+                    down_exps: di,
+                    down_scale: None,
+                    fused_gate_up: false,
+                    dst: y3i,
+                    ne: ne as u32,
+                    n_expert: n_expert as u32,
+                    n_used: n_used as u32,
+                    n_ff_exp: nff as u32,
+                    scale: 1.0,
+                    act: Activation::Silu,
+                    gating: infr_core::graph::MoeGating::Softmax,
+                    norm_w: true,
+                    weight_before: false,
+                    ep_band: None,
+                    exp_probs_b: None,
+                    n_expert_groups: 0,
+                    n_expert_groups_used: 0,
+                    swiglu_clamp: None,
+                    expert_ids: None,
+                });
+                outs.push((y3i, ne));
+                weights.extend([(rti, &router), (gi, &gq), (ui, &uq), (di, &dq)]);
+            }
+            let mk = |bytes: &[u8], usage| {
+                let b = be_.alloc(bytes.len(), usage).unwrap();
+                be_.upload(b.as_ref(), bytes).unwrap();
+                b
+            };
+            let xb = mk(bytemuck::cast_slice(&x), BufferUsage::Activations);
+            let wbufs: Vec<_> = weights
+                .iter()
+                .map(|&(t, w)| (t, mk(w, BufferUsage::Weights)))
+                .collect();
+            let obufs: Vec<_> = outs
+                .iter()
+                .map(|&(t, n)| (t, be_.alloc(n * 4, BufferUsage::Activations).unwrap(), n))
+                .collect();
+            if cut {
+                g = crate::multi::segment(&g, 0..3);
+                assert!(!g.ops.iter().any(|op| matches!(op, Op::MoeFfn { .. })));
+            }
+            let plan = be_.compile(&g).unwrap();
+            let mut bind = Bindings::new();
+            bind.bind(xi, xb.as_ref());
+            for (t, b) in wbufs.iter().filter(|(t, _)| g.touched().contains(t)) {
+                bind.bind(*t, b.as_ref());
+            }
+            let obufs: Vec<_> = obufs
+                .into_iter()
+                .filter(|(t, _, _)| g.outputs.contains(t))
+                .collect();
+            for (t, b, _) in &obufs {
+                bind.bind(*t, b.as_ref());
+            }
+            be_.execute(plan.as_ref(), &bind).unwrap();
+            let mut bits = Vec::new();
+            for (_, b, n) in &obufs {
+                let mut got = vec![0f32; *n];
+                be_.download(b.as_ref(), bytemuck::cast_slice_mut(&mut got))
+                    .unwrap();
+                bits.extend(got.iter().map(|v| v.to_bits()));
+            }
+            (bits, be_.built_kernel_names())
+        };
+        let gpu = |moe_float, off_everywhere| backend(moe_float, off_everywhere).expect("the GPU");
+        for (moe, cut) in [(true, false), (true, true), (false, false)] {
+            let what = match (moe, cut) {
+                (true, false) => "MoE graph",
+                (true, true) => "MoE graph's segment without the MoeFfn",
+                _ => "dense graph",
+            };
+            let (y_def, k_def) = run(&gpu(None, false), moe, cut);
+            let (y_off, k_off) = run(&gpu(Some(false), false), moe, cut);
+            let (y_on, k_on) = run(&gpu(Some(true), false), moe, cut);
+            let (y_f32, k_f32) = run(&gpu(None, true), moe, cut);
+            // Both lowering sites ran on the int8 GEMV by default: the plain and the fused one.
+            assert!(
+                k_def.iter().any(|k| int8_gemv(k) && k.ends_with("_res"))
+                    && k_def.iter().any(|k| int8_gemv(k) && !k.ends_with("_res")),
+                "{what}: the default took no int8 GEMV at one of the decode sites: {k_def:?}"
+            );
+            assert!(
+                !k_f32.iter().any(|k| int8_gemv(k)),
+                "{what}: mmv_mw = false built an int8 GEMV: {k_f32:?}"
+            );
+            assert_eq!(k_off, k_def, "{what}: switch off built other kernels");
+            assert!(y_off == y_def, "{what}: switch off changed the output bits");
+            let (want_y, want_k) = if moe {
+                (&y_f32, &k_f32)
+            } else {
+                (&y_def, &k_def)
+            };
+            assert_eq!(&k_on, want_k, "{what}: switch on built other kernels");
+            assert!(&y_on == want_y, "{what}: switch on changed the output bits");
         }
     }
 

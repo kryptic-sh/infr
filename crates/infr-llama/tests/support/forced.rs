@@ -464,17 +464,35 @@ pub const DIAGNOSIS_CONFIGS: &[GpuConfig] = &[
         },
         reference_kv: None,
     },
+    // `gpu-dense-decode-float` for a model with routed experts only (the tuning parameter
+    // `mmv_mw.moe_float`): such a model runs what that configuration runs, a dense one what `gpu`
+    // runs (`gpu_seam_tolerance_moe_decode_float_reaches_moe_models_only`).
+    GpuConfig {
+        name: "gpu-moe-decode-float",
+        edit: moe_decode_float,
+        reference_kv: None,
+    },
 ];
 
-/// `gpu-experts-hi`'s edit: the tuning parameter `quant_q8.experts_hi` on, at the command line's
-/// level, so no other layer of the test environment overrides it.
+/// `gpu-experts-hi`'s edit: the tuning parameter `quant_q8.experts_hi` on.
 fn experts_hi(c: &mut EngineConfig) {
+    tune_on(c, "quant_q8.experts_hi");
+}
+
+/// `gpu-moe-decode-float`'s edit: the tuning parameter `mmv_mw.moe_float` on.
+fn moe_decode_float(c: &mut EngineConfig) {
+    tune_on(c, "mmv_mw.moe_float");
+}
+
+/// The boolean tuning parameter `key` on, at the command line's level, so no other layer of the
+/// test environment overrides it.
+fn tune_on(c: &mut EngineConfig, key: &str) {
     c.kernels
         .vulkan
         .tune
         .entries
         .push(infr_core::config::TuneEntry {
-            key: "quant_q8.experts_hi".into(),
+            key: key.into(),
             value: "true".into(),
             level: infr_core::config::TuneLevel::Cli,
         });

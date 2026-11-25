@@ -367,21 +367,12 @@ impl ExpertParallelBackend {
             // One compiled plan per rank: clone the segment, set the rank's ep_band on its MoeFfn.
             let mut plans = Vec::with_capacity(w);
             for (r, rank) in self.ranks.iter().enumerate() {
-                let mut sub = lowered.clone();
-                sub.ops = lowered.ops[lo..hi].to_vec();
+                let mut sub = crate::multi::segment(&lowered, lo..hi);
                 for op in &mut sub.ops {
                     if let Op::MoeFfn { ep_band, .. } = op {
                         *ep_band = Some(((r * nl) as u32, nl as u32));
                     }
                 }
-                let written: HashSet<TensorId> = sub.ops.iter().flat_map(|op| op.io().1).collect();
-                sub.outputs = lowered
-                    .outputs
-                    .iter()
-                    .copied()
-                    .filter(|t| written.contains(t))
-                    .collect();
-                sub.no_decode_replay = true;
                 plans.push(rank.compile(&sub)?);
             }
             segments.push(Segment {

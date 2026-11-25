@@ -10201,7 +10201,8 @@ impl<'a> Recorder<'a> {
     /// [`Self::quant_q8_gather`], on the outlier quantizer (`quant_q8.comp`'s `-DHI` build) when
     /// `hres` is given: a block whose largest activation stands over `QUANT_Q8_HI_RATIO` times
     /// above the rest carries its remainder and lane there (`[n_slots, k_dim/32]` `vec2`, 8 bytes
-    /// a block), which [`Self::matmul_mmq_experts_with`] reads. `None` is the plain build.
+    /// a block, written for such blocks only) and is marked by the sign bit of its `dact`, which
+    /// therefore only [`Self::matmul_mmq_experts_with`] can read. `None` is the plain build.
     #[allow(clippy::too_many_arguments)]
     pub fn quant_q8_gather_with(
         &self,
@@ -10340,9 +10341,10 @@ impl<'a> Recorder<'a> {
     }
 
     /// [`Self::matmul_mmq_experts`], on activations from the outlier quantizer when `hres` is
-    /// given ([`Self::quant_q8_gather_with`] / [`Self::quant_q8_with`]): each block adds its
-    /// carried remainder times the weight element at its lane. Q4_K and Q6_K only
-    /// (`moe_mmq_hi_ok`); the tile is picked as the plain GEMM's is. `None` is the plain GEMM.
+    /// given ([`Self::quant_q8_gather_with`] / [`Self::quant_q8_with`]): each block whose scale
+    /// carries the split mark adds its remainder times the weight element at its lane. Q4_K and
+    /// Q6_K only (`moe_mmq_hi_ok`); the tile is picked as the plain GEMM's is. `None` is the
+    /// plain GEMM.
     #[allow(clippy::too_many_arguments)]
     pub fn matmul_mmq_experts_with(
         &self,

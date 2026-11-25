@@ -284,6 +284,87 @@ fn gpu_seam_tolerance_float_runs_build_no_int8_kernel() {
     assert!(bad.is_empty(), "the Float run built int8 kernels: {bad:?}");
 }
 
+/// `gpu-moe-decode-float` (the tuning parameter `mmv_mw.moe_float`) changes a routed-expert
+/// model's one-row `Linear`s and nothing else: on ERNIE-4.5-21B-A3B it builds exactly the kernels
+/// `gpu-dense-decode-float` (`kernels.vulkan.mmv_mw = false`) builds and gives the same logits
+/// bits; on Qwen3-0.6B (dense) it builds the shipped kernels and gives the shipped bits. Each
+/// model also shows `gpu-dense-decode-float` building other kernels than the shipped run, so
+/// neither comparison passes by the switches doing nothing. Without either model, or with either
+/// unable to run on the device, the whole test is skipped, saying so.
+#[test]
+#[ignore = "needs Qwen3-0.6B and ERNIE-4.5-21B-A3B Q4_K_M and a Vulkan GPU"]
+fn gpu_seam_tolerance_moe_decode_float_reaches_moe_models_only() {
+    use infr_llama::seam::{ForcedOn, PrefillHead};
+    let _guard = forced::watchdog("the MoE decode switch check", forced::GATE_TIMEOUT);
+    let edit = |name: &str| {
+        forced::DIAGNOSIS_CONFIGS
+            .iter()
+            .find(|c| c.name == name)
+            .unwrap_or_else(|| panic!("no configuration {name}"))
+            .edit
+    };
+    // Both models or neither: a run with one of them checks only half of the claim. A missing
+    // model fails the test under `INFR_TEST_REQUIRE_MODELS` (`forced::open_or_skip`).
+    let mut cases = Vec::new();
+    for (key, moe) in [("ernie-21b-moe", true), ("qwen3-0.6b", false)] {
+        let Some(case) = forced::open_or_skip(key) else {
+            eprintln!("SKIPPED, the whole test: {key} is needed for its half of the check");
+            return;
+        };
+        if forced::device_for(key, case.bytes).is_none() {
+            eprintln!("SKIPPED, the whole test: {key} cannot run on this device");
+            return;
+        }
+        cases.push((key, moe, case));
+    }
+    for (key, moe, case) in &cases {
+        let (key, moe) = (*key, *moe);
+        // The prompt, then its own first tokens forced: every run feeds the same sequence, and
+        // a routed-expert model follows its own routers.
+        let ids = &case.prompts[1];
+        let run = |name: Option<&str>| {
+            let g = case
+                .model
+                .forced_logits(
+                    ForcedOn::Vulkan,
+                    |c| {
+                        if let Some(n) = name {
+                            edit(n)(c);
+                        }
+                    },
+                    ids,
+                    forced::N_DECODE,
+                    PrefillHead::All,
+                    None,
+                    |s, _| ids[s % ids.len()],
+                )
+                .unwrap_or_else(|e| panic!("{key}: {e:#}"));
+            let bits: Vec<u32> = g.logits.iter().map(|v| v.to_bits()).collect();
+            (bits, g.kernels)
+        };
+        let shipped = run(None);
+        let dense_float = run(Some("gpu-dense-decode-float"));
+        let moe_float = run(Some("gpu-moe-decode-float"));
+        eprintln!(
+            "{key}: shipped {:?}\n  dense decode float {:?}\n  MoE decode float {:?}",
+            shipped.1, dense_float.1, moe_float.1
+        );
+        assert_ne!(
+            dense_float.1, shipped.1,
+            "{key}: mmv_mw = false changed no kernel, so this check cannot fail"
+        );
+        let want = if moe { &dense_float } else { &shipped };
+        assert_eq!(
+            moe_float.1, want.1,
+            "{key}: mmv_mw.moe_float built other kernels"
+        );
+        assert!(
+            moe_float.0 == want.0,
+            "{key}: mmv_mw.moe_float changed the logits bits"
+        );
+    }
+}
+
 /// What makes a kernel a cooperative-matrix prefill GEMM, by its name. Typed by hand, like
 /// [`INT8_KERNEL_MARKERS`] and with the same gap: one named otherwise would pass unseen (B207).
 const COOPMAT_GEMM_MARKER: &str = "gemm_warp";

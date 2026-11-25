@@ -431,6 +431,20 @@ pub(crate) static PARAMS: &[Param] = &[
         set: |t, q, v| t.mmv_mw_warps[q.expect("qualified")] = v.u32(),
     },
     Param {
+        family: "mmv_mw",
+        name: "moe_float",
+        kind: Kind::Variant,
+        ty: Ty::Bool,
+        axis: Axis::None,
+        doc: "experimental: on a graph with routed experts, every one-row Linear takes the \
+              dequantizing GEMVs instead of the int8 ones, exactly as kernels.vulkan.mmv_mw = \
+              false does on every graph",
+        rule: "false",
+        default: |_, _| Value::Bool(false),
+        get: |t, _| Value::Bool(t.mmv_mw_moe_float),
+        set: |t, _, v| t.mmv_mw_moe_float = v.flag(),
+    },
+    Param {
         family: "mmv_mrow",
         name: "o4_max_in_f",
         kind: Kind::Variant,

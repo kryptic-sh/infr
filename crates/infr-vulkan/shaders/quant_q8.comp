@@ -15,13 +15,16 @@
 // scale (the first token's massive activations otherwise round the other 31 elements of their
 // block to 0 or ±1, docs/gpu-tolerance.md). The outlier keeps a code clamped to ±127 at that
 // scale, and what the code leaves of it goes to one more output:
-//   hres[m,nblk] vec2 — (v − q·d, its lane) for a split block, (0, 0) for any other
-// so `q·dact + hres.x` is the outlier again, and a consumer adds `hres.x · w[lane]` per block. A
-// split block's scale is rounded up to a value f16 holds exactly, so `dact` is that scale under
-// any f16 rounding and the remainder is taken against what consumers read. A block that does not
-// split writes the same qa/dact/sact bits as the plain build. `sact` stays Σ(d·q) and leaves the
-// remainder out. MIRRORS `QUANT_Q8_HI_RATIO` in recorder.rs
-// (`quant_q8_hi_ratio_matches_shader`).
+//   hres[m,nblk] vec2 — (v − q·d, its lane), written for a split block only
+// so `q·|dact| + hres.x` is the outlier again, and a consumer adds `hres.x · w[lane]` per block.
+// A split block is marked by the sign bit of its `dact` (a finite scale is never negative, and a
+// NaN one, from a NaN activation, makes the block's products NaN whichever way the bit reads, so
+// the bit is free): a consumer reads the scale as |dact| and touches `hres` only where the bit is
+// set, so the blocks that do not split (nearly all) cost it no load, and no write here. A split block's
+// scale is rounded up to a value f16 holds exactly, so |dact| is that scale under any f16
+// rounding and the remainder is taken against what consumers read. A block that does not split
+// writes the same qa/dact/sact bits as the plain build. `sact` stays Σ(d·q) and leaves the
+// remainder out. MIRRORS `QUANT_Q8_HI_RATIO` in recorder.rs (`quant_q8_hi_ratio_matches_shader`).
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_shader_8bit_storage : require
@@ -108,14 +111,17 @@ void main() {
     qa[idx] = int8_t(q);
     float s = subgroupAdd(d * float(q));
 #ifdef HI
-    // The outlier's remainder, to lane 0: one non-zero term, so the sum is that term exactly.
-    float rem = subgroupAdd((split && t == top) ? v - float(q) * d : 0.0);
+    // The outlier's own lane holds its remainder, so it writes it without a reduction.
+    if (split && t == top) {
+        hres[row * nblk + blk] = vec2(v - float(q) * d, float(top));
+    }
 #endif
     if (t == 0u) {
-        dact[row * nblk + blk] = float16_t(d);
-        sact[row * nblk + blk] = float16_t(s);
 #ifdef HI
-        hres[row * nblk + blk] = split ? vec2(rem, float(top)) : vec2(0.0);
+        dact[row * nblk + blk] = float16_t(split ? -d : d);
+#else
+        dact[row * nblk + blk] = float16_t(d);
 #endif
+        sact[row * nblk + blk] = float16_t(s);
     }
 }

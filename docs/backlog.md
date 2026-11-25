@@ -50,12 +50,23 @@ Queue order (the owner's): MoE routing first, then the rest in the order below.
    Timed on the RX 7900 XTX (the doc's Speed tables): the parameter costs 8.7%
    of pp512 on Qwen3-30B-A3B and 8.0% on ERNIE-21B-A3B; float dense decode GEMVs
    cost nothing on Qwen3-30B-A3B (+0.4%) and 3.4% of tg128 on ERNIE. **Decided
-   2026-11-25:** (i) `quant_q8.experts_hi` stays off; build the cheaper
-   remainder load (a per-row "any block split" flag, so the expert GEMM skips
-   the read on nearly every row), time it, and bring the owner the numbers for
-   the default; (ii) build a MoE-only float dense decode switch, default off,
-   with harness rows and timings on both GPUs (the integrated GPU is not timed
-   yet), for the owner to pick its default. Still open: (iii) whether the
+   2026-11-25:** (i) `quant_q8.experts_hi` stays off; make the remainder load
+   cheaper and re-time; (ii) build a MoE-only float dense decode switch, default
+   off. **Both built 2026-11-25** (the doc's Speed section and "(d)"): (i) a
+   split block is now marked by the sign bit of its f16 scale, so the expert
+   GEMMs read a remainder only for marked blocks; output is bit-identical to the
+   first build's, and pp512 now costs 1.1% on Qwen3-30B-A3B and 1.4% on ERNIE
+   (was 8.7% and 8.0%; RX 7900 XTX), what is left mostly the quantizer's two
+   extra reductions. (ii) is the tuning parameter `mmv_mw.moe_float` (harness
+   configuration `gpu-moe-decode-float`): on a MoE model it runs exactly what
+   `mmv_mw = false` runs, so its accuracy rows are `gpu-dense-decode-float`'s;
+   tg128 +0.2% on Qwen3-30B-A3B and -3.3% on ERNIE on the RX 7900 XTX, -18.4% on
+   ERNIE on the integrated GPU (Qwen3-30B-A3B not timed there). **The owner
+   decides both defaults:** `quant_q8.experts_hi` (first rows 3.8e-2 to 2.5e-4
+   on Qwen3-30B-A3B for about 1% of prefill) and `mmv_mw.moe_float` (7% to 19%
+   fewer forced selections differing, free on Qwen3-30B-A3B's decode, 3% of
+   ERNIE's on the RX 7900 XTX and 18% on the integrated GPU; a device-specific
+   default is possible, it is a tuning parameter). Still open: (iii) whether the
    routing gap is worth more (the simulation's only lever was finer blocks, 8
    elements: about 40% fewer selections differing, a change to every int8 kernel
    family). The real MoE rows of the tolerance table still wait for these.

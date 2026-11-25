@@ -560,16 +560,7 @@ impl TensorParallelBackend {
         let mut segments = Vec::with_capacity(bounds.len());
         let mut lo = 0usize;
         for (si, &hi) in bounds.iter().enumerate() {
-            let mut sub = lowered.clone();
-            sub.ops = lowered.ops[lo..hi].to_vec();
-            let written: HashSet<TensorId> = sub.ops.iter().flat_map(|op| op.io().1).collect();
-            sub.outputs = lowered
-                .outputs
-                .iter()
-                .copied()
-                .filter(|t| written.contains(t))
-                .collect();
-            sub.no_decode_replay = true;
+            let sub = crate::multi::segment(&lowered, lo..hi);
             let mut plans = Vec::with_capacity(w);
             for rank in &self.ranks {
                 plans.push(rank.compile(&sub)?);

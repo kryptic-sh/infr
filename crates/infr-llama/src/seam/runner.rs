@@ -2115,6 +2115,9 @@ pub(crate) fn generate_dense_backend_bound(
         let hc_carry = c.deepseek4 && (l_first, l_end) != (0, c.n_layer);
         let mut g = Graph::new();
         g.mtp_verify = mtp_verify;
+        // A layer span is a part of the model's forward: it answers `has_routed_experts` for the
+        // model, so a span without an expert layer lowers its Linears as the others do.
+        g.part_of_routed = span.is_some() && (0..c.n_layer).any(|l| c.is_moe_layer(l));
         // DiffusionGemma: force the per-execute STATIC path for every graph of this model (see
         // `Graph::no_decode_replay`). The record-once replay's `_dyn` kernels agree with the
         // static recording only to float-reassociation noise; the entropy-bound denoise loop

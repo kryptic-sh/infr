@@ -82,8 +82,9 @@ layout(binding = 6) writeonly buffer CB { float c[]; };         // [n_pairs, n] 
 layout(binding = 3) readonly buffer CNT { uint counts[]; };
 layout(binding = 4) readonly buffer OFF { uint offsets[]; };
 #ifdef ACT_HI
-// -DACT_HI: activations from quant_q8.comp's HI build — each block's carried outlier remainder
-// and its lane (`hres`, (0, 0) where the block did not split), added below as remainder × weight.
+// -DACT_HI: activations from quant_q8.comp's HI build — a block whose `dact` has its sign bit set
+// carries its outlier's remainder and lane in `hres` (written for those blocks only), added below
+// as remainder × weight.
 layout(binding = 5) readonly buffer HB { vec2 hres[]; };        // [n_pairs, k/32]
 layout(binding = 6) writeonly buffer CB { float c[]; };         // [n_pairs, n] packed
 #else
@@ -236,8 +237,19 @@ void main() {
         }
 
         float dval[TM];
+#ifdef ACT_HI
+        bool carried[TM];
+        bool anyCarried = false;
+        [[unroll]] for (uint i = 0u; i < TM; i++) {
+            dval[i] = float(dact[(wgRow + tr * TM + i) * nblk32 + blk32]);
+            carried[i] = (floatBitsToUint(dval[i]) >> 31u) != 0u;
+            anyCarried = anyCarried || carried[i];
+            dval[i] = abs(dval[i]);
+        }
+#else
         [[unroll]] for (uint i = 0u; i < TM; i++)
             dval[i] = float(dact[(wgRow + tr * TM + i) * nblk32 + blk32]);
+#endif
         // Sub-block 0 then sub-block 1 into each accumulator. The integer dp4a sums equal the old
         // 16-per-step loop's exactly, but the float accumulation is free to contract differently
         // (FMA), so outputs move at ulp level against it — measured up to 5.3e-5 on values near 22.
@@ -251,17 +263,21 @@ void main() {
         }
 #ifdef ACT_HI
         // The outlier's remainder times the weight element at its lane, `d·sc·(q6 − 32)` of its
-        // 16-element half: `As` holds its clamped code, so the block's dot is whole again. The lane
-        // is masked: the rows past the segment read whatever the padding holds, and their results
-        // are dropped at the store.
-        [[unroll]] for (uint i = 0u; i < TM; i++) {
-            vec2 hr = hres[(wgRow + tr * TM + i) * nblk32 + blk32];
-            if (hr.x != 0.0) {
-                uint e = uint(hr.y) & 31u;
-                [[unroll]] for (uint j = 0u; j < TN; j++) {
-                    uint cc = tc * TN + j;
-                    int q6 = int(Bs[cc * SP + (e >> 2u)] << (24u - (e & 3u) * 8u)) >> 24;
-                    acc[i][j] += hr.x * (Bdl[2u * cc + (e >> 4u)] * float(q6));
+        // 16-element half: `As` holds its clamped code, so the block's dot is whole again. Only a
+        // marked block reads `hres`. The lane is masked: the rows past the segment read whatever
+        // the padding holds, and their results are dropped at the store.
+        // A thread none of whose rows is marked (nearly every one) takes a single branch.
+        if (anyCarried) {
+            [[unroll]] for (uint i = 0u; i < TM; i++) {
+                if (!carried[i]) { continue; }
+                vec2 hr = hres[(wgRow + tr * TM + i) * nblk32 + blk32];
+                if (hr.x != 0.0) {
+                    uint e = uint(hr.y) & 31u;
+                    [[unroll]] for (uint j = 0u; j < TN; j++) {
+                        uint cc = tc * TN + j;
+                        int q6 = int(Bs[cc * SP + (e >> 2u)] << (24u - (e & 3u) * 8u)) >> 24;
+                        acc[i][j] += hr.x * (Bdl[2u * cc + (e >> 4u)] * float(q6));
+                    }
                 }
             }
         }

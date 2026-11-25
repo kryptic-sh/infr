@@ -61,6 +61,26 @@ pub(crate) fn refuse_scratch_across_cuts(graph: &Graph, ends: &[usize], who: &st
     Ok(())
 }
 
+/// The plan of one segment, `ops` of `graph`: the same tensor declarations (so handles match the
+/// bindings), those ops, only the outputs they write, on the static per-execute path, and marked
+/// a part of a routed forward when `graph` runs routed experts (`Graph::part_of_routed`), so a
+/// segment without an expert layer makes the model's per-model choices as the others do.
+pub(crate) fn segment(graph: &Graph, ops: std::ops::Range<usize>) -> Graph {
+    let mut sub = graph.clone();
+    sub.ops = graph.ops[ops].to_vec();
+    let written: std::collections::HashSet<TensorId> =
+        sub.ops.iter().flat_map(|op| op.io().1).collect();
+    sub.outputs = graph
+        .outputs
+        .iter()
+        .copied()
+        .filter(|t| written.contains(t))
+        .collect();
+    sub.no_decode_replay = true;
+    sub.part_of_routed = graph.has_routed_experts();
+    sub
+}
+
 /// The capabilities a multi-device wrapper reports for the work the runner sizes from them: the
 /// MOST conservative value over every rank. A world mixing a discrete card with an integrated GPU
 /// must size its prefill chunk for the integrated one (whose hang watchdog the smaller chunk
@@ -124,6 +144,32 @@ mod tests {
         let one = merge_conservative(std::iter::once(discrete));
         assert!(!one.integrated);
         assert_eq!(one.compute_units, 96);
+    }
+
+    /// A segment answers for the forward it was cut from: one without an expert layer still says
+    /// the model runs routed experts, and one cut from a dense graph says it does not. The source
+    /// is marked by hand here; that the mark follows an `Op::MoeFfn` is `infr-core`'s
+    /// `has_routed_experts_follows_the_ops`.
+    #[test]
+    fn a_segment_keeps_the_forwards_routed_mark() {
+        let mut g = Graph::new();
+        let d = || TensorDesc::new(vec![4], DType::F32);
+        let x = g.input(d());
+        let y = g.output(d());
+        g.push(Op::Scale {
+            x,
+            dst: y,
+            s: 2.0,
+            n: 4,
+        });
+        let dense = segment(&g, 0..1);
+        assert!(!dense.has_routed_experts());
+        assert!(dense.no_decode_replay);
+        assert_eq!(dense.outputs, vec![y]);
+
+        let mut routed = g.clone();
+        routed.part_of_routed = true;
+        assert!(segment(&routed, 0..1).has_routed_experts());
     }
 
     /// `x → [a = scale(x)] | cut | y = a + x`: `a` is scratch written before the cut and read after

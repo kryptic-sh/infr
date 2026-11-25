@@ -49,14 +49,16 @@ Queue order (the owner's): MoE routing first, then the rest in the order below.
    take 7% to 19% off the selections differing and 5% to 44% off the mean KL.
    Timed on the RX 7900 XTX (the doc's Speed tables): the parameter costs 8.7%
    of pp512 on Qwen3-30B-A3B and 8.0% on ERNIE-21B-A3B; float dense decode GEMVs
-   cost nothing on Qwen3-30B-A3B (+0.4%) and 3.4% of tg128 on ERNIE. **For the
-   owner:** (i) `quant_q8.experts_hi` on by default for MoE models at that
-   prefill cost, or left off; (ii) a MoE-only float decode switch; (iii) whether
-   the routing gap is worth more (the simulation's only lever was finer blocks,
-   8 elements: about 40% fewer selections differing, a change to every int8
-   kernel family). Not tried: making the remainder load cheaper (a per-row "any
-   block split" flag would skip the read on nearly every row). The real MoE rows
-   of the tolerance table still wait for these.
+   cost nothing on Qwen3-30B-A3B (+0.4%) and 3.4% of tg128 on ERNIE. **Decided
+   2026-11-25:** (i) `quant_q8.experts_hi` stays off; build the cheaper
+   remainder load (a per-row "any block split" flag, so the expert GEMM skips
+   the read on nearly every row), time it, and bring the owner the numbers for
+   the default; (ii) build a MoE-only float dense decode switch, default off,
+   with harness rows and timings on both GPUs (the integrated GPU is not timed
+   yet), for the owner to pick its default. Still open: (iii) whether the
+   routing gap is worth more (the simulation's only lever was finer blocks, 8
+   elements: about 40% fewer selections differing, a change to every int8 kernel
+   family). The real MoE rows of the tolerance table still wait for these.
 3. **`kv.overflow` without `VK_EXT_memory_budget`.** Stays off there
    (`kv_spill_armed`). Add a one-line load warning that the flag has no effect
    on this driver and why.

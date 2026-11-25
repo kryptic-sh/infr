@@ -34,6 +34,7 @@ pub(crate) static SHADER_CLASSES: &[(&str, ShaderClass)] = &[
     ("attention_kv", C5b),
     ("attn_combine", C3),
     ("attn_decode", C3),
+    ("attn_decode_gqa", C3),
     ("attn_flash", C4),
     ("attn_flash_combine", C5a),
     ("attn_flash_partial", C4),

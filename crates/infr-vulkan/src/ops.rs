@@ -32,6 +32,10 @@ pub(crate) struct ComputeKernel {
     /// The subgroup pin the pipeline was created with, so a `DISPATCH_BASE` twin
     /// ([`VulkanBackend::dispatch_base_pipeline`]) is created the same way.
     pub pin: Option<SubgroupPin>,
+    /// Whether the pipeline carries the `W64` specialization (the wave64 path's virtual wave32),
+    /// so a `DISPATCH_BASE` twin is specialized the same. A `kernel_sg64_native` build is `false`
+    /// even on a wave64 device: it wants the real 64 lanes.
+    pub wave64: bool,
     /// The shader declares `gl_NumWorkGroups` (`spirv::reads_num_workgroups`): its grid may then
     /// be cut into ranges only under a convention the op states (`work::Split::WideGrid`).
     pub reads_num_workgroups: bool,
@@ -250,6 +254,7 @@ pub(crate) fn try_make_compute_kernel(
         push_size,
         spv_hash: hash_spv(spv),
         pin,
+        wave64,
         reads_num_workgroups: crate::spirv::reads_num_workgroups(spv),
     })
 }
@@ -392,7 +397,7 @@ impl VulkanBackend {
         n_buf: usize,
         push_size: u32,
     ) -> ComputeKernel {
-        self.kernel_inner(name, spv, n_buf, push_size, None)
+        self.kernel_inner(name, spv, n_buf, push_size, None, self.shared.wave64)
     }
 
     /// Like `kernel`, but pins the pipeline's subgroup size (coopmat needs wave32 on RDNA3).
@@ -412,10 +417,28 @@ impl VulkanBackend {
             n_buf,
             push_size,
             (sg_size > 0).then_some(sg_size),
+            self.shared.wave64,
         )
     }
 
-    /// Shared fetch-or-build for [`Self::kernel`]/[`Self::kernel_sg`]. The build runs UNDER the
+    /// Wave64-NATIVE subgroup kernel: pins 64 invocations per subgroup WITHOUT the `W64`
+    /// wave32-halves emulation of `shaders/wave64.glsl`, so a module that addresses all 64 lanes
+    /// (`attn_decode_gqa.comp`) runs as plain full-wave subgroup ops. Only valid where 64 is
+    /// pinnable — the caller gates on the device's subgroup range — and a `-DSG=64`-style module
+    /// must not include `wave64.glsl`, which would re-cluster its ops at 32.
+    pub(crate) fn kernel_sg64_native(
+        &self,
+        name: &'static str,
+        spv: &[u32],
+        n_buf: usize,
+        push_size: u32,
+    ) -> ComputeKernel {
+        self.kernel_inner(name, spv, n_buf, push_size, Some(64), false)
+    }
+
+    /// Shared fetch-or-build for [`Self::kernel`]/[`Self::kernel_sg`]. `wave64` selects the `W64`
+    /// specialization: the caller's device flag for the ordinary kernels, `false` for
+    /// [`Self::kernel_sg64_native`] even on a wave64 device. The build runs UNDER the
     /// cache lock so exactly one thread compiles a given `name` on concurrent first use — the old
     /// lock→get→unlock→compile→lock→insert had two racing threads both build the full
     /// shader+pipeline+pool and the second `insert` overwrite (and leak for process life) the
@@ -432,6 +455,7 @@ impl VulkanBackend {
         n_buf: usize,
         push_size: u32,
         required_sg: Option<u32>,
+        wave64: bool,
     ) -> ComputeKernel {
         let mut map = self.shared.kernels.lock().unwrap();
         let cached = map.get(name).copied();
@@ -451,7 +475,7 @@ impl VulkanBackend {
                 self.shared
                     .rte_f16
                     .load(std::sync::atomic::Ordering::Relaxed),
-                self.shared.wave64,
+                wave64,
             ) {
                 Ok(k) => *map.entry(name).or_insert(k),
                 Err(e) => {
@@ -513,7 +537,7 @@ impl VulkanBackend {
             k.shader,
             k.pipeline_layout,
             k.pin,
-            self.shared.wave64,
+            k.wave64,
             vk::PipelineCreateFlags::DISPATCH_BASE,
         );
         match built {
@@ -801,6 +825,10 @@ mod tests {
         // subgroupMax/Min, picks a lane with subgroupElect and walks `gl_NumSubgroups` partials,
         // none of which assumes 32 lanes; `wave64_probe.comp` reads the real subgroups on purpose.
         const WIDTH_AGNOSTIC: &[&str] = &["moe_topk", "wave64_probe"];
+        // Kernels written for exactly 64 lanes and created through `kernel_sg64_native`, which pins
+        // them without `wave64.glsl`: `attn_decode_gqa.comp` folds its P·V accumulators across all
+        // 64 and guts its lane map with `gl_LocalInvocationIndex`.
+        const PINNED_64: &[&str] = &["attn_decode_gqa"];
 
         let (mut covered, mut agnostic, mut coopmat) = (0, 0, 0);
         for entry in std::fs::read_dir(env!("OUT_DIR")).expect("OUT_DIR") {
@@ -872,9 +900,10 @@ mod tests {
             }
             if !w64 {
                 assert!(
-                    WIDTH_AGNOSTIC.iter().any(|k| name.starts_with(k)),
-                    "{name}: uses subgroups without including wave64.glsl (and is not one of the \
-                     width-agnostic kernels) — on a wave64 device its subgroups are 64 lanes"
+                    WIDTH_AGNOSTIC.iter().chain(PINNED_64).any(|k| name.starts_with(k)),
+                    "{name}: uses subgroups without including wave64.glsl and is neither one of the \
+                     width-agnostic kernels nor one the host pins to a native 64 (on a wave64 \
+                     device its subgroups are 64 lanes)"
                 );
                 agnostic += 1;
                 continue;

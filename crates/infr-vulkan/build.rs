@@ -3812,6 +3812,29 @@ fn main() {
             }
         })
         .collect();
+    // GQA-batched decode pass 1 (`attn_decode_gqa.comp`): every (head dim, query heads per kv head,
+    // sliding window, record-once) shape `gemm::attn_decode_gqa_kernel` can select. Its own family —
+    // no weight build, so nothing below applies to it.
+    let mut builds = builds;
+    for hd in [128u32, 256, 512] {
+        for g in [4u32, 8] {
+            for swa in [false, true] {
+                for dynac in [false, true] {
+                    let mut defines = vec![format!("-DHD={hd}"), format!("-DG={g}")];
+                    let mut name = format!("attn_decode_gqa_hd{hd}_g{g}");
+                    if swa {
+                        defines.extend(["-DSWA".to_string(), "-DRING".to_string()]);
+                        name.push_str("_swa");
+                    }
+                    if dynac {
+                        defines.extend(["-DUSE_PARAMS".to_string(), "-DSELF_CHUNK".to_string()]);
+                        name.push_str("_dynac");
+                    }
+                    builds.push(("attn_decode_gqa".to_string(), name, defines));
+                }
+            }
+        }
+    }
     if let Err(msg) = compile_shaders(&glslc_path(), &out, &builds) {
         // `cargo::error` prints each line once as `error: infr-vulkan@…: <line>` and fails the
         // build when the script returns. Exiting non-zero instead would make cargo also dump the

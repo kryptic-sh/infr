@@ -7714,6 +7714,32 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// The GQA-batched decode pass-1 build (`attn_decode_gqa.comp`) for this shape, when
+    /// `kernels.vulkan.attn_decode_gqa` turns it on explicitly and a build covers `(hd, nh/nkv)`.
+    /// Auto (`None`) is OFF: on the only hardware it was tuned for (GFX8/Polaris) the batched pass
+    /// 1 runs about 1.6x slower per dispatch than `attn_decode` (43.8us vs ~27us at qwen d1024;
+    /// tg64@d4096 qwen -7.5%, gemma-4-E4B -5.5%), so it has to be opted into per device rather
+    /// than picked by class. A caller that already resolved `attn_decode` proves every shared gate
+    /// (f16 K/V read by device address, one row, no canvas, chunk <= 512, ring-safe).
+    fn gqa_pass1(
+        &self,
+        hd: usize,
+        nh: usize,
+        nkv: usize,
+        window: usize,
+        dynac: bool,
+    ) -> Option<(&'static str, &'static [u32])> {
+        let caps = self.be.caps();
+        let can_pin_64 = caps.subgroup_min <= 64 && caps.subgroup_max >= 64;
+        if !self.vk().attn_decode_gqa.unwrap_or(false) || !can_pin_64 {
+            return None;
+        }
+        if nkv == 0 || !nh.is_multiple_of(nkv) {
+            return None;
+        }
+        crate::gemm::attn_decode_gqa_kernel(hd, nh / nkv, window > 0, dynac)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn attention_kv_split_impl(
         &self,
@@ -7872,11 +7898,19 @@ impl<'a> Recorder<'a> {
         } else {
             None
         };
-        let (p1name, p1spv) = fast.unwrap_or((p1name, p1spv));
+        // `fast` being Some already proves every gate the GQA-batched build shares (f16 K/V read by
+        // device address, one row, no canvas, chunk <= 512, ring-safe); `gqa` then adds the pin and
+        // the knob, and falls back to it otherwise.
+        let gqa = fast.and_then(|_| self.gqa_pass1(hd, nh, nkv, window, false));
+        let (p1name, p1spv) = gqa.or(fast).unwrap_or((p1name, p1spv));
         // The -DKV_BDA push grows by k_lo/k_hi/v_lo/v_hi (uvec2 splits) → 60 bytes; the bound push is
         // the base 44. n_buf stays 6 (q, kc, vc, pm, pl, pacc): kc/vc are inert-but-bound under BDA.
         let plen: usize = if bda { 60 } else { 44 };
-        let k1 = self.be.kernel_sg(p1name, p1spv, 6, plen as u32, 32);
+        let k1 = if gqa.is_some() {
+            self.be.kernel_sg64_native(p1name, p1spv, 6, plen as u32)
+        } else {
+            self.be.kernel_sg(p1name, p1spv, 6, plen as u32, 32)
+        };
         let mut p1 = [0u8; 60];
         p1[0..4].copy_from_slice(&(kv_len as u32).to_ne_bytes());
         p1[4..8].copy_from_slice(&(nh as u32).to_ne_bytes());
@@ -8667,7 +8701,8 @@ impl<'a> Recorder<'a> {
         } else {
             None
         };
-        let (p1name, p1spv) = fast.unwrap_or((p1name, p1spv));
+        let gqa = fast.and_then(|_| self.gqa_pass1(hd, nh, nkv, window, true));
+        let (p1name, p1spv) = gqa.or(fast).unwrap_or((p1name, p1spv));
         // attn_partial.comp's `layout(push_constant) uniform PC {...}` block is declared
         // UNCONDITIONALLY (11 x 4-byte members = 44 bytes) — `pos`/`rows` (offsets 36..44) are
         // dead code under `-DUSE_PARAMS` (never read in the compiled SPIR-V for this variant, see
@@ -8679,7 +8714,11 @@ impl<'a> Recorder<'a> {
         // range must cover the full declared block; the trailing 8 bytes stay zero and unread.
         // BDA push grows to 60 (k_lo/k_hi/v_lo/v_hi at 44..60); bound stays 44. n_buf stays 7.
         let plen: usize = if bda { 60 } else { 44 };
-        let k1 = self.be.kernel_sg(p1name, p1spv, 7, plen as u32, 32);
+        let k1 = if gqa.is_some() {
+            self.be.kernel_sg64_native(p1name, p1spv, 7, plen as u32)
+        } else {
+            self.be.kernel_sg(p1name, p1spv, 7, plen as u32, 32)
+        };
         let mut p1 = [0u8; 60];
         p1[4..8].copy_from_slice(&(nh as u32).to_ne_bytes());
         p1[8..12].copy_from_slice(&(nkv as u32).to_ne_bytes());

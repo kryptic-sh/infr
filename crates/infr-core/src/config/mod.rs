@@ -426,6 +426,13 @@ cfg_struct! {
         /// (`attn_decode.comp`). Setting the env var keeps the general `attn_partial` builds on
         /// the decode fast path; the output is bit-identical either way, so this is an A/B knob.
         attn_decode: bool = true,
+        /// `INFR_ATTN_DECODE_GQA`, TRI-state: the GQA-batched decode pass 1
+        /// (`attn_decode_gqa.comp`), which reads each K/V row once for every query head sharing a
+        /// KV head instead of once per head. NOT bit-identical to `attn_decode` (float summation
+        /// order). `None` = auto = off, because it measured slower than `attn_decode` on the only
+        /// hardware it has been tuned for (GFX8/Polaris: 43.8us vs ~27us per dispatch at qwen
+        /// d1024, tg64@d4096 -7.5%); opt in per device with `=1`.
+        attn_decode_gqa: Option<bool> = None,
         /// `INFR_NO_MROWS_ATTN` / `INFR_MROWS_ATTN`, an ASYMMETRIC tri-state: `Some(false)` (the
         /// `NO_` key) wins unconditionally; `Some(true)` bypasses the rows/kv_len heuristic;
         /// `None` lets the heuristic decide.

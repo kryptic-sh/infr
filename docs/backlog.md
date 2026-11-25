@@ -26,6 +26,53 @@ Provenance tags point at the finding that opened the item:
 
 ## Open
 
+### B-HANDOFF-2026-11-26 — where the session of 2026-11-25/26 stopped
+
+**Kind:** work raised and not finished, in the order it should be picked up.
+
+1. **PR #111 (Q4_K mmq staging with 16-byte loads, one shader) is reviewed but
+   not measured.** The reviewer found no defect and a clean merge with `main`.
+   Not done: build the PR's shader in a separate worktree; check a MoE model's
+   logits are bit-identical to `main`; run the GPU parity tests on both GPUs
+   (`nc_mmq_dense_gemm_parity_and_determinism`, the `*_expert_gemm_*` tests,
+   `expert_gemm_hi_matches_its_decomposition`); alternated `-p 512 -n 0 -r 3` on
+   Qwen3-30B-A3B and ERNIE-21B-A3B with two seconds between runs. The author
+   measured one dense model on an RX 6600 XT in a fork whose routing differs;
+   our MoE prefill path is unmeasured. The owner gives the verdict.
+2. **PR #110 (Gemma 4 image input) is reviewed; the owner gives the verdict.**
+   Confirmed against llama.cpp: image spans need non-causal attention
+   (`mtmd_decode_use_non_causal` returns true for GEMMA4V) and the PR feeds them
+   through causal prefill; the per-layer output scale (`ls_out_w` in `clip.cpp`)
+   is not applied. Reported and not confirmed by us: the first image request
+   dequantises the whole token-embedding table to host RAM. It adds `gemm` and
+   `image` as always-on dependencies of `infr-llama`.
+3. **Bugs found in the #109 fork that are still on `main`** (offered to the
+   author as PRs on the issue; fix here and credit them if none arrives):
+   - `vulkan_moe_binder`'s `kv_fmts` closure prices the KV cache from
+     `kv_auto_q8()` alone and ignores an explicit `kv.type_k`/`type_v`, so a
+     q8_0 cache is priced as f16 (their `a300d038`).
+   - `attention.head_count_kv` stored as a per-layer array is read through
+     `meta_u64`, which answers nothing for an array, so `n_kv` silently becomes
+     `n_head` on such a Qwen3.5 file (config half of their `5e513b96`).
+   - `rope.comp` dispatches a 64-thread workgroup per (token, head) pair
+     (`dispatch_wide(..., t * n_heads)` in `recorder.rs`); performance only,
+     prefill unmeasured (their `15149a26`).
+4. **Plan 15 slice R0:** confirm with a run, then fix, that a spilled KV cache
+   is refused at load when the weights stream and the host tier sizes itself
+   (read from code only).
+5. **Plan 14 slices L and W** (placement label; bounded wait at start-up).
+6. **Owner decisions still open:** the defaults of `quant_q8.experts_hi` (now
+   about 1% of MoE prefill) and `mmv_mw.moe_float` (free on Qwen3-30B-A3B, 3.3%
+   of decode on ERNIE on the RX 7900 XTX, 18.4% on the integrated GPU); whether
+   to run `rustup update stable` (local 1.98.1 against CI's newer stable).
+7. Then B-DECISIONS-2026-11-25 from item 3 on.
+
+Not verified in the slice pushed as `54448f08`: the pipeline, tensor-parallel
+and expert-parallel paths with `mmv_mw.moe_float` on (only the shared cut,
+`multi::segment`, is tested); the layer-span mark in the seam's graph builder;
+the MTP draft head keeps int8 GEMVs with the switch on (a choice, not checked
+for effect on acceptance); nothing ran on Windows or Metal.
+
 ### B-DECISIONS-2026-11-25 — owner's decisions, and the slices they queue (2026-11-25)
 
 **Kind:** decisions taken by the owner on 2026-11-25, one question at a time.

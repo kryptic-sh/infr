@@ -5073,8 +5073,9 @@ attention-factor rule (`config::yarn_mscale_ratio`).
 
 ### B-PP-SLOW-RUNS — a run started right after another pages its experts for good (2026-11-25)
 
-**Kind:** diagnosed, reproduced on demand, not fixed; the fix is the owner's
-call.
+**Kind:** diagnosed, reproduced on demand, not fixed. **Decided 2026-11-25:**
+build options 1 and 3 below together (wait briefly at start-up, and promote
+experts back into VRAM when room appears later), with option 2's label.
 
 A MoE run that starts within about 150 ms of another infr process exiting can
 read that process's VRAM as still in use, decide the experts do not fit, and

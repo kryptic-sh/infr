@@ -4999,14 +4999,14 @@ attention-factor rule (`config::yarn_mscale_ratio`).
   there is a one-row graph. A chunk straddling the length is checked against
   that one-row path instead
   (`synthetic_mistral_large3_straddling_chunk_matches_one_row_at_a_time`, CPU
-  bit-exact; Vulkan at chunks of 5). Quantizing the oracle file's experts to
-  Q8_0 so llama.cpp sees the batched chunk was tried and left: infr's CPU then
-  missed llama.cpp by 2.08e-2 / 1.31e-2 / 7.5e-4 at 16 / 17 / 40 tokens (f32 KV,
-  flash attention off), with the temperature off as far apart at 16 tokens, so
-  the gap is the expert activations' int8 rounding (infr's float reference
-  backend was 4.3e-2 to 5.2e-2 away), not the temperature, and too wide to judge
-  a row mapping (the per-head red moved the f32 oracle by 5.9e-3). Measured
-  2026-11-25.
+  bit-exact; Vulkan at the default chunk too). Quantizing the oracle file's
+  experts to Q8_0 so llama.cpp sees the batched chunk was tried and left: infr's
+  CPU then missed llama.cpp by 2.08e-2 / 1.31e-2 / 7.5e-4 at 16 / 17 / 40 tokens
+  (f32 KV, flash attention off), with the temperature off as far apart at 16
+  tokens, so the gap is the expert activations' int8 rounding (infr's float
+  reference backend was 4.3e-2 to 5.2e-2 away), not the temperature, and too
+  wide to judge a row mapping (the per-head red moved the f32 oracle by 5.9e-3).
+  Measured 2026-11-25.
 - **No real Mistral-Large-3 file has been run.** The temperature is checked
   against llama.cpp only on the synthetic file
   (`synthetic_mistral_large3_cpu_matches_llama_cpp`); the real one is about
@@ -5050,20 +5050,86 @@ attention-factor rule (`config::yarn_mscale_ratio`).
   likely the cause, not confirmed); this slice's diff leaves those tests and the
   methods they call untouched. Not run on HEAD.
 
-### B-DSV2-Q8-VK-NAN — Vulkan batched MoE gives NaN on the synthetic deepseek2 with Q8_0 experts (2026-11-25)
+### B-PP-SLOW-RUNS — whole bench runs at two thirds or a quarter of the usual prefill speed (2026-11-25)
 
-**Kind:** bug seen in a run, not diagnosed.
+**Kind:** surprise seen in a measurement, not diagnosed.
 
-The synthetic `deepseek2` model (`grouped_model` in
-`tests/synthetic_deepseek2.rs`) with its three expert banks in Q8_0
-(`Fill::Quant`) prefills to NaN logits on Vulkan once a batched prefill chunk
-reaches 9 rows (prompt of 10 tokens; 9 tokens, an 8-row chunk, is finite), on
-both GPUs; the CPU is finite throughout. The attention temperature is not
-involved (the same with it off, and on the plain deepseek2 model). The file's
-dims are toy-sized (`n_embd` 64, `n_ff_exp` 32, 16 experts top 2), so a kernel
-tiling assumption a real model meets is a candidate; not investigated. The
-Mistral-Large-3 straddle test runs Vulkan at chunks of 5
-(`ML3_VULKAN_STRADDLE_UBATCH`) to stay under it.
+`infr bench unsloth/Qwen3-30B-A3B-GGUF:Q4_K_M -p 1024 -n 0 -r 3` on the RX 7900
+XTX, sixteen runs alternating two builds (HEAD `42178c70` and the tree that
+became the expert-width fix), load average 5 to 7 with a desktop session in use:
+thirteen runs read 4440 to 4536 t/s, and three read 2948, 2999 and 1208 t/s.
+Each slow run was slow in all three of its reps (spread 1.0% to 3.9%), so it is
+a state the whole process was in, not one slow rep; both builds had one or more,
+so it is not either build. Decode (`-p 0 -n 64`) on the same builds read 221.1
+to 222.1 t/s in all six runs. Not known: whether it is another client of the GPU
+(the desktop was in use), a clock or power state the card settles in for a
+process, or something infr decides once at start-up (a cold pipeline cache would
+not explain a spread that tight over three reps). What would settle it: the same
+loop with the desktop idle, and `INFR_PROF_OPS=1` on a slow run to see whether
+every kernel is slower or one is. Until then a single prefill figure from this
+card is not a measurement; alternate and repeat.
+
+### B-MOE-EXPERT-TILE — batched expert GEMMs take only whole 64-column tiles (2026-11-25)
+
+**Kind:** what the fix for the synthetic deepseek2 Q8_0 NaN left, and what it
+measured on the way.
+
+The batched `MoeFfn` arms' expert GEMMs (`Recorder::matmul_mmq_experts` and
+`matmul_mmq_experts_paged`, every `native_gemm_mmq_*` EXPERT_GRID build) cover
+`n` in whole `MOE_EXPERT_GEMM_TILE_N` tiles (`tilesN = n / BN` in the shaders,
+`expert_grid_x` on the host). An `n_ff_exp` of 32 got no workgroups and 96 lost
+its last 32 columns, so the synthetic deepseek2 file with Q8_0 banks
+(`n_ff_exp` 32) prefilled to NaN from the first chunk past `moe.small_m`. The
+fix sends such a width to the small-m id-GEMV arm
+(`infr_core::tensor::moe_expert_gemm_widths_ok`, read by both adapter arms),
+makes `expert_grid_x_or_refuse` refuse it by name, and caps the model's Vulkan
+prefill chunk at `MOE_SMALL_M_CHUNK_CAP` through the placement pins
+(`moe_small_m_chunk_cap`, read by `ubatch_rows`). Left:
+
+- **Kernel tail support was not written.** The other fix is a column guard in
+  every `native_gemm_mmq_*` shader: `tilesN` rounded up, the weight-column index
+  clamped to `n - 1` in the staging loops (the last expert's overread would
+  otherwise leave the bank), and the store skipped past `n`; the host grid would
+  use `n.div_ceil(bn)`. Declined for now because it changes the SPIR-V of every
+  shape that is already right (a `min` per staged column and a compare per
+  store, unmeasured) to serve shapes no known shipped file has; the gate costs
+  aligned shapes nothing (one host-side branch). With it, such a model would
+  also get its full prefill chunk back.
+- **The small-m recorders are not under the work-bounded submit splitter.**
+  `linear_native_id_multi`, `linear_native_id_multi_at` and
+  `linear_native_id_multi_paged` dispatch through `dispatch_wide` and never call
+  `work_next`/`tag_gemm` (read in `recorder.rs`, not run), so a small-m chunk's
+  cost is bounded only by the chunk height, which is why the capped model above
+  relies on the chunk cap rather than on the splitter.
+- **A device without `caps.i8_dot` runs every MoE model's prefill on the small-m
+  arm at full chunk height.** The resident and paged batched arms both require
+  `i8_dot`, and nothing caps the chunk for that case, so the watchdog exposure
+  `moe_small_m_threshold`'s doc records (a 1024-row chunk through that arm hung
+  the GPU) applies there to every MoE model, not just narrow ones. Read from
+  `adapter.rs` and the seam's chunk funnel; not run (no such device here).
+  `moe_small_m_chunk_cap` could take the device's `i8_dot` as a second reason to
+  cap.
+- **The capped path was run at toy sizes only.** `moe_batched_ffn_widths.rs` and
+  the synthetic deepseek2 tests (prompts to 198 tokens, three capped chunks and
+  a partial one, and the paged arm) cover it; no real-sized model with such a
+  width exists here to time or to check against the watchdog.
+- **Vulkan's small-m arm is up to 9.5e-2 of the logit RMS from the CPU on the
+  Q8_0-banked synthetic deepseek2 file** (`n_ff_exp` 32, prompts 1 to 66, both
+  GPUs), against 7.2e-2 for the batched arm at `n_ff_exp` 64. The op-level test
+  holds the small-m arm to `SMALL_M_MAX_REL` (1e-4 of the RMS) against an f64
+  reference with f32 activations, and it measured about 1e-6 there, so the gap
+  is presumably the CPU's int8 activation rounding compounding over two MoE
+  layers; not checked against the CPU's `reference()` mode.
+- **Validation layers do not see this class.** The pre-fix repro ran clean under
+  `VK_LAYER_KHRONOS_validation` on the discrete GPU: a zero-workgroup dispatch
+  is legal and an uninitialised read is not flagged. GPU-assisted validation was
+  not tried. The debug build's `alloc_uninit` poison (0xFF, NaN as f32) is what
+  made the symptom a deterministic NaN.
+- **Routing near-ties look like kernel errors on unbiased synthetic files.** A
+  sweep of the deepseek2 file with flat routing and no `exp_probs_b` showed
+  isolated prompt lengths 1.1 to 2.4 RMS away from the CPU on Vulkan (both arms,
+  Q8_0/Q5_0/Q4_K banks), with neighbours at 2e-2 to 7e-2; consistent with a
+  routing flip, not verified. The tests use `FORCE_BIAS` or a routing margin.
 
 ### B-MLA-KV-SHIFT — a KV shift re-ropes cached K with the magnitude (2026-11-25)
 

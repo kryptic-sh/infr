@@ -249,6 +249,30 @@ pub fn moe_paged_mmq_ok(dt: DType) -> bool {
     MOE_MMQ_PAGED_DTYPES.contains(&dt)
 }
 
+/// The column tile of Vulkan's batched-MoE expert GEMMs (`BN` in the `native_gemm_mmq_*`
+/// EXPERT_GRID builds; their wide builds double it). They cover an output width in whole tiles
+/// and write nothing past the last one.
+pub const MOE_EXPERT_GEMM_TILE_N: usize = 64;
+
+/// Whether an `Op::MoeFfn` of model width `ne` and gate/up GEMM width `gate_up_width`
+/// (`n_ff_exp`, or twice it when gate and up are fused) can take the batched expert GEMMs: both
+/// GEMM widths (`gate_up_width` for gate/up, `ne` for down) must be whole numbers of
+/// [`MOE_EXPERT_GEMM_TILE_N`]. A shape that is not takes the small-m expert path instead. The
+/// Vulkan adapter's batched arms and the seam's prefill chunk cap ([`MOE_SMALL_M_CHUNK_CAP`]) both
+/// read this.
+pub fn moe_expert_gemm_widths_ok(gate_up_width: usize, ne: usize) -> bool {
+    gate_up_width.is_multiple_of(MOE_EXPERT_GEMM_TILE_N)
+        && ne.is_multiple_of(MOE_EXPERT_GEMM_TILE_N)
+}
+
+/// The tallest prefill chunk the seam runs on Vulkan for a MoE model whose widths fail
+/// [`moe_expert_gemm_widths_ok`], so that every chunk goes through the small-m expert path: the
+/// top of the row range that path was measured at (the table on `moe_small_m_threshold` in
+/// infr-vulkan's adapter), which is also the ceiling of the `moe.small_m` tuning range. Past it
+/// nothing has measured the path, and its per-(row, slot, column) workgroups at a full default
+/// chunk are what that doc records hanging the GPU.
+pub const MOE_SMALL_M_CHUNK_CAP: usize = 64;
+
 pub type Shape = Vec<usize>;
 
 /// Shape + dtype of a tensor value flowing through the graph.

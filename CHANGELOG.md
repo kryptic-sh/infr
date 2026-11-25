@@ -1291,6 +1291,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Vulkan prefill of a MoE model whose expert width (`n_ff_exp`, or the model
+  width) is not a multiple of 64 no longer gives NaN or wrong logits.** The
+  batched expert GEMMs that run prefill chunks of more than `moe.small_m` rows
+  cover their output width in whole 64-column tiles; a width under one tile got
+  no workgroups and a longer one lost its last partial tile, so the expert FFN
+  read uninitialised scratch there. Shorter chunks were right. Such a model now
+  prefills on Vulkan in chunks of at most 64 rows (an explicit `INFR_UBATCH`
+  included), all through the small-m expert path, which is slower than the
+  batched GEMMs, and the recorder refuses a partial-tile width by name. Files
+  whose widths are multiples of 64 are unchanged — Qwen3-30B-A3B (768 and 2048)
+  and ERNIE-4.5-21B-A3B (1536 and 2560) are; no shipped MoE file is known that
+  is not. The failure was seen on a synthetic DeepSeek-V2 file with
+  `n_ff_exp` 32.
 - **`infr pull` gives the connections a finished file frees to the files still
   downloading, whatever mode they started in.** A file of more than one 64 MiB
   range now starts as ranges whenever the server serves them, even when every

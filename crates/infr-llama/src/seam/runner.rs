@@ -661,6 +661,13 @@ pub(crate) fn generate_dense_backend_bound(
     // Every prefill chunk height this call reads (`crate::seam::ubatch_rows`) comes from the
     // current placement pins, which must have been made for this backend's class.
     crate::seam::debug_assert_pins_for(be);
+    // A Vulkan run of a model whose expert widths need it takes the capped prefill chunk
+    // (`crate::seam::moe_small_m_chunk_cap`), whichever entry point made the scope: before
+    // anything below sizes a cache or a chunk. The multi-device wrappers, named otherwise, get it
+    // from their chunk scope (`run_dense_oneshot`).
+    if be.name() == "vulkan" {
+        crate::seam::pin_model_chunk_cap(c);
+    }
     let (ne, nh) = (c.n_embd, c.n_head);
     // gemma4: per-layer SWA/full dims differ; size shared scratch + KV by the max over layers.
     let max_hd = c.max_head_dim();

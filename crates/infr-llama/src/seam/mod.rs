@@ -760,7 +760,7 @@ pub(crate) fn generate_dense_vulkan(
     max_new: usize,
     on_token: impl FnMut(u32),
 ) -> AResult<(Vec<u32>, GenStats)> {
-    let _scope = enter_backend_scope(vk);
+    let _scope = enter_model_scope(vk, cfg);
     generate_dense_vulkan_session(
         vk,
         g,
@@ -807,6 +807,9 @@ pub(crate) fn generate_dense_vulkan_session(
     // A caller-held `state` was sized against the pins of the scope it was made in, so the caller
     // must hold that scope across calls: a fresh one here would forget a chunk placement pinned.
     debug_assert_scope_for(vk);
+    // The model's chunk cap, for a caller whose scope was made without it. Before placement,
+    // which prices the chunk.
+    pin_model_chunk_cap(cfg);
     // Placement can allocate + upload (the pager arenas, a weight re-bind), i.e. it RECORDS on the
     // Vulkan command pool — so it takes a turn on the baton like any other GPU region. Scoped: the
     // baton is released before the runner starts stepping. See `StepGate`.
@@ -1158,15 +1161,72 @@ const ACT_RESERVE_PAD: (u64, u64) = (3, 2);
 /// `device.ubatch.is_some()` would silently re-enable the residency sweep for it, so `DeviceCfg`
 /// carries the presence flag separately and every input — valid value, `0`, garbage, unset — keeps
 /// today's behaviour bit-for-bit (R1).
+///
+/// Whatever the height, the scope's model cap ([`moe_small_m_chunk_cap`], pinned by
+/// [`enter_model_scope`] / [`PlacementPins::for_model`]) bounds it — an explicit `INFR_UBATCH`
+/// included, since the cap keeps a chunk inside the range the small-m expert path was measured at
+/// rather than tuning throughput.
 pub(crate) fn ubatch_rows(ec: &EngineConfig) -> usize {
-    ec.device.ubatch.filter(|&v| v > 0).unwrap_or_else(|| {
-        with_placement_pins(
-            |p| match p.ubatch.load(std::sync::atomic::Ordering::Relaxed) {
-                0 => p.default_ubatch, // nothing pinned
-                rows => rows,
-            },
-        )
+    use std::sync::atomic::Ordering::Relaxed;
+    with_placement_pins(|p| {
+        let rows =
+            ec.device
+                .ubatch
+                .filter(|&v| v > 0)
+                .unwrap_or_else(|| match p.ubatch.load(Relaxed) {
+                    0 => p.default_ubatch, // nothing pinned
+                    rows => rows,
+                });
+        match p.moe_chunk_cap.load(Relaxed) {
+            0 => rows, // no cap
+            cap => rows.min(cap),
+        }
     })
+}
+
+/// The prefill chunk cap a model needs on Vulkan, or `None`: an MoE model whose expert widths fail
+/// [`infr_core::tensor::moe_expert_gemm_widths_ok`] runs every `Op::MoeFfn` through the small-m
+/// expert path, at any chunk height, so its chunks are held to
+/// [`infr_core::tensor::MOE_SMALL_M_CHUNK_CAP`], the rows that path was measured at. Gate/up are
+/// one GEMM of twice `n_ff_exp` when fused ([`Config::dual_moe`], as the runner emits them).
+pub(crate) fn moe_small_m_chunk_cap(cfg: &Config) -> Option<usize> {
+    let mc = cfg.moe.as_ref()?;
+    let gate_up_width = if cfg.dual_moe() {
+        2 * mc.n_ff_exp
+    } else {
+        mc.n_ff_exp
+    };
+    (!infr_core::tensor::moe_expert_gemm_widths_ok(gate_up_width, cfg.n_embd))
+        .then_some(infr_core::tensor::MOE_SMALL_M_CHUNK_CAP)
+}
+
+/// Pin [`moe_small_m_chunk_cap`] of `cfg` on the current scope's pins: for a Vulkan run of `cfg`
+/// whose scope was made without it. A scope serves one model; the cap only ever lowers. Outside
+/// any scope it does nothing: the process-wide [`FALLBACK_PINS`] serve the CPU and Metal, which
+/// this cap is not for, and every Vulkan entry point runs in a scope of its own.
+pub(crate) fn pin_model_chunk_cap(cfg: &Config) {
+    CURRENT_PINS.with(|c| {
+        if let Some(p) = c.borrow().as_ref() {
+            pin_moe_chunk_cap(p, cfg);
+        }
+    });
+}
+
+/// Pin [`moe_small_m_chunk_cap`] of `cfg` on `pins` (a no-op for a model that needs none).
+fn pin_moe_chunk_cap(pins: &PlacementPins, cfg: &Config) {
+    if let Some(cap) = moe_small_m_chunk_cap(cfg) {
+        lower_moe_chunk_cap(pins, cap);
+    }
+}
+
+/// Cap `pins`' prefill chunk at `cap` rows. The cap only ever lowers: pins that already hold one
+/// keep the smaller.
+fn lower_moe_chunk_cap(pins: &PlacementPins, cap: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    // The closure always returns `Some`, so the update cannot fail.
+    let _ = pins.moe_chunk_cap.fetch_update(Relaxed, Relaxed, |cur| {
+        Some(if cur == 0 { cap } else { cur.min(cap) })
+    });
 }
 
 /// Did the user PIN a prefill chunk height? The PRESENCE half of `INFR_UBATCH` — the dense
@@ -1231,10 +1291,11 @@ fn default_ubatch_rows(caps: &infr_core::backend::Capabilities) -> usize {
 /// card with an integrated GPU must size every chunk for the integrated one (each wrapper reports
 /// its ranks' most conservative class). An explicit `device.ubatch` still wins (see
 /// [`ubatch_rows`]); a chunk or auto-q8 KV the enclosing scope already pinned carries over, the
-/// chunk lowered to the backend's default when that is smaller.
-fn backend_chunk_scope(caps: &infr_core::backend::Capabilities) -> PlacementScope {
+/// chunk lowered to the backend's default when that is smaller. The model `cfg`'s chunk cap
+/// ([`moe_small_m_chunk_cap`]) applies, as does one the enclosing scope held.
+fn backend_chunk_scope(caps: &infr_core::backend::Capabilities, cfg: &Config) -> PlacementScope {
     use std::sync::atomic::Ordering::Relaxed;
-    let pins = PlacementPins::for_caps(caps);
+    let pins = PlacementPins::for_model(caps, cfg);
     let rows = pins.default_ubatch;
     with_placement_pins(|cur| {
         let pinned = cur.ubatch.load(Relaxed);
@@ -1242,6 +1303,10 @@ fn backend_chunk_scope(caps: &infr_core::backend::Capabilities) -> PlacementScop
             .store(if pinned == 0 { rows } else { pinned.min(rows) }, Relaxed);
         if cur.kv_q8.get().is_some() {
             let _ = pins.kv_q8.set(());
+        }
+        let cap = cur.moe_chunk_cap.load(Relaxed);
+        if cap != 0 {
+            lower_moe_chunk_cap(&pins, cap);
         }
     });
     PlacementScope::enter(std::sync::Arc::new(pins))
@@ -1301,6 +1366,11 @@ pub(crate) fn ubatch_rows_parallel(ec: &EngineConfig) -> usize {
 /// point cannot silently take the discrete chunk on an integrated GPU.
 pub(crate) struct PlacementPins {
     ubatch: std::sync::atomic::AtomicUsize,
+    /// The model's prefill chunk cap ([`moe_small_m_chunk_cap`]), `0` for none: [`ubatch_rows`]
+    /// answers at most this, whoever set the height, so the prefill loop, the activation reserve,
+    /// the SWA ring and every fit estimate see the capped chunk. Set when the scope is made for a
+    /// model ([`PlacementPins::for_model`], [`enter_model_scope`]) and only ever lowered.
+    moe_chunk_cap: std::sync::atomic::AtomicUsize,
     /// The prefill chunk when nothing pinned one ([`default_ubatch_rows`] of the backend these
     /// pins were made for). Never changes after construction.
     default_ubatch: usize,
@@ -1334,11 +1404,20 @@ impl PlacementPins {
     pub(crate) fn for_caps(caps: &infr_core::backend::Capabilities) -> Self {
         Self {
             ubatch: Default::default(),
+            moe_chunk_cap: Default::default(),
             default_ubatch: default_ubatch_rows(caps),
             kv_q8: Default::default(),
             act_over_reserve_reported: Default::default(),
             host_tier_bytes: Default::default(),
         }
+    }
+
+    /// [`for_caps`](Self::for_caps) for a Vulkan session of the model `cfg`: its prefill chunk is
+    /// capped as that model needs ([`moe_small_m_chunk_cap`]).
+    pub(crate) fn for_model(caps: &infr_core::backend::Capabilities, cfg: &Config) -> Self {
+        let pins = Self::for_caps(caps);
+        pin_moe_chunk_cap(&pins, cfg);
+        pins
     }
 }
 
@@ -1434,6 +1513,15 @@ pub(crate) fn enter_backend_scope(be: &dyn Backend) -> Option<PlacementScope> {
             PlacementPins::for_caps(&be.capabilities()),
         )))
     }
+}
+
+/// [`enter_backend_scope`] for a Vulkan run of the model `cfg`: the scope in force (the caller's,
+/// or a fresh one for `be`) gets that model's prefill chunk cap ([`moe_small_m_chunk_cap`]) before
+/// anything reads a chunk height. A scope serves one model; the cap only ever lowers it.
+pub(crate) fn enter_model_scope(be: &dyn Backend, cfg: &Config) -> Option<PlacementScope> {
+    let scope = enter_backend_scope(be);
+    pin_model_chunk_cap(cfg);
+    scope
 }
 
 /// RAII guard binding `pins` as the current thread's placement scope. Every seam entry that runs a
@@ -4440,7 +4528,7 @@ fn run_dense_oneshot(
     max_new: usize,
     on_token: impl FnMut(u32),
 ) -> AResult<(Vec<u32>, GenStats)> {
-    let _chunk = backend_chunk_scope(&be.capabilities());
+    let _chunk = backend_chunk_scope(&be.capabilities(), cfg);
     generate_dense_backend(
         be,
         bind,
@@ -5267,7 +5355,7 @@ pub(crate) fn verify_dense_vulkan(
     ple: Option<&PerLayerEmbd>,
     tokens: &[u32],
 ) -> AResult<Vec<f32>> {
-    let _scope = enter_backend_scope(vk);
+    let _scope = enter_model_scope(vk, cfg);
     let mut logits = Vec::new();
     let mut state = None;
     generate_dense_backend(
@@ -5308,7 +5396,7 @@ pub(crate) fn verify_rows_vulkan(
     ple: Option<&PerLayerEmbd>,
     tokens: &[u32],
 ) -> AResult<Vec<f32>> {
-    let _scope = enter_backend_scope(vk);
+    let _scope = enter_model_scope(vk, cfg);
     let mut logits = Vec::new();
     let mut state = None;
     generate_dense_backend(
@@ -5604,7 +5692,7 @@ pub(crate) fn forced_run_vulkan(
 ) -> AResult<ForcedLogits> {
     let vk = infr_vulkan::VulkanBackend::new_with(ec.clone())
         .map_err(|e| anyhow!("vulkan init: {e}"))?;
-    let _scope = enter_backend_scope(&vk);
+    let _scope = enter_model_scope(&vk, cfg);
     let bind = vulkan_upload_bind(&vk);
     // `moe_topk` writes a selection, not the scores it ranked by (`Op::MoeRoute::dst_scores`).
     let mut out = forced_run(
@@ -5654,7 +5742,7 @@ pub(crate) fn greedy_tail_vulkan(
     let vk = infr_vulkan::VulkanBackend::new_with(ec.clone())
         .map_err(|e| anyhow!("vulkan init: {e}"))?;
     // One scope over the generation and the step after it, which reuses its session.
-    let _scope = enter_backend_scope(&vk);
+    let _scope = enter_model_scope(&vk, cfg);
     let want_ctx = prompt.len() + n + 2;
     let mut state = None;
     let (ids, stats) = generate_dense_vulkan_session(
@@ -6100,6 +6188,103 @@ mod seam_helper_tests {
             1024,
             "…and the height falls back"
         );
+    }
+
+    /// An MoE model whose expert widths the batched expert GEMMs cannot cover runs its prefill on
+    /// the small-m expert path, so its chunk is capped at
+    /// [`infr_core::tensor::MOE_SMALL_M_CHUNK_CAP`]: the default, a placement pin and an explicit
+    /// `INFR_UBATCH` alike, and through every candidate height the fit sweeps price. An aligned
+    /// model, fused or split, keeps the default.
+    #[test]
+    fn a_width_failing_moe_model_gets_the_capped_chunk() {
+        use infr_core::tensor::{MOE_EXPERT_GEMM_TILE_N, MOE_SMALL_M_CHUNK_CAP};
+        let moe = |n_ff_exp| crate::MoeConfig {
+            n_expert: 16,
+            n_used: 2,
+            n_ff_exp,
+            scale: 1.0,
+            gating: infr_core::graph::MoeGating::Softmax,
+            norm_w: true,
+            weight_before: false,
+            n_expert_groups: 0,
+            n_expert_groups_used: 0,
+        };
+        let tile = MOE_EXPERT_GEMM_TILE_N;
+        let model = |n_embd, n_ff_exp, fused| Config {
+            n_layer: 1,
+            n_embd,
+            moe: Some(moe(n_ff_exp)),
+            gemma4_moe: fused,
+            ..Default::default()
+        };
+        let aligned = [
+            model(tile, tile, false),
+            model(2 * tile, 3 * tile, false),
+            // Fused gate|up is one GEMM of twice `n_ff_exp`: half a tile each fills it.
+            model(tile, tile / 2, true),
+        ];
+        let failing = [
+            model(tile, tile / 2, false),
+            model(tile, 3 * tile / 2, false),
+            model(3 * tile / 2, tile, false),
+            model(3 * tile / 2, tile / 2, true),
+        ];
+        let dense = Config {
+            n_layer: 1,
+            n_embd: tile / 2,
+            ..Default::default()
+        };
+        let unset = EngineConfig::default();
+        let explicit = EngineConfig {
+            device: infr_core::config::DeviceCfg {
+                ubatch: Some(512),
+                ubatch_specified: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let default_rows = {
+            let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
+            super::ubatch_rows(&unset)
+        };
+        assert!(
+            default_rows > MOE_SMALL_M_CHUNK_CAP,
+            "the default chunk is already under the cap, so this checks nothing"
+        );
+        for cfg in aligned.iter().chain([&dense]) {
+            assert_eq!(super::moe_small_m_chunk_cap(cfg), None, "{:?}", cfg.moe);
+            let pins = PlacementPins::for_model(&Default::default(), cfg);
+            let _scope = PlacementScope::enter(std::sync::Arc::new(pins));
+            assert_eq!(super::ubatch_rows(&unset), default_rows, "{:?}", cfg.moe);
+            assert_eq!(super::ubatch_rows(&explicit), 512, "{:?}", cfg.moe);
+        }
+        for cfg in &failing {
+            assert_eq!(
+                super::moe_small_m_chunk_cap(cfg),
+                Some(MOE_SMALL_M_CHUNK_CAP),
+                "{:?}",
+                cfg.moe
+            );
+            let pins = PlacementPins::for_model(&Default::default(), cfg);
+            let _scope = PlacementScope::enter(std::sync::Arc::new(pins));
+            assert_eq!(super::ubatch_rows(&unset), MOE_SMALL_M_CHUNK_CAP);
+            assert_eq!(super::ubatch_rows(&explicit), MOE_SMALL_M_CHUNK_CAP);
+            super::pin_ubatch(256);
+            assert_eq!(super::ubatch_rows(&unset), MOE_SMALL_M_CHUNK_CAP);
+            assert!(
+                super::ubatch_candidates(&unset)
+                    .iter()
+                    .all(|&c| c <= MOE_SMALL_M_CHUNK_CAP),
+                "a fit sweep would price a chunk past the cap"
+            );
+        }
+        // The scope a one-shot Vulkan entry point enters for a model carries the cap too, over a
+        // scope the caller made without it.
+        let _outer = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
+        let cpu = infr_cpu::CpuBackend::new();
+        let inner = super::enter_model_scope(&cpu, &failing[0]);
+        assert!(inner.is_none(), "an active scope is reused");
+        assert_eq!(super::ubatch_rows(&unset), MOE_SMALL_M_CHUNK_CAP);
     }
 
     /// Two backends of different classes in one process each get their own default prefill chunk:

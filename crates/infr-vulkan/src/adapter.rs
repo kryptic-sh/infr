@@ -4154,8 +4154,19 @@ fn lower_op(
             // integer dot product falls through to the small-m path unconditionally instead (its
             // `linear_native_id_multi` id-indexed GEMVs are plain dequant-in-shader, no dp4a) —
             // correct for any `rows`, just without the batched path's cross-token weight-bank
-            // reuse (a real perf cost for large-batch MoE prefill on such hardware).
-            if rows > moe_small_m_threshold(be_) && be_.caps().i8_dot {
+            // reuse (a real perf cost for large-batch MoE prefill on such hardware). A gate/up or
+            // down width the expert GEMMs' column tile does not divide takes it too
+            // (`infr_core::tensor::moe_expert_gemm_widths_ok`: they cover whole tiles only and
+            // would leave the rest of the output unwritten). The small-m path is correct at any
+            // row count but was measured only up to `infr_core::tensor::MOE_SMALL_M_CHUNK_CAP`
+            // rows, and a full default chunk through it can hang the GPU (see
+            // `moe_small_m_threshold`), so the seam caps such a model's prefill chunk at that
+            // height; this arm does not bound `rows` itself.
+            let gu_width = if *fused_gate_up { 2 * nff } else { nff };
+            if rows > moe_small_m_threshold(be_)
+                && be_.caps().i8_dot
+                && infr_core::tensor::moe_expert_gemm_widths_ok(gu_width, ne)
+            {
                 // `matmul_mmq_experts` is dtype-generic (dp4a mmq kernels exist for every dtype in
                 // `infr_core::tensor::MOE_MMQ_DTYPES` — that's why `down_ok` already covered the
                 // wider set) and role-agnostic (gate/up/down all call the SAME function, just with
@@ -4229,7 +4240,6 @@ fn lower_op(
                 // Packed scratch, POOLED — one set serves every MoE layer in the graph. `gu_width`
                 // is the fused gate|up GEMM's output width (2*nff) vs split's (nff); `ue` (the
                 // split path's separate up-projection buffer) is unused/unallocated when fused.
-                let gu_width = if *fused_gate_up { 2 * nff } else { nff };
                 let qa = pooled(pool, be_, "moe_qa", npad * ne)?;
                 let qda = pooled(pool, be_, "moe_qda", npad * (ne / 32) * 2)?;
                 let qsa = pooled(pool, be_, "moe_qsa", npad * (ne / 32) * 2)?;
@@ -7514,7 +7524,10 @@ fn execute_paged_moe<'a>(
     // fits); buckets with count 0 never read the window. Gated on the exact dtype set that has
     // `_xpg` kernel builds (`infr_core::tensor::MOE_MMQ_PAGED_DTYPES` — the FULL
     // `MOE_MMQ_DTYPES` set, mirror checked by `moe_mmq_drift_test`) + activation + dp4a
-    // support; anything else stays on the id-GEMV arm below, which is shape-general.
+    // support, at widths the GEMMs' column tile divides
+    // (`infr_core::tensor::moe_expert_gemm_widths_ok`); anything else stays on the id-GEMV arm
+    // below, which is shape-general (the seam caps such a model's prefill chunk, as for the
+    // resident arm).
     {
         let paged_mmq_ok = infr_core::tensor::moe_paged_mmq_ok;
         let act_ok = if *fused_gate_up {
@@ -7530,6 +7543,7 @@ fn execute_paged_moe<'a>(
             && paged_mmq_ok(gdt)
             && paged_mmq_ok(udt)
             && paged_mmq_ok(ddt)
+            && infr_core::tensor::moe_expert_gemm_widths_ok(gu_width, ne)
         {
             let n_pairs = n_slots;
             // The GEMM As stage reads up to 63 rows past a segment end — pad the packed row

@@ -1589,6 +1589,149 @@ fn gpu_synthetic_deepseek2_routing_paths_execute() {
     );
 }
 
+/// [`grouped_model`] at expert width `n_ff_exp`, its expert banks in Q8_0 — a format of
+/// `infr_core::tensor::MOE_MMQ_DTYPES`, so a prefill chunk past the small-m threshold may take
+/// Vulkan's batched expert GEMMs.
+fn grouped_q8_experts_model(n_ff_exp: usize) -> SyntheticModel {
+    let mut d = ds2_dims(N_GROUPS, N_GROUPS_USED, Some(force_bias()));
+    d.n_ff_exp = n_ff_exp;
+    let mut m = deepseek2_model(&d);
+    for bank in [
+        "ffn_gate_exps.weight",
+        "ffn_up_exps.weight",
+        "ffn_down_exps.weight",
+    ] {
+        m = with_fill(m, bank, Fill::Quant(infr_core::tensor::DType::Q8_0));
+    }
+    m
+}
+
+/// The longest prompt [`gpu_synthetic_deepseek2_q8_experts_prefill_matches_cpu`] sweeps to.
+/// Prefill batches all but the last token, so its largest chunk is one row past the expert GEMMs'
+/// BM=64 row tile, and at `n_ff_exp` 32 one row past the small-m chunk cap
+/// (`infr_core::tensor::MOE_SMALL_M_CHUNK_CAP`): a second chunk.
+const Q8_EXPERTS_MAX_PROMPT: usize = infr_core::tensor::MOE_SMALL_M_CHUNK_CAP + 2;
+
+/// The bound on Vulkan's logits against the CPU's on [`grouped_q8_experts_model`], as a fraction
+/// of the CPU logits' RMS: the two round the quantized experts' activations differently, a few
+/// percent apart (measured); NaN, or a column of the expert FFN left unwritten, is not.
+const Q8_EXPERTS_MAX_REL: f32 = 0.15;
+
+/// **Every prefill length on Vulkan is finite and near the CPU on the Q8_0-banked file**, at
+/// `n_ff_exp` 32 (half the batched expert GEMMs' column tile) and 64 (one tile). The first width
+/// once gave NaN logits from 10 tokens on, the first prompt whose chunk passed the small-m
+/// threshold: the batched gate/up GEMM covered its width in whole 64-column tiles, so at 32 it got
+/// no workgroups and its output was uninitialised scratch. [`FORCE_BIAS`] pins the routing, so the
+/// gap is arithmetic.
+#[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+fn gpu_synthetic_deepseek2_q8_experts_prefill_matches_cpu() {
+    let _lk = gpu_serial_lock();
+    for n_ff_exp in [32, 64] {
+        let tmp = TempGguf::write("ds2-q8-experts", &grouped_q8_experts_model(n_ff_exp));
+        let model = load(&tmp);
+        let mut worst = 0f32;
+        for len in 1..=Q8_EXPERTS_MAX_PROMPT {
+            let prompt = ml3_prompt(len);
+            let gpu = model
+                .prefill_logits_vulkan(&prompt)
+                .expect("vulkan prefill");
+            let cpu = model.prefill_logits_cpu(&prompt).expect("cpu prefill");
+            let rel = max_abs_diff(&gpu, &cpu) / rms(&cpu);
+            assert!(
+                rel <= Q8_EXPERTS_MAX_REL,
+                "n_ff_exp {n_ff_exp}, {len} tokens: Vulkan misses the CPU by {rel:e} of the logit \
+                 RMS (NaN: a non-finite logit)"
+            );
+            worst = worst.max(rel);
+        }
+        println!(
+            "synthetic deepseek2 q8 experts, n_ff_exp {n_ff_exp}: worst max|Δ| over 1..={} \
+             tokens = {worst:e} of the logit RMS",
+            Q8_EXPERTS_MAX_PROMPT
+        );
+    }
+}
+
+/// [`grouped_q8_experts_model`]'s narrow width, whose expert FFN takes the small-m path at every
+/// chunk height, so the seam caps its Vulkan prefill chunk at
+/// `infr_core::tensor::MOE_SMALL_M_CHUNK_CAP` rows.
+const Q8_EXPERTS_NARROW_FF: usize = 32;
+
+/// A prompt of several capped prefill chunks and a partial one: it fits the synthetic file's
+/// context, and the chunks it splits into are each the cap's height but the last.
+const Q8_EXPERTS_LONG_PROMPT: usize = 3 * infr_core::tensor::MOE_SMALL_M_CHUNK_CAP + 6;
+
+/// **A long prompt on the narrow Q8_0-banked file matches the CPU on Vulkan**, through several
+/// prefill chunks of the small-m cap (the cap itself is checked by the seam's
+/// `a_width_failing_moe_model_gets_the_capped_chunk`). Held to [`Q8_EXPERTS_MAX_REL`].
+#[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+fn gpu_synthetic_deepseek2_q8_experts_long_prompt_matches_cpu() {
+    let _lk = gpu_serial_lock();
+    let tmp = TempGguf::write(
+        "ds2-q8-experts-long",
+        &grouped_q8_experts_model(Q8_EXPERTS_NARROW_FF),
+    );
+    let model = load(&tmp);
+    let prompt = ml3_prompt(Q8_EXPERTS_LONG_PROMPT);
+    let gpu = model
+        .prefill_logits_vulkan(&prompt)
+        .expect("vulkan prefill");
+    let cpu = model.prefill_logits_cpu(&prompt).expect("cpu prefill");
+    let rel = max_abs_diff(&gpu, &cpu) / rms(&cpu);
+    println!(
+        "synthetic deepseek2 q8 experts, {} tokens: max|Δ| = {rel:e} of the logit RMS",
+        prompt.len()
+    );
+    assert!(
+        rel <= Q8_EXPERTS_MAX_REL,
+        "{} tokens: Vulkan misses the CPU by {rel:e} of the logit RMS",
+        prompt.len()
+    );
+}
+
+/// The pager budget [`gpu_synthetic_deepseek2_q8_experts_paged_matches_cpu`] runs at: a few
+/// expert layers' banks, so the synthetic file's experts page through the cache.
+const Q8_EXPERTS_PAGER_BYTES: u64 = 4 * 1024 * 1024;
+
+/// **The paged expert path on the narrow Q8_0-banked file matches the CPU.** `paging.cache` sends
+/// every MoE layer through `execute_paged_moe`, whose batched arm has its own width gate; the
+/// prompt's chunks pass the small-m threshold, so without that gate the paged expert GEMM would be
+/// recorded at a partial column tile (and refused by the recorder by name). The run is a
+/// production greedy generation ([`infr_llama::SeamModel::greedy_tail_vulkan`], the path that
+/// places and pages the experts) and its last step's logits, held to the CPU's over the same
+/// tokens at [`Q8_EXPERTS_MAX_REL`].
+#[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+fn gpu_synthetic_deepseek2_q8_experts_paged_matches_cpu() {
+    let _lk = gpu_serial_lock();
+    let tmp = TempGguf::write(
+        "ds2-q8-experts-paged",
+        &grouped_q8_experts_model(Q8_EXPERTS_NARROW_FF),
+    );
+    let model = load(&tmp);
+    let prompt = ml3_prompt(Q8_EXPERTS_MAX_PROMPT);
+    let tail = model
+        .greedy_tail_vulkan(
+            |c| c.paging.cache = Some(infr_core::SizeSpec::Bytes(Q8_EXPERTS_PAGER_BYTES)),
+            &prompt,
+            1,
+        )
+        .expect("paged vulkan generation");
+    let seq: Vec<u32> = prompt.iter().chain(&tail.ids).copied().collect();
+    let cpu = model.prefill_logits_cpu(&seq).expect("cpu prefill");
+    let rel = max_abs_diff(&tail.row, &cpu) / rms(&cpu);
+    println!(
+        "synthetic deepseek2 q8 experts, paged, {} tokens: max|Δ| = {rel:e} of the logit RMS",
+        seq.len()
+    );
+    assert!(
+        rel <= Q8_EXPERTS_MAX_REL,
+        "paged: Vulkan misses the CPU by {rel:e} of the logit RMS"
+    );
+}
+
 /// [`gpu_synthetic_deepseek2_matches_cpu`]'s V3.2 twin — the only cross-backend check the lightning
 /// indexer will ever get, since no real `deepseek32` file exists. Everything the indexer adds runs
 /// on the GPU here: `layernorm.comp`, `rope.comp`'s `-DNEOX` build, the second `WriteKv` into the
@@ -3934,40 +4077,35 @@ fn synthetic_mistral_large3_straddling_chunk_matches_one_row_at_a_time() {
     assert_eq!(dv, 0.0, "a straddling chunk moved the logits");
 }
 
-/// The prefill chunk height [`gpu_synthetic_mistral_large3_straddling_chunk_matches_one_row_at_a_time`]
-/// runs at:
-/// one whose chunks do not align with [`ML3_TEMP_LENGTH`], so one of them straddles it, and short
-/// enough to stay under the Vulkan batched-MoE row count at which this synthetic file's quantized
-/// experts give NaN logits (backlog B-ATTN-TEMP).
-const ML3_VULKAN_STRADDLE_UBATCH: usize = 5;
-
 /// [`synthetic_mistral_large3_straddling_chunk_matches_one_row_at_a_time`] on Vulkan, where
-/// `attn_temp.comp` steps the position per row: the quantized model prefilled in chunks of
-/// [`ML3_VULKAN_STRADDLE_UBATCH`], one of which straddles the length (checked on the CPU through the
-/// op tap; the tap is CPU-only), against the same model one row per graph, at
+/// `attn_temp.comp` steps the position per row: the quantized model's default prefill, one
+/// multi-row chunk across the length (checked on the CPU through the op tap; the tap is CPU-only),
+/// against the same model one row per graph, at
 /// [`ML3_VULKAN_MAX_ABS`]: the two agree exactly on the discrete GPU and to reassociation on the
-/// integrated one (measured). Against the CPU they are int8-activation rounding apart, too far to
-/// judge the mapping.
+/// integrated one (measured). The bound holds because this file's expert width is narrower than
+/// the batched expert GEMMs' column tile, which sends the chunked run's MoE to the same small-m
+/// path the one-row run takes (and caps its chunk); if those kernels gain partial-tile support, the
+/// chunked run moves to int8 activations and this bound will need revisiting. Against the CPU they
+/// are int8-activation rounding apart, too far to judge the mapping.
 #[test]
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_synthetic_mistral_large3_straddling_chunk_matches_one_row_at_a_time() {
     let _lk = gpu_serial_lock();
     let tmp = TempGguf::write("ml3-straddle-vk", &mistral_large3_quantized_model());
     let prompt = ml3_prompt(*ML3_PROMPT_LENS.last().expect("lengths"));
-    let (_, temps) = ml3_attn_temps(&tmp, &prompt, Some(ML3_VULKAN_STRADDLE_UBATCH));
+    let (_, temps) = ml3_attn_temps(&tmp, &prompt, None);
     assert!(
         temps
             .iter()
             .any(|&(rows, pos)| rows > 1 && pos < ML3_TEMP_LENGTH && pos + rows > ML3_TEMP_LENGTH),
         "no chunk straddles the temperature length: {temps:?}"
     );
-    let mut cfg = env_cfg();
-    cfg.device.ubatch = Some(ML3_VULKAN_STRADDLE_UBATCH);
-    cfg.device.ubatch_specified = true;
-    let chunked = load_with(&tmp, cfg.clone())
+    let chunked = load(&tmp)
         .prefill_logits_vulkan(&prompt)
         .expect("vulkan prefill");
+    let mut cfg = env_cfg();
     cfg.device.ubatch = Some(1);
+    cfg.device.ubatch_specified = true;
     let rows = load_with(&tmp, cfg)
         .prefill_logits_vulkan(&prompt)
         .expect("vulkan prefill");

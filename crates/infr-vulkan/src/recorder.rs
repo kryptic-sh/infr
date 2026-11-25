@@ -53,6 +53,15 @@ pub(crate) const DN_SEQ_NCOL: usize = 2;
 /// BM=64 as the segments fill in.
 const MOE_EXPERT_SMALL_TILE_AVG_ROWS: usize = 24;
 
+/// The batched-MoE expert GEMMs' default column tile ([`infr_core::tensor::MOE_EXPERT_GEMM_TILE_N`],
+/// `BN` in the `native_gemm_mmq_*` EXPERT_GRID builds; the wide `_xp128`/`_xp32w` builds double
+/// it). The kernels cover `n` in whole tiles only and write nothing past the last one, so `n` must
+/// be a multiple of the tile a dispatch picks: [`Recorder::matmul_mmq_experts`] and
+/// [`Recorder::matmul_mmq_experts_paged`] refuse one that is not, and the adapter's batched
+/// `MoeFfn` arms send such a shape to the small-m id-GEMV path instead
+/// ([`infr_core::tensor::moe_expert_gemm_widths_ok`]).
+pub(crate) const MOE_EXPERT_BN: usize = infr_core::tensor::MOE_EXPERT_GEMM_TILE_N;
+
 /// Max K for which the DEFAULT (BM=64) expert tile takes the BN=128 wide-N kernel (`_xp128`).
 ///
 /// Wide-N halves the per-workgroup activation (As) staging and the workgroup count, but costs
@@ -10141,7 +10150,9 @@ impl<'a> Recorder<'a> {
     /// The x workgroup count of the expert GEMM `name` ([`expert_grid_x`] at this device's
     /// `maxComputeWorkGroupCount[0]`, `KernelLimits::workgroup_count_x`), or `None` once the
     /// refusal is kept for finishing the recorder to return: the dispatch is not recorded, and the
-    /// open command buffer never runs.
+    /// open command buffer never runs. An `n` that is not a whole number of `bn`-column tiles is
+    /// refused too: the grid would cover only the whole tiles (none at all below one tile), and
+    /// the columns past them would keep whatever the output buffer held.
     fn expert_grid_x_or_refuse(
         &self,
         name: &str,
@@ -10151,6 +10162,13 @@ impl<'a> Recorder<'a> {
         n: usize,
         bn: usize,
     ) -> Option<u32> {
+        if !n.is_multiple_of(bn) {
+            self.fail(be(format!(
+                "vulkan recorder: batched-MoE expert GEMM {name} ({dtype:?}) covers its output \
+                 width in whole {bn}-column tiles, and n={n} is not a multiple of {bn}"
+            )));
+            return None;
+        }
         let max_x = self.be.kernel_limits().workgroup_count_x;
         match expert_grid_x(rows, bm, n, bn, max_x) {
             Ok(gx) => Some(gx),
@@ -10235,11 +10253,15 @@ impl<'a> Recorder<'a> {
             .expect("resident-BDA weight: matmul_mmq_experts requires a u64 BDA device address");
         let avg_rows = rows.saturating_mul(n_used) / n_expert.max(1);
         let small_tile = avg_rows <= MOE_EXPERT_SMALL_TILE_AVG_ROWS;
-        let wide_bn = n.is_multiple_of(128)
+        let wide_bn = n.is_multiple_of(2 * MOE_EXPERT_BN)
             && (small_tile || k <= MOE_EXPERT_WIDE_BN_MAX_K)
             && matches!(dtype, infr_core::DType::Q4K | infr_core::DType::Q6K);
         let bm: usize = if small_tile { 32 } else { 64 };
-        let bn: usize = if wide_bn { 128 } else { 64 };
+        let bn: usize = if wide_bn {
+            2 * MOE_EXPERT_BN
+        } else {
+            MOE_EXPERT_BN
+        };
         // Kernel selection from the SINGLE dtype→kernel table shared with the paged twin (see
         // [`moe_mmq_desc`]) — resident suffix + tile picked here, byte-identical to the old inline
         // match. `wide_bn` is only ever set for Q4_K/Q6_K (see its definition above), which are the
@@ -10357,7 +10379,7 @@ impl<'a> Recorder<'a> {
         });
         let (name, spv) = if small_tile { desc.xpg32 } else { desc.xpg };
         // Checked before any label is set, so a refused dispatch leaves none pending.
-        let Some(gx) = self.expert_grid_x_or_refuse(name, dtype, rows, bm, n, 64) else {
+        let Some(gx) = self.expert_grid_x_or_refuse(name, dtype, rows, bm, n, MOE_EXPERT_BN) else {
             return;
         };
         self.label_next(stage);

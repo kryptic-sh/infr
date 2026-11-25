@@ -317,9 +317,9 @@ fn assert_native_k(kernel: &str, in_f: usize) {
     );
 }
 
-/// Threads per `rope.comp` workgroup, one per (token, head): a rope grid is this many times fewer
-/// workgroups than the (token, head) pairs it covers. MIRRORS the shader's `local_size_x`;
-/// `rope_wg_matches_shader` fails on a drift.
+/// Threads per `rope.comp` workgroup: the shader grid-strides over `(token, head, slot)`, so this
+/// is the workgroup WIDTH only. MIRRORS the shader's `local_size_x`; `rope_wg_matches_shader`
+/// fails on a drift.
 pub(crate) const ROPE_WG: usize = 64;
 
 /// Threads per `attention.comp` workgroup, one per (token, head), as [`ROPE_WG`] is for rope.
@@ -333,6 +333,14 @@ pub(crate) const SPLITK_REDUCE_WG: usize = 64;
 /// Threads per `moe_ep_band_remap.comp` workgroup, one per packed (token, slot) assignment.
 /// MIRRORS the shader's `local_size_x`; `moe_ep_band_remap_wg_matches_shader` fails on a drift.
 pub(crate) const MOE_EP_BAND_REMAP_WG: usize = 64;
+
+/// Workgroups for `rope.comp`, which grid-strides one thread over each `(token, head, slot)` — a
+/// slot rotates one pair, or copies two elements of `[rope_dim, hd)`. The shader strides past the
+/// launched grid, so this sizes the parallelism and never bounds coverage; `dispatch_wide` splits a
+/// grid past the guaranteed group count.
+fn rope_groups(t: usize, n_heads: usize, hd: usize) -> u32 {
+    (t * n_heads * hd.div_ceil(2)).div_ceil(ROPE_WG).max(1) as u32
+}
 
 /// 32-element blocks `quant_q8.comp` quantizes per workgroup, one subgroup each. MIRRORS the
 /// shader's `QUANT_Q8_BLOCKS_PER_WG`; `quant_q8_blocks_per_wg_matches_shader` fails on a drift.
@@ -5790,7 +5798,7 @@ impl<'a> Recorder<'a> {
                     &[Self::vkb(x), Self::vkb(ff), Self::vkb(y)],
                     1,
                     &push,
-                    (t * n_heads).div_ceil(ROPE_WG) as u32,
+                    rope_groups(t, n_heads, hd),
                 );
             }
             None => {
@@ -5808,7 +5816,7 @@ impl<'a> Recorder<'a> {
                     &[Self::vkb(x), Self::vkb(y)],
                     1,
                     &push,
-                    (t * n_heads).div_ceil(ROPE_WG) as u32,
+                    rope_groups(t, n_heads, hd),
                 );
             }
         }
@@ -5851,7 +5859,7 @@ impl<'a> Recorder<'a> {
                     &[Self::vkb(x), Self::vkb(ff), Self::vkb(y)],
                     1,
                     &push,
-                    (t * n_heads).div_ceil(ROPE_WG) as u32,
+                    rope_groups(t, n_heads, hd),
                 );
             }
             None => {
@@ -5863,7 +5871,7 @@ impl<'a> Recorder<'a> {
                     &[Self::vkb(x), Self::vkb(y)],
                     1,
                     &push,
-                    (t * n_heads).div_ceil(ROPE_WG) as u32,
+                    rope_groups(t, n_heads, hd),
                 );
             }
         }
@@ -5904,7 +5912,7 @@ impl<'a> Recorder<'a> {
                     &[Self::vkb(x), Self::vkb(params), Self::vkb(ff), Self::vkb(y)],
                     1,
                     &push,
-                    (t * n_heads).div_ceil(ROPE_WG) as u32,
+                    rope_groups(t, n_heads, hd),
                 );
             }
             None => {
@@ -5916,7 +5924,7 @@ impl<'a> Recorder<'a> {
                     &[Self::vkb(x), Self::vkb(params), Self::vkb(y)],
                     1,
                     &push,
-                    (t * n_heads).div_ceil(ROPE_WG) as u32,
+                    rope_groups(t, n_heads, hd),
                 );
             }
         }
@@ -6944,7 +6952,7 @@ impl<'a> Recorder<'a> {
                     &[Self::vkb(x), Self::vkb(ff), Self::vkb(y)],
                     1,
                     &push,
-                    (t * n_heads).div_ceil(ROPE_WG) as u32,
+                    rope_groups(t, n_heads, hd),
                 );
             }
             None => {
@@ -6956,7 +6964,7 @@ impl<'a> Recorder<'a> {
                     &[Self::vkb(x), Self::vkb(y)],
                     1,
                     &push,
-                    (t * n_heads).div_ceil(ROPE_WG) as u32,
+                    rope_groups(t, n_heads, hd),
                 );
             }
         }
@@ -7002,7 +7010,7 @@ impl<'a> Recorder<'a> {
                     &[Self::vkb(x), Self::vkb(params), Self::vkb(ff), Self::vkb(y)],
                     1,
                     &push,
-                    (t * n_heads).div_ceil(ROPE_WG) as u32,
+                    rope_groups(t, n_heads, hd),
                 );
             }
             None => {
@@ -7017,7 +7025,7 @@ impl<'a> Recorder<'a> {
                     &[Self::vkb(x), Self::vkb(params), Self::vkb(y)],
                     1,
                     &push,
-                    (t * n_heads).div_ceil(ROPE_WG) as u32,
+                    rope_groups(t, n_heads, hd),
                 );
             }
         }
@@ -12425,6 +12433,24 @@ mod tests {
         assert!(src.contains(&want), "rope.comp lacks `{want}`");
     }
 
+    /// [`rope_groups`] sizes the slot grid `rope.comp` grid-strides over, so it is a parallelism
+    /// choice: it has to cover every `(token, head, slot)` at least once, and a decode dispatch must
+    /// not be one workgroup of mostly idle lanes (14 heads launched 1 workgroup before).
+    #[test]
+    fn rope_groups_size_the_slot_grid() {
+        // One token, 32 heads, hd 128: 2048 slots = 32 full workgroups.
+        assert_eq!(rope_groups(1, 32, 128), 32);
+        // Every slot gets its own thread.
+        assert_eq!(
+            rope_groups(512, 32, 128) as usize * ROPE_WG,
+            512 * 32 * 128 / 2
+        );
+        // An odd head dim rounds a tail copy up to a whole slot's worth of threads.
+        assert_eq!(rope_groups(1, 1, 5), 1);
+        // A prefill grid past the guaranteed group count still covers every slot via the stride.
+        assert!(rope_groups(65_536, 64, 512) > Recorder::MAX_GROUP_COUNT_X);
+    }
+
     #[test]
     fn attention_wg_matches_shader() {
         let src = include_str!("../shaders/attention.comp");
@@ -12783,12 +12809,12 @@ mod tests {
         // Not a multiple of the workgroup width or of `SPLIT_AT`, so the split grid has a ragged
         // last workgroup and padding workgroups after it.
         const N: usize = 64 * 10 + 5;
-        // Row-shaped cases. The rope family and `attention` take ROWS tokens of W heads: one
-        // thread per (token, head) pair in `ROPE_WG`- / `ATTENTION_WG`-wide workgroups, so their
-        // grid is N threads like the elementwise kernels'. Both runs here use one grid, so a grid
-        // sized short of the pairs leaves the same rows unwritten in both and passes:
-        // `rope_recorder_matches_host` and `attention_recorder_matches_host` hold the sizing to a
-        // host reference.
+        // Row-shaped cases. The rope family and `attention` take ROWS tokens of W heads: rope one
+        // thread per (token, head, pair-or-tail) slot in `ROPE_WG`-wide workgroups, `attention` one
+        // per (token, head) pair in `ATTENTION_WG`-wide ones. Neither run here proves the grid
+        // covers its work — a grid sized short leaves the same rows unwritten in both runs and
+        // passes — so `rope_recorder_matches_host` and `attention_recorder_matches_host` hold the
+        // sizing to a host reference.
         const ROWS: usize = 5;
         const W: usize = 129;
         const _: () = assert!(ROWS * W == N);
@@ -13460,8 +13486,8 @@ mod tests {
     /// Every recorder rope dispatch site against `ops::tests::host_rope`, through `dispatch_wide`
     /// at two shapes: one whose last workgroup is ragged, and, with the split point lowered, one
     /// whose grid takes the 2-D split and ends in a padding workgroup. Each output starts NaN, so a
-    /// (token, head) pair the grid leaves out fails the bound; the grid each site recorded is
-    /// pinned to one thread per pair in `ROPE_WG`-wide workgroups, so a grid too large fails too.
+    /// (token, head, slot) the grid leaves out fails the bound; the grid each site recorded is
+    /// pinned to `rope_groups`, so a grid too large fails too.
     /// `elementwise_ops_split_wide_grids` cannot catch a short grid: both of its runs use one.
     #[test]
     #[ignore = "requires a Vulkan GPU"]
@@ -13684,7 +13710,10 @@ mod tests {
                         i / HD % nh,
                     );
                 }
-                let groups = (t * nh).div_ceil(ROPE_WG) as u32;
+                // One thread per (token, head, slot), and no more than that: the shader strides,
+                // so a coarser grid still covers every slot and the NaN-filled output below fails
+                // one it leaves out.
+                let groups = rope_groups(t, nh, HD);
                 assert_eq!(
                     grids,
                     [(*name, wide_grid(groups, split))],

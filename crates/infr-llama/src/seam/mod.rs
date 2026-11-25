@@ -1978,8 +1978,8 @@ impl KvAlign {
 }
 
 /// [`kv_bytes_estimate_fmt`] with one format for both sides: `q8` prices them Q8_0, else f16. The
-/// pricing helper the MoE expert-placement budget and the CPU arena budget read, so both reserve
-/// the cache the runner will allocate, a pinned auto-q8 cache included.
+/// pricing helper the CPU arena budget reads, so it reserves the cache the runner will allocate, a
+/// pinned auto-q8 cache included. A caller pricing a pair the user chose reads [`moe_kv_estimate`].
 pub(crate) fn kv_bytes_estimate(
     cfg: &Config,
     want_ctx: usize,
@@ -2504,6 +2504,26 @@ pub(crate) fn kv_fit_fmts(cfg: &Config, ec: &EngineConfig, auto_q8: bool) -> (DT
     };
     let k = side(ec.kv.type_k);
     (k, kv_v_fmt(cfg, k, side(ec.kv.type_v)))
+}
+
+/// The KV bytes the MoE expert-placement budget holds back: [`kv_bytes_estimate_fmt`] at the pair
+/// the runner will allocate ([`kv_fit_fmts`]), in the backend's own rounding.
+///
+/// [`kv_bytes_estimate`] prices both sides as ONE format, which is only right while the user set
+/// neither side: an explicit `INFR_KV_TYPE_K`/`_V` pair (f32 both sides, or q8_0 on one) priced a
+/// cache the runner never allocates. Over-reserving pages experts for room the cache never took;
+/// under-reserving spends the difference and lands in the alloc-time VRAM guard mid-load, which is
+/// a backstop against over-commit, not a placement decision.
+pub(crate) fn moe_kv_estimate(
+    cfg: &Config,
+    ec: &EngineConfig,
+    want_ctx: usize,
+    ring: bool,
+    ubatch: usize,
+    align: KvAlign,
+) -> u64 {
+    let (k, v) = kv_fit_fmts(cfg, ec, kv_auto_q8());
+    kv_bytes_estimate_fmt(cfg, want_ctx, ring, ubatch, align, k, v)
 }
 
 /// Device memory a live session commits AFTER its KV cache is allocated, which therefore has to be
@@ -3457,11 +3477,13 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 // Per-layer rows: SWA layers ring at window+ubatch rows (see `kv_rows_at`), so a
                 // mostly-SWA model's KV prices far below n_layer * ctx.
                 let ring = kv_ring_wanted(cfg, ec);
-                // Route through the shared q8-aware helper (the dense placement path already does),
-                // so a pinned auto-q8 KV cache is priced at ~half the bytes instead of the old
-                // hard-coded f16 `*2*2` — which over-reserved ~2× and forced avoidable expert paging.
+                // Price the pair the runner will allocate: `kv_fit_fmts` walks the same ladder
+                // `parse_kv_fmt` does, so an explicit format reserves its own bytes instead of a
+                // single-format guess. That guess over-reserved ~2× for an explicit q8_0 pair
+                // (avoidable expert paging) and under-reserved the same for f32, leaving the
+                // alloc-time guard to refuse the real cache mid-load.
                 let kv_bytes: u64 =
-                    kv_bytes_estimate(cfg, want_ctx, ring, ubatch_rows(ec), align, kv_auto_q8());
+                    moe_kv_estimate(cfg, ec, want_ctx, ring, ubatch_rows(ec), align);
                 // Budgeted against the ALLOCATOR's ceiling (`VramInfo::alloc_room`), like the
                 // dense sweeps below and the context-fit math: the last 256 MiB of "free" VRAM is
                 // the guard's headroom and can never be handed out, so an expert budget sized
@@ -9000,6 +9022,58 @@ mod seam_helper_tests {
         assert_eq!(
             super::kv_bytes_estimate_fmt(&mla, 1000, false, 512, rows16, k8, v16),
             27 * (616_896 + 258_048)
+        );
+    }
+
+    /// The MoE expert-placement budget holds back the KV cache the runner will allocate, so it
+    /// prices the (K, V) pair the runner resolved — not one format for both sides. Pricing a
+    /// single format is wrong in both directions: an explicit `INFR_KV_TYPE_K/_V=f32` pair
+    /// allocates 4 B/elem but reserved 2, so the expert arena is sized against a cache twice the
+    /// real one and the over-commit lands on the alloc-time VRAM guard; an explicit q8_0 pair
+    /// allocates ~1.06 B/elem but reserved 2, paging experts for room the cache never took.
+    ///
+    /// One plain layer of 2 KV heads x 64 is 128 elements a side, and at 1000 rows with no
+    /// rounding: f16 256 000 B a side, f32 512 000, q8_0 4000 blocks x 34 = 136 000.
+    #[test]
+    fn moe_budget_prices_the_kv_pair_the_runner_allocates() {
+        let cfg = Config {
+            n_layer: 1,
+            n_embd: 256,
+            n_head: 4,
+            n_kv: 2,
+            head_dim: 64,
+            ..Default::default()
+        };
+        let (ctx, ub) = (1000usize, 512usize);
+        let pair = |k: Option<DType>, v: Option<DType>| EngineConfig {
+            kv: infr_core::config::KvCfg {
+                type_k: k,
+                type_k_specified: k.is_some(),
+                type_v: v,
+                type_v_specified: v.is_some(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // The MoE binder's own budget term, which the expert placement subtracts.
+        let estimate = |ec: &EngineConfig| {
+            super::moe_kv_estimate(&cfg, ec, ctx, false, ub, super::KvAlign::NONE)
+        };
+        assert_eq!(estimate(&pair(None, None)), 512_000, "f16, both sides");
+        assert_eq!(
+            estimate(&pair(Some(DType::F32), Some(DType::F32))),
+            1_024_000,
+            "f32 prices 4 B/elem on both sides"
+        );
+        assert_eq!(
+            estimate(&pair(Some(DType::Q8_0), Some(DType::Q8_0))),
+            272_000,
+            "q8_0 prices 34 B per 32 elems, ~half of f16"
+        );
+        assert_eq!(
+            estimate(&pair(Some(DType::Q8_0), None)),
+            392_000,
+            "an explicit K alone leaves V at f16"
         );
     }
 

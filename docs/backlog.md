@@ -35,19 +35,25 @@ line when its slice ships.
 Queue order (the owner's): MoE routing first, then the rest in the order below.
 (Item 1, the download fan-out, shipped; see B-FANOUT for what it left.)
 
-2. **MoE routing: keep int8, fix the GPU activation quantizer (B207).** Measured
-   2026-11-25 (`docs/gpu-tolerance.md`, "MoE routing, int8 against float"): the
-   router already runs on float activations, so the gap is upstream int8 error
-   in the hidden state; Float decodes at the shipped speed and prefills about
-   5.6 times slower on Qwen3-30B-A3B on the RX 7900 XTX. **Decided by the owner,
-   2026-11-25:** the default stays int8. Next slice: outlier handling in
-   `quant_q8.comp` for the activations feeding the expert kernels (and f32 block
-   scales and sums as a second variant), measured with the same harness on both
-   models and both GPUs plus a decode and prefill A/B; if it does not close most
-   of the gap, back to the owner with the numbers. To measure in the same slice
-   because it looked free: the dense decode GEMVs on float for MoE models only
-   (decode read the same speed with them float). The real MoE rows of the
-   tolerance table wait for that result.
+2. **MoE routing: keep int8, fix the GPU activation quantizer (B207).** The
+   slice ran 2026-11-25 (`docs/gpu-tolerance.md`, "The routed experts' outlier
+   quantizer"): f32 block scales and sums change nothing; carrying each
+   32-block's outlier exactly fixes the first rows, and is built as the
+   experimental Vulkan tuning parameter `quant_q8.experts_hi` (off). It takes
+   Qwen3-30B-A3B's first rows from 3.8e-2 to 2.5e-4 (RX 7900 XTX) and 1.3e-3
+   (integrated GPU) and lowers the forced KL on the RX 7900 XTX, but leaves the
+   routing gap: forced, the selections differing fall by 1% to 21%
+   (Qwen3-30B-A3B on the RX 7900 XTX: 339 to 318), where the Float runs differ
+   at only 13 to 20 selections. The dense decode GEMVs on float
+   (`kernels.vulkan.mmv_mw = false`, measured, not built as a MoE-only switch)
+   take 7% to 19% off the selections differing and 5% to 44% off the mean KL.
+   **For the owner:** (i) `quant_q8.experts_hi` on by default for MoE models,
+   after the prefill A/B (commands in the doc; its structural cost is 8 bytes
+   per 32 activations read and written, no extra dispatch); (ii) a MoE-only
+   float decode switch, its decode A/B first; (iii) whether the routing gap is
+   worth more (the simulation's only lever was finer blocks, 8 elements: about
+   40% fewer selections differing, a change to every int8 kernel family). The
+   real MoE rows of the tolerance table still wait for these.
 3. **`kv.overflow` without `VK_EXT_memory_budget`.** Stays off there
    (`kv_spill_armed`). Add a one-line load warning that the flag has no effect
    on this driver and why.
@@ -5056,7 +5062,9 @@ attention-factor rule (`config::yarn_mscale_ratio`).
   `moe_topk_refuses_groups_it_cannot_route`, on both GPUs. Each test makes a
   dispatch refuse with an error and drops its recorder without `finish` (read,
   likely the cause, not confirmed); this slice's diff leaves those tests and the
-  methods they call untouched. Not run on HEAD.
+  methods they call untouched. Confirmed pre-existing 2026-11-25: a detached
+  worktree of `824c5989` (before the `quant_q8.experts_hi` slice) reported the
+  same error once in each of those three tests on the integrated GPU. Not fixed.
 
 ### B-PP-SLOW-RUNS — whole bench runs at two thirds or a quarter of the usual prefill speed (2026-11-25)
 
@@ -7820,32 +7828,39 @@ values. What it leaves:
     model is the owner's call (on the integrated GPU the test's memory rule
     needs about 39 GB of free host memory for ERNIE, about 50 GB for
     Qwen3-30B-A3B).
-  - **Candidate next slice: a more accurate `quant_q8` on the GPU, for the
-    steady-state routing gap and the first rows alike.** Every int8 family the
-    decomposition names quantizes through `quant_q8.comp` (one scale per 32
-    activations, `amax/127`, the scale and block sum stored as f16, no outlier
-    split). Options, none tried: (a) the CPU's outlier split
-    (`docs/cpu-activations.md`) in `quant_q8` and the kernels that read it; (b)
-    f32 block scales and sums in place of f16; (c) a finer activation format for
-    the routed experts' batched GEMM alone, the larger share on the RX 7900 XTX.
-    Each needs its accuracy measured by this harness (forced selections
-    differing and their widest margin, forced KL, the first rows, both GPUs,
-    both models) and its decode and prefill speed against today's in a quiet
-    window. Which kernel families an option touches decides the work: (a) and
-    (b) change every int8 GEMV and GEMM that reads the quantized activations.
-  - **Decode and prefill cost of the float alternatives: not timed.** Needs a
-    quiet window; the A/B commands are in `docs/gpu-tolerance.md`. The router
-    itself costs the same in every configuration (one F32 GEMV per routed layer
-    per token, no activation pass). Float loses the int8 dense decode GEMVs and,
+  - **The GPU activation quantizer, measured and partly built (2026-11-25,
+    `docs/gpu-tolerance.md`, "The routed experts' outlier quantizer").**
+    Simulated on the CPU reference's own expert activations (a scratch
+    instrumentation of its expert banks, not committed): (b) f32 scales and sums
+    change nothing; (a) carrying a 32-block's largest value exactly when it is
+    over 16 times every other fixes the first rows (Qwen3-30B-A3B 3.4e-2 to
+    2.5e-4) and lowers the forced KL; (c) 16- and 8-element blocks only shrink
+    the first rows (9.4e-3, 3.4e-3) but are the one lever on the routing gap (8
+    elements: 314 to 188 selections differing on Qwen3-30B-A3B). (a) is built
+    behind the tuning parameter `quant_q8.experts_hi` (off):
+    `quant_q8.comp -DHI` and the Q4_K/Q6_K resident expert tiles `-DACT_HI`,
+    switched in `Op::MoeFfn`'s resident batched arm. Left: the prefill and
+    decode A/B (commands in the doc); the paged expert path (`_xpg`) and the
+    other expert formats keep the shipped quantizer; the integrated GPU's int8
+    dense prefill GEMM (`nc_gemm_choice`'s `mmq` tile), the larger share of that
+    device's gap, has no outlier handling, nor do the dense decode GEMVs;
+    Windows has run none of it. The ratio (16, the CPU's) is a trade the
+    simulation puts close: 8 takes a little more of the steady KL.
+  - **Decode and prefill cost of the float alternatives: timed once, not in a
+    quiet window** (`docs/gpu-tolerance.md`, "Cost"). A quiet window is still
+    owed; the A/B commands are in `docs/gpu-tolerance.md`. The router itself
+    costs the same in every configuration (one F32 GEMV per routed layer per
+    token, no activation pass). Float loses the int8 dense decode GEMVs and,
     with `i8_dot` off, the routed experts' batched prefill GEMM altogether
     (every chunk then takes the per-row small-batch path), so its prefill cost
     may be large.
   - **Qwen3-30B-A3B's first rows are far off on the shipped GPU path**: 3.8e-2
-    (RX 7900 XTX) and 3.9e-2 (integrated GPU) worst KL in the first two
-    positions (`gpu-ub32`; position 0 on every prompt), three times the CPU
-    production's 1.1e-2; with the routed experts on float 1.8e-5 and 1.2e-3.
-    Candidate causes, untried: no outlier split in `quant_q8`, and its f16
-    `dact`/`sact`; the fix is the previous item's.
+    (RX 7900 XTX) and 3.9e-2 (integrated GPU) in the first two positions, three
+    times the CPU production's 1.1e-2. Cause found: position 0's massive
+    activations make the other 31 elements of their 32-block quantize to 0 in
+    the routed experts' activations. Fixed with `quant_q8.experts_hi` on (2.5e-4
+    and 1.3e-3, the rest on the integrated GPU being its int8 dense prefill
+    GEMM); shipped still has it until the owner turns it on.
   - **The CPU production path is far from the reference on both MoE models**:
     forced along the reference's routing, 1003 (ERNIE) and 1135 (Qwen3-30B-A3B)
     selections differ, at margins up to 1.5e-2 and 1.8e-2, and the worst KL from

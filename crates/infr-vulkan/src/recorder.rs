@@ -321,6 +321,11 @@ fn assert_native_k(kernel: &str, in_f: usize) {
 /// shader's `QUANT_Q8_BLOCKS_PER_WG`; `quant_q8_blocks_per_wg_matches_shader` fails on a drift.
 pub(crate) const QUANT_Q8_BLOCKS_PER_WG: usize = 8;
 
+/// How far a block's largest activation must stand above every other one for `quant_q8.comp`'s
+/// `-DHI` build to carry it apart (the CPU's `HI_RATIO`, at one outlier per 32-element block).
+/// MIRRORS the shader's `QUANT_Q8_HI_RATIO`; `quant_q8_hi_ratio_matches_shader` fails on a drift.
+pub(crate) const QUANT_Q8_HI_RATIO: f32 = 16.0;
+
 /// A batched-MoE expert-GEMM kernel variant: `(kernel name, SPIR-V)`.
 type MmqKern = (&'static str, &'static [u32]);
 
@@ -331,8 +336,9 @@ type MmqKern = (&'static str, &'static [u32]);
 /// one but not the other would silently `unreachable!` at runtime. Here the two share this single
 /// `match dtype`, so the set can't drift; the callers pick the variant (tile/wide) and apply the
 /// paged +1 LUT binding. `resident_nb` is the resident binding count; paged is always
-/// `resident_nb + 1`. `moe_mmq_kernels_match` (in `#[cfg(test)]`) freezes the whole mapping so a
-/// refactor can't change any `(name, nb)` the two old tables produced.
+/// `resident_nb + 1`, and the outlier-reading resident builds (`xp_hi`) also `+ 1`, for the
+/// remainders. `moe_mmq_table_matches_frozen_names` (in `#[cfg(test)]`) freezes the whole
+/// mapping so a refactor can't change any `(name, nb)` the two old tables produced.
 struct MoeMmqDesc {
     /// Resident (`_xp`) STORAGE_BUFFER binding count; the paged (`_xpg`) build adds one for the LUT.
     resident_nb: usize,
@@ -345,6 +351,23 @@ struct MoeMmqDesc {
     /// Paged: `_xpg` (big-tile) / `_xpg32` (small-tile).
     xpg: MmqKern,
     xpg32: MmqKern,
+    /// Resident builds reading the outlier quantizer's remainders (`-DACT_HI`, the tuning
+    /// parameter `quant_q8.experts_hi`) — Q4_K/Q6_K only, else `None`.
+    xp_hi: Option<MoeMmqHi>,
+}
+
+/// The `-DACT_HI` twins of a resident row's four tiles ([`MoeMmqDesc::xp_hi`]).
+struct MoeMmqHi {
+    xp: MmqKern,
+    xp32: MmqKern,
+    xp128: MmqKern,
+    xp32w: MmqKern,
+}
+
+/// Whether the batched expert GEMM of `dtype` has a build reading the outlier quantizer's
+/// remainders ([`Recorder::matmul_mmq_experts_with`]).
+pub(crate) fn moe_mmq_hi_ok(dtype: infr_core::DType) -> bool {
+    moe_mmq_desc(dtype).is_some_and(|d| d.xp_hi.is_some())
 }
 
 /// The single dtype→kernel table (see [`MoeMmqDesc`]). `None` for any dtype outside the mmq set.
@@ -374,6 +397,24 @@ fn moe_mmq_desc(dtype: infr_core::DType) -> Option<MoeMmqDesc> {
                 "native_gemm_mmq_q4k_xpg32",
                 g::native_gemm_mmq_q4k_xpg32_spv(),
             ),
+            xp_hi: Some(MoeMmqHi {
+                xp: (
+                    "native_gemm_mmq_q4k_xp_hi",
+                    g::native_gemm_mmq_q4k_xp_hi_spv(),
+                ),
+                xp32: (
+                    "native_gemm_mmq_q4k_xp32_hi",
+                    g::native_gemm_mmq_q4k_xp32_hi_spv(),
+                ),
+                xp128: (
+                    "native_gemm_mmq_q4k_xp128_hi",
+                    g::native_gemm_mmq_q4k_xp128_hi_spv(),
+                ),
+                xp32w: (
+                    "native_gemm_mmq_q4k_xp32w_hi",
+                    g::native_gemm_mmq_q4k_xp32w_hi_spv(),
+                ),
+            }),
         },
         D::Q6K => MoeMmqDesc {
             resident_nb: 6,
@@ -397,6 +438,24 @@ fn moe_mmq_desc(dtype: infr_core::DType) -> Option<MoeMmqDesc> {
                 "native_gemm_mmq_q6k_xpg32",
                 g::native_gemm_mmq_q6k_xpg32_spv(),
             ),
+            xp_hi: Some(MoeMmqHi {
+                xp: (
+                    "native_gemm_mmq_q6k_xp_hi",
+                    g::native_gemm_mmq_q6k_xp_hi_spv(),
+                ),
+                xp32: (
+                    "native_gemm_mmq_q6k_xp32_hi",
+                    g::native_gemm_mmq_q6k_xp32_hi_spv(),
+                ),
+                xp128: (
+                    "native_gemm_mmq_q6k_xp128_hi",
+                    g::native_gemm_mmq_q6k_xp128_hi_spv(),
+                ),
+                xp32w: (
+                    "native_gemm_mmq_q6k_xp32w_hi",
+                    g::native_gemm_mmq_q6k_xp32w_hi_spv(),
+                ),
+            }),
         },
         D::Q8_0 => MoeMmqDesc {
             resident_nb: 6,
@@ -406,6 +465,7 @@ fn moe_mmq_desc(dtype: infr_core::DType) -> Option<MoeMmqDesc> {
                 g::native_gemm_mmq_q8_0_xp32_spv(),
             ),
             xp_wide: None,
+            xp_hi: None,
             xpg: (
                 "native_gemm_mmq_q8_0_xpg",
                 g::native_gemm_mmq_q8_0_xpg_spv(),
@@ -423,6 +483,7 @@ fn moe_mmq_desc(dtype: infr_core::DType) -> Option<MoeMmqDesc> {
                 g::native_gemm_mmq_q5_0_xp32_spv(),
             ),
             xp_wide: None,
+            xp_hi: None,
             xpg: (
                 "native_gemm_mmq_q5_0_xpg",
                 g::native_gemm_mmq_q5_0_xpg_spv(),
@@ -440,6 +501,7 @@ fn moe_mmq_desc(dtype: infr_core::DType) -> Option<MoeMmqDesc> {
                 g::native_gemm_mmq_q5k_xp32_spv(),
             ),
             xp_wide: None,
+            xp_hi: None,
             xpg: ("native_gemm_mmq_q5k_xpg", g::native_gemm_mmq_q5k_xpg_spv()),
             xpg32: (
                 "native_gemm_mmq_q5k_xpg32",
@@ -454,6 +516,7 @@ fn moe_mmq_desc(dtype: infr_core::DType) -> Option<MoeMmqDesc> {
                 g::native_gemm_mmq_q5_1_xp32_spv(),
             ),
             xp_wide: None,
+            xp_hi: None,
             xpg: (
                 "native_gemm_mmq_q5_1_xpg",
                 g::native_gemm_mmq_q5_1_xpg_spv(),
@@ -471,6 +534,7 @@ fn moe_mmq_desc(dtype: infr_core::DType) -> Option<MoeMmqDesc> {
                 g::native_gemm_mmq_q2_k_xp32_spv(),
             ),
             xp_wide: None,
+            xp_hi: None,
             xpg: (
                 "native_gemm_mmq_q2_k_xpg",
                 g::native_gemm_mmq_q2_k_xpg_spv(),
@@ -488,6 +552,7 @@ fn moe_mmq_desc(dtype: infr_core::DType) -> Option<MoeMmqDesc> {
                 g::native_gemm_mmq_q3_k_xp32_spv(),
             ),
             xp_wide: None,
+            xp_hi: None,
             xpg: (
                 "native_gemm_mmq_q3_k_xpg",
                 g::native_gemm_mmq_q3_k_xpg_spv(),
@@ -505,6 +570,7 @@ fn moe_mmq_desc(dtype: infr_core::DType) -> Option<MoeMmqDesc> {
                 g::native_gemm_mmq_q4_0_xp32_spv(),
             ),
             xp_wide: None,
+            xp_hi: None,
             xpg: (
                 "native_gemm_mmq_q4_0_xpg",
                 g::native_gemm_mmq_q4_0_xpg_spv(),
@@ -522,6 +588,7 @@ fn moe_mmq_desc(dtype: infr_core::DType) -> Option<MoeMmqDesc> {
                 g::native_gemm_mmq_q4_1_xp32_spv(),
             ),
             xp_wide: None,
+            xp_hi: None,
             xpg: (
                 "native_gemm_mmq_q4_1_xpg",
                 g::native_gemm_mmq_q4_1_xpg_spv(),
@@ -542,6 +609,7 @@ fn moe_mmq_desc(dtype: infr_core::DType) -> Option<MoeMmqDesc> {
                 g::native_gemm_mmq_iq4_nl_xp32_spv(),
             ),
             xp_wide: None,
+            xp_hi: None,
             xpg: (
                 "native_gemm_mmq_iq4_nl_xpg",
                 g::native_gemm_mmq_iq4_nl_xpg_spv(),
@@ -562,6 +630,7 @@ fn moe_mmq_desc(dtype: infr_core::DType) -> Option<MoeMmqDesc> {
                 g::native_gemm_mmq_iq4_xs_xp32_spv(),
             ),
             xp_wide: None,
+            xp_hi: None,
             xpg: (
                 "native_gemm_mmq_iq4_xs_xpg",
                 g::native_gemm_mmq_iq4_xs_xpg_spv(),
@@ -582,6 +651,7 @@ fn moe_mmq_desc(dtype: infr_core::DType) -> Option<MoeMmqDesc> {
                 g::native_gemm_mmq_iq2_s_xp32_spv(),
             ),
             xp_wide: None,
+            xp_hi: None,
             xpg: (
                 "native_gemm_mmq_iq2_s_xpg",
                 g::native_gemm_mmq_iq2_s_xpg_spv(),
@@ -602,6 +672,7 @@ fn moe_mmq_desc(dtype: infr_core::DType) -> Option<MoeMmqDesc> {
                 g::native_gemm_mmq_iq3_s_xp32_spv(),
             ),
             xp_wide: None,
+            xp_hi: None,
             xpg: (
                 "native_gemm_mmq_iq3_s_xpg",
                 g::native_gemm_mmq_iq3_s_xpg_spv(),
@@ -622,6 +693,7 @@ fn moe_mmq_desc(dtype: infr_core::DType) -> Option<MoeMmqDesc> {
                 g::native_gemm_mmq_mxfp4_xp32_spv(),
             ),
             xp_wide: None,
+            xp_hi: None,
             xpg: (
                 "native_gemm_mmq_mxfp4_xpg",
                 g::native_gemm_mmq_mxfp4_xpg_spv(),
@@ -642,6 +714,7 @@ fn moe_mmq_desc(dtype: infr_core::DType) -> Option<MoeMmqDesc> {
                 g::native_gemm_mmq_nvfp4_xp32_spv(),
             ),
             xp_wide: None,
+            xp_hi: None,
             xpg: (
                 "native_gemm_mmq_nvfp4_xpg",
                 g::native_gemm_mmq_nvfp4_xpg_spv(),
@@ -659,6 +732,7 @@ fn moe_mmq_desc(dtype: infr_core::DType) -> Option<MoeMmqDesc> {
                 g::native_gemm_mmq_q2_0_xp32_spv(),
             ),
             xp_wide: None,
+            xp_hi: None,
             xpg: (
                 "native_gemm_mmq_q2_0_xpg",
                 g::native_gemm_mmq_q2_0_xpg_spv(),
@@ -10121,27 +10195,48 @@ impl<'a> Recorder<'a> {
         n_slots: usize,
         k_dim: usize,
     ) {
-        let kq = self.be.kernel_sg(
-            "quant_q8_gather",
-            crate::gemm::quant_q8_gather_spv(),
-            5,
-            12,
-            32,
-        );
+        self.quant_q8_gather_with(a, bucket_rows, qa, dact, sact, None, n_slots, k_dim);
+    }
+
+    /// [`Self::quant_q8_gather`], on the outlier quantizer (`quant_q8.comp`'s `-DHI` build) when
+    /// `hres` is given: a block whose largest activation stands over `QUANT_Q8_HI_RATIO` times
+    /// above the rest carries its remainder and lane there (`[n_slots, k_dim/32]` `vec2`, 8 bytes
+    /// a block), which [`Self::matmul_mmq_experts_with`] reads. `None` is the plain build.
+    #[allow(clippy::too_many_arguments)]
+    pub fn quant_q8_gather_with(
+        &self,
+        a: &dyn Buffer,
+        bucket_rows: &dyn Buffer,
+        qa: &dyn Buffer,
+        dact: &dyn Buffer,
+        sact: &dyn Buffer,
+        hres: Option<&dyn Buffer>,
+        n_slots: usize,
+        k_dim: usize,
+    ) {
+        let (name, spv) = match hres {
+            None => ("quant_q8_gather", crate::gemm::quant_q8_gather_spv()),
+            Some(_) => ("quant_q8_gather_hi", crate::gemm::quant_q8_gather_hi_spv()),
+        };
+        // `hres` last when given; the plain build binds the first five (no allocation per call).
+        let all = [
+            Self::vkb(a),
+            Self::vkb(bucket_rows),
+            Self::vkb(qa),
+            Self::vkb(dact),
+            Self::vkb(sact),
+            Self::vkb(hres.unwrap_or(sact)),
+        ];
+        let bufs = &all[..5 + usize::from(hres.is_some())];
+        let kq = self.be.kernel_sg(name, spv, bufs.len(), 12, 32);
         let mut p = [0u8; 12];
         p[0..4].copy_from_slice(&(n_slots as u32).to_ne_bytes());
         p[4..8].copy_from_slice(&(k_dim as u32).to_ne_bytes());
         p[8..12].copy_from_slice(&32u32.to_ne_bytes());
         self.dispatch_wide(
             kq,
-            &[
-                Self::vkb(a),
-                Self::vkb(bucket_rows),
-                Self::vkb(qa),
-                Self::vkb(dact),
-                Self::vkb(sact),
-            ],
-            3,
+            bufs,
+            bufs.len() - 2,
             &p,
             (n_slots * (k_dim / 32)).div_ceil(QUANT_Q8_BLOCKS_PER_WG) as u32,
         );
@@ -10238,6 +10333,37 @@ impl<'a> Recorder<'a> {
         n_expert: usize,
         n_used: usize,
     ) {
+        self.matmul_mmq_experts_with(
+            dtype, stage, qa, dact, sact, None, w, w_base, stride, counts, offsets, c, rows, k, n,
+            n_expert, n_used,
+        );
+    }
+
+    /// [`Self::matmul_mmq_experts`], on activations from the outlier quantizer when `hres` is
+    /// given ([`Self::quant_q8_gather_with`] / [`Self::quant_q8_with`]): each block adds its
+    /// carried remainder times the weight element at its lane. Q4_K and Q6_K only
+    /// (`moe_mmq_hi_ok`); the tile is picked as the plain GEMM's is. `None` is the plain GEMM.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_mmq_experts_with(
+        &self,
+        dtype: infr_core::DType,
+        stage: &'static str,
+        qa: &dyn Buffer,
+        dact: &dyn Buffer,
+        sact: Option<&dyn Buffer>,
+        hres: Option<&dyn Buffer>,
+        w: &dyn Buffer,
+        w_base: usize,
+        stride: usize,
+        counts: &dyn Buffer,
+        offsets: &dyn Buffer,
+        c: &dyn Buffer,
+        rows: usize,
+        k: usize,
+        n: usize,
+        n_expert: usize,
+        n_used: usize,
+    ) {
         assert_native_k("matmul_mmq_experts", k);
         // The stacked expert bank is read from its resident-BDA arena address, never a bound SSBO.
         // `pc.m` is REPURPOSED as the per-expert BYTE stride applied on the pointer
@@ -10272,7 +10398,17 @@ impl<'a> Recorder<'a> {
                  Q5_K/Q6_K/Q8_0/Q5_0/Q5_1/Q2_K/Q3_K/Q2_0/IQ4_NL/IQ4_XS/IQ2_S/IQ3_S/MXFP4/NVFP4)"
             )
         });
-        let (name, spv) = if wide_bn {
+        let (name, spv) = if hres.is_some() {
+            let hi = desc.xp_hi.as_ref().unwrap_or_else(|| {
+                unreachable!("matmul_mmq_experts_with: {dtype:?} has no outlier build")
+            });
+            match (small_tile, wide_bn) {
+                (false, false) => hi.xp,
+                (true, false) => hi.xp32,
+                (false, true) => hi.xp128,
+                (true, true) => hi.xp32w,
+            }
+        } else if wide_bn {
             let (w128, w32w) = desc
                 .xp_wide
                 .expect("wide_bn is set only for Q4_K/Q6_K, which carry xp_wide");
@@ -10298,7 +10434,7 @@ impl<'a> Recorder<'a> {
             self.next_label
                 .set(Some(intern_label(format!("{stage}:{name}:{k}x{n}"))));
         }
-        let nb = desc.resident_nb;
+        let nb = desc.resident_nb + usize::from(hres.is_some());
         let kern = self.be.kernel(name, spv, nb, 24);
         let mut push = [0u8; 24];
         let stride_bytes = expert_stride_bytes(dtype, stride);
@@ -10314,12 +10450,9 @@ impl<'a> Recorder<'a> {
         }
         // The vacated weight-SSBO slot takes a small FILLER (`qa`) — same convention as
         // `matmul_mmq_at`'s dense twin; the arena is read by device address, not this slot.
-        bufs.extend_from_slice(&[
-            Self::vkb(qa),
-            Self::vkb(counts),
-            Self::vkb(offsets),
-            Self::vkb(c),
-        ]);
+        bufs.extend_from_slice(&[Self::vkb(qa), Self::vkb(counts), Self::vkb(offsets)]);
+        bufs.extend(hres.map(Self::vkb));
+        bufs.push(Self::vkb(c));
         self.dispatch3(kern, &bufs, 1, &push, gx, n_expert as u32, 1);
     }
 
@@ -10750,22 +10883,44 @@ impl<'a> Recorder<'a> {
         m: usize,
         k: usize,
     ) {
-        let kq = self
-            .be
-            .kernel_sg("quant_q8", crate::gemm::quant_q8_spv(), 4, 12, 32);
+        self.quant_q8_with(a, qa, dact, sact, None, m, k);
+    }
+
+    /// [`Self::quant_q8`], on the outlier quantizer when `hres` (`[m, k/32]` `vec2`) is given:
+    /// see [`Self::quant_q8_gather_with`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn quant_q8_with(
+        &self,
+        a: &dyn Buffer,
+        qa: &dyn Buffer,
+        dact: &dyn Buffer,
+        sact: &dyn Buffer,
+        hres: Option<&dyn Buffer>,
+        m: usize,
+        k: usize,
+    ) {
+        let (name, spv) = match hres {
+            None => ("quant_q8", crate::gemm::quant_q8_spv()),
+            Some(_) => ("quant_q8_hi", crate::gemm::quant_q8_hi_spv()),
+        };
+        // `hres` last when given; the plain build binds the first four (no allocation per call).
+        let all = [
+            Self::vkb(a),
+            Self::vkb(qa),
+            Self::vkb(dact),
+            Self::vkb(sact),
+            Self::vkb(hres.unwrap_or(sact)),
+        ];
+        let bufs = &all[..4 + usize::from(hres.is_some())];
+        let kq = self.be.kernel_sg(name, spv, bufs.len(), 12, 32);
         let mut p = [0u8; 12];
         p[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
         p[4..8].copy_from_slice(&(k as u32).to_ne_bytes());
         p[8..12].copy_from_slice(&32u32.to_ne_bytes());
         self.dispatch_wide(
             kq,
-            &[
-                Self::vkb(a),
-                Self::vkb(qa),
-                Self::vkb(dact),
-                Self::vkb(sact),
-            ],
-            3,
+            bufs,
+            bufs.len() - 1,
             &p,
             (m * (k / 32)).div_ceil(QUANT_Q8_BLOCKS_PER_WG) as u32,
         );
@@ -12015,6 +12170,13 @@ mod tests {
     fn quant_q8_blocks_per_wg_matches_shader() {
         let src = include_str!("../shaders/quant_q8.comp");
         let want = format!("#define QUANT_Q8_BLOCKS_PER_WG {QUANT_Q8_BLOCKS_PER_WG}u");
+        assert!(src.contains(&want), "quant_q8.comp lacks `{want}`");
+    }
+
+    #[test]
+    fn quant_q8_hi_ratio_matches_shader() {
+        let src = include_str!("../shaders/quant_q8.comp");
+        let want = format!("#define QUANT_Q8_HI_RATIO {QUANT_Q8_HI_RATIO:.1}");
         assert!(src.contains(&want), "quant_q8.comp lacks `{want}`");
     }
 
@@ -13405,8 +13567,22 @@ mod tests {
                     format!("native_gemm_mmq_{stem}_xp32w").as_str(),
                     "{dt:?} xp32w"
                 );
+                let hi = d.xp_hi.as_ref().expect("Q4_K/Q6_K carry xp_hi");
+                for (got, tile) in [
+                    (hi.xp, "xp"),
+                    (hi.xp32, "xp32"),
+                    (hi.xp128, "xp128"),
+                    (hi.xp32w, "xp32w"),
+                ] {
+                    assert_eq!(
+                        got.0,
+                        format!("native_gemm_mmq_{stem}_{tile}_hi").as_str(),
+                        "{dt:?} {tile}_hi"
+                    );
+                }
             } else {
                 assert!(d.xp_wide.is_none(), "{dt:?} must not carry xp_wide");
+                assert!(d.xp_hi.is_none(), "{dt:?} must not carry xp_hi");
             }
         }
         // A dtype outside the mmq set maps to None (drives the callers' `unreachable!`).

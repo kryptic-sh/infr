@@ -1713,6 +1713,319 @@ Float rows' near ties are of the order the synthetic row has and would hold a
 router bug (bug (i) under "Mutations" moved selections at margins up to 0.37).
 B207 records the recommendation and what stays open.
 
+## The routed experts' outlier quantizer
+
+Measured 2026-11-25 (B207, B-DECISIONS-2026-11-25 item 2, the owner's decision
+to keep int8 and fix the GPU's activation quantizer). The question: which change
+to `quant_q8.comp` (one scale per 32 activations, `amax/127`, the scale and
+block sum stored as f16, no outlier handling) removes the routed experts' share
+of the error, and in particular Qwen3-30B-A3B's first rows (3.8e-2 shipped,
+1.8e-5 with the routed experts on float).
+
+### Diagnosis
+
+**What the activations entering the expert GEMMs look like.** The CPU reference
+(`kernels.cpu.reference`) computes the same activations in f32 the GPU's expert
+GEMMs quantize: the gate/up input (the normed hidden state each routed pair
+reads, what `quant_q8_gather` quantizes) and the down input (the gated
+activation, what `quant_q8` quantizes). Dumped from Qwen3-30B-A3B's reference
+run on the gate's three prompts (every position, every routed layer, every
+routed pair), cut into 32-element blocks and run through each candidate
+quantizer on the host (a scratch instrumentation of the reference's expert
+banks, not committed):
+
+| Rows                      | Blocks    | Blocks the outlier rule splits | The rest of such a block, shipped                        |
+| ------------------------- | --------- | ------------------------------ | -------------------------------------------------------- |
+| gate/up input, position 0 | 9,216     | 135 (1.47%)                    | quantized to 0, every element (relative error 1.000)     |
+| gate/up input, position 1 | 9,216     | 0                              |                                                          |
+| gate/up input, 2 on       | 961,536   | 11 (0.001%)                    | relative error 0.082                                     |
+| down input, position 0    | 27,648    | 138 (0.50%)                    | 71% of the elements quantized to 0 (relative error 0.45) |
+| down input, position 1    | 27,648    | 77 (0.28%)                     | 53% to 0 (0.34)                                          |
+| down input, 2 on          | 2,884,608 | 2,778 (0.10%)                  | 35% to 0 (0.16)                                          |
+
+"Splits" is the rule the build below applies: the block's largest magnitude more
+than 16 times every other one. At position 0 every routed layer but the first
+two and the last has exactly one such block in the gate/up input (Qwen3's
+massive-activation dimensions, which RMSNorm leaves dominant at that position),
+and all 31 other elements of it quantize to 0. Split, the rest of those blocks
+is quantized to a relative error of 6.1e-3 (gate/up, position 0) to 7.2e-3
+(down, position 0), the ordinary level. f16 storage of the scale is not the
+problem: no gate/up block and 2.9% of the position-0 down blocks have a scale
+below f16's normal range (134 of 2,884,608 from position 2 on), and an f32 scale
+changes the rows' quantization error by at most 1.2%. ERNIE-4.5-21B-A3B (dumped
+the same way) has more of them at position 0: 276 of 6,480 gate/up blocks (4.3%)
+and 808 of 23,328 down blocks (3.5%) split, the rest of them quantized to a
+relative error of 0.43 and 0.45 shipped; from position 2 on 0.025% and 0.11%.
+
+**What each candidate does end to end.** The same scratch instrumentation made
+the CPU reference round-trip each routed pair's two activations through a
+simulated quantizer, everything else float, routing forced along the plain
+reference's, scored against the plain reference as the harness scores a GPU run
+(`measure_gpu_tolerance`'s prompts and columns). The shipped scheme reproduces
+the RX 7900 XTX's `gpu-ub32-dense-float` (its routed experts int8, its dense
+`Linear`s float) to within its run-to-run order: 314 against 280 selections
+differing on Qwen3-30B-A3B, first rows 3.4e-2 against 3.8e-2; 226 against 192
+and 1.1e-3 against 1.1e-3 on ERNIE.
+
+| Scheme (both activations unless named)                          | Qwen3-30B-A3B: differ (widest) | forced KL worst / mean | first rows | ERNIE-4.5-21B-A3B: differ (widest) | forced KL worst / mean | first rows |
+| --------------------------------------------------------------- | ------------------------------ | ---------------------- | ---------- | ---------------------------------- | ---------------------- | ---------- |
+| shipped: 32-element blocks, f16 scale                           | 314 (1.2e-3)                   | 3.1e-3 / 1.7e-4        | 3.4e-2     | 226 (7.0e-4)                       | 6.7e-3 / 1.4e-4        | 1.1e-3     |
+| (b) f32 scale                                                   | 337 (2.3e-3)                   | 2.4e-3 / 1.4e-4        | 3.2e-2     | 217 (7.6e-4)                       | 7.3e-3 / 1.5e-4        | 1.3e-3     |
+| (c) 16-element blocks                                           | 272 (1.2e-3)                   | 7.9e-4 / 7.1e-5        | 9.4e-3     | 193 (7.0e-4)                       | 2.2e-3 / 1.2e-4        | 4.3e-4     |
+| (c) 8-element blocks                                            | 188 (5.3e-4)                   | 6.0e-4 / 4.1e-5        | 3.4e-3     | 130 (7.7e-4)                       | 2.3e-3 / 6.3e-5        | 2.7e-4     |
+| (a) the largest kept exact past 16x the next, f16 scale (built) | 312 (1.7e-3)                   | 2.1e-3 / 1.0e-4        | 2.5e-4     | 182 (5.8e-4)                       | 1.6e-3 / 9.3e-5        | 2.6e-4     |
+| (a) the same past 8x                                            | 317 (5.8e-3)                   | 1.0e-3 / 7.6e-5        | 2.9e-4     | 174 (6.1e-4)                       | 7.4e-4 / 7.3e-5        | 1.6e-4     |
+| (a) the same past 4x                                            | 291 (1.9e-3)                   | 1.7e-3 / 7.3e-5        | 2.7e-4     | 163 (6.7e-4)                       | 8.6e-4 / 6.6e-5        | 1.0e-4     |
+| (a) the CPU's split (two kept, past 16x the third, own scale)   | 325 (1.2e-3)                   | 1.4e-3 / 9.9e-5        | 2.3e-4     | 181 (7.9e-4)                       | 1.2e-3 / 8.2e-5        | 1.8e-4     |
+| (a) at 16x, gate/up input only                                  | 360 (1.7e-2)                   | 2.1e-3 / 1.3e-4        | 7.1e-3     | 232 (6.6e-4)                       | 1.6e-3 / 9.8e-5        | 2.5e-4     |
+| (a) at 16x, down input only                                     | 307 (3.7e-4)                   | 1.3e-3 / 1.0e-4        | 1.3e-2     | 221 (9.8e-4)                       | 3.4e-3 / 1.4e-4        | 1.3e-3     |
+| gate/up input int8 (shipped), down input float                  | 206 (4.8e-4)                   | 4.2e-4 / 4.0e-5        | 9.9e-3     | 135 (7.0e-4)                       | 4.1e-3 / 9.3e-5        | 1.0e-3     |
+| down input int8 (shipped), gate/up input float                  | 282 (5.5e-4)                   | 2.4e-3 / 1.2e-4        | 6.8e-3     | 189 (8.2e-4)                       | 1.1e-3 / 6.5e-5        | 2.7e-4     |
+
+What it says:
+
+- **(b) does nothing.** An f32 scale and sum leave every column where the f16
+  one has it (Qwen3-30B-A3B's first rows 3.2e-2 against 3.4e-2).
+- **(a) removes the first-row defect, (c) only shrinks it.** Carrying a block's
+  outlier exactly takes Qwen3-30B-A3B's first rows from 3.4e-2 to 2.5e-4 (the
+  steady state's order) and lowers the forced KL (worst by 32% and 76%, mean by
+  41% and 34%, Qwen3-30B-A3B and ERNIE); 16-element blocks leave 9.4e-3 and
+  8-element ones 3.4e-3. Both activations need it: either one alone leaves
+  7.1e-3 or 1.3e-2.
+- **No candidate closes the routing gap.** The routers keep selecting
+  differently at 163 to 360 selections, where the Float runs differ at 8 to 23
+  (the first measurement): that gap is the int8 rounding of every ordinary
+  block, and the most any candidate moves it is 8-element blocks (314 to 188 and
+  226 to 130). The ratio is a secondary trade: 8x and 4x take a little more of
+  the steady KL than 16x.
+
+So (a) was built, at one outlier per block and the CPU's ratio of 16.
+
+### What was built
+
+The Vulkan tuning parameter **`quant_q8.experts_hi`** (experimental, off by
+default): `--set kernels.vulkan.tune.quant_q8.experts_hi=true`,
+`INFR_TUNE=quant_q8.experts_hi=true`, or `"quant_q8.experts_hi" = true` under
+`[kernels.vulkan.tune]`.
+
+- **`quant_q8.comp -DHI`** (`quant_q8_hi`, and `quant_q8_gather_hi` with
+  `-DGATHER`): a block whose largest magnitude is more than `QUANT_Q8_HI_RATIO`
+  (16) times every other one quantizes the rest on their own scale, rounded up
+  to a value f16 holds exactly; the outlier keeps a code clamped to ±127 and its
+  remainder in f32 goes to a fourth output, `hres` (one `vec2` per block: the
+  remainder and the lane, `(0, 0)` where the block does not split). A block that
+  does not split gets the plain build's bits.
+- **`native_gemm_mmq_q4k` and `native_gemm_mmq_q6k` `-DACT_HI`** (the four
+  resident expert tiles of each, `_xp_hi`, `_xp128_hi`, `_xp32_hi`,
+  `_xp32w_hi`): after each block's integer dot and epilogue, a row whose block
+  carries a remainder adds remainder × the weight at its lane, read from the
+  weight tile already in shared memory (`dl·q4 − mm` for Q4_K, `d·sc·(q6 − 32)`
+  for Q6_K).
+- **The lowering** (`Op::MoeFfn`'s resident batched arm in `adapter.rs`): with
+  the parameter on, a stage whose expert GEMMs all have an `ACT_HI` build (gate
+  and up for the gate/up input, down for the down input) quantizes on the HI
+  build and passes `hres` on. Another expert format keeps the shipped quantizer
+  for its stage. The paged expert path (`execute_paged_moe`), the per-row decode
+  and small-batch experts (float GEMVs already) and every dense `Linear` are
+  unchanged.
+
+**Which models and kernels see it.** Only a routed-expert model's batched
+prefill (a chunk taller than `moe.small_m` rows), with Q4_K or Q6_K expert banks
+held resident: both files measured here, and any other Q4_K_M MoE file. Dense
+models never reach the batched MoE arm, so they run exactly the shipped kernels
+with the parameter on or off.
+
+**Off is the shipped path.** Every SPIR-V module the tree built before this
+change is byte-identical after it (913 modules compared by SHA-256; ten new
+ones). `moe_ffn_batched_experts_hi_switch` (adapter tests) runs a batched Q4_K
+`MoeFfn` with the parameter unset and set off and asserts the same built kernel
+list, no `_hi` kernel and the same output bits. The `gpu` and `gpu-ub32` rows
+below reproduce the first measurement's (above) figure for figure on both
+devices and both models, forced and unforced.
+
+**Op-level tests** (`kq_gemm_tests.rs`, both GPUs, Khronos validation layer
+clean): `quant_q8_hi_follows_its_rule` drives blocks with one massive value, two
+in different blocks, a largest value exactly 16 times the next (does not split)
+and just over it (splits), an all-zero block, a single non-zero value and two
+equal largest values, through the plain, the HI and the gathered HI builds;
+`expert_gemm_hi_matches_its_decomposition` holds every Q4_K and Q6_K `ACT_HI`
+tile to the f64 sum of its decomposition (asserted within 1e-5 of the absolute
+term sum; the worst measured is 5.1e-7), with the carried lanes covering every
+byte position of a packed word, and each row with a massive activation closer to
+the f64 dot of the f32 activations than the plain GEMM by at least 10 times
+(asserted; the least measured is 42 times). A row without an outlier is held to
+the plain GEMM's output within the same 1e-5 of the term sum, not bit for bit:
+the two builds may contract the epilogue differently.
+
+### Accuracy
+
+`measure_gpu_tolerance` as in the first measurement (same machine, Mesa RADV
+26.3.1, headless, native lanes, tuning rows on), the configurations
+`DIAGNOSIS_CONFIGS` adds: `gpu-experts-hi` and `gpu-ub32-experts-hi` (the
+parameter on, at the shipped chunk height and at 32 rows),
+`gpu-dense-decode-float` (`kernels.vulkan.mmv_mw = false`, which empties the
+int8 decode set: a decode row's dense `Linear`s take the dequantizing GEMVs, a
+prefill chunk keeps its int8 kernels, (d) below) and the two together. The
+kernel lists (`INFR_TOL_ROWS=1`) show each configuration swapping exactly what
+it names: `quant_q8_gather`, `native_gemm_mmq_q4k_xp32w` and
+`native_gemm_mmq_q6k_xp32w` for their `_hi` builds plus `quant_q8_hi`; and the
+`native_mmv_mrow_*` decode GEMVs for `native_q4k_rm2_reg_res`, `native_q6k_rm2`
+(and on ERNIE `native_q6k_sg2_res`).
+
+Each cell sums the three prompts (selections) or takes their worst; the CPU
+production and Float rows are this run's and repeat the first measurement's.
+
+ERNIE-4.5-21B-A3B, `Vulkan0` (8802 selections):
+
+| Configuration                       | Forced: differ (widest) | Forced KL, worst / mean | First rows | Unforced: differ (widest) | Unforced KL, worst / mean | Unforced top-1 |
+| ----------------------------------- | ----------------------- | ----------------------- | ---------- | ------------------------- | ------------------------- | -------------- |
+| CPU production                      | 1003 (1.5e-2)           | 3.3e-2 / 2.1e-3         | 1.1e-2     | 1300 (1.6e-1)             | 1.1e-1 / 4.1e-3           | 315/326        |
+| `gpu` (shipped)                     | 242 (1.7e-3)            | 3.6e-3 / 1.4e-4         | 1.2e-3     | 417 (6.5e-3)              | 1.4e-2 / 6.5e-4           | 324/326        |
+| `gpu-ub32` (shipped)                | 247 (1.7e-3)            | 3.6e-3 / 1.3e-4         | 1.1e-3     | 429 (6.5e-3)              | 1.4e-2 / 6.2e-4           | 322/326        |
+| `gpu-float-ub32` (Float)            | 18 (2.7e-5)             | 6.1e-6 / 5.9e-7         | 1.1e-6     | 61 (4.6e-3)               | 6.8e-3 / 7.5e-5           | 326/326        |
+| `gpu-experts-hi`                    | 192 (9.3e-4)            | 8.8e-4 / 9.3e-5         | 2.4e-4     | 353 (5.8e-3)              | 1.8e-2 / 4.6e-4           | 325/326        |
+| `gpu-ub32-experts-hi`               | 203 (7.5e-4)            | 6.0e-4 / 9.6e-5         | 2.4e-4     | 313 (5.8e-3)              | 8.7e-3 / 3.9e-4           | 326/326        |
+| `gpu-dense-decode-float`            | 195 (8.7e-4)            | 3.6e-3 / 1.2e-4         | 1.2e-3     | 385 (9.1e-3)              | 1.5e-2 / 6.4e-4           | 324/326        |
+| `gpu-experts-hi-dense-decode-float` | 126 (8.4e-4)            | 8.8e-4 / 6.4e-5         | 2.4e-4     | 281 (9.1e-3)              | 8.7e-3 / 3.1e-4           | 325/326        |
+
+ERNIE-4.5-21B-A3B, `Vulkan1` (8802 selections):
+
+| Configuration                       | Forced: differ (widest) | Forced KL, worst / mean | First rows | Unforced: differ (widest) | Unforced KL, worst / mean | Unforced top-1 |
+| ----------------------------------- | ----------------------- | ----------------------- | ---------- | ------------------------- | ------------------------- | -------------- |
+| CPU production                      | 1003 (1.5e-2)           | 3.3e-2 / 2.1e-3         | 1.1e-2     | 1300 (1.6e-1)             | 1.1e-1 / 4.1e-3           | 315/326        |
+| `gpu` (shipped)                     | 425 (3.2e-2)            | 1.3e-2 / 4.3e-4         | 1.7e-3     | 674 (5.2e-2)              | 3.1e-2 / 1.2e-3           | 322/326        |
+| `gpu-ub32` (shipped)                | 434 (1.3e-2)            | 1.3e-2 / 4.6e-4         | 1.7e-3     | 680 (2.1e-2)              | 3.1e-2 / 1.3e-3           | 322/326        |
+| `gpu-float-ub32` (Float)            | 13 (1.1e-5)             | 3.8e-6 / 1.7e-7         | 1.5e-7     | 57 (3.2e-3)               | 2.7e-3 / 3.7e-5           | 324/326        |
+| `gpu-experts-hi`                    | 422 (3.2e-2)            | 6.8e-3 / 4.7e-4         | 2.3e-3     | 664 (1.4e-1)              | 1.8e-2 / 1.3e-3           | 323/326        |
+| `gpu-ub32-experts-hi`               | 393 (5.2e-2)            | 5.2e-3 / 4.0e-4         | 2.3e-3     | 659 (5.2e-2)              | 1.8e-2 / 1.3e-3           | 321/326        |
+| `gpu-dense-decode-float`            | 397 (3.2e-2)            | 1.3e-2 / 4.1e-4         | 1.7e-3     | 689 (5.2e-2)              | 3.1e-2 / 1.2e-3           | 323/326        |
+| `gpu-experts-hi-dense-decode-float` | 405 (3.2e-2)            | 6.8e-3 / 4.5e-4         | 2.3e-3     | 668 (1.4e-1)              | 1.8e-2 / 1.3e-3           | 323/326        |
+
+Qwen3-30B-A3B, `Vulkan0` (15312 selections):
+
+| Configuration                       | Forced: differ (widest) | Forced KL, worst / mean | First rows | Unforced: differ (widest) | Unforced KL, worst / mean | Unforced top-1 |
+| ----------------------------------- | ----------------------- | ----------------------- | ---------- | ------------------------- | ------------------------- | -------------- |
+| CPU production                      | 1135 (1.8e-2)           | 5.2e-2 / 2.9e-3         | 1.1e-2     | 1957 (4.7e-2)             | 1.0e-1 / 4.7e-3           | 307/319        |
+| `gpu` (shipped)                     | 339 (6.0e-4)            | 2.2e-3 / 1.8e-4         | 3.8e-2     | 974 (1.7e-2)              | 1.4e-2 / 9.1e-4           | 318/319        |
+| `gpu-ub32` (shipped)                | 344 (5.8e-3)            | 2.0e-3 / 1.8e-4         | 3.8e-2     | 1135 (4.1e-2)             | 2.1e-2 / 1.1e-3           | 312/319        |
+| `gpu-float-ub32` (Float)            | 20 (3.4e-4)             | 5.8e-6 / 4.5e-7         | 1.2e-5     | 304 (2.2e-2)              | 1.7e-2 / 2.3e-4           | 319/319        |
+| `gpu-experts-hi`                    | 318 (1.7e-3)            | 1.8e-3 / 1.5e-4         | 2.5e-4     | 1101 (2.2e-2)             | 1.3e-2 / 1.1e-3           | 313/319        |
+| `gpu-ub32-experts-hi`               | 326 (6.3e-4)            | 1.6e-3 / 1.6e-4         | 2.5e-4     | 1033 (4.1e-2)             | 4.0e-2 / 1.1e-3           | 314/319        |
+| `gpu-dense-decode-float`            | 276 (5.3e-4)            | 1.9e-3 / 1.0e-4         | 3.8e-2     | 960 (3.7e-2)              | 1.4e-2 / 8.6e-4           | 319/319        |
+| `gpu-experts-hi-dense-decode-float` | 262 (1.7e-3)            | 1.8e-3 / 7.8e-5         | 2.5e-4     | 1075 (2.2e-2)             | 1.3e-2 / 1.0e-3           | 314/319        |
+
+Qwen3-30B-A3B, `Vulkan1` (15312 selections):
+
+| Configuration                       | Forced: differ (widest) | Forced KL, worst / mean | First rows | Unforced: differ (widest) | Unforced KL, worst / mean | Unforced top-1 |
+| ----------------------------------- | ----------------------- | ----------------------- | ---------- | ------------------------- | ------------------------- | -------------- |
+| CPU production                      | 1135 (1.8e-2)           | 5.2e-2 / 2.9e-3         | 1.1e-2     | 1957 (4.7e-2)             | 1.0e-1 / 4.7e-3           | 307/319        |
+| `gpu` (shipped)                     | 564 (1.7e-2)            | 3.3e-3 / 4.4e-4         | 3.8e-2     | 1341 (4.1e-2)             | 2.2e-2 / 1.6e-3           | 313/319        |
+| `gpu-ub32` (shipped)                | 574 (1.7e-2)            | 3.4e-3 / 4.1e-4         | 3.9e-2     | 1447 (2.2e-2)             | 1.6e-2 / 1.6e-3           | 313/319        |
+| `gpu-float-ub32` (Float)            | 14 (2.4e-5)             | 4.0e-6 / 1.5e-7         | 6.7e-8     | 315 (2.2e-2)              | 5.0e-2 / 4.4e-4           | 319/319        |
+| `gpu-experts-hi`                    | 528 (1.7e-2)            | 2.5e-3 / 3.7e-4         | 1.3e-3     | 1344 (3.7e-2)             | 3.8e-2 / 1.6e-3           | 312/319        |
+| `gpu-ub32-experts-hi`               | 505 (1.7e-2)            | 4.1e-3 / 4.0e-4         | 1.3e-3     | 1375 (4.1e-2)             | 2.7e-2 / 1.6e-3           | 311/319        |
+| `gpu-dense-decode-float`            | 518 (5.8e-3)            | 3.3e-3 / 3.5e-4         | 3.8e-2     | 1311 (4.1e-2)             | 2.2e-2 / 1.5e-3           | 315/319        |
+| `gpu-experts-hi-dense-decode-float` | 467 (6.4e-3)            | 2.5e-3 / 2.9e-4         | 1.3e-3     | 1280 (2.7e-2)             | 3.8e-2 / 1.4e-3           | 312/319        |
+
+What the numbers say:
+
+- **The first-row defect is gone where the routed experts carried it.**
+  Qwen3-30B-A3B's first two positions go from 3.8e-2 to 2.5e-4 on the RX 7900
+  XTX and from 3.8e-2 and 3.9e-2 to 1.3e-3 on the integrated GPU, both now under
+  the CPU production's 1.1e-2; what is left on the integrated GPU is its int8
+  dense prefill GEMM (with the routed experts float it measured 1.2e-3). ERNIE's
+  go from 1.2e-3 to 2.4e-4 on the RX 7900 XTX and from 1.7e-3 to 2.3e-3 on the
+  integrated GPU, where the same dense GEMM sets them.
+- **The forced KL drops on the RX 7900 XTX, less evenly on the integrated GPU.**
+  RX 7900 XTX: ERNIE's worst from 3.6e-3 to 8.8e-4 and 6.0e-4, mean from 1.4e-4
+  and 1.3e-4 to 9.3e-5 and 9.6e-5; Qwen3-30B-A3B's worst from 2.2e-3 and 2.0e-3
+  to 1.8e-3 and 1.6e-3, mean 1.8e-4 to 1.5e-4 and 1.6e-4. Integrated GPU:
+  ERNIE's worst halves (1.3e-2 to 6.8e-3 and 5.2e-3) while its mean moves from
+  4.3e-4 to 4.7e-4 at the shipped chunk height; Qwen3-30B-A3B's worst goes from
+  3.3e-3 to 2.5e-3 at the shipped chunk height and from 3.4e-3 to 4.1e-3 at 32
+  rows.
+- **The routing gap stays.** Forced, 1% to 21% fewer selections differ (242 to
+  192 and 247 to 203 on ERNIE, 339 to 318 and 344 to 326 on Qwen3-30B-A3B on the
+  RX 7900 XTX; 425 to 422, 434 to 393, 564 to 528 and 574 to 505 on the
+  integrated GPU), against 13 to 20 for Float. The widest margin moves both
+  ways: on the RX 7900 XTX ERNIE's from 1.7e-3 to 9.3e-4 and 7.5e-4,
+  Qwen3-30B-A3B's from 6.0e-4 to 1.7e-3 and from 5.8e-3 to 6.3e-4; on the
+  integrated GPU it stays at 3.2e-2 and 1.7e-2, except ERNIE at 32 rows, 1.3e-2
+  to 5.2e-2. That is the simulation's finding: the routers read the ordinary
+  blocks' int8 rounding, which the outlier quantizer does not touch.
+- **Unforced, nothing a user sees moves beyond the near ties.** Top-1 agreement
+  ranges 311 to 326 with the parameter on against 312 to 324 shipped; the
+  largest change is Qwen3-30B-A3B at the shipped chunk height on the RX 7900
+  XTX, 318 to 313. Unforced KL measures where near ties fell (the first
+  measurement's finding), and its worst moves both ways.
+
+### (d) The dense decode GEMVs on float
+
+`gpu-dense-decode-float` against `gpu` (the decode rows' dense `Linear`s on the
+dequantizing GEMVs, everything else shipped):
+
+- **Forced selections differing drop 7% to 19%**: ERNIE 242 to 195 and 425 to
+  397, Qwen3-30B-A3B 339 to 276 and 564 to 518 (RX 7900 XTX, integrated GPU);
+  the widest margin narrows on Qwen3-30B-A3B's integrated GPU (1.7e-2 to 5.8e-3)
+  and nowhere widens.
+- **The mean forced KL drops 5% to 44%** (ERNIE 1.4e-4 to 1.2e-4 and 4.3e-4 to
+  4.1e-4, Qwen3-30B-A3B 1.8e-4 to 1.0e-4 and 4.4e-4 to 3.5e-4); the worst stays
+  within 15% and the first rows do not move (they are prefill rows).
+- **Unforced top-1** is level or one or two better (324, 319, 323, 315 against
+  324, 318, 322, 313).
+- **With the outlier quantizer on as well**
+  (`gpu-experts-hi-dense-decode-float`) the two add up on the RX 7900 XTX: 126
+  selections differing on ERNIE (242 shipped) at a mean KL of 6.4e-5 (1.4e-4),
+  262 on Qwen3-30B-A3B (339) at 7.8e-5 (1.8e-4); on the integrated GPU 405 (425)
+  and 467 (564).
+
+Decode measured the same speed with every decode GEMV float (the first
+measurement's Cost, not a quiet window). What this configuration sets,
+`kernels.vulkan.mmv_mw = false`, takes the int8 decode GEMVs off for every
+model; a MoE-only form of it does not exist and was not built (the switch would
+have to key on the graph having routed experts, in the decode `Linear` lowering
+of `adapter.rs`).
+
+### Speed
+
+Not timed (a shared machine; the orchestrator's A/B). Structurally, with the
+parameter on:
+
+- **No extra dispatch or pass.** The quantizer and the expert GEMMs are the same
+  dispatches; the HI quantizer adds three subgroup reductions per block and
+  writes 8 more bytes per 32 activations (36 to 44 bytes per block with the
+  codes, scale and sum).
+- **Each expert GEMM reads 8 more bytes per activation row per 32-element
+  block** (Q4_K 36 to 44, Q6_K 34 to 42): every column thread of a tile loads
+  its rows' remainders after each block, from the same few cache lines (the
+  added traffic is not measured), and runs a per-row branch after each block's
+  epilogue that is taken only where the block split (0.001% of the gate/up
+  blocks and 0.10% of the down blocks from position 2 on, on Qwen3-30B-A3B); a
+  taken branch adds `TN` shared-memory reads and fused multiply-adds per row.
+- **Two pooled scratch buffers** of `npad × k/32 × 8` bytes (gate/up and down;
+  at a 512-token chunk on Qwen3-30B-A3B about 2.1 and 0.8 MB).
+- Decode does not change: its routed experts take the float per-row GEMVs.
+
+The A/B, decode and prefill as separate runs, the shipped against the parameter
+on:
+
+```text
+INFR_DEV=Vulkan0 infr bench -p 0 -n 128 -r 5 <model.gguf>
+INFR_DEV=Vulkan0 infr bench -p 0 -n 128 -r 5 <model.gguf> --set kernels.vulkan.tune.quant_q8.experts_hi=true
+INFR_DEV=Vulkan0 infr bench -p 512 -n 0 -r 5 <model.gguf>
+INFR_DEV=Vulkan0 infr bench -p 512 -n 0 -r 5 <model.gguf> --set kernels.vulkan.tune.quant_q8.experts_hi=true
+```
+
+and for (d), `--set kernels.vulkan.mmv_mw=false` in place of the tuning key.
+
+### Not covered
+
+The paged expert path (`_xpg` builds) and every expert format but Q4_K and Q6_K
+keep the shipped quantizer. Metal has no int8 activation path (its experts read
+float activations), so it needs nothing; the CPU already splits outliers
+(`quantize_q8`, 256-element blocks, "CPU int8 activations"). Windows has run
+none of it.
+
 ## Not measured
 
 - **Metal.** Nothing here ran on Apple hardware; the harness drives the CPU and

@@ -2915,6 +2915,61 @@ fn main() {
             &["-DEXPERT_GRID", "-DPAGED", "-DBM_TILE=32u"],
         ),
         ("quant_q8", "quant_q8_gather", &["-DGATHER"]),
+        // The routed experts' outlier quantizer and the expert GEMMs that read it (tuning
+        // parameter `quant_q8.experts_hi`, off by default): quant_q8.comp's `-DHI` doc. Q4_K and
+        // Q6_K, every resident expert tile.
+        ("quant_q8", "quant_q8_hi", &["-DHI"]),
+        ("quant_q8", "quant_q8_gather_hi", &["-DGATHER", "-DHI"]),
+        (
+            "native_gemm_mmq_q4k",
+            "native_gemm_mmq_q4k_xp_hi",
+            &["-DEXPERT_GRID", "-DACT_HI"],
+        ),
+        (
+            "native_gemm_mmq_q4k",
+            "native_gemm_mmq_q4k_xp128_hi",
+            &["-DEXPERT_GRID", "-DBN_TILE=128u", "-DACT_HI"],
+        ),
+        (
+            "native_gemm_mmq_q4k",
+            "native_gemm_mmq_q4k_xp32_hi",
+            &["-DEXPERT_GRID", "-DBM_TILE=32u", "-DACT_HI"],
+        ),
+        (
+            "native_gemm_mmq_q4k",
+            "native_gemm_mmq_q4k_xp32w_hi",
+            &[
+                "-DEXPERT_GRID",
+                "-DBM_TILE=32u",
+                "-DBN_TILE=128u",
+                "-DACT_HI",
+            ],
+        ),
+        (
+            "native_gemm_mmq_q6k",
+            "native_gemm_mmq_q6k_xp_hi",
+            &["-DEXPERT_GRID", "-DACT_HI"],
+        ),
+        (
+            "native_gemm_mmq_q6k",
+            "native_gemm_mmq_q6k_xp128_hi",
+            &["-DEXPERT_GRID", "-DBN_TILE=128u", "-DACT_HI"],
+        ),
+        (
+            "native_gemm_mmq_q6k",
+            "native_gemm_mmq_q6k_xp32_hi",
+            &["-DEXPERT_GRID", "-DBM_TILE=32u", "-DACT_HI"],
+        ),
+        (
+            "native_gemm_mmq_q6k",
+            "native_gemm_mmq_q6k_xp32w_hi",
+            &[
+                "-DEXPERT_GRID",
+                "-DBM_TILE=32u",
+                "-DBN_TILE=128u",
+                "-DACT_HI",
+            ],
+        ),
         ("moe_scatter_reduce", "moe_scatter_reduce", &[]),
         ("moe_topk", "moe_topk", &[]),
         // Embedding-row gather+dequant (Op::EmbedGather): one .spv per table format.

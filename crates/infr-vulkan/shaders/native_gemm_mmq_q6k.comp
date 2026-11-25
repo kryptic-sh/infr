@@ -31,6 +31,9 @@ const uint BM = BM_TILE; // row tile — 64 default, EXPERT_GRID batched-MoE cal
 #define BN_TILE 64u
 #endif
 const uint BN = BN_TILE; // col tile — 64 default, EXPERT_GRID small-row callers may widen (128)
+#if defined(ACT_HI) && (!defined(EXPERT_GRID) || defined(PAGED))
+#error "ACT_HI is built for the resident expert grid only"
+#endif
 const uint BLK = 32u;       // one k-step: the activation 32-block = two Q6_K scale sub-blocks
 const uint WPB = BLK / 4u;  // 8 packed-int8 u32 words per step (words 0-3: first sub-block)
 const uint TM = 4u;
@@ -78,7 +81,14 @@ layout(binding = 6) writeonly buffer CB { float c[]; };         // [n_pairs, n] 
 // extra readonly inputs sit before `c` so the recorder's inputs-first/outputs-last order holds.
 layout(binding = 3) readonly buffer CNT { uint counts[]; };
 layout(binding = 4) readonly buffer OFF { uint offsets[]; };
+#ifdef ACT_HI
+// -DACT_HI: activations from quant_q8.comp's HI build — each block's carried outlier remainder
+// and its lane (`hres`, (0, 0) where the block did not split), added below as remainder × weight.
+layout(binding = 5) readonly buffer HB { vec2 hres[]; };        // [n_pairs, k/32]
+layout(binding = 6) writeonly buffer CB { float c[]; };         // [n_pairs, n] packed
+#else
 layout(binding = 5) writeonly buffer CB { float c[]; };         // [n_pairs, n] packed
+#endif
 #else
 layout(binding = 3) writeonly buffer CB { float c[]; };         // [m, n]
 #endif
@@ -239,6 +249,23 @@ void main() {
                 }
             }
         }
+#ifdef ACT_HI
+        // The outlier's remainder times the weight element at its lane, `d·sc·(q6 − 32)` of its
+        // 16-element half: `As` holds its clamped code, so the block's dot is whole again. The lane
+        // is masked: the rows past the segment read whatever the padding holds, and their results
+        // are dropped at the store.
+        [[unroll]] for (uint i = 0u; i < TM; i++) {
+            vec2 hr = hres[(wgRow + tr * TM + i) * nblk32 + blk32];
+            if (hr.x != 0.0) {
+                uint e = uint(hr.y) & 31u;
+                [[unroll]] for (uint j = 0u; j < TN; j++) {
+                    uint cc = tc * TN + j;
+                    int q6 = int(Bs[cc * SP + (e >> 2u)] << (24u - (e & 3u) * 8u)) >> 24;
+                    acc[i][j] += hr.x * (Bdl[2u * cc + (e >> 4u)] * float(q6));
+                }
+            }
+        }
+#endif
         }
         // Placed AFTER the shared-scale reads above (Bdl/Bmm), not after the qsum loop: every
         // shared read of this iteration (As/Bs in qsum AND the per-col scales here) must complete

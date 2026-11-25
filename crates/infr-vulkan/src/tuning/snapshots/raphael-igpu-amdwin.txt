@@ -1,6 +1,6 @@
 device:  AMD Radeon(TM) Graphics (AmdRdna2, AMD_PROPRIETARY, integrated)
 match:   vendor=amd arch=AmdRdna2 driver=AMD_PROPRIETARY integrated=true device_id=0x13c0 cu=2 subgroup=32-64 driver_version=0x800161
-hash:    4d6f47de
+hash:    1a8fbc0c
 rows:
   amd-proprietary-split-k [class row, maintainer] sets split_k.scale_by_cu
   amd-proprietary-i8cm-kq [class row, maintainer] sets gemm_i8cm_kq.enabled
@@ -64,3 +64,4 @@ gemm_i8cm_kq.l_fill_per_cu   2      default
 rmsnorm.wide                 true   default
 rmsnorm.wide_min_dim         2048   default
 quant_q8.blocks_per_wg       8      fixed
+quant_q8.experts_hi          false  default

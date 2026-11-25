@@ -9,6 +9,19 @@
 //   s_act      f16    — per-block Σ(d·q) = Σ(dequant a), [m, nblk]  (folds the weight-min term)
 // Fixed BLK=32 (the u4 weight block) = one subgroup; dispatched at a required subgroup size of 32.
 // MIRRORS `QUANT_Q8_BLOCKS_PER_WG` in recorder.rs (`quant_q8_blocks_per_wg_matches_shader`).
+//
+// -DHI (the routed experts' outlier build, `quant_q8.experts_hi`): a block whose largest magnitude
+// stands more than QUANT_Q8_HI_RATIO times above every other one quantizes the rest on THEIR own
+// scale (the first token's massive activations otherwise round the other 31 elements of their
+// block to 0 or ±1, docs/gpu-tolerance.md). The outlier keeps a code clamped to ±127 at that
+// scale, and what the code leaves of it goes to one more output:
+//   hres[m,nblk] vec2 — (v − q·d, its lane) for a split block, (0, 0) for any other
+// so `q·dact + hres.x` is the outlier again, and a consumer adds `hres.x · w[lane]` per block. A
+// split block's scale is rounded up to a value f16 holds exactly, so `dact` is that scale under
+// any f16 rounding and the remainder is taken against what consumers read. A block that does not
+// split writes the same qa/dact/sact bits as the plain build. `sact` stays Σ(d·q) and leaves the
+// remainder out. MIRRORS `QUANT_Q8_HI_RATIO` in recorder.rs
+// (`quant_q8_hi_ratio_matches_shader`).
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_shader_8bit_storage : require
@@ -17,6 +30,7 @@
 #include "wave64.glsl"
 
 #define QUANT_Q8_BLOCKS_PER_WG 8u
+#define QUANT_Q8_HI_RATIO 16.0
 layout(local_size_x = 32 * QUANT_Q8_BLOCKS_PER_WG, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform PC { uint m; uint k; uint blk; } pc;
@@ -39,6 +53,19 @@ layout(binding = 0) readonly buffer ABuf { float a[]; };       // [m, k]
 layout(binding = QB) writeonly buffer QBuf { int8_t qa[]; };    // [m, k]
 layout(binding = DBI) writeonly buffer DBuf { float16_t dact[]; }; // [m, nblk]
 layout(binding = SBI) writeonly buffer SBuf { float16_t sact[]; }; // [m, nblk]
+#ifdef HI
+layout(binding = SBI + 1) writeonly buffer HBuf { vec2 hres[]; }; // [m, nblk]
+
+// The least value f16 holds exactly at or above `x` (finite, non-negative, within f16's range):
+// a multiple of 2^-24 in the subnormal range, else `x` with the 13 mantissa bits f16 lacks
+// rounded up.
+float f16_ceil(float x) {
+    if (x < 6.103515625e-05) {
+        return ceil(x * 16777216.0) / 16777216.0;
+    }
+    return uintBitsToFloat((floatBitsToUint(x) + 0x1FFFu) & ~0x1FFFu);
+}
+#endif
 
 void main() {
     uint nblk = pc.k / pc.blk;
@@ -60,14 +87,35 @@ void main() {
     float v = a[idx];
 #endif
     float amax = subgroupMax(abs(v));
+#ifdef HI
+    // The lowest lane holding the largest magnitude, and the largest magnitude of the others.
+    uint top = subgroupMin(abs(v) == amax ? t : 32u);
+    float next = subgroupMax(t == top ? 0.0 : abs(v));
+    bool split = amax > QUANT_Q8_HI_RATIO * next;
+    if (split) {
+        amax = next;
+    }
+#endif
     float d = amax / 127.0;
+#ifdef HI
+    if (split) {
+        d = f16_ceil(d);
+    }
+#endif
     float inv = (amax > 0.0) ? 1.0 / d : 0.0;
     int q = int(round(v * inv));
     q = clamp(q, -127, 127);
     qa[idx] = int8_t(q);
     float s = subgroupAdd(d * float(q));
+#ifdef HI
+    // The outlier's remainder, to lane 0: one non-zero term, so the sum is that term exactly.
+    float rem = subgroupAdd((split && t == top) ? v - float(q) * d : 0.0);
+#endif
     if (t == 0u) {
         dact[row * nblk + blk] = float16_t(d);
         sact[row * nblk + blk] = float16_t(s);
+#ifdef HI
+        hres[row * nblk + blk] = split ? vec2(rem, float(top)) : vec2(0.0);
+#endif
     }
 }

@@ -1,6 +1,6 @@
 device:  NVIDIA GeForce RTX 2080 Ti (NvidiaTuring, NVIDIA_PROPRIETARY)
 match:   vendor=nvidia arch=NvidiaTuring driver=NVIDIA_PROPRIETARY integrated=false device_id=0x1e07 cu=68 subgroup=32-32 driver_version=0x0
-hash:    1c9241fa
+hash:    2ca37f2d
 rows: none
 
 device.sg_pref               32     default
@@ -61,3 +61,4 @@ gemm_i8cm_kq.l_fill_per_cu   2      default
 rmsnorm.wide                 true   default
 rmsnorm.wide_min_dim         2048   default
 quant_q8.blocks_per_wg       8      fixed
+quant_q8.experts_hi          false  default

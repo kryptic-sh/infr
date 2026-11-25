@@ -907,6 +907,20 @@ pub(crate) static PARAMS: &[Param] = &[
         get: |_, _| Value::Uint(crate::recorder::QUANT_Q8_BLOCKS_PER_WG as u64),
         set: fixed_set,
     },
+    Param {
+        family: "quant_q8",
+        name: "experts_hi",
+        kind: Kind::Variant,
+        ty: Ty::Bool,
+        axis: Axis::None,
+        doc: "experimental: the routed experts' batched Q4_K/Q6_K GEMMs on the outlier \
+              quantizer, which carries a block's largest activation exactly when it stands far \
+              above the rest (quant_q8.comp's -DHI build)",
+        rule: "false",
+        default: |_, _| Value::Bool(false),
+        get: |t, _| Value::Bool(t.quant_q8_experts_hi),
+        set: |t, _, v| t.quant_q8_experts_hi = v.flag(),
+    },
 ];
 
 /// The parameter named `family.param`, if there is one.

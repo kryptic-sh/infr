@@ -89,6 +89,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Experimental: the Vulkan tuning parameter `quant_q8.experts_hi`** (off by
+  default; `--set kernels.vulkan.tune.quant_q8.experts_hi=true`). With it on, a
+  MoE model's batched prefill quantizes the routed experts' activations with an
+  outlier-aware int8 quantizer: a 32-element block whose largest value stands
+  over 16 times above the rest is quantized on the scale of the rest, and that
+  value's remainder is carried in f32 and added back in the expert GEMM. Q4_K
+  and Q6_K expert weights only, resident (not paged) experts only; another
+  format keeps the shipped quantizer for its stage. On Qwen3-30B-A3B it takes
+  the first two positions' KL against the CPU reference from 3.8e-2 to 2.5e-4 on
+  the RX 7900 XTX and to 1.3e-3 on the integrated GPU (`docs/gpu-tolerance.md`,
+  "The routed experts' outlier quantizer"). Decode is unchanged; prefill speed
+  is not yet measured. `Recorder::quant_q8_with`, `quant_q8_gather_with` and
+  `matmul_mmq_experts_with` take the carried remainders as an `Option`.
 - **`Op::AttnTemp`** on the CPU, Vulkan and Metal backends: llama.cpp's
   position-dependent attention temperature (`llm_graph_input_attn_temp`), which
   scales each row by `ln(floor((pos + offset) / floor_scale) + 1) * scale + 1`.

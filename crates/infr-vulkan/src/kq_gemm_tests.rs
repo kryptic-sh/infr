@@ -10,6 +10,10 @@
 //! the tolerance is a small multiple of f32 epsilon over the absolute term sum; a wrong nibble,
 //! scale, sign or row lands at the size of the terms themselves. What int8 activations cost
 //! against f32 is bounded separately, in `seam_op_parity`'s `kquant_linear_*` tests.
+//!
+//! The same file holds the routed experts' outlier quantizer (`quant_q8.comp`'s `-DHI` build) to
+//! its rule, and the batched expert GEMMs that read it (`-DACT_HI`) to their decomposition plus
+//! each block's carried remainder.
 // Wrapped in its own `#[cfg(test)]` module, like every in-crate test, so the bare-print guard
 // (`infr-core/tests/no_bare_print.rs`) reads its skip notices as test output.
 #[cfg(test)]
@@ -301,5 +305,468 @@ mod tests {
             });
             fx.assert_matches_decomposition(dt, "dp4a", &got, &w_host, &mins);
         }
+    }
+
+    // ── The routed experts' outlier quantizer (`quant_q8.comp`'s `-DHI`) and the expert GEMMs
+    // that read it (`-DACT_HI`), against their rule and an f64 reference. ──
+
+    /// The outlier tests' depth: a multiple of the K-quant superblock, more than one of them, so
+    /// a weight row spans superblocks.
+    const K_HI: usize = 512;
+
+    /// `rows` activation rows of `K_HI`, ordinary values (`|x| <= 0.15`) with the cases the
+    /// outlier quantizer exists for or must leave alone, by row:
+    /// - `r % 4 == 0`: one massive activation (±150) in block `r % 16`, at lane `(7r + 1) % 32`
+    ///   (`≡ 1 mod 4`, the second byte of a packed word);
+    /// - `r % 4 == 1`: nothing but ordinary values;
+    /// - `r % 4 == 2`: massive activations in two blocks (80 in block 3, −60 in block 9);
+    /// - `r % 4 == 3`: block 5's largest exactly `QUANT_Q8_HI_RATIO` times the next (does not
+    ///   split), block 6's just over it (splits), block 7 all zero, block 8 a single non-zero
+    ///   value, block 10 two equal largest values (does not split).
+    fn hi_rows(rows: usize) -> Vec<f32> {
+        let mut x: Vec<f32> = (0..rows * K_HI)
+            .map(|i| ((i % K_HI) as f32 * 0.37 + (i / K_HI) as f32 * 1.3).sin() * 0.15)
+            .collect();
+        let ratio = crate::recorder::QUANT_Q8_HI_RATIO;
+        for (r, row) in x.chunks_mut(K_HI).enumerate() {
+            match r % 4 {
+                0 => {
+                    let sign = if r % 8 == 0 { 1.0 } else { -1.0 };
+                    row[(r % 16) * 32 + (7 * r + 1) % 32] = 150.0 * sign;
+                }
+                2 => {
+                    row[3 * 32 + 11] = 80.0;
+                    row[9 * 32 + 30] = -60.0;
+                }
+                3 => {
+                    // The largest magnitude of block `b` without lane `lane`.
+                    let next = |row: &[f32], b: usize, lane: usize| {
+                        (0..32)
+                            .filter(|&i| i != lane)
+                            .fold(0f32, |m, i| m.max(row[b * 32 + i].abs()))
+                    };
+                    row[5 * 32 + 9] = ratio * next(row, 5, 9);
+                    row[6 * 32 + 2] = ratio * next(row, 6, 2) * 1.001;
+                    row[7 * 32..8 * 32].fill(0.0);
+                    row[8 * 32..9 * 32].fill(0.0);
+                    row[8 * 32 + 4] = 0.7;
+                    row[10 * 32 + 1] = 5.0;
+                    row[10 * 32 + 20] = -5.0;
+                }
+                _ => {}
+            }
+        }
+        x
+    }
+
+    /// The rule `quant_q8.comp`'s `-DHI` build applies to one block: the lowest lane holding the
+    /// largest magnitude, and whether that magnitude stands more than `QUANT_Q8_HI_RATIO` times
+    /// above every other one.
+    fn hi_split(blk: &[f32]) -> (usize, bool) {
+        let amax = blk.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let top = blk.iter().position(|v| v.abs() == amax).unwrap();
+        let next = (0..blk.len())
+            .filter(|&i| i != top)
+            .fold(0f32, |m, i| m.max(blk[i].abs()));
+        (top, amax > crate::recorder::QUANT_Q8_HI_RATIO * next)
+    }
+
+    fn vec2_at(bytes: &[u8], i: usize) -> (f32, f32) {
+        let f = |o: usize| f32::from_le_bytes(bytes[o..o + 4].try_into().unwrap());
+        (f(8 * i), f(8 * i + 4))
+    }
+
+    fn upload_f32(be: &VulkanBackend, v: &[f32]) -> Box<dyn Buffer> {
+        let b = be.alloc(v.len() * 4, BufferUsage::Activations).unwrap();
+        be.upload(b.as_ref(), bytemuck::cast_slice(v)).unwrap();
+        b
+    }
+
+    fn upload_u32(be: &VulkanBackend, v: &[u32]) -> Box<dyn Buffer> {
+        let b = be.alloc(v.len() * 4, BufferUsage::Activations).unwrap();
+        be.upload(b.as_ref(), bytemuck::cast_slice(v)).unwrap();
+        b
+    }
+
+    /// One quantization's outputs: codes, f16 scales, f16 sums, and (the `-DHI` builds) the
+    /// carried remainders.
+    struct Quantized {
+        qa: Box<dyn Buffer>,
+        dact: Box<dyn Buffer>,
+        sact: Box<dyn Buffer>,
+        hres: Box<dyn Buffer>,
+    }
+
+    impl Quantized {
+        fn new(be: &VulkanBackend, rows: usize, k: usize) -> Self {
+            let nblk = k / 32;
+            let a = |n: usize| be.alloc(n, BufferUsage::Activations).unwrap();
+            Quantized {
+                qa: a(rows * k),
+                dact: a(rows * nblk * 2),
+                sact: a(rows * nblk * 2),
+                hres: a(rows * nblk * 8),
+            }
+        }
+
+        fn host(&self, be: &VulkanBackend) -> [Vec<u8>; 4] {
+            [&self.qa, &self.dact, &self.sact, &self.hres].map(|b| download_bytes(be, b.as_ref()))
+        }
+    }
+
+    /// The outlier quantizer against its rule, block by block: a block that does not split gets
+    /// the plain build's bits and a zero remainder; one that splits takes the scale of the rest
+    /// (each other element within half a step of it), keeps a ±127 code at its outlier, and the
+    /// code times the f16 scale plus the remainder is the outlier again. The gather build gives
+    /// the same bits as the plain one for the row each slot reads.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn quant_q8_hi_follows_its_rule() {
+        let Some(be) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
+            return;
+        };
+        let rows = 12;
+        let nblk = K_HI / 32;
+        let x = hi_rows(rows);
+        let xbuf = upload_f32(&be, &x);
+        // Slot j reads row perm[j]: reversed, so no slot reads its own row.
+        let perm: Vec<u32> = (0..rows as u32).rev().collect();
+        let pbuf = upload_u32(&be, &perm);
+        let (plain, hi, gathered) = (
+            Quantized::new(&be, rows, K_HI),
+            Quantized::new(&be, rows, K_HI),
+            Quantized::new(&be, rows, K_HI),
+        );
+        let rec = be.recorder().unwrap();
+        let x_in = xbuf.as_ref();
+        let (p, h, g) = (&plain, &hi, &gathered);
+        rec.quant_q8(
+            x_in,
+            p.qa.as_ref(),
+            p.dact.as_ref(),
+            p.sact.as_ref(),
+            rows,
+            K_HI,
+        );
+        let hres = Some(h.hres.as_ref());
+        rec.quant_q8_with(
+            x_in,
+            h.qa.as_ref(),
+            h.dact.as_ref(),
+            h.sact.as_ref(),
+            hres,
+            rows,
+            K_HI,
+        );
+        rec.quant_q8_gather_with(
+            x_in,
+            pbuf.as_ref(),
+            g.qa.as_ref(),
+            g.dact.as_ref(),
+            g.sact.as_ref(),
+            Some(g.hres.as_ref()),
+            rows,
+            K_HI,
+        );
+        rec.finish().unwrap();
+        assert!(be.built_kernel_names().contains(&"quant_q8_hi"));
+        let [qa0, da0, sa0, _] = plain.host(&be);
+        let [qa1, da1, sa1, h1] = hi.host(&be);
+        let [qa2, da2, sa2, h2] = gathered.host(&be);
+        let (mut split_blocks, mut whole_blocks) = (0, 0);
+        for r in 0..rows {
+            for b in 0..nblk {
+                let i = r * nblk + b;
+                let blk = &x[r * K_HI + b * 32..r * K_HI + (b + 1) * 32];
+                let codes = |qa: &[u8]| qa[r * K_HI + b * 32..r * K_HI + (b + 1) * 32].to_vec();
+                let (top, split) = hi_split(blk);
+                let (rem, lane) = vec2_at(&h1, i);
+                if !split {
+                    whole_blocks += 1;
+                    assert_eq!(codes(&qa1), codes(&qa0), "row {r} block {b}: codes");
+                    assert_eq!(
+                        da1[2 * i..2 * i + 2],
+                        da0[2 * i..2 * i + 2],
+                        "row {r} block {b}"
+                    );
+                    assert_eq!(
+                        sa1[2 * i..2 * i + 2],
+                        sa0[2 * i..2 * i + 2],
+                        "row {r} block {b}"
+                    );
+                    assert_eq!((rem, lane), (0.0, 0.0), "row {r} block {b}: remainder");
+                    continue;
+                }
+                split_blocks += 1;
+                let next = (0..32)
+                    .filter(|&l| l != top)
+                    .fold(0f32, |m, l| m.max(blk[l].abs()));
+                let d = f16_at(&da1, i);
+                let want_d = next as f64 / 127.0;
+                assert!(
+                    (d - want_d).abs() <= want_d * 2f64.powi(-10),
+                    "row {r} block {b}: scale {d}, the rest's {want_d}"
+                );
+                assert_eq!(lane, top as f32, "row {r} block {b}: lane");
+                let c = codes(&qa1);
+                for (l, (&q, &v)) in c.iter().zip(blk).enumerate() {
+                    let q = q as i8 as f64;
+                    if l == top {
+                        let want_q = if next > 0.0 {
+                            127.0 * v.signum() as f64
+                        } else {
+                            0.0
+                        };
+                        assert_eq!(q, want_q, "row {r} block {b}: the outlier's code");
+                        let back = q * d + rem as f64;
+                        assert!(
+                            (back - v as f64).abs() <= 1e-6 * (v as f64).abs(),
+                            "row {r} block {b}: outlier {v} comes back as {back}"
+                        );
+                    } else {
+                        // A split block's scale is f16-exact, so the codes round against the
+                        // very scale read back: half a step, and a hair for `v · (1/d)`'s f32
+                        // rounding at a tie.
+                        assert!(
+                            (q * d - v as f64).abs() <= d * (0.5 + 1e-6),
+                            "row {r} block {b} lane {l}: {v} quantized to {q} x {d}"
+                        );
+                    }
+                }
+            }
+        }
+        // Every kind of block ran: the massive-activation rows and row 3's just-over block split;
+        // the ordinary blocks, the exact-ratio, all-zero and tied blocks did not.
+        assert_eq!(split_blocks, rows / 4 * (1 + 2 + 2));
+        assert!(whole_blocks > 0);
+        for (j, &src) in perm.iter().enumerate() {
+            let s = src as usize;
+            let row = |v: &[u8], w: usize| v[j * w..(j + 1) * w].to_vec();
+            let src_row = |v: &[u8], w: usize| v[s * w..(s + 1) * w].to_vec();
+            for (got, want, w) in [
+                (&qa2, &qa1, K_HI),
+                (&da2, &da1, nblk * 2),
+                (&sa2, &sa1, nblk * 2),
+                (&h2, &h1, nblk * 8),
+            ] {
+                assert_eq!(row(got, w), src_row(want, w), "gather slot {j} (row {s})");
+            }
+        }
+        eprintln!("quant_q8_hi: {split_blocks} blocks split, {whole_blocks} whole");
+    }
+
+    /// The outlier-reading expert GEMMs (Q4_K, Q6_K, every resident tile) against the f64 sum of
+    /// their decomposition from the GPU's own codes, scales, sums and remainders, plus the
+    /// remainder times the weight at its lane. Then what it is for: on a row with a massive
+    /// activation its output is held to the exact f64 dot of the f32 activation at least ten
+    /// times closer than the plain GEMM's, and on a row without one it matches the plain GEMM's
+    /// to within 1e-5 of the absolute term sum (the two builds may contract the epilogue
+    /// differently). The carried lanes cover every byte position of a packed word.
+    #[test]
+    #[ignore = "requires a Vulkan GPU with int8 dot"]
+    fn expert_gemm_hi_matches_its_decomposition() {
+        let Some(be) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
+            return;
+        };
+        if !be.caps().i8_dot {
+            eprintln!("expert_gemm_hi_matches_its_decomposition: no int8 dot here — skipped");
+            return;
+        }
+        // (rows per expert, n, the tile `matmul_mmq_experts` picks for it at K_HI): an average
+        // over the small-tile cutoff takes BM=64, under it BM=32; n % 128 == 0 takes BN=128.
+        let big = [50u32, 40, 45, 35, 30];
+        let small = [0u32, 0, 4, 3, 2];
+        for dt in [DType::Q4K, DType::Q6K] {
+            let tag = if dt == DType::Q4K { "q4k" } else { "q6k" };
+            for (counts, n, tile) in [
+                (&big, 192, "xp"),
+                (&big, 256, "xp128"),
+                (&small, 192, "xp32"),
+                (&small, 256, "xp32w"),
+            ] {
+                expert_gemm_hi_case(
+                    &be,
+                    dt,
+                    counts,
+                    n,
+                    &format!("native_gemm_mmq_{tag}_{tile}_hi"),
+                );
+            }
+        }
+    }
+
+    fn expert_gemm_hi_case(
+        be: &VulkanBackend,
+        dt: DType,
+        counts_host: &[u32],
+        n: usize,
+        kernel: &str,
+    ) {
+        let k = K_HI;
+        let nblk = k / 32;
+        let n_expert = counts_host.len();
+        let stride = k * n;
+        let banks: Vec<Vec<u8>> = (0..n_expert)
+            .map(|e| synth_bank(dt, stride, 0x41c7 ^ ((e as u64) << 32) ^ n as u64))
+            .collect();
+        let w_host: Vec<Vec<f32>> = banks
+            .iter()
+            .map(|b| infr_gguf::dequant::dequant_block(dt, b).unwrap())
+            .collect();
+        let mins: Vec<Vec<f32>> = banks.iter().map(|b| block_mins(dt, b)).collect();
+        let bank_bytes = banks.concat();
+        let flat = crate::linear::pad_to_u32_align(&bank_bytes);
+        let w = be.alloc(flat.len(), BufferUsage::Weights).unwrap();
+        be.upload(w.as_ref(), &flat).unwrap();
+        let offsets_host: Vec<u32> = counts_host
+            .iter()
+            .scan(0u32, |acc, &c| {
+                let o = *acc;
+                *acc += c;
+                Some(o)
+            })
+            .collect();
+        let rows = counts_host.iter().sum::<u32>() as usize;
+        // The GEMM's activation stage reads up to a tile past a segment's end.
+        let npad = rows.div_ceil(64) * 64 + 64;
+        let x = hi_rows(rows);
+        let xbuf = upload_f32(be, &x);
+        let (plain, hi) = (Quantized::new(be, npad, k), Quantized::new(be, npad, k));
+        let out = || be.alloc(npad * n * 4, BufferUsage::Activations).unwrap();
+        let (out_plain, out_hi) = (out(), out());
+        let counts = upload_u32(be, counts_host);
+        let offsets = upload_u32(be, &offsets_host);
+        let with_sact = infr_core::tensor::moe_mmq_needs_sact(dt);
+        let rec = be.recorder().unwrap();
+        for (qz, hres, c) in [
+            (&plain, None, &out_plain),
+            (&hi, Some(hi.hres.as_ref()), &out_hi),
+        ] {
+            rec.quant_q8_with(
+                xbuf.as_ref(),
+                qz.qa.as_ref(),
+                qz.dact.as_ref(),
+                qz.sact.as_ref(),
+                hres,
+                rows,
+                k,
+            );
+            rec.matmul_mmq_experts_with(
+                dt,
+                "expert_gateup",
+                qz.qa.as_ref(),
+                qz.dact.as_ref(),
+                with_sact.then(|| qz.sact.as_ref()),
+                hres,
+                w.as_ref(),
+                0,
+                stride,
+                counts.as_ref(),
+                offsets.as_ref(),
+                c.as_ref(),
+                rows,
+                k,
+                n,
+                n_expert,
+                1,
+            );
+        }
+        rec.finish().unwrap();
+        assert!(
+            be.built_kernel_names().contains(&kernel),
+            "{dt:?}: {kernel} was not built"
+        );
+        let dl = |b: &dyn Buffer| {
+            let mut v = vec![0f32; npad * n];
+            be.download(b, bytemuck::cast_slice_mut(&mut v)).unwrap();
+            v
+        };
+        let (y_plain, y_hi) = (dl(out_plain.as_ref()), dl(out_hi.as_ref()));
+        let [qa_h, da_h, sa_h, h_h] = hi.host(be);
+        let (mut worst, mut outlier_rows, mut gain) = (0f64, 0, f64::INFINITY);
+        // Byte positions (lane % 4) of the remainders the routed rows carried.
+        let mut lanes_seen = [false; 4];
+        for (e, (&off, &cnt)) in offsets_host.iter().zip(counts_host).enumerate() {
+            for r in off as usize..(off + cnt) as usize {
+                let has_split =
+                    (0..nblk).any(|b| hi_split(&x[r * k + b * 32..r * k + (b + 1) * 32]).1);
+                // The rows `hi_rows` gives a massive activation (rows 0 and 2 of every four).
+                let massive = x[r * k..(r + 1) * k].iter().any(|v| v.abs() >= 50.0);
+                let (mut err_hi, mut err_plain) = (0f64, 0f64);
+                for o in 0..n {
+                    let wr = &w_host[e][o * k..(o + 1) * k];
+                    let (mut want, mut mag) = (0f64, 0f64);
+                    for b in 0..nblk {
+                        let i = r * nblk + b;
+                        let (d, s) = (f16_at(&da_h, i), f16_at(&sa_h, i));
+                        let min = mins[e][o * nblk + b] as f64;
+                        let mut dot = 0f64;
+                        for l in b * 32..(b + 1) * 32 {
+                            let t = (qa_h[r * k + l] as i8 as f64) * (wr[l] as f64 - min);
+                            dot += t;
+                            mag += (t * d).abs();
+                        }
+                        let (rem, lane) = vec2_at(&h_h, i);
+                        if rem != 0.0 {
+                            lanes_seen[lane as usize % 4] = true;
+                        }
+                        let carried = rem as f64 * wr[b * 32 + lane as usize] as f64;
+                        want += d * dot + s * min + carried;
+                        mag += (s * min).abs() + carried.abs();
+                    }
+                    let g = y_hi[r * n + o] as f64;
+                    let err = (g - want).abs();
+                    worst = worst.max(err / mag);
+                    assert!(
+                        err <= 1e-5 * mag,
+                        "{kernel}: expert {e} row {r} col {o}: got {g} want {want} (terms {mag})"
+                    );
+                    let exact: f64 = wr
+                        .iter()
+                        .zip(&x[r * k..(r + 1) * k])
+                        .map(|(&a, &b)| a as f64 * b as f64)
+                        .sum();
+                    err_hi += (y_hi[r * n + o] as f64 - exact).powi(2);
+                    err_plain += (y_plain[r * n + o] as f64 - exact).powi(2);
+                    if !has_split {
+                        let p = y_plain[r * n + o] as f64;
+                        assert!(
+                            (g - p).abs() <= 1e-5 * mag,
+                            "{kernel}: row {r} (no outlier) col {o}: {g} against plain {p}"
+                        );
+                    }
+                }
+                if has_split {
+                    eprintln!(
+                        "  {kernel} row {r}: error against the exact dot {:.3e}, plain {:.3e}",
+                        err_hi.sqrt(),
+                        err_plain.sqrt()
+                    );
+                }
+                if massive {
+                    outlier_rows += 1;
+                    let g = (err_plain / err_hi).sqrt();
+                    gain = gain.min(g);
+                    assert!(
+                        g >= 10.0,
+                        "{kernel}: row {r}: error against the exact dot {:.3e}, plain {:.3e}",
+                        err_hi.sqrt(),
+                        err_plain.sqrt()
+                    );
+                }
+            }
+        }
+        assert!(
+            outlier_rows > 0,
+            "{kernel}: no routed row carried an outlier"
+        );
+        assert_eq!(
+            lanes_seen, [true; 4],
+            "{kernel}: the carried lanes miss a byte position of the packed word"
+        );
+        eprintln!(
+            "{kernel}: worst error / term sum {worst:e}; {outlier_rows} outlier rows, each at \
+             least {gain:.0}x closer to the exact dot than the plain GEMM"
+        );
     }
 }

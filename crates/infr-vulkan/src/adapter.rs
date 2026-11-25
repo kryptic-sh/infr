@@ -4254,6 +4254,23 @@ fn lower_op(
                 let dda = pooled(pool, be_, "moe_dda", npad * (nff / 32) * 2)?;
                 let dsa = pooled(pool, be_, "moe_dsa", npad * (nff / 32) * 2)?;
                 let ye = pooled(pool, be_, "moe_ye", npad * ne * 4)?;
+                // `quant_q8.experts_hi`: each stage whose GEMMs all have an outlier build quantizes
+                // on it and carries each block's outlier remainder (`vec2`, 8 bytes a block).
+                let hi = be_.tuning().quant_q8_experts_hi;
+                let gu_hi = hi
+                    && crate::recorder::moe_mmq_hi_ok(gdt)
+                    && (*fused_gate_up || crate::recorder::moe_mmq_hi_ok(udt));
+                let down_hi = hi && crate::recorder::moe_mmq_hi_ok(ddt);
+                let qha = if gu_hi {
+                    Some(pooled(pool, be_, "moe_qha", npad * (ne / 32) * 8)?)
+                } else {
+                    None
+                };
+                let dha = if down_hi {
+                    Some(pooled(pool, be_, "moe_dha", npad * (nff / 32) * 8)?)
+                } else {
+                    None
+                };
 
                 // Router logits for all rows (on `router_x`, NOT `x`), then GPU routing.
                 let rdt = graph.desc(*router).dtype;
@@ -4324,12 +4341,14 @@ fn lower_op(
 
                 let (gw, dw) = (r(*gate_exps)?, r(*down_exps)?);
                 // Gather+quant all assignments into the packed layout in one pass.
-                rec.quant_q8_gather(
+                let qh = qha.map(|k| pool[&k].as_ref());
+                rec.quant_q8_gather_with(
                     xb,
                     bucket_rows.as_ref(),
                     pool[&qa].as_ref(),
                     pool[&qda].as_ref(),
                     pool[&qsa].as_ref(),
+                    qh,
                     n_pairs,
                     ne,
                 );
@@ -4342,12 +4361,13 @@ fn lower_op(
                 // below. Mirrored per-role here since gate/up can each independently be any
                 // `MOE_MMQ_DTYPES` member.
                 let gate_needs_sact = infr_core::tensor::moe_mmq_needs_sact(gdt);
-                rec.matmul_mmq_experts(
+                rec.matmul_mmq_experts_with(
                     gdt,
                     "expert_gateup",
                     pool[&qa].as_ref(),
                     pool[&qda].as_ref(),
                     gate_needs_sact.then(|| pool[&qsa].as_ref()),
+                    qh,
                     gw,
                     0,
                     stride,
@@ -4365,12 +4385,13 @@ fn lower_op(
                     // and writes its own buffer — disjoint from the gate GEMM, no barrier needed.
                     let up_needs_sact = infr_core::tensor::moe_mmq_needs_sact(udt);
                     rec.suppress_sync(true);
-                    rec.matmul_mmq_experts(
+                    rec.matmul_mmq_experts_with(
                         udt,
                         "expert_gateup",
                         pool[&qa].as_ref(),
                         pool[&qda].as_ref(),
                         up_needs_sact.then(|| pool[&qsa].as_ref()),
+                        qh,
                         r(*up_exps)?,
                         0,
                         stride,
@@ -4433,11 +4454,13 @@ fn lower_op(
                         }
                     }
                 }
-                rec.quant_q8(
+                let dh = dha.map(|k| pool[&k].as_ref());
+                rec.quant_q8_with(
                     pool[&ae].as_ref(),
                     pool[&dqa].as_ref(),
                     pool[&dda].as_ref(),
                     pool[&dsa].as_ref(),
+                    dh,
                     n_pairs,
                     nff,
                 );
@@ -4446,12 +4469,13 @@ fn lower_op(
                 // self-computes its own min term in-shader (see the gate/up `_needs_sact` comment
                 // above), same as the per-token path's dtype-gated `sact` use.
                 let down_needs_sact = infr_core::tensor::moe_mmq_needs_sact(ddt);
-                rec.matmul_mmq_experts(
+                rec.matmul_mmq_experts_with(
                     ddt,
                     "expert_down",
                     pool[&dqa].as_ref(),
                     pool[&dda].as_ref(),
                     down_needs_sact.then(|| pool[&dsa].as_ref()),
+                    dh,
                     dw,
                     0,
                     down_stride,
@@ -12492,6 +12516,198 @@ mod tests {
                     "batched split q5k-down moe_ffn mismatch rows={rows} at {i}: got {} want {}",
                     got[i],
                     want[i]
+                );
+            }
+        }
+    }
+
+    /// The tuning parameter `quant_q8.experts_hi` through the batched MoE lowering, Q4_K experts,
+    /// four token rows carrying a massive activation. Off (the default, and set off explicitly) no
+    /// outlier build is made and the output has the same bits either way; on, both stages'
+    /// quantizers and GEMMs take their outlier builds, and the rows with a massive activation land
+    /// at least four times closer to the f64 reference of the float experts (dequantized weights,
+    /// unquantized activations) than the default does.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn moe_ffn_batched_experts_hi_switch() {
+        let backend = |hi: Option<bool>| {
+            let mut cfg = crate::test_config();
+            if let Some(on) = hi {
+                cfg.kernels
+                    .vulkan
+                    .tune
+                    .entries
+                    .push(infr_core::config::TuneEntry {
+                        key: "quant_q8.experts_hi".into(),
+                        value: on.to_string(),
+                        level: infr_core::config::TuneLevel::Cli,
+                    });
+            }
+            infr_testkit::gpu_or_skip_noted(VulkanBackend::new_with(std::sync::Arc::new(cfg)))
+        };
+        let Some(be_default) = backend(None) else {
+            return; // no GPU — self-skip
+        };
+        if !be_default.caps().i8_dot {
+            // The batched expert GEMMs, plain and outlier builds alike, need an int8 dot.
+            eprintln!("moe_ffn_batched_experts_hi_switch: no int8 dot here — skipped");
+            return;
+        }
+        let (ne, n_expert, n_used, nff, rows) = (256usize, 4usize, 2usize, 256usize, 16usize);
+        let f = |i: usize, s: f32| (i as f32 * s).sin() * 0.5;
+        let router: Vec<f32> = (0..n_expert * ne)
+            .map(|i| f(i, 0.037) + (i / ne) as f32 * 0.15)
+            .collect();
+        let bank = |s: f32, n: usize| (0..n).map(|i| f(i, s) * 0.3).collect::<Vec<f32>>();
+        let rq = q8_0(&router);
+        let (gq, uq, dq) = (
+            q4k(&bank(0.017, n_expert * nff * ne)),
+            q4k(&bank(0.023, n_expert * nff * ne)),
+            q4k(&bank(0.029, n_expert * ne * nff)),
+        );
+        let (rd, gd, ud, dd) = (deq_q8(&rq), deq_q4k(&gq), deq_q4k(&uq), deq_q4k(&dq));
+        let mut x: Vec<f32> = (0..rows * ne).map(|i| f(i, 0.11) * 0.2 + 0.01).collect();
+        // One massive activation at each byte position of a packed word (lane % 4: 3, 0, 1, 2).
+        x[7] = 60.0;
+        x[3 * ne + 100] = -40.0;
+        x[5 * ne + 33] = 50.0;
+        x[9 * ne + 66] = -45.0;
+        let massive = [0usize, 3, 5, 9];
+
+        // The f64 reference: the router's own selection, float experts, no activation rounding.
+        let dot = |w: &[f32], v: &[f64]| w.iter().zip(v).map(|(&a, &b)| a as f64 * b).sum::<f64>();
+        let mut want = vec![0f64; rows * ne];
+        for t in 0..rows {
+            let xr: Vec<f64> = x[t * ne..(t + 1) * ne].iter().map(|&v| v as f64).collect();
+            let logits: Vec<f64> = (0..n_expert)
+                .map(|e| dot(&rd[e * ne..(e + 1) * ne], &xr))
+                .collect();
+            let maxl = logits.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let probs: Vec<f64> = logits.iter().map(|&v| (v - maxl).exp()).collect();
+            let mut idx: Vec<usize> = (0..n_expert).collect();
+            idx.sort_by(|&a, &b| probs[b].total_cmp(&probs[a]));
+            idx.truncate(n_used);
+            let wsum: f64 = idx.iter().map(|&e| probs[e]).sum();
+            for &e in &idx {
+                let (gs, ds) = (e * nff * ne, e * ne * nff);
+                let act: Vec<f64> = (0..nff)
+                    .map(|j| {
+                        let g = dot(&gd[gs + j * ne..gs + (j + 1) * ne], &xr);
+                        let u = dot(&ud[gs + j * ne..gs + (j + 1) * ne], &xr);
+                        g / (1.0 + (-g).exp()) * u
+                    })
+                    .collect();
+                for i in 0..ne {
+                    want[t * ne + i] +=
+                        probs[e] / wsum * dot(&dd[ds + i * nff..ds + (i + 1) * nff], &act);
+                }
+            }
+        }
+
+        let run = |be_: &VulkanBackend| -> (Vec<f32>, Vec<&'static str>) {
+            let mut g = Graph::new();
+            let xi = g.input(TensorDesc::new(vec![rows, ne], DType::F32));
+            let ri = g.weight(TensorDesc::new(vec![n_expert, ne], DType::Q8_0));
+            let gi = g.weight(TensorDesc::new(vec![n_expert, nff, ne], DType::Q4K));
+            let ui = g.weight(TensorDesc::new(vec![n_expert, nff, ne], DType::Q4K));
+            let di = g.weight(TensorDesc::new(vec![n_expert, ne, nff], DType::Q4K));
+            let yi = g.output(TensorDesc::new(vec![rows, ne], DType::F32));
+            g.push(Op::MoeFfn {
+                x: xi,
+                router_x: xi,
+                router: ri,
+                gate_exps: gi,
+                up_exps: ui,
+                down_exps: di,
+                down_scale: None,
+                fused_gate_up: false,
+                dst: yi,
+                ne: ne as u32,
+                n_expert: n_expert as u32,
+                n_used: n_used as u32,
+                n_ff_exp: nff as u32,
+                scale: 1.0,
+                act: Activation::Silu,
+                gating: infr_core::graph::MoeGating::Softmax,
+                norm_w: true,
+                weight_before: false,
+                ep_band: None,
+                exp_probs_b: None,
+                n_expert_groups: 0,
+                n_expert_groups_used: 0,
+                swiglu_clamp: None,
+                expert_ids: None,
+            });
+            let mk = |bytes: &[u8], usage| {
+                let b = be_.alloc(bytes.len(), usage).unwrap();
+                be_.upload(b.as_ref(), bytes).unwrap();
+                b
+            };
+            let xb = mk(bytemuck::cast_slice(&x), BufferUsage::Activations);
+            let (rb, gb) = (mk(&rq, BufferUsage::Weights), mk(&gq, BufferUsage::Weights));
+            let (ub, db) = (mk(&uq, BufferUsage::Weights), mk(&dq, BufferUsage::Weights));
+            let yb = be_.alloc(rows * ne * 4, BufferUsage::Activations).unwrap();
+            let plan = be_.compile(&g).unwrap();
+            let mut bind = Bindings::new();
+            for (t, b) in [
+                (xi, &xb),
+                (ri, &rb),
+                (gi, &gb),
+                (ui, &ub),
+                (di, &db),
+                (yi, &yb),
+            ] {
+                bind.bind(t, b.as_ref());
+            }
+            be_.execute(plan.as_ref(), &bind).unwrap();
+            let mut got = vec![0f32; rows * ne];
+            be_.download(yb.as_ref(), bytemuck::cast_slice_mut(&mut got))
+                .unwrap();
+            (got, be_.built_kernel_names())
+        };
+        let (y_default, k_default) = run(&be_default);
+        drop(be_default);
+        let (y_off, k_off) = run(&backend(Some(false)).expect("the GPU found above"));
+        let (y_on, k_on) = run(&backend(Some(true)).expect("the GPU found above"));
+
+        assert!(
+            k_default.iter().all(|k| !k.ends_with("_hi")),
+            "the default built an outlier kernel: {k_default:?}"
+        );
+        assert_eq!(
+            k_off, k_default,
+            "switch off: other kernels than the default's"
+        );
+        let ndiff = y_off
+            .iter()
+            .zip(&y_default)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        assert_eq!(
+            ndiff, 0,
+            "switch off: {ndiff} outputs differ from the default's"
+        );
+        for k in ["quant_q8_gather_hi", "quant_q8_hi"] {
+            assert!(k_on.contains(&k), "switch on: {k} not built: {k_on:?}");
+        }
+        assert!(
+            k_on.iter()
+                .any(|k| k.starts_with("native_gemm_mmq_q4k_") && k.ends_with("_hi")),
+            "switch on: no outlier expert GEMM built: {k_on:?}"
+        );
+        let err = |y: &[f32], t: usize| {
+            (0..ne)
+                .map(|i| (y[t * ne + i] as f64 - want[t * ne + i]).powi(2))
+                .sum::<f64>()
+                .sqrt()
+        };
+        for t in 0..rows {
+            let (on, def) = (err(&y_on, t), err(&y_default, t));
+            eprintln!("row {t}: error against the float reference {on:.3e} on, {def:.3e} off");
+            if massive.contains(&t) {
+                assert!(
+                    on * 4.0 < def,
+                    "row {t} carries a massive activation: {on:.3e} on, {def:.3e} off"
                 );
             }
         }

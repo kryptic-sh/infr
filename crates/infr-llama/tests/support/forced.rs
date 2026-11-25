@@ -431,7 +431,54 @@ pub const DIAGNOSIS_CONFIGS: &[GpuConfig] = &[
         },
         reference_kv: None,
     },
+    // The routed experts' batched GEMMs on the outlier quantizer (the tuning parameter
+    // `quant_q8.experts_hi`, `docs/gpu-tolerance.md`), everything else as shipped: at the shipped
+    // chunk height and at `SMALL_UBATCH`, beside `gpu` and `gpu-ub32`.
+    GpuConfig {
+        name: "gpu-experts-hi",
+        edit: experts_hi,
+        reference_kv: None,
+    },
+    GpuConfig {
+        name: "gpu-ub32-experts-hi",
+        edit: |c| {
+            experts_hi(c);
+            c.device.ubatch = Some(SMALL_UBATCH);
+        },
+        reference_kv: None,
+    },
+    // The dense decode GEMVs on float activations, everything else as shipped:
+    // `kernels.vulkan.mmv_mw = false` empties the int8 decode set (`mmv_int8_decode_dtypes`), so
+    // a decode row's dense `Linear`s take the dequantizing GEMVs; a prefill chunk keeps its int8
+    // multi-row GEMVs and GEMMs, and the routed experts their int8 batched GEMM.
+    GpuConfig {
+        name: "gpu-dense-decode-float",
+        edit: |c| c.kernels.vulkan.mmv_mw = Some(false),
+        reference_kv: None,
+    },
+    GpuConfig {
+        name: "gpu-experts-hi-dense-decode-float",
+        edit: |c| {
+            experts_hi(c);
+            c.kernels.vulkan.mmv_mw = Some(false);
+        },
+        reference_kv: None,
+    },
 ];
+
+/// `gpu-experts-hi`'s edit: the tuning parameter `quant_q8.experts_hi` on, at the command line's
+/// level, so no other layer of the test environment overrides it.
+fn experts_hi(c: &mut EngineConfig) {
+    c.kernels
+        .vulkan
+        .tune
+        .entries
+        .push(infr_core::config::TuneEntry {
+            key: "quant_q8.experts_hi".into(),
+            value: "true".into(),
+            level: infr_core::config::TuneLevel::Cli,
+        });
+}
 
 /// `gpu-ub32-both-float`'s edit: [`dense_float_ub32`] with every row on the small-batch MoE path.
 fn both_float_ub32(c: &mut EngineConfig) {

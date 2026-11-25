@@ -293,6 +293,9 @@ pub(crate) struct Tuning {
     /// `rmsnorm.*`: the 1024-wide decode RMSNorm build.
     pub rmsnorm_wide: bool,
     pub rmsnorm_wide_min_dim: usize,
+    /// `quant_q8.experts_hi`: the routed experts' batched GEMMs on the outlier quantizer
+    /// (`quant_q8.comp`'s `-DHI` build) where their weight format has a build that reads it.
+    pub quant_q8_experts_hi: bool,
     /// `queue.family`: which queue family inference submits on
     /// (`VulkanBackend::pick_queue_family`).
     pub queue_family: QueueFamily,

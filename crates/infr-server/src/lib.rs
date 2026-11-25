@@ -9,6 +9,7 @@
 //!   GET  /metrics               -> Prometheus text exposition (see `metrics`)          (auth)
 //!   GET  /status                -> JSON: per-model backend, device, ctx, slots, memory (auth)
 //!   POST /v1/chat/completions   -> chat.completion | SSE chat.completion.chunk stream   (auth)
+//!   POST /v1/completions        -> text_completion | SSE text_completion stream (raw prompt, no template) (auth)
 //!
 //! Two process-level limits bound one request's hold on a `--parallel` slot: `serve.max_tokens_cap`
 //! (tokens — see `clamp_max_tokens`) and `serve.request_timeout_secs` (wall clock — see
@@ -49,6 +50,7 @@ use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use tokio::sync::Semaphore;
 
+mod completions;
 mod host;
 mod metrics;
 mod status;
@@ -120,6 +122,34 @@ pub trait ChatGenerator: Send + Sync {
         cancel: &Arc<AtomicBool>,
         on_delta: &mut dyn FnMut(Delta),
     ) -> anyhow::Result<ChatOutcome>;
+
+    /// Continue `prompt` as raw text — no chat template, no reasoning/tool splitting — streaming the
+    /// decoded pieces to `on_text`. Backs `/v1/completions`; `cancel` and the return value behave as
+    /// in [`chat`](Self::chat).
+    ///
+    /// Default: the model cannot serve raw completions, which the server answers as a `400`
+    /// naming `model` rather than a `500` that reads as a server fault.
+    fn complete(
+        &self,
+        _prompt: &str,
+        _params: &GenParams,
+        _cancel: &Arc<AtomicBool>,
+        _on_text: &mut dyn FnMut(&str),
+    ) -> anyhow::Result<ChatOutcome> {
+        Err(ParamError {
+            param: "model",
+            message: "this model does not support text completions".into(),
+        }
+        .into())
+    }
+
+    /// `prompt`'s token count and the model's usable prompt budget, counted before a slot is
+    /// taken so an over-long raw completion is refused instead of queued. `None` for a backend
+    /// that cannot count a raw prompt without generating it — its generator still reports the
+    /// overflow, and the server answers that as the same `400`.
+    fn prepare_completion(&self, _prompt: &str) -> anyhow::Result<Option<(u32, Option<u32>)>> {
+        Ok(None)
+    }
 
     /// Where this generator runs and how much room it has, read fresh on each call, for
     /// `GET /status` and the device gauges in `/metrics`. Report `None` for what the backend
@@ -460,7 +490,7 @@ impl ResponseFormat {
 /// A request's `logit_bias` as the client sent it: the object's entries in order with a repeated
 /// key kept (a JSON object map would silently merge it), or the JSON type sent instead of an
 /// object. `null` deserializes as an absent field.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum LogitBiasArg {
     Entries(Vec<(String, serde_json::Value)>),
     /// Not an object; the JSON type it was, for the `400`.
@@ -1535,6 +1565,18 @@ fn log_request_done(req_id: u64, model: &str, stream: bool, rec: &ReqRecord) {
     );
 }
 
+/// One request's arrival, as its start line reports it.
+struct RequestStart<'a> {
+    /// The route that generates; two exist and the log line names which.
+    route: &'a str,
+    model: &'a str,
+    messages: usize,
+    prompt_chars: usize,
+    prompt_tokens: Option<u32>,
+    max_tokens: Option<u32>,
+    stream: bool,
+}
+
 /// Emit one request's arrival line at INFO.
 ///
 /// `prompt_tokens` is the rendered prompt's real count from [`ChatGenerator::prepare`], and
@@ -1545,19 +1587,19 @@ fn log_request_done(req_id: u64, model: &str, stream: bool, rec: &ReqRecord) {
 /// **No prompt text, ever.** Counts only. Putting user prompt text into an operator's logs is a
 /// privacy decision that has been made in the negative — do not add a preview here, not even
 /// truncated, not even behind a flag.
-fn log_request_start(
-    req_id: u64,
-    model: &str,
-    messages: usize,
-    prompt_chars: usize,
-    prompt_tokens: Option<u32>,
-    max_tokens: Option<u32>,
-    stream: bool,
-) {
+fn log_request_start(req_id: u64, start: RequestStart<'_>) {
+    let RequestStart {
+        route,
+        model,
+        messages,
+        prompt_chars,
+        prompt_tokens,
+        max_tokens,
+        stream,
+    } = start;
     tracing::info!(
         req = req_id,
-        // The one route that generates.
-        route = "/v1/chat/completions",
+        route,
         model,
         messages,
         prompt_chars,
@@ -1795,6 +1837,11 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/v1/chat/completions",
             post(chat_completions_handler)
+                .route_layer(middleware::from_fn_with_state(state.clone(), require_auth)),
+        )
+        .route(
+            "/v1/completions",
+            post(completions::completions_handler)
                 .route_layer(middleware::from_fn_with_state(state.clone(), require_auth)),
         )
         .layer(middleware::from_fn_with_state(
@@ -2053,12 +2100,15 @@ async fn chat_completions_handler(
     };
     log_request_start(
         ctx.id,
-        &ctx.model_id,
-        n_messages,
-        prompt_chars,
-        prompt_tokens,
-        params.max_tokens,
-        ctx.stream,
+        RequestStart {
+            route: "/v1/chat/completions",
+            model: &ctx.model_id,
+            messages: n_messages,
+            prompt_chars,
+            prompt_tokens,
+            max_tokens: params.max_tokens,
+            stream: ctx.stream,
+        },
     );
     if let Some(e) = refused {
         ctx.stats.fold_failure();

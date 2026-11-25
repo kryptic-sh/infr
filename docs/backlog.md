@@ -5071,33 +5071,45 @@ attention-factor rule (`config::yarn_mscale_ratio`).
   worktree of `824c5989` (before the `quant_q8.experts_hi` slice) reported the
   same error once in each of those three tests on the integrated GPU. Not fixed.
 
-### B-PP-SLOW-RUNS — whole bench runs at two thirds or a quarter of the usual prefill speed (2026-11-25)
+### B-PP-SLOW-RUNS — a run started right after another pages its experts for good (2026-11-25)
 
-**Kind:** surprise seen in a measurement, not diagnosed.
+**Kind:** diagnosed, reproduced on demand, not fixed; the fix is the owner's
+call.
 
-`infr bench unsloth/Qwen3-30B-A3B-GGUF:Q4_K_M -p 1024 -n 0 -r 3` on the RX 7900
-XTX, sixteen runs alternating two builds (HEAD `42178c70` and the tree that
-became the expert-width fix), load average 5 to 7 with a desktop session in use:
-thirteen runs read 4440 to 4536 t/s, and three read 2948, 2999 and 1208 t/s.
-Each slow run was slow in all three of its reps (spread 1.0% to 3.9%), so it is
-a state the whole process was in, not one slow rep; both builds had one or more,
-so it is not either build. Decode (`-p 0 -n 64`) on the same builds read 221.1
-to 222.1 t/s in all six runs. Not known: whether it is another client of the GPU
-(the desktop was in use), a clock or power state the card settles in for a
-process, or something infr decides once at start-up (a cold pipeline cache would
-not explain a spread that tight over three reps). What would settle it: the same
-loop with the desktop idle, and `INFR_PROF_OPS=1` on a slow run to see whether
-every kernel is slower or one is. Until then a single prefill figure from this
-card is not a measurement; alternate and repeat.
+A MoE run that starts within about 150 ms of another infr process exiting can
+read that process's VRAM as still in use, decide the experts do not fit, and
+page them through a small VRAM cache for the whole process. Seen as whole bench
+runs at 848 to 2999 t/s against about 4050 to 4500 (prefill) and 21.7 to 36.2
+t/s against 217.5 (decode) on Qwen3-30B-A3B Q4_K_M, RX 7900 XTX, RADV.
 
-Seen again 2026-11-25 on commit `8004eefe` with nothing else building or testing
-(load average 1.1 to 4.6, desktop idle), so another busy session is not the
-cause: one Qwen3-30B-A3B `-p 512 -n 0` run of three read 848.5 t/s against
-4040.5 and 4064.0 (spread 0.2%), and one `-p 0 -n 128` run of three read 36.2
-t/s against 217.5 and 217.6 (spread 0.3%). So decode has the state too, at a
-sixth of its speed. That is two of the six plain Qwen3-30B-A3B runs; none of the
-sixteen other runs in the batch (a `--set` override, or ERNIE-21B-A3B) showed
-it, which is too few to call a pattern.
+- **Mechanism.** `vram_info` (infr-vulkan `lib.rs`) takes free memory as
+  `VK_EXT_memory_budget`'s heap budget minus heap usage, which counts other
+  processes. The seam reads it once on first load, before any upload; if
+  `moe_expert_budget` is below the expert bytes every expert layer is paged with
+  what is left, and placement is never looked at again (the comment above that
+  read in `seam/mod.rs` calls the case "deliberately not compensated"). After a
+  bench exits the card sometimes still reports its ~16.7 GB for 129 to 149 ms (3
+  of 12 exits polled); infr reaches the read 104 to 120 ms after launch.
+- **Evidence.** Back-to-back `-p 512 -n 0` runs with no gap: 3 of 12 slow
+  (2045.7, 910.4, 2157.6 t/s; the rest 4046 to 4061), each slow one logging
+  `MoE pager: 48/48 expert layers PAGED` and none of the fast ones; the same
+  twelve with `sleep 1` between: 0 of 12 slow. A run started 2.5 s into another
+  one's decode read 21.7 t/s. Load average 2.8 to 3.6. The smaller the budget
+  left, the slower the run (6360 cached blocks 910 t/s, about 15000 blocks about
+  2100 t/s). Ruled out: GTT spill, power state, pipeline cache.
+- **A guess, not checked:** why amdgpu frees late only sometimes (lazy buffer
+  release after process exit).
+- **Fix options.** (1) When the automatic tier is about to page and the
+  shortfall is less than what other processes hold, re-read the free figure for
+  a bounded time (0.5 to 1 s) before deciding; costs a delay only on runs that
+  would page anyway, and also under real lasting pressure. (2) Put the placement
+  in the bench line and its JSON (`experts paged N/M`), so a paged run labels
+  itself; worth doing whichever else is chosen. (3) Promote experts back into
+  VRAM when room appears mid-run: the thorough fix, a large pager change. (4)
+  Budget against the heap size: declined, RADV would spill past VRAM into GTT.
+- **Until fixed:** leave a second between benchmark runs, and keep stderr: the
+  pager line prints at the default log level and a `grep t/s` pipe drops it. The
+  same thing would hit a server restarted at once.
 
 ### B-MOE-EXPERT-TILE — batched expert GEMMs take only whole 64-column tiles (2026-11-25)
 

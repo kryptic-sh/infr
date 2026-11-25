@@ -10,6 +10,25 @@ outside proposal it answers.
 
 Nothing here is built or measured yet. Every figure marked **guess** is one.
 
+## Decided by the owner (2026-11-25)
+
+- **The goal is the full disk → RAM → VRAM tier for the KV cache**, the way
+  weights already stream. Idle prefix blocks go to disk first. The live window
+  stays VRAM then RAM, and only when both are full does its coldest part page to
+  disk, so any context length runs on any hardware; that rung is slow by nature,
+  is logged loudly, and is built last (slice S13).
+- **One global disk budget**, least recently used model first: `kv.disk_size`
+  bounds the whole cache directory, and when it is full the store of the model
+  used longest ago shrinks or goes first (only stores no running process holds).
+- **Same setup only.** A block is reused only by the backend, GPU model, driver
+  version, kernel choices and KV format that wrote it. The key names the GPU
+  model and driver, not the individual card, so identical cards in one machine
+  share blocks; other hardware misses, predictably.
+- **Off by default** until measured; the owner picks the default from the
+  numbers.
+- **How weights and KV share system RAM** is being researched; this file's RAM
+  rules below are provisional until that is decided.
+
 ## The tiers
 
 | Tier            | Holds                                                                                                                                      | State                                                           |
@@ -23,10 +42,11 @@ Nothing here is built or measured yet. Every figure marked **guess** is one.
 
 Rules that hold across them:
 
-- **Disk never holds a live window.** Attention reads every row of the window
-  every step; a store behind it is a bandwidth floor (the fork's own figures: 5
-  to 13 times slower). `kv_spill_split` and the spill reserve are unchanged by
-  this plan, and the disk tier has its own byte budget.
+- **Disk holds idle rows first and a live window last.** Attention reads every
+  row of the window every step; a store behind it is a bandwidth floor (the
+  fork's own figures: 5 to 13 times slower). So the live window reaches disk
+  only when VRAM and RAM are both full (S13). `kv_spill_split` and the spill
+  reserve are unchanged until then, and the disk tier has its own byte budget.
 - **One host budget.** Anything this plan keeps in host memory (staging, the
   later RAM block cache) is charged where `refuse_unhostable_kv` charges the
   weights' host tier.
@@ -83,7 +103,10 @@ a mismatch wipes the namespace. The key holds:
    resolved `kernels.*` path and tuning parameter. CPU: crate version and
    `kernels.cpu.*`. Metal: `None` until checked on Apple hardware. Serving one
    backend's or device's rows to another is off, because GPUs are only held
-   within tolerance of the CPU (plan 11).
+   within tolerance of the CPU (plan 11). The device part names the GPU model
+   and driver, never the card instance. A model split across GPUs adds the split
+   layout to the key, since it decides which kernels compute which rows (the
+   multi-GPU wrappers are out of scope until then).
 5. **KV formats** and each stored layer's row widths.
 
 Not in the key: template and BOS (the chain is over token ids), context length
@@ -166,7 +189,8 @@ One intrusive LRU over slot indices (the list in `pager/lru.rs`, shared), every
 operation O(1). Chain order is an invariant, not a scan: a touch links a chain
 leaf first and root last, so a parent is never older than its children and plain
 LRU takes leaves before trunks. A child count per slot guards it; pinned slots
-are never taken. The budget fixes the slot count at open.
+are never taken. The global budget is divided among the open stores; a store's
+slot count can shrink when another model needs room.
 
 ## Config and reporting
 
@@ -196,21 +220,22 @@ possible on top and is slice S12, not the design centre.
 
 Each ships alone through coder then reviewer.
 
-| #   | Slice                                                                                                                                                                                         | Size | Gate                                                       |
-| --- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---- | ---------------------------------------------------------- |
-| S0  | Measure only: direct I/O into Vulkan-mapped staging and which memory type; upload rate from it; sha256 and XXH64 throughput; prefill baseline at 2k, 8k, 32k tokens; Windows unbuffered reads | S    | figures in this file                                       |
-| S1  | `infr-plat` direct I/O, alignment query, aligned buffers, buffered fallback                                                                                                                   | S–M  | tests on all three CI systems                              |
-| S2  | `infr-core` store: format, slots, scan and index, chain LRU, lock, XXH64                                                                                                                      | M    | unit tests below                                           |
-| S3  | Identity: blob sha detection, tree hash with memo, stamp tier, `kv_numerics_key`, config hash                                                                                                 | M    | one weight byte changed is a miss                          |
-| S4  | Row mapping (linear, ring, planar Q8_0) and offset upload/download plus the mapped and staged primitives on CPU, Vulkan, Metal                                                                | M    | span tests; byte round trip per KV format                  |
-| S5  | Capture path, writer thread, backpressure, refusals, config keys                                                                                                                              | M–L  | captured bytes equal device rows; decode t/s unchanged     |
-| S6  | Restore path, window cut, partial restore, choosing between continuation, slot seed and disk                                                                                                  | L    | round trips; tolerance rows; restore against prefill table |
-| S7  | `/status`, metrics, `tune show`                                                                                                                                                               | S    | serialisation test                                         |
-| S8  | Capture during prefill for window models                                                                                                                                                      | M    | a shared gemma prefix restores                             |
-| S9  | Recurrent snapshot at a block boundary                                                                                                                                                        | M–L  | bit-identical continuation after restore                   |
-| S10 | RAM block cache under the host budget                                                                                                                                                         | M    | only if S6 shows the disk is the floor                     |
-| S11 | Read-ahead while queued; restore overlapping the suffix prefill                                                                                                                               | L    | measure first                                              |
-| S12 | Adapter to a host-bytes store interface                                                                                                                                                       | S    | only if one is adopted                                     |
+| #   | Slice                                                                                                                                                                                         | Size | Gate                                                                                                  |
+| --- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---- | ----------------------------------------------------------------------------------------------------- |
+| S0  | Measure only: direct I/O into Vulkan-mapped staging and which memory type; upload rate from it; sha256 and XXH64 throughput; prefill baseline at 2k, 8k, 32k tokens; Windows unbuffered reads | S    | figures in this file                                                                                  |
+| S1  | `infr-plat` direct I/O, alignment query, aligned buffers, buffered fallback                                                                                                                   | S–M  | tests on all three CI systems                                                                         |
+| S2  | `infr-core` store: format, slots, scan and index, chain LRU, lock, XXH64                                                                                                                      | M    | unit tests below                                                                                      |
+| S3  | Identity: blob sha detection, tree hash with memo, stamp tier, `kv_numerics_key`, config hash                                                                                                 | M    | one weight byte changed is a miss                                                                     |
+| S4  | Row mapping (linear, ring, planar Q8_0) and offset upload/download plus the mapped and staged primitives on CPU, Vulkan, Metal                                                                | M    | span tests; byte round trip per KV format                                                             |
+| S5  | Capture path, writer thread, backpressure, refusals, config keys                                                                                                                              | M–L  | captured bytes equal device rows; decode t/s unchanged                                                |
+| S6  | Restore path, window cut, partial restore, choosing between continuation, slot seed and disk                                                                                                  | L    | round trips; tolerance rows; restore against prefill table                                            |
+| S7  | `/status`, metrics, `tune show`                                                                                                                                                               | S    | serialisation test                                                                                    |
+| S8  | Capture during prefill for window models                                                                                                                                                      | M    | a shared gemma prefix restores                                                                        |
+| S9  | Recurrent snapshot at a block boundary                                                                                                                                                        | M–L  | bit-identical continuation after restore                                                              |
+| S10 | RAM block cache under the host budget                                                                                                                                                         | M    | only if S6 shows the disk is the floor                                                                |
+| S11 | Read-ahead while queued; restore overlapping the suffix prefill                                                                                                                               | L    | measure first                                                                                         |
+| S13 | Live window paging to disk when VRAM and RAM are full: page map for the cold part of the window, eviction between tiers, loud log, refusals for layouts it cannot page                        | L    | a context past VRAM plus RAM runs and matches the in-memory run within tolerance; decode t/s recorded |
+| S12 | Adapter to a host-bytes store interface                                                                                                                                                       | S    | only if one is adopted                                                                                |
 
 ## Tests that can fail
 
@@ -240,9 +265,8 @@ B-PP-SLOW-RUNS):
 
 ## Open
 
-- **Owner:** disk budget across models. `kv.disk_size` is per namespace, so old
-  models' namespaces pile up; proposed is deleting unlocked namespaces unused
-  for a period at open.
+- The shared usage record the global budget needs: where it lives, and how two
+  processes on different namespaces update it (S2).
 - Direct I/O into GPU-mapped memory and the memory type to use (S0).
 - Whether staging must be priced into the device reserve on unified memory;
   `reclamp_ctx_to_live_room` does not price it today (S5).

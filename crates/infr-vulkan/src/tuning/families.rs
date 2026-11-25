@@ -858,6 +858,21 @@ pub(crate) static PARAMS: &[Param] = &[
         set: |t, _, v| t.split_k_scale_by_cu = v.flag(),
     },
     Param {
+        family: "gemm",
+        name: "kq_fma",
+        kind: Kind::Variant,
+        ty: Ty::Bool,
+        axis: Axis::None,
+        doc: "the fp32 K-quant prefill GEMM for devices without an accelerated int8 dot: \
+              Q4_0/Q4_K/Q6_K weights dequantized in-shader (native_gemm_kq_fma), where the \
+              dp4a mmq tile emulates the int8 dot in ALU",
+        rule: "true where the driver does not report the packed int8 dot as accelerated, where \
+               it was measured; else false",
+        default: |f, _| Value::Bool(!f.dot_accelerated),
+        get: |t, _| Value::Bool(t.gemm_kq_fma),
+        set: |t, _, v| t.gemm_kq_fma = v.flag(),
+    },
+    Param {
         family: "gemm_i8cm_kq",
         name: "enabled",
         kind: Kind::Variant,

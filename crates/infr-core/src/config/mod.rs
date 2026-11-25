@@ -145,7 +145,9 @@ cfg_struct! {
         overflow: bool = false,
         /// `INFR_KV_OVERFLOW_VRAM_MB`, in MiB (the byte conversion is the accessor's).
         overflow_vram_mb: Option<u64> = None,
-        /// `INFR_KV_OVERFLOW_RESERVE_MB`, in MiB. `None` = `max(12% of VRAM, 2 GiB)`.
+        /// `INFR_KV_OVERFLOW_RESERVE_MB`, in MiB: device memory the `overflow` spill leaves free
+        /// beyond what the run is priced to need after its cache (`budget::reserve_bytes`).
+        /// `None` = no extra.
         overflow_reserve_mb: Option<u64> = None,
     }
 }

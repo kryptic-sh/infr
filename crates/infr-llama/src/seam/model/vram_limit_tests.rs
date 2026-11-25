@@ -13,12 +13,13 @@
 mod tests {
     use std::sync::Arc;
 
+    use infr_core::backend::Backend;
     use infr_core::{DType, SizeSpec};
 
     use super::super::{open_backend, DenseVulkanSession, SeamModel};
     use crate::seam::{
-        dense_act_reserve_at, kv_bytes_estimate_fmt, kv_recurrent_alloc_bytes, KvAlign, SeamKv,
-        MIN_SESSION_CTX,
+        dense_act_reserve_at, kv_bytes_estimate_fmt, kv_recurrent_alloc_bytes, kv_spill_reserve,
+        kv_spill_split, KvAlign, SeamKv, MIN_SESSION_CTX,
     };
     use crate::EngineConfig;
 
@@ -158,20 +159,64 @@ mod tests {
     /// refusal; consecutive settled readings that did not step differed by under 100 KB.
     const IN_USE_MOVED: u64 = MIB;
 
+    /// What marks a failure as a wrong result ([`wrong`]), which [`retry_if_moved`] never runs
+    /// again.
+    const WRONG_RESULT: &str = "wrong result: ";
+
+    /// A failure no movement of the device's memory can explain — a logit or a token that differs
+    /// from the reference — marked so [`retry_if_moved`] reports it on the first run.
+    fn wrong(msg: impl std::fmt::Display) -> String {
+        format!("{WRONG_RESULT}{msg}")
+    }
+
+    /// Whether a failed run may be run again when the device's memory moved across it: a session
+    /// that did not open or an allocation that was refused may be the movement's doing; a wrong
+    /// result ([`wrong`]) never is.
+    trait MayRetry {
+        fn may_retry(&self) -> bool;
+    }
+
+    impl MayRetry for String {
+        fn may_retry(&self) -> bool {
+            !self.starts_with(WRONG_RESULT)
+        }
+    }
+
+    impl MayRetry for Vec<String> {
+        fn may_retry(&self) -> bool {
+            self.iter().all(MayRetry::may_retry)
+        }
+    }
+
     /// Run `run`, which opens a session on a limited device, between two [`in_use`] readings, and
     /// once more when it failed while the reading moved by more than [`IN_USE_MOVED`] across it,
     /// saying so; the second result is the one returned. A failure on a device that did not move,
-    /// or a second failure, is returned as it is.
-    fn retry_if_moved<T, E>(
+    /// a wrong result ([`MayRetry`]), or a second failure, is returned as it is.
+    fn retry_if_moved<T, E: MayRetry>(
+        what: impl std::fmt::Display,
+        run: impl FnMut() -> Result<T, E>,
+    ) -> Result<T, E> {
+        retry_if_moved_with(
+            || in_use().expect("a backend opened for the test"),
+            what,
+            run,
+        )
+    }
+
+    /// [`retry_if_moved`] with the device's memory in use read by `reading`.
+    fn retry_if_moved_with<T, E: MayRetry>(
+        mut reading: impl FnMut() -> u64,
         what: impl std::fmt::Display,
         mut run: impl FnMut() -> Result<T, E>,
     ) -> Result<T, E> {
-        let before = in_use().expect("a backend opened for the test");
+        let before = reading();
         let first = run();
-        if first.is_ok() {
-            return first;
+        match &first {
+            Ok(_) => return first,
+            Err(e) if !e.may_retry() => return first,
+            Err(_) => {}
         }
-        let moved = in_use().expect("a backend").abs_diff(before);
+        let moved = reading().abs_diff(before);
         if moved <= IN_USE_MOVED {
             return first;
         }
@@ -249,6 +294,12 @@ mod tests {
         NoUsableCache(String),
         /// Anything else.
         Other(String),
+    }
+
+    impl MayRetry for RunErr {
+        fn may_retry(&self) -> bool {
+            true
+        }
     }
 
     impl std::fmt::Display for RunErr {
@@ -685,7 +736,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
     fn arena_commits_its_floor_for_a_model() {
-        use infr_core::backend::{Backend, BufferUsage};
+        use infr_core::backend::BufferUsage;
         for (name, path) in [("Qwen3-0.6B", qwen3_06b()), ("Qwen3.5-0.8B", qwen35_08b())] {
             let Some(path) = path else {
                 eprintln!("skip: {name} is not in the HF cache");
@@ -920,10 +971,12 @@ mod tests {
     /// `kv.overflow` (dense placement was then decided for it) and left the re-clamp after the
     /// load to cut it.
     ///
-    /// On a unified-memory device the system RAM a spilled buffer takes counts in the same budget
-    /// as device memory, so where the cache landed is not read off the budget there and only the
-    /// windows are checked. An explicit window that does not fit is not run here: on this tree it
-    /// does not reach a working spill (docs/backlog.md B62).
+    /// The backend placed none of the cache in system RAM, on either kind of device: on a discrete
+    /// one a window the ladder serves whole is allocated as without the flag (B13's few KB a buffer
+    /// past its price must not send its last buffers to system RAM), and on a unified-memory one
+    /// nothing spills at all. Where the budget is live and not unified, the allocation's commitment
+    /// says the same. The explicit window that does not fit, which spills, is
+    /// [`overflow_spills_an_explicit_ctx_that_does_not_fit`]'s.
     #[test]
     #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
     fn overflow_clamps_an_auto_sized_ctx() {
@@ -969,6 +1022,10 @@ mod tests {
             ensure((MIN_SESSION_CTX..=opened).contains(&kv.max_ctx), || {
                 format!("opened with {opened} tokens, served {}", kv.max_ctx)
             })?;
+            let placed = sess.be.kv_spill_counts();
+            ensure(placed.host_bufs == 0, || {
+                format!("a served cache placed buffers in system RAM: {placed:?}")
+            })?;
             match committed {
                 Some(c) => ensure(c >= allocated, || {
                     format!(
@@ -983,6 +1040,740 @@ mod tests {
             }
         };
         retry_if_moved("the auto-sized window", run).unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    /// The prefill chunk the spill tests pin, so their prompts run several chunks on either device
+    /// and the chunk cannot move between the runs one test compares.
+    const SPILL_UBATCH: usize = 256;
+
+    /// Words in the spill tests' prompt: more than two [`SPILL_UBATCH`] chunks of Qwen3-0.6B
+    /// tokens and under [`MIN_SESSION_CTX`] with the decode, which the tests check.
+    const SPILL_PROMPT_WORDS: usize = 640;
+
+    /// Tokens the spill tests decode after the prompt.
+    const SPILL_DECODE: usize = 8;
+
+    /// [`limited_cfg_with`] under `kv.overflow` with the chunk pinned at [`SPILL_UBATCH`], and,
+    /// when `kv` is given, both cache sides set to it.
+    fn overflow_cfg(limit: u64, ctx: Option<usize>, kv: Option<DType>) -> Arc<EngineConfig> {
+        limited_cfg_with(limit, ctx, |c| {
+            c.kv.overflow = true;
+            c.device.ubatch = Some(SPILL_UBATCH);
+            c.device.ubatch_specified = true;
+            if let Some(dt) = kv {
+                c.kv.type_k = Some(dt);
+                c.kv.type_k_specified = true;
+                c.kv.type_v = Some(dt);
+                c.kv.type_v_specified = true;
+            }
+        })
+    }
+
+    /// What one spilled run allocated, as the backend placed it.
+    struct SpilledRun {
+        ctx: usize,
+        k_fmt: DType,
+        v_fmt: DType,
+        counts: infr_core::budget::SpillCounts,
+        prompt_tokens: usize,
+        n_gen: usize,
+        /// Whether placement streamed the weights.
+        streamed: bool,
+    }
+
+    /// Open `open`'s session on `model`, run the spill prompt of several chunks and a short decode
+    /// on it, and report where the backend placed the cache. On a device with a live budget that
+    /// is not unified memory, also check what the spill left: when any of the cache went to device
+    /// memory, the device memory free after it is at least the spill reserve the run was priced
+    /// with (`kv_spill_reserve`), short by no more than [`RESIDUAL_SLACK`] a buffer placed there
+    /// (what the driver takes per buffer past its price, B13); and the bytes the backend placed in
+    /// device memory are the split `kv_spill_split` priced from the same room, to within one
+    /// buffer.
+    fn spilled_run(
+        model: &SeamModel,
+        open: impl FnOnce(&SeamModel) -> anyhow::Result<DenseVulkanSession>,
+    ) -> Result<SpilledRun, String> {
+        let prompt = long_prompt(SPILL_PROMPT_WORDS);
+        let prompt_tokens = model.encode(&prompt).expect("encode").len();
+        ensure(
+            prompt_tokens > 2 * SPILL_UBATCH && prompt_tokens + SPILL_DECODE < MIN_SESSION_CTX,
+            || format!("the spill prompt is {prompt_tokens} tokens"),
+        )?;
+        let mut sess = open(model).map_err(|e| format!("the session did not open: {e}"))?;
+        let stats = model
+            .generate_vulkan_session(&mut sess, &prompt, SPILL_DECODE, None, |_| {})
+            .map_err(|e| format!("the run failed: {e}"))?;
+        let (_, kv) = slot(&sess);
+        let run = SpilledRun {
+            ctx: kv.max_ctx,
+            k_fmt: kv.k_fmt,
+            v_fmt: kv.v_fmt,
+            counts: sess.be.kv_spill_counts(),
+            prompt_tokens,
+            n_gen: stats.n_gen,
+            streamed: sess.be.dense_pager_totals().is_some(),
+        };
+        let vram = sess.vram();
+        let reserve = kv_spill_reserve(
+            &model.cfg,
+            &model.ecfg,
+            kv.max_ctx,
+            kv.ubatch,
+            sess.be.dense_paged(),
+        );
+        let measured = kv
+            .room_after_weights
+            .zip(kv.kv_committed)
+            .filter(|_| vram.live && !vram.uma);
+        if let Some((room, committed)) = measured {
+            let align = KvAlign::of(&sess.be);
+            let split = kv_spill_split(
+                &model.cfg,
+                kv.max_ctx,
+                kv.kv_ring,
+                kv.ubatch,
+                align,
+                kv.k_fmt,
+                kv.v_fmt,
+                1,
+                room,
+                reserve,
+                crate::seam::kv_spill_cap(&model.ecfg),
+            );
+            let largest = kv
+                .kbufs
+                .iter()
+                .chain(&kv.vbufs)
+                .map(|b| align.commit.committed(b.len_bytes() as u64))
+                .max()
+                .unwrap_or(0);
+            let left = room.saturating_sub(committed);
+            eprintln!(
+                "room after the weights {room}, cache committed {committed}, left {left}, \
+                 reserve {reserve}; priced split {split:?}"
+            );
+            // What the cache itself may not take: a buffer placed in device memory leaves the
+            // reserve free. Where the weights already left less than the reserve, the whole cache
+            // goes to system RAM.
+            ensure(
+                run.counts.vram_bufs == 0
+                    || left + RESIDUAL_SLACK * run.counts.vram_bufs >= reserve,
+                || format!("the spill left {left} bytes free, short of its reserve {reserve}"),
+            )?;
+            ensure(
+                run.counts.vram_bytes.abs_diff(split.vram) <= largest,
+                || {
+                    format!(
+                        "the backend placed {} bytes in device memory, the split priced {}",
+                        run.counts.vram_bytes, split.vram
+                    )
+                },
+            )?;
+        }
+        eprintln!(
+            "ctx {} ({:?}/{:?}), ubatch {}, prompt {} tokens, decoded {}, weights streamed {}; \
+             {:?}",
+            run.ctx,
+            run.k_fmt,
+            run.v_fmt,
+            kv.ubatch,
+            run.prompt_tokens,
+            run.n_gen,
+            run.streamed,
+            run.counts
+        );
+        ensure(kv.ubatch == SPILL_UBATCH, || {
+            format!("the pinned {SPILL_UBATCH}-row chunk ran at {}", kv.ubatch)
+        })?;
+        ensure(stats.n_gen > 0, || "nothing was decoded".to_string())?;
+        Ok(run)
+    }
+
+    /// B62's first case: under `kv.overflow`, an explicit context neither cache format holds in
+    /// device memory beside the weights (Qwen3-0.6B's trained window at [`B12_ROOM`]) opens as
+    /// asked and runs a prefill of several chunks and a decode, with part of its cache in system
+    /// RAM and nothing later refused ([`spilled_run`]'s checks). In the session's own f16 and with
+    /// q8_0 set. On a unified-memory device, where a spill frees nothing, the window is refused
+    /// when the session opens, before any weight loads, as it is without `kv.overflow`.
+    #[test]
+    #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+    fn overflow_spills_an_explicit_ctx_that_does_not_fit() {
+        let Some(path) = qwen3_06b() else {
+            eprintln!("skip: Qwen3-0.6B is not in the HF cache");
+            return;
+        };
+        let Some(reader) = reader() else {
+            return;
+        };
+        let unified = reader.capabilities().unified_memory;
+        for kv in [None, Some(DType::Q8_0)] {
+            let run = || -> Result<(), String> {
+                let limit = settled_use(reader) + B12_ROOM;
+                let probe = SeamModel::load_with(&path, None, overflow_cfg(limit, None, kv))
+                    .expect("model load");
+                let want = probe.cfg.n_ctx_train;
+                let vk = open_backend(None, probe.ecfg.clone()).expect("backend");
+                let f16 = probe
+                    .kv_fit_ctx_fmt(&vk, false)
+                    .expect("an attention model");
+                let q8 = probe.kv_fit_ctx_fmt(&vk, true).expect("an attention model");
+                drop(vk);
+                settled_use(reader);
+                ensure(f16 < want && q8 < want, || {
+                    format!("{want} tokens fit (f16 {f16}, q8_0 {q8}): nothing would spill")
+                })?;
+                let model = SeamModel::load_with(&path, None, overflow_cfg(limit, Some(want), kv))
+                    .expect("model load");
+                if unified {
+                    let err = match model.vulkan_session(want) {
+                        Ok(_) => return Err(format!("kv {kv:?}: {want} opened on unified memory")),
+                        Err(e) => e.to_string(),
+                    };
+                    eprintln!("unified memory, kv {kv:?}: {err}");
+                    return ensure(
+                        err.contains(&format!("context {want} cannot be served on this device")),
+                        || format!("kv {kv:?}: not the refusal before the load: {err}"),
+                    );
+                }
+                let ran = spilled_run(&model, |m| m.vulkan_session(want))
+                    .map_err(|e| format!("kv {kv:?}, ctx {want}: {e}"))?;
+                ensure(ran.ctx == want, || {
+                    format!("asked {want}, served {}", ran.ctx)
+                })?;
+                let fmt = kv.unwrap_or(DType::F16);
+                ensure((ran.k_fmt, ran.v_fmt) == (fmt, fmt), || {
+                    format!("served {:?}/{:?}, not {fmt:?}", ran.k_fmt, ran.v_fmt)
+                })?;
+                ensure(
+                    ran.counts.host_bytes > 0 && ran.counts.vram_bytes > 0,
+                    || format!("not a partial spill: {:?}", ran.counts),
+                )?;
+                ensure(!ran.streamed, || "the weights streamed".to_string())
+            };
+            retry_if_moved(format!("the explicit window, kv {kv:?}"), run)
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+    }
+
+    /// The room above what is in use, in MiB, at which Qwen3-0.6B's q8_0 cache holds about half the
+    /// minimum session context beside its weights under `cfg_at`'s configuration: where the
+    /// auto-sized window has nothing usable to clamp to, and a spill at the minimum keeps part of
+    /// it in device memory.
+    fn half_minimum_room(
+        path: &std::path::Path,
+        reader: &infr_vulkan::VulkanBackend,
+        cfg_at: impl Fn(u64) -> Arc<EngineConfig>,
+    ) -> u64 {
+        let mut room = 700;
+        loop {
+            let limit = settled_use(reader) + room * MIB;
+            let probe = SeamModel::load_with(path, None, cfg_at(limit)).expect("model load");
+            let vk = open_backend(None, probe.ecfg.clone()).expect("backend");
+            let q8 = probe.kv_fit_ctx_fmt(&vk, true).expect("an attention model");
+            if q8 >= MIN_SESSION_CTX / 2 {
+                eprintln!("{room} MiB of room: q8_0 holds {q8} tokens");
+                return room;
+            }
+            room += 8;
+            assert!(room < 2000, "no room up to 2000 MiB holds half the minimum");
+        }
+    }
+
+    /// B62's second case: under `kv.overflow`, an auto-sized context for which not even the minimum
+    /// fits in either cache format opens at the minimum and runs a prefill of several chunks and a
+    /// decode, with part of its cache in system RAM and nothing later refused ([`spilled_run`]'s
+    /// checks). On a unified-memory device it is refused when the session opens, as it is without
+    /// `kv.overflow`.
+    #[test]
+    #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+    fn overflow_spills_the_minimum_when_nothing_fits() {
+        let Some(path) = qwen3_06b() else {
+            eprintln!("skip: Qwen3-0.6B is not in the HF cache");
+            return;
+        };
+        let Some(reader) = reader() else {
+            return;
+        };
+        let unified = reader.capabilities().unified_memory;
+        let room = half_minimum_room(&path, reader, |limit| overflow_cfg(limit, None, None));
+        let run = || -> Result<(), String> {
+            let limit = settled_use(reader) + room * MIB;
+            let model = SeamModel::load_with(&path, None, overflow_cfg(limit, None, None))
+                .expect("model load");
+            if unified {
+                let err = match model.vulkan_session_default() {
+                    Ok(s) => return Err(format!("opened {} on unified memory", s.max_ctx)),
+                    Err(e) => e.to_string(),
+                };
+                eprintln!(
+                    "unified memory, {room} MiB of room: {}",
+                    err.lines().next().unwrap_or("")
+                );
+                return ensure(err.contains("no usable KV cache fits"), || {
+                    format!("not the refusal before the load: {err}")
+                });
+            }
+            let ran = spilled_run(&model, |m| m.vulkan_session_default())
+                .map_err(|e| format!("{room} MiB of room: {e}"))?;
+            ensure(ran.ctx == MIN_SESSION_CTX, || {
+                format!("{room} MiB of room: served {}, not the minimum", ran.ctx)
+            })?;
+            ensure(
+                ran.counts.host_bytes > 0 && ran.counts.vram_bytes > 0,
+                || format!("{room} MiB of room: not a partial spill: {:?}", ran.counts),
+            )?;
+            ensure(!ran.streamed, || {
+                format!("{room} MiB of room: the weights streamed")
+            })
+        };
+        retry_if_moved(format!("the minimum at {room} MiB"), run).unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    /// `Ok` when a run's last prompt logits and decoded tokens (`got`) are the reference's
+    /// (`want`) bit for bit, else a [`wrong`] result naming how many differ.
+    fn same_result(
+        name: &str,
+        got: (&[f32], &[u32]),
+        want: (&[f32], &[u32]),
+    ) -> Result<(), String> {
+        if got.1 != want.1 {
+            return Err(wrong(format!(
+                "{name}: decoded {:?}, resident {:?}",
+                got.1, want.1
+            )));
+        }
+        let differ = got
+            .0
+            .iter()
+            .zip(want.0)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        if got.0.len() != want.0.len() || differ > 0 {
+            return Err(wrong(format!(
+                "{name}: {differ} of {} logits differ from the resident run's",
+                want.0.len()
+            )));
+        }
+        Ok(())
+    }
+
+    /// A wrong result fails on its first run even when the device's memory moved across it, where
+    /// a failure to open is run once more: a planted logits mismatch, through the comparison the
+    /// logits test makes, against readings that move by far more than [`IN_USE_MOVED`].
+    #[test]
+    fn a_wrong_result_is_never_run_again() {
+        let moving = || {
+            let mut r = 0u64;
+            move || {
+                r += 64 * MIB;
+                r
+            }
+        };
+        let want = (vec![1.0f32, 2.0, 3.0], vec![7u32, 8]);
+        let planted = (vec![1.0f32, 2.0, 3.5], vec![7u32, 8]);
+        let mut runs = 0;
+        let got = retry_if_moved_with(moving(), "planted", || {
+            runs += 1;
+            same_result("planted", (&planted.0, &planted.1), (&want.0, &want.1))
+        });
+        assert_eq!(runs, 1, "a logits mismatch was run again: {got:?}");
+        assert!(got.is_err_and(|e| e.contains("1 of 3 logits differ")));
+        let mut runs = 0;
+        let got = retry_if_moved_with(moving(), "planted", || {
+            runs += 1;
+            same_result("planted", (&want.0, &[7, 9]), (&want.0, &want.1))
+        });
+        assert_eq!(runs, 1, "a token mismatch was run again: {got:?}");
+        let mut runs = 0;
+        let _ = retry_if_moved_with(moving(), "open", || -> Result<(), String> {
+            runs += 1;
+            Err("the session did not open".to_string())
+        });
+        assert_eq!(
+            runs, 2,
+            "a failure to open while memory moved runs once more"
+        );
+        let mut runs = 0;
+        let _ = retry_if_moved_with(
+            || 0,
+            "open",
+            || -> Result<(), String> {
+                runs += 1;
+                Err("the session did not open".to_string())
+            },
+        );
+        assert_eq!(
+            runs, 1,
+            "a failure on a device that did not move is not run again"
+        );
+    }
+
+    /// A change to a test's configuration.
+    type ConfigEdit = Box<dyn Fn(&mut EngineConfig)>;
+
+    /// Qwen3-0.6B's trained window under `cfg`'s device, generated straight through the runner for
+    /// the spill prompt with EOS ignored: the last prompt token's logits, the greedy tokens decoded
+    /// after it, and where the backend placed the cache.
+    fn spill_logits(
+        path: &std::path::Path,
+        cfg: Arc<EngineConfig>,
+    ) -> Result<(Vec<f32>, Vec<u32>, infr_core::budget::SpillCounts), String> {
+        let model = SeamModel::load_with(path, None, cfg).expect("model load");
+        let ctx = model.cfg.n_ctx_train;
+        let prompt = model
+            .encode(&long_prompt(SPILL_PROMPT_WORDS))
+            .expect("encode");
+        let vk = open_backend(None, model.ecfg.clone()).expect("backend");
+        let _scope = crate::seam::PlacementScope::enter(Default::default());
+        let bind =
+            crate::seam::vulkan_moe_binder(&vk, &model.gguf, &model.cfg, &model.ecfg, true, ctx)
+                .map_err(|e| format!("placement: {e}"))?;
+        let (mut logits, mut ids, mut state) = (Vec::new(), Vec::new(), None);
+        crate::seam::generate_dense_backend(
+            &vk,
+            &*bind,
+            &model.gguf,
+            &model.cfg,
+            &model.ecfg,
+            model.embd(),
+            model.per_layer_embd(),
+            &prompt,
+            SPILL_DECODE,
+            |id| ids.push(id),
+            &mut state,
+            ctx,
+            None,
+            None,
+            None,
+            Some(&mut logits),
+            None,
+            None,
+            None,
+        )
+        .map_err(|e| format!("the run failed: {e}"))?;
+        let counts = vk.kv_spill_counts();
+        eprintln!("decoded {ids:?}; {counts:?}");
+        Ok((logits, ids, counts))
+    }
+
+    /// A spilled cache gives the logits a cache wholly in device memory gives: Qwen3-0.6B's trained
+    /// window, the spill prompt prefilled in several chunks and a few tokens decoded, the last
+    /// prompt token's logits and the decoded tokens compared bit for bit against the same run with
+    /// the cache resident. The spilled layers read every row of the prompt from system RAM. Spilled
+    /// once by `kv.overflow_vram_mb` capping the cache's device memory at half of it, on a device
+    /// with room for all of it, and once by the room itself ([`B12_ROOM`]), through the placement
+    /// and reserve the spill tests check. Not on a unified-memory device, where nothing spills.
+    #[test]
+    #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+    fn spilled_kv_gives_the_logits_of_a_resident_one() {
+        let Some(path) = qwen3_06b() else {
+            eprintln!("skip: Qwen3-0.6B is not in the HF cache");
+            return;
+        };
+        let Some(reader) = reader() else {
+            return;
+        };
+        if reader.capabilities().unified_memory {
+            eprintln!("skip: nothing spills on a unified-memory device");
+            return;
+        }
+        let trained = SeamModel::load_with(&path, None, limited_cfg(u64::MAX, None))
+            .expect("model load")
+            .cfg
+            .n_ctx_train;
+        // Every leg: the trained window set explicitly (so no leg clamps it), the chunk pinned,
+        // EOS ignored, and f16 set on both sides (so no leg's placement may pick q8_0).
+        let leg = |limit: u64, edit: &dyn Fn(&mut EngineConfig)| {
+            let cfg = limited_cfg_with(limit, Some(trained), |c| {
+                c.device.ubatch = Some(SPILL_UBATCH);
+                c.device.ubatch_specified = true;
+                c.sampling.ignore_eos = true;
+                c.kv.type_k = Some(DType::F16);
+                c.kv.type_k_specified = true;
+                c.kv.type_v = Some(DType::F16);
+                c.kv.type_v_specified = true;
+                edit(c);
+            });
+            settled_use(reader);
+            spill_logits(&path, cfg)
+        };
+        let (want_logits, want_ids, resident) =
+            leg(u64::MAX, &|_| {}).unwrap_or_else(|e| panic!("the resident run: {e}"));
+        assert_eq!(
+            resident.total_bufs(),
+            0,
+            "the resident run placed {resident:?}"
+        );
+        assert_eq!(
+            want_ids.len(),
+            SPILL_DECODE,
+            "the resident run decoded {want_ids:?}"
+        );
+        let model = SeamModel::load_with(&path, None, limited_cfg(u64::MAX, None)).expect("load");
+        let cache = kv_bytes_estimate_fmt(
+            &model.cfg,
+            trained,
+            false,
+            SPILL_UBATCH,
+            KvAlign::NONE,
+            DType::F16,
+            DType::F16,
+        );
+        let half_mib = cache / 2 / MIB;
+        let legs: [(&str, u64, ConfigEdit); 2] = [
+            (
+                "capped at half the cache",
+                u64::MAX,
+                Box::new(move |c: &mut EngineConfig| {
+                    c.kv.overflow = true;
+                    c.kv.overflow_vram_mb = Some(half_mib);
+                }),
+            ),
+            (
+                "spilled by the room",
+                0,
+                Box::new(|c: &mut EngineConfig| c.kv.overflow = true),
+            ),
+        ];
+        for (name, limit, edit) in legs {
+            let run = || -> Result<(), String> {
+                let limit = if limit == 0 {
+                    settled_use(reader) + B12_ROOM
+                } else {
+                    limit
+                };
+                let (logits, ids, counts) = leg(limit, &*edit)?;
+                ensure(counts.host_bytes > 0 && counts.vram_bytes > 0, || {
+                    format!("{name}: not a partial spill: {counts:?}")
+                })?;
+                same_result(name, (&logits, &ids), (&want_logits, &want_ids))
+            };
+            retry_if_moved(name, run).unwrap_or_else(|e| panic!("{e}"));
+        }
+    }
+
+    /// What `kv.overflow` cannot serve is refused before a weight is uploaded, with the sizes: an
+    /// explicit window on a device whose room, with the whole cache spilled, still leaves the
+    /// streamed weights less than the streaming floor (Qwen3-0.6B at 500 MiB of room). On a
+    /// unified-memory device, where nothing spills, the refusal is the one without the flag.
+    #[test]
+    #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+    fn overflow_refuses_what_cannot_stream_before_the_load() {
+        let Some(path) = qwen3_06b() else {
+            eprintln!("skip: Qwen3-0.6B is not in the HF cache");
+            return;
+        };
+        let Some(reader) = reader() else {
+            return;
+        };
+        let unified = reader.capabilities().unified_memory;
+        let want = 4096;
+        let run = || -> Result<(), String> {
+            let limit = settled_use(reader) + 500 * MIB;
+            let model = SeamModel::load_with(&path, None, overflow_cfg(limit, Some(want), None))
+                .expect("model load");
+            let err = match model.vulkan_session(want) {
+                Err(e) => e.to_string(),
+                Ok(mut sess) => {
+                    let before = sess.be.alloc_room();
+                    let err = match model.generate_vulkan_session(&mut sess, "Hi", 1, None, |_| {})
+                    {
+                        Ok(_) => return Err(format!("{want} ran at 500 MiB of room")),
+                        Err(e) => e.to_string(),
+                    };
+                    let after = sess.be.alloc_room();
+                    ensure(after + IN_USE_SLACK >= before, || {
+                        format!("the refusal came after {} bytes were taken", before - after)
+                    })?;
+                    err
+                }
+            };
+            eprintln!("{err}");
+            let wording = if unified {
+                format!("context {want} cannot be served on this device")
+            } else {
+                "even with its whole KV cache".to_string()
+            };
+            ensure(
+                err.contains(&wording) && (err.contains(" GB") || err.contains(" GiB")),
+                || format!("not the refusal with the sizes: {err}"),
+            )
+        };
+        retry_if_moved("the window that cannot stream", run).unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    /// Two serve slots on one backend under `kv.overflow`, with an f16 window per slot that one
+    /// cache holds beside the weights at [`B12_ROOM`] and two do not: the engine opens with at
+    /// least a whole cache's buffers in device memory (the first slot's, which the ladder serves
+    /// whole and allocates first, with no reserve; the backend's tally does not say which slot a
+    /// buffer belongs to), the second slot's fork spills past the one spill reserve the backend
+    /// holds, the room left after both is at least that reserve, and both slots then run the spill
+    /// prompt at once, taking turns on the GPU. One reserve serves every slot because the slots
+    /// take turns step by step (`sampling::StepGate`), and a step's activations are released with
+    /// it.
+    #[test]
+    #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+    fn overflow_spills_a_second_slot_past_the_reserve() {
+        let Some(path) = qwen3_06b() else {
+            eprintln!("skip: Qwen3-0.6B is not in the HF cache");
+            return;
+        };
+        let Some(reader) = reader() else {
+            return;
+        };
+        if reader.capabilities().unified_memory {
+            eprintln!("skip: nothing spills on a unified-memory device");
+            return;
+        }
+        let want = 4096;
+        let run = || -> Result<(), String> {
+            let limit = settled_use(reader) + B12_ROOM;
+            let model =
+                SeamModel::load_with(&path, None, overflow_cfg(limit, None, Some(DType::F16)))
+                    .expect("model load");
+            let vk = open_backend(None, model.ecfg.clone()).expect("backend");
+            let fit = model
+                .kv_fit_ctx_fmt(&vk, false)
+                .expect("an attention model");
+            drop(vk);
+            settled_use(reader);
+            ensure(want <= fit && fit < 2 * want, || {
+                format!("{fit} tokens fit: not one {want}-token cache and short of two")
+            })?;
+            let model = SeamModel::load_with(
+                &path,
+                None,
+                overflow_cfg(limit, Some(want), Some(DType::F16)),
+            )
+            .expect("model load");
+            let cfg = model.cfg.clone();
+            let ecfg = model.ecfg.clone();
+            let engine =
+                crate::parallel::ParallelSeam::new(model, 2, Some(SizeSpec::Bytes(want as u64)))
+                    .map_err(|e| format!("the two-slot engine did not open: {e}"))?;
+            let be = engine.backend();
+            let placed = be.kv_spill_counts();
+            let reserve = kv_spill_reserve(&cfg, &ecfg, want, SPILL_UBATCH, false);
+            let left = be.alloc_room();
+            eprintln!("two slots of {want}: {placed:?}; {left} left, reserve {reserve}");
+            ensure(placed.host_bytes > 0, || {
+                format!("nothing spilled: {placed:?}")
+            })?;
+            ensure(placed.vram_bufs >= 2 * cfg.n_layer as u64, || {
+                format!("less than a whole cache in device memory: {placed:?}")
+            })?;
+            ensure(left + RESIDUAL_SLACK * placed.vram_bufs >= reserve, || {
+                format!("the slots left {left} bytes free, short of the reserve {reserve}")
+            })?;
+            let greedy = crate::sampling::RequestSampling {
+                temp: Some(0.0),
+                ..Default::default()
+            };
+            let prompt = long_prompt(SPILL_PROMPT_WORDS);
+            std::thread::scope(|s| {
+                let handles: Vec<_> = (0..2)
+                    .map(|_| {
+                        let req = engine.request_ctx(greedy.clone());
+                        let (engine, prompt) = (&engine, &prompt);
+                        s.spawn(move || engine.generate(prompt, SPILL_DECODE, None, &req, |_| {}))
+                    })
+                    .collect();
+                handles.into_iter().try_for_each(|h| {
+                    let stats = h
+                        .join()
+                        .expect("sequence thread")
+                        .map_err(|e| format!("a slot's run failed: {e}"))?;
+                    ensure(stats.n_gen > 0, || "a slot decoded nothing".to_string())
+                })
+            })
+        };
+        retry_if_moved("two slots", run).unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    /// How far below the room where placement's spill rung keeps the weights resident the
+    /// streamed-spill test runs. Measured on the RX 7900 XTX on 2026-11-25 with Qwen3-1.7B: the
+    /// rung took the weights resident from about 1940 MiB of room, and the arenas held their floor
+    /// with the whole cache spilled down to about 1810.
+    const STREAM_SPILL_BELOW_RESIDENT: u64 = 64 * MIB;
+
+    /// The room above what is in use, in MiB, at which placement's spill rung would keep the model
+    /// at `path` resident with `want` tokens spilled, priced as the rung prices it: the weights at
+    /// the least the arena commits for them and the upload staging (`resident_load_held`), and the
+    /// spill reserve at the spilled chunk. Read off one limited backend: what its room holds less
+    /// what the rung needs.
+    fn spill_resident_room(
+        path: &std::path::Path,
+        reader: &infr_vulkan::VulkanBackend,
+        want: usize,
+    ) -> u64 {
+        const PROBE_ROOM: u64 = 2048 * MIB;
+        let limit = settled_use(reader) + PROBE_ROOM;
+        let model = SeamModel::load_with(path, None, overflow_cfg(limit, Some(want), None))
+            .expect("model load");
+        let vk = open_backend(None, model.ecfg.clone()).expect("backend");
+        let (held, staging) =
+            crate::seam::resident_load_held(&vk, &model.gguf, &model.cfg, &model.ecfg);
+        let ubatch = crate::seam::spill_ubatch(&model.ecfg);
+        let need = held + staging + kv_spill_reserve(&model.cfg, &model.ecfg, want, ubatch, false);
+        let room = vk.alloc_room();
+        (PROBE_ROOM + need).saturating_sub(room) / MIB
+    }
+
+    /// A model whose weights do not fit the device even without its cache streams them, with the
+    /// whole cache in system RAM, when the cache would leave the streaming arenas less than their
+    /// floor: Qwen3-1.7B under `kv.overflow`, its trained window set explicitly, the spill prompt
+    /// and a short decode, at [`STREAM_SPILL_BELOW_RESIDENT`] below the room where the weights
+    /// would stay resident ([`spill_resident_room`]). Skips, saying so, where that room leaves the
+    /// arenas short of their floor too (no streamed spill exists between the two on that device).
+    /// Not on a unified-memory device, where nothing spills.
+    #[test]
+    #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+    fn overflow_streams_weights_beside_a_wholly_spilled_cache() {
+        let Some(path) =
+            crate::util::test_hub_gguf("unsloth/Qwen3-1.7B-GGUF", "Qwen3-1.7B-Q4_K_M.gguf")
+        else {
+            eprintln!("skip: Qwen3-1.7B is not in the HF cache");
+            return;
+        };
+        let Some(reader) = reader() else {
+            return;
+        };
+        if reader.capabilities().unified_memory {
+            eprintln!("skip: nothing spills on a unified-memory device");
+            return;
+        }
+        let want = SeamModel::load_with(&path, None, overflow_cfg(u64::MAX, None, None))
+            .expect("model load")
+            .cfg
+            .n_ctx_train;
+        let resident = spill_resident_room(&path, reader, want);
+        let room = resident * MIB - STREAM_SPILL_BELOW_RESIDENT;
+        eprintln!(
+            "weights resident from {resident} MiB of room; running at {} MiB",
+            room / MIB
+        );
+        let run = || -> Result<bool, String> {
+            let limit = settled_use(reader) + room;
+            let model = SeamModel::load_with(&path, None, overflow_cfg(limit, Some(want), None))
+                .expect("model load");
+            let ran = match spilled_run(&model, |m| m.vulkan_session(want)) {
+                Err(e) if e.contains("below the streaming floor") => {
+                    eprintln!("skip: no streamed spill below the resident room here: {e}");
+                    return Ok(false);
+                }
+                ran => ran?,
+            };
+            ensure(ran.ctx == want, || {
+                format!("asked {want}, served {}", ran.ctx)
+            })?;
+            ensure(ran.streamed, || "the weights did not stream".to_string())?;
+            ensure(
+                ran.counts.host_bytes > 0 && ran.counts.vram_bytes == 0,
+                || format!("not a whole spill: {:?}", ran.counts),
+            )?;
+            Ok(true)
+        };
+        retry_if_moved("the streamed spill", run).unwrap_or_else(|e| panic!("{e}"));
     }
 
     /// gemma-4-12b-it Q4_K_M, the largest dense model the GPU tests use, or `None` (saying so)
@@ -1043,7 +1834,6 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
     fn auto_ctx_prefills_full_chunks_on_a_large_model() {
-        use infr_core::backend::Backend;
         let Some(path) = gemma4_12b() else {
             return;
         };

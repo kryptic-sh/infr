@@ -61,15 +61,22 @@ const MIN_USEFUL: u64 = 256 << 20;
 ///
 /// Returns `0` when nothing worth having is left, which callers treat as "stay on the mmap path".
 pub fn auto_arena_bytes(available: u64, committed: u64, pageable: u64) -> u64 {
-    let headroom = HEADROOM_MIN.max(available / HEADROOM_FRACTION);
-    let usable = available
-        .saturating_sub(committed)
-        .saturating_sub(headroom)
-        .min(pageable);
+    let usable = spare_bytes(available, committed).min(pageable);
     if usable < MIN_USEFUL {
         return 0;
     }
     usable
+}
+
+/// The anonymous, non-reclaimable host memory a run may take on top of `committed` (what it already
+/// holds that `available`, from [`available_bytes`], does not see): `available` less `committed`
+/// less the headroom left to the rest of the machine, the larger of `HEADROOM_MIN` and
+/// `available / HEADROOM_FRACTION`. The rule [`auto_arena_bytes`] sizes an arena by, without the
+/// arena's own floor (`MIN_USEFUL` is about whether an arena is worth building, not about what the
+/// host can spare), so a caller placing a buffer it needs takes the same headroom.
+pub fn spare_bytes(available: u64, committed: u64) -> u64 {
+    let headroom = HEADROOM_MIN.max(available / HEADROOM_FRACTION);
+    available.saturating_sub(committed).saturating_sub(headroom)
 }
 
 /// What a caller should do about a host weight arena.
@@ -232,6 +239,22 @@ mod tests {
     use super::*;
 
     const GIB: u64 = 1 << 30;
+
+    /// What the host can spare a run, at known values: half of what is free above 2 GiB, 1 GiB
+    /// kept below it, `committed` off the top, saturating at zero, and no worth-building floor (a
+    /// few MiB spare is a few MiB, where an arena would be refused).
+    #[test]
+    fn spare_bytes_takes_the_headroom_and_nothing_else() {
+        const MIB: u64 = 1 << 20;
+        assert_eq!(spare_bytes(64 * GIB, 0), 32 * GIB);
+        assert_eq!(spare_bytes(4 * GIB, 0), 2 * GIB);
+        assert_eq!(spare_bytes(4 * GIB, 1800 * MIB), 248 * MIB);
+        assert_eq!(spare_bytes(GIB + 8 * MIB, 0), 8 * MIB);
+        assert_eq!(auto_arena_bytes(GIB + 8 * MIB, 0, u64::MAX), 0);
+        assert_eq!(spare_bytes(GIB, 0), 0);
+        assert_eq!(spare_bytes(GIB / 2, 0), 0);
+        assert_eq!(spare_bytes(4 * GIB, 8 * GIB), 0);
+    }
 
     /// Headroom is the point: the budget never equals what is available, however much there is.
     #[test]

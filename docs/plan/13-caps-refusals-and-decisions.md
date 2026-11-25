@@ -72,10 +72,26 @@ not foresee.
 
 ### S3 — ladder order and the cache percentage — done 2026-11-25
 
-Shipped; what it left is backlog B62: the two places the ladder spills (an
-explicit window that does not fit, and the minimum when nothing fits) do not
-reach a working run on a dense model, because dense placement prices the whole
-cache in VRAM and the spill leaves later allocations no room.
+Shipped; what it left is backlog B62. The two places the ladder spills (an
+explicit window that does not fit, and the minimum when nothing fits) did not
+reach a working run on a dense model when S3 shipped: dense placement priced the
+whole cache in VRAM and the spill left later allocations no room. A follow-up
+slice (2026-11-25) made both run, with one split rule and one reserve shared by
+the fit, placement, the re-clamp and the allocation; on a unified-memory device
+the spill is not armed, since system RAM counts in the same budget there.
+
+The follow-up departs from the ladder as decided in one place, as the
+orchestrator's call and open to the owner's veto: under `kv.overflow`, when no
+cache format fits beside the weights but the weights fit without it, placement
+keeps the weights resident and spills the cache, where the decided order streams
+the weights first. The reasoning: spilled rows are read over PCIe in proportion
+to the depth a generation reaches, while streamed weights are read again every
+token whatever the depth; and the fit before the load already spills such a
+window on the assumption of resident weights, so streaming them would price the
+session two ways. Not measured: no run compared the two; backlog B62 has the
+measurement to take. Streaming still comes first when the weights do not fit
+resident at all (with the whole cache then spilled when it would leave the
+streaming arenas less than their floor).
 
 Departs from the slice as planned in two places. The pre-load rule
 (`seam::preload_ctx`) covers the explicit window too, so

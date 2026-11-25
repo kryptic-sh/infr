@@ -655,6 +655,11 @@ struct VulkanShared {
     /// split; the actual budgeting is `device_used` alone. All 0 when the flag is off. The
     /// bookkeeping (and the cumulative-cap gate) is the shared [`SpillTally`].
     kv_spill: SpillTally,
+    /// The device memory `INFR_KV_OVERFLOW`'s VRAM-first placement leaves free below the guard's
+    /// budget: a KV buffer goes to device memory only when at least this much is left after it
+    /// ([`kv_stays_in_vram`]). Set by the runner before it allocates a session's cache
+    /// (`Backend::set_kv_spill_reserve`); `0` until then.
+    kv_spill_reserve: AtomicU64,
     /// Reused staging ring for weight uploads (see [`StagingRing`]). Built lazily on
     /// the first staged weight upload of a load and torn down with the weight scope.
     staging_ring: Mutex<Option<StagingRing>>,
@@ -1036,20 +1041,37 @@ fn probe_uma_overflow_type(mp: &vk::PhysicalDeviceMemoryProperties) -> Option<u3
 }
 
 /// Opt-in: place the KV cache VRAM-FIRST, spilling to system RAM only what does not fit. Each
-/// per-layer/per-side KV buffer is tried in device-local VRAM (budget-guarded); once the VRAM
-/// budget is reached, that buffer — and, since the budget only shrinks as later buffers land, every
-/// subsequent one — is placed in host RAM and read by attention over PCIe via its device address
-/// (the KV read seam is 100% `bufferDeviceAddress`, so off-device bytes need no shader change). So a
-/// context whose KV overflows VRAM by a modest amount keeps most layers resident and pays PCIe only
-/// on the spilled tail; a context that overflows entirely spills entirely (slice-1 whole-host as the
-/// limiting case). `INFR_KV_OVERFLOW=1` (config `kv.overflow`). Default OFF (empty or `0` = off) =
-/// today's VRAM-only behavior, unchanged. See [`VulkanBackend::alloc_kv_host`],
-/// [`VulkanBackend::vram_budget_fits`], and the ctx-clamp ladder's last rung.
+/// per-layer/per-side KV buffer is tried in device-local VRAM; one that would leave less than the
+/// session's spill reserve free ([`kv_stays_in_vram`]) is placed in host RAM instead and read by
+/// attention over PCIe via its device address (the KV read seam is 100% `bufferDeviceAddress`, so
+/// off-device bytes need no shader change). So a context whose KV overflows VRAM by a modest amount
+/// keeps most layers resident and pays PCIe only on the spilled tail; a context that overflows
+/// entirely spills entirely (slice-1 whole-host as the limiting case). `INFR_KV_OVERFLOW=1` (config
+/// `kv.overflow`). Default OFF (empty or `0` = off) = today's VRAM-only behavior, unchanged. See
+/// [`VulkanBackend::alloc_kv_host`], [`kv_vram_bytes`], and the ctx-clamp ladder's spill rung.
 ///
 /// Read off the backend's `Config`, not the process environment; `budget::flag_from`'s grammar
 /// (empty and `"0"` are OFF, unlike every `is_ok()` knob) is preserved by the config layer.
 fn kv_overflow_enabled(cfg: &infr_core::config::Config) -> bool {
     cfg.kv.overflow
+}
+
+/// Whether `INFR_KV_OVERFLOW` can spill on a device: the flag is on, the device is not
+/// unified-memory, and the driver reports a live memory budget (`VK_EXT_memory_budget`).
+///
+/// - On a unified-memory device the system RAM a spilled buffer takes is counted in the same
+///   budget as its device memory (`vram_info` sums every heap there), so a spill frees nothing.
+/// - Without a live budget, the room the context ladder measures after the load
+///   (`VramInfo::alloc_room`, the whole heap then) does not see what this backend has allocated,
+///   while the allocation guard counts it: a cache the ladder judged to fit could leave the
+///   activations nothing, and the spill's reserve could not be kept. Without the flag such a cache
+///   is refused cleanly when it is allocated, so the spill stays off there.
+///
+/// Where it is not armed the flag places no KV buffer in system RAM and decides no context. The
+/// one definition this backend's KV placement and, through `Backend::kv_spill_armed`, the seam's
+/// context ladder read.
+pub fn kv_spill_armed(overflow: bool, unified_memory: bool, live_budget: bool) -> bool {
+    overflow && !unified_memory && live_budget
 }
 
 /// Nouns for this backend's KV placement banner (see [`spill_report_line`], which owns the
@@ -1079,16 +1101,60 @@ const KV_SPILL: SpillNouns<'static> = SpillNouns {
 /// nothing when unset, and it is what makes a partial-spill placement reproducible on hardware
 /// where the model would otherwise fit — i.e. what lets a placement bug be re-created on a machine
 /// that is not the one that hit it. The feature it serves is opt-in either way.
-fn kv_overflow_vram_cap(cfg: &infr_core::config::Config) -> Option<u64> {
+pub fn kv_overflow_vram_cap(cfg: &infr_core::config::Config) -> Option<u64> {
     infr_core::budget::mib_bytes(cfg.kv.overflow_vram_mb)
 }
 
+/// `INFR_KV_OVERFLOW`'s placement rule for one KV buffer of `bytes`: it goes to device memory when
+/// the diagnostic cap ([`kv_overflow_vram_cap`]) admits it beside the KV bytes `placed` there
+/// already ([`SpillTally::admits`]), and, with `used` of the guard's `budget` taken, the
+/// `committed` bytes it takes there (`Backend::kv_alloc_cost`) still leave `reserve` free; to
+/// system RAM otherwise. The allocation decides each buffer with it against the live budget and
+/// this backend's tally; [`kv_vram_bytes`] applies it to a whole cache before anything is
+/// allocated.
+pub fn kv_stays_in_vram(
+    used: u64,
+    budget: u64,
+    reserve: u64,
+    committed: u64,
+    placed: &SpillTally,
+    cap: Option<u64>,
+    bytes: u64,
+) -> bool {
+    placed.admits(cap, bytes) && pool::fits_budget(used, committed.saturating_add(reserve), budget)
+}
+
+/// The device-memory bytes, as committed, of a KV cache whose buffers ask for `bytes` and commit
+/// `committed` each (`(bytes, committed)`, in the order they are allocated) that
+/// `INFR_KV_OVERFLOW`'s placement keeps in device memory when `room` is free before the first,
+/// `reserve` must stay free and `cap` bounds the KV bytes it places there
+/// ([`kv_stays_in_vram`], buffer by buffer: one that does not fit goes to system RAM, and a
+/// smaller one after it can still fit). The rest of the cache is what spills. The cap is counted
+/// from this cache's first buffer, where the allocation counts it over the backend's life: a cache
+/// allocated after another on the same backend has less of it left.
+pub fn kv_vram_bytes(
+    buffers: impl IntoIterator<Item = (u64, u64)>,
+    room: u64,
+    reserve: u64,
+    cap: Option<u64>,
+) -> u64 {
+    let placed = SpillTally::default();
+    buffers.into_iter().fold(0, |used, (bytes, c)| {
+        if kv_stays_in_vram(used, room, reserve, c, &placed, cap, bytes) {
+            placed.record_vram(bytes);
+            used + c
+        } else {
+            used
+        }
+    })
+}
+
 /// Headroom the VRAM budget reserves below the true heap size, shared by the hard guard
-/// ([`VulkanBackend::check_vram_budget`]) and the non-erroring probe
-/// ([`VulkanBackend::vram_budget_fits`]) so VRAM-first KV spill and the guard agree to the byte on
-/// where "full" is. Absorbs allocation slop (alignment; on a device without a live budget,
-/// gpu-allocator's block rounding, which a live budget charges in full — see `pool`) and
-/// driver-internal allocations (descriptor pools, pipeline/shader memory, command buffers).
+/// ([`VulkanBackend::check_vram_budget`]) and the VRAM-first KV spill's placement
+/// ([`VulkanBackend::kv_stays_in_vram`]) so the two agree to the byte on where "full" is. Absorbs
+/// allocation slop (alignment; on a device without a live budget, gpu-allocator's block rounding,
+/// which a live budget charges in full — see `pool`) and driver-internal allocations (descriptor
+/// pools, pipeline/shader memory, command buffers).
 const GUARD_HEADROOM: u64 = 256 * 1024 * 1024;
 
 /// Smallest buffer [`VulkanBackend::make_buf_ex`] gives its own dedicated `VkDeviceMemory`; a
@@ -3484,6 +3550,7 @@ impl VulkanBackend {
                 uma_overflow_type,
                 host_overflow_type,
                 kv_spill: SpillTally::default(),
+                kv_spill_reserve: AtomicU64::new(0),
                 staging_ring: Mutex::new(None),
                 gpu_wait,
             }),
@@ -4144,6 +4211,22 @@ impl VulkanBackend {
         self.vram().alloc_room()
     }
 
+    /// [`kv_spill_armed`] for this backend: its `kv.overflow`, whether it is unified-memory, and
+    /// whether its driver reports a live budget.
+    fn spill_armed(&self) -> bool {
+        kv_spill_armed(
+            kv_overflow_enabled(&self.cfg),
+            self.shared.caps.unified_memory,
+            self.shared.has_mem_budget,
+        )
+    }
+
+    /// Where `kv.overflow`'s VRAM-first placement has put this backend's KV buffers so far: how
+    /// many, and how many bytes, in device memory and in system RAM. All zero with the flag off.
+    pub fn kv_spill_counts(&self) -> infr_core::budget::SpillCounts {
+        self.shared.kv_spill.counts()
+    }
+
     /// What a resident weight load takes from [`alloc_room`](Self::alloc_room) besides the
     /// tensors' own bytes, as this backend can say before the load: how the resident-BDA arena
     /// places them (see [`WeightLoadCost`]) and the upload staging ring live while they are copied.
@@ -4243,7 +4326,7 @@ impl VulkanBackend {
         if self.cfg.kernels.vulkan.no_vram_guard {
             return Ok(());
         }
-        // The decision is `pool::admits`, over the same snapshot arithmetic as `vram_budget_fits`
+        // The decision is `pool::admits`, over the same snapshot arithmetic as `kv_stays_in_vram`
         // (`budget_snapshot`, `pool::fits_budget`), so the hard guard here and the VRAM-first KV
         // spill can never disagree. The driver is asked only for a commitment the guard checks.
         let mut seen = None;
@@ -4290,17 +4373,29 @@ impl VulkanBackend {
         )))
     }
 
-    /// Non-erroring budget probe: would a device-local allocation of `want` bytes fit under the SAME
-    /// budget [`check_vram_budget`](Self::check_vram_budget) enforces? The VRAM-first KV-overflow
-    /// path (`make_alloc`'s `KvCache` arm with `INFR_KV_OVERFLOW`) needs "would this fit?" to choose
-    /// VRAM vs host placement, not "error if not" — but it must agree with the guard to the byte, so
-    /// this and the guard share `GUARD_HEADROOM` and the same `used`/`budget` math. A `true` here
-    /// means `check_vram_budget(want)` returns `Ok` (the guard errors iff this returns `false`);
-    /// unlike the guard it ignores `INFR_NO_VRAM_GUARD` and the sub-MiB skip — it is a placement
-    /// decision, not a safety gate, so it always reports the honest budget answer.
-    fn vram_budget_fits(&self, want: u64) -> bool {
+    /// Whether `INFR_KV_OVERFLOW`'s VRAM-first placement keeps a KV buffer of `bytes` in device
+    /// memory: [`kv_stays_in_vram`] over the used/budget figures
+    /// [`check_vram_budget`](Self::check_vram_budget) reads, this backend's KV tally and cap, the
+    /// buffer priced at what `Backend::kv_alloc_cost` says the device commits for it, and the
+    /// session's spill reserve held free. It prices the buffer at that commitment where the guard
+    /// checks the driver's `requirements.size` for it, and it ignores `INFR_NO_VRAM_GUARD` and the
+    /// sub-MiB skip — a placement decision, not a safety gate — so a `true` with a zero reserve is
+    /// the guard's admission only as far as the two sizes agree (B13: the driver can take a few KB
+    /// more), and a VRAM allocation the guard then refuses goes to system RAM instead.
+    fn kv_stays_in_vram(&self, bytes: u64) -> bool {
         let (_, used, budget) = self.budget_snapshot();
-        pool::fits_budget(used, want, budget)
+        let committed = self.shared.kv_alloc_cost().0.committed(bytes);
+        let reserve = self.shared.kv_spill_reserve.load(Ordering::Relaxed);
+        let cap = kv_overflow_vram_cap(&self.cfg);
+        kv_stays_in_vram(
+            used,
+            budget,
+            reserve,
+            committed,
+            &self.shared.kv_spill,
+            cap,
+            bytes,
+        )
     }
 
     /// The device memory snapshot the guard decides against, with the bytes it counts as used
@@ -4923,31 +5018,29 @@ impl VulkanBackend {
                 || self.device_memory_allocations(),
                 self.shared.max_memory_allocations,
             )?;
-            // Opt-in overflow (issue: KV-in-system-RAM), VRAM-FIRST: keep this KV buffer resident in
-            // device-local VRAM while it fits the guard's budget; once VRAM is full, place it — and,
-            // since the budget only shrinks as later buffers land, every subsequent one — in host RAM,
-            // read by attention over PCIe via its device address (the read seam is 100% BDA — see
-            // `alloc_kv_host`). This bounds PCIe cost to the overflow tail instead of paying it on the
-            // whole cache; whole-host (slice-1 behavior) is now just the case where nothing fits.
-            // Off by default ⇒ unchanged device-local VRAM KV.
-            if kv_overflow_enabled(&self.cfg) {
-                // Probe agrees with the guard to the byte (both key off `vram_budget_fits`), so a
-                // `true` here means the VRAM alloc's own guard will pass. Guard against the rounding
-                // slop between the requested `bytes` and the allocation's aligned size at the exact
-                // budget edge by treating a VRAM alloc failure as "spill it" rather than propagating —
-                // the whole point of overflow mode is to degrade to host, never to hard-error.
+            // Opt-in overflow (issue: KV-in-system-RAM), VRAM-FIRST: keep this KV buffer resident
+            // in device-local VRAM while it leaves the session's spill reserve free (what the run
+            // allocates after its cache: activations, the driver's pipelines); else place it in
+            // host RAM, read by attention over PCIe via its device address (the read seam is 100%
+            // BDA — see `alloc_kv_host`). This bounds PCIe cost to the overflow tail instead of
+            // paying it on the whole cache; whole-host (slice-1 behavior) is now just the case
+            // where nothing fits. Off by default ⇒ unchanged device-local VRAM KV.
+            if self.spill_armed() {
+                // The placement reads the guard's own budget (`kv_stays_in_vram`), so a `true` here
+                // with any reserve means the VRAM alloc's own guard will pass. Guard against the
+                // rounding slop between the requested `bytes` and the allocation's aligned size at
+                // the exact budget edge by treating a VRAM alloc failure as "spill it" rather than
+                // propagating — the whole point of overflow mode is to degrade to host, never to
+                // hard-error.
                 //
                 // `INFR_KV_OVERFLOW_VRAM_MB` (diagnostic) additionally caps CUMULATIVE KV-in-VRAM
                 // bytes: it forces a partial (or, at 0, whole-host) spill on a model that would
                 // otherwise fit entirely, so the mix path is exercisable on small models and the
                 // whole-host case is reproducible apples-to-apples for benchmarking. It gates ONLY
-                // this KV placement — never the real guard (`vram_budget_fits`/`check_vram_budget`),
-                // which keeps protecting weights + activations against true VRAM.
-                let cap_ok = self
-                    .shared
-                    .kv_spill
-                    .admits(kv_overflow_vram_cap(&self.cfg), bytes as u64);
-                if cap_ok && self.vram_budget_fits(bytes as u64) {
+                // this KV placement — never the real guard
+                // (`kv_stays_in_vram`/`check_vram_budget`), which keeps protecting weights +
+                // activations against true VRAM.
+                if self.kv_stays_in_vram(bytes as u64) {
                     if let Ok(buf) =
                         self.make_buf_ex(bytes, MemoryLocation::GpuOnly, "kv-cache", true, true)
                     {
@@ -5456,7 +5549,7 @@ impl Backend for VulkanBackend {
     /// partial split is visible. All-resident (nothing spilled) and all-spilled (slice-1 whole-host)
     /// are both reported. Nothing printed with the flag off or when no KV was allocated.
     fn kv_overflow_report(&self) {
-        if !kv_overflow_enabled(&self.cfg) {
+        if !self.spill_armed() {
             return;
         }
         if let Some(line) = spill_report_line(self.shared.kv_spill.counts(), &KV_SPILL, fmt_bytes) {
@@ -5473,6 +5566,14 @@ impl Backend for VulkanBackend {
     /// footprint has a term for).
     fn device_alloc_room(&self) -> Option<u64> {
         Some(self.alloc_room())
+    }
+
+    fn kv_spill_armed(&self) -> bool {
+        self.spill_armed()
+    }
+
+    fn set_kv_spill_reserve(&self, bytes: u64) {
+        self.shared.kv_spill_reserve.store(bytes, Ordering::Relaxed);
     }
 
     fn activation_peak(&self) -> Option<u64> {

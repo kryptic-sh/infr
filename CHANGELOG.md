@@ -8,6 +8,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Breaking
 
+- **`infr_core::budget::reserve_bytes` takes only the override.** It returns
+  `kv.overflow_reserve_mb` in bytes, `0` when unset, where it took the device's
+  total memory and defaulted to max(12% of it, 2 GiB).
 - **`infr serve` checks the `Host` header on a keyless loopback server.** A
   request whose `Host` is not a loopback name (`localhost`, `*.localhost`,
   `127.0.0.1`, `[::1]`, or the bind host, on any port) now gets a `403` naming
@@ -61,6 +64,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`Backend::set_kv_spill_reserve`** and **`Backend::kv_spill_armed`**; on
+  Vulkan **`kv_spill_armed`**, **`kv_stays_in_vram`**, **`kv_vram_bytes`**,
+  **`kv_overflow_vram_cap`** and **`VulkanBackend::kv_spill_counts`**; and
+  **`infr_core::hostmem::spare_bytes`**: the device memory a `kv.overflow` spill
+  must leave free (default no-op), whether a backend spills at all (not on
+  unified memory, nor without a live memory budget), the placement rule a KV
+  buffer is placed by under it and the bytes of a whole cache it keeps in device
+  memory, the `kv.overflow_vram_mb` cap in bytes, where the backend has placed
+  its KV buffers so far, and the host memory a run may take beside the headroom
+  host arenas leave (`auto_arena_bytes` without its worth-building floor).
 - **`infr_vulkan::VulkanBackend::weight_load_cost`** returns a `WeightLoadCost`:
   the resident weight arena's upload alignment and block size, and the upload
   staging ring's bytes where the device's budget counts them, which the context
@@ -522,22 +535,48 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
-- **`INFR_KV_OVERFLOW` no longer keeps a default context that does not fit
-  VRAM.** On Vulkan, with `kv.overflow` on, a context infr sizes itself (no
-  `--ctx` / `INFR_CTX`) is now clamped to what fits in VRAM, exactly as without
-  the flag. It used to keep the model's whole trained window and decide weight
-  placement for it, which on a device too small for that window's cache failed
-  at load with a "below the streaming floor" error (seen with Qwen3-0.6B Q4_K_M
-  under `INFR_VRAM_LIMIT` with 1880 MiB of room, on both GPUs here); that run
-  now opens at 6 174 tokens on the integrated GPU and 6 956 on the RX 7900 XTX.
-  Below that, a q8_0 cache that holds the 1024-token minimum is tried first, and
-  only when neither does the session open at the minimum with its cache to be
-  spilled to system RAM; on a dense model such a run still fails at load, at
-  weight placement or at the first allocation after the spilled cache, as it did
-  before. A context you set is still never cut: q8_0 is tried first, then it is
-  kept as asked; but under `kv.overflow` a set context that neither format fits
-  also still fails on a dense model, the same way, instead of spilling. Without
+- **`INFR_KV_OVERFLOW` spills the KV cache on a dense model, and no longer keeps
+  a default context that does not fit VRAM.** On Vulkan, with `kv.overflow` on,
+  a context infr sizes itself (no `--ctx` / `INFR_CTX`) is clamped to what fits
+  in VRAM, exactly as without the flag; it used to keep the model's whole
+  trained window and fail at load with a "below the streaming floor" error
+  (Qwen3-0.6B Q4_K_M under `INFR_VRAM_LIMIT` with 1880 MiB of room now opens at
+  6 174 tokens on the integrated GPU and 6 956 on the RX 7900 XTX). Below the
+  1024-token minimum a q8_0 cache that holds it is tried first, and when neither
+  format does the session opens at the minimum with its cache spilled to system
+  RAM. A context you set is never cut: q8_0 is tried first, then it is kept as
+  asked with its cache spilled. A spilled cache now runs, where on a dense model
+  it failed at weight placement or at the first allocation after the cache:
+  placement keeps the weights resident when they fit without the cache, and
+  streams them with the whole cache in system RAM when they do not and the cache
+  would leave the streaming arenas less than their floor; the cache takes only
+  the device memory the rest of the run is priced to need after it leaves free
+  (the activation reserve, the driver's own later allocations and
+  `kv.overflow_reserve_mb`), and runs at the shortest prefill chunk unless
+  `INFR_UBATCH` pins one. On the RX 7900 XTX, Qwen3-0.6B's 40960-token trained
+  window at 1880 MiB of room ran with 755 MB of its f16 cache in VRAM and 3.94
+  GB in system RAM, and gave the logits of the same cache wholly in VRAM bit for
+  bit. What cannot be served even spilled is refused, naming the sizes: before
+  the load, a spilled part larger than what the host can spare a run (after the
+  headroom host weight arenas leave the rest of the machine); before any weight
+  is uploaded, weights that leave the streaming arenas less than their floor
+  with the whole cache spilled; and after the weights are uploaded but before
+  any of the cache is allocated, a device whose measured free memory is below
+  what the run needs after the cache, or a spilled part that no longer fits the
+  host beside the weights' host tier. A cache the ladder serves whole is
+  allocated as without the flag; with more than one `infr serve` slot, a slot
+  that does not fit spills past the same reserve, its host part checked before
+  it is forked. `kv.overflow` does nothing (no context decision changes and no
+  KV buffer is placed in system RAM) on a unified-memory device (an integrated
+  GPU), where system RAM counts in the same budget as device memory so a spill
+  frees nothing, nor on a driver without `VK_EXT_memory_budget`, where the free
+  memory measured after the load does not see what infr has allocated. Without
   `kv.overflow` nothing changes.
+- **`kv.overflow_reserve_mb` (`INFR_KV_OVERFLOW_RESERVE_MB`) is read.** It is
+  the device memory, in MiB, a cache `kv.overflow` spills leaves free on top of
+  what the run is priced to need after it; unset adds nothing, and a cache that
+  fits is sized without it. Nothing read the key before, so the documented
+  default of max(12% of VRAM, 2 GiB) was never applied.
 - **An `INFR_CACHE` (`paging.cache`) percentage is of the allocatable VRAM.**
   `INFR_CACHE=80%` now means 80% of what the Vulkan allocator can still hand out
   when placement runs (free VRAM less the allocation guard's 256 MiB headroom),

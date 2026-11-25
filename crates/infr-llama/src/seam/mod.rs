@@ -1301,6 +1301,22 @@ pub(crate) struct PlacementPins {
     /// the peak is a high-water mark and the reserve is fixed — so without a latch a server would
     /// repeat the same line on every request for as long as it runs.
     act_over_reserve_reported: std::sync::atomic::AtomicBool,
+    /// Host memory the session's weight-streaming host tier was sized to take (its arenas'
+    /// bytes, `0` with none), set by placement each time it runs for a cold init. The tier's
+    /// arenas are zero-filled on first touch, so the live host probe does not see them yet when
+    /// the post-load re-clamp prices a spilled cache's system-RAM part against what the host has
+    /// free ([`refuse_unhostable_kv`]); this is what it counts for them.
+    ///
+    /// Counted once there, not twice: a session cold-inits only its first slot (later ones are
+    /// forks, `SlotPool::pick` and `ParallelSeam::init_slots`), and a cold init that failed and
+    /// is retried runs placement again, which replaces the tier (`init_dense_pager`, dropping the
+    /// old arenas) and re-pins this to the new one before any weight is read through it — the
+    /// weights a streamed session uploads are resident ones, so nothing touches the tier between
+    /// placement and the re-clamp. The fork check after a first generation
+    /// ([`refuse_unhostable_forks`]) is different: by then the generation has touched part of the
+    /// arenas, which the probe sees and this still counts, so it over-counts the tier there — the
+    /// conservative side (traced in code 2026-11-25, not run).
+    host_tier_bytes: std::sync::atomic::AtomicU64,
 }
 
 thread_local! {
@@ -1384,6 +1400,21 @@ pub(crate) fn claim_act_over_reserve_report() -> bool {
         !p.act_over_reserve_reported
             .swap(true, std::sync::atomic::Ordering::Relaxed)
     })
+}
+
+/// Record the host memory the current session's weight-streaming host tier takes (see
+/// [`PlacementPins`]'s `host_tier_bytes`).
+fn pin_host_tier_bytes(bytes: u64) {
+    with_placement_pins(|p| {
+        p.host_tier_bytes
+            .store(bytes, std::sync::atomic::Ordering::Relaxed)
+    });
+}
+
+/// The host memory the current session's weight-streaming host tier takes, as placement recorded
+/// it (`0` before any placement, or with no tier).
+pub(crate) fn host_tier_bytes() -> u64 {
+    with_placement_pins(|p| p.host_tier_bytes.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// Whether the placement ladder pinned auto-q8 KV for the current session scope (see
@@ -1992,14 +2023,7 @@ pub(crate) fn dense_stream_budget_at(
     v_fmt: DType,
 ) -> u64 {
     let ring = placement_ring(cfg, ec, k_fmt, v_fmt);
-    // A streamed session prefills LAYER-MAJOR by default, which holds every chunk's residual
-    // stream at once — those bytes come out of the same VRAM the arenas want, and they are
-    // allocated later, so the arena has to leave room for them (see `layer_major_act_bytes`).
-    let lm = if ec.paging.layer_major == Some(false) {
-        0
-    } else {
-        layer_major_act_bytes(cfg, want_ctx, ubatch)
-    };
+    let lm = stream_layer_major_bytes(cfg, ec, want_ctx, ubatch);
     vram.alloc_room()
         .saturating_sub(dense_resident_need(
             cfg,
@@ -2012,6 +2036,43 @@ pub(crate) fn dense_stream_budget_at(
             v_fmt,
         ))
         .saturating_sub(lm)
+}
+
+/// What a streamed session's layer-major prefill holds beside the arenas. A streamed session
+/// prefills LAYER-MAJOR by default, which holds every chunk's residual stream at once — those
+/// bytes come out of the same VRAM the arenas want, and they are allocated later, so the arena has
+/// to leave room for them (see `layer_major_act_bytes`).
+fn stream_layer_major_bytes(
+    cfg: &Config,
+    ec: &EngineConfig,
+    want_ctx: usize,
+    ubatch: usize,
+) -> u64 {
+    if ec.paging.layer_major == Some(false) {
+        0
+    } else {
+        layer_major_act_bytes(cfg, want_ctx, ubatch)
+    }
+}
+
+/// [`dense_stream_budget_at`] for a session whose KV cache spills whole (`kv.overflow`): the
+/// cache takes none of the room, which holds the weight upload's staging (`staging`, live when
+/// the cache is allocated) and the streamed session's spill reserve ([`kv_spill_reserve`])
+/// instead, so what the arenas leave is the reserve and the cache's buffers land in system RAM
+/// ([`kv_spill_split`] of a room at the reserve).
+pub(crate) fn dense_stream_spill_budget_at(
+    cfg: &Config,
+    ec: &EngineConfig,
+    resident_weights: u64,
+    staging: u64,
+    vram: &infr_vulkan::VramInfo,
+    want_ctx: usize,
+    ubatch: usize,
+) -> u64 {
+    vram.alloc_room()
+        .saturating_sub(resident_weights)
+        .saturating_sub(staging)
+        .saturating_sub(kv_spill_reserve(cfg, ec, want_ctx, ubatch, true))
 }
 
 /// Headroom the MoE expert budget holds back on top of the dense weights and the KV cache: covers
@@ -2172,6 +2233,18 @@ pub(crate) fn weight_upload_units(
     ec: &EngineConfig,
     combined_gu: bool,
 ) -> Vec<u64> {
+    weight_upload_units_of(g, cfg, ec, combined_gu, |_| true)
+}
+
+/// [`weight_upload_units`] of the tensors whose names `keep` accepts: the units a load that
+/// uploads only those makes, such as the weights a streamed session keeps resident.
+pub(crate) fn weight_upload_units_of(
+    g: &Gguf,
+    cfg: &Config,
+    ec: &EngineConfig,
+    combined_gu: bool,
+    keep: impl Fn(&str) -> bool,
+) -> Vec<u64> {
     let fuse_qkv = runner::fuse_qkv_decision(combined_gu, g, cfg, ec);
     let fuse_gu = runner::fuse_gu_decision(combined_gu, g, cfg);
     // The fused unit a tensor belongs to, keyed by its layer and which concatenation it joins.
@@ -2186,7 +2259,7 @@ pub(crate) fn weight_upload_units(
     };
     let mut units = Vec::new();
     let mut fused: std::collections::BTreeMap<(usize, bool), u64> = Default::default();
-    for t in g.tensors() {
+    for t in g.tensors().iter().filter(|t| keep(&t.name)) {
         let numel: usize = t.shape.iter().product();
         let bytes = crate::weights::tensor_resident_bytes(t.dtype, numel, t.nbytes);
         match fused_unit(&t.name) {
@@ -2220,6 +2293,38 @@ pub(crate) fn weight_arena_floor(units: &[u64], cost: infr_vulkan::WeightLoadCos
     whole + shared.div_ceil(cost.block_min) * cost.block_min
 }
 
+/// What a dense model's resident weight load takes from the device's room besides the KV cache and
+/// what is allocated after it, priced before the load: `(weights, staging)`, the weights as the
+/// resident arena commits them at the least ([`weight_arena_floor`]) and the upload staging still
+/// live when the post-load re-clamp reads the room. The weights half of what the fit before the
+/// load (`SeamModel::preload_held`) and the spill rung of dense placement hold back.
+pub(crate) fn resident_load_held(
+    vk: &infr_vulkan::VulkanBackend,
+    g: &Gguf,
+    cfg: &Config,
+    ec: &EngineConfig,
+) -> (u64, u64) {
+    let cost = vk.weight_load_cost();
+    let units = weight_upload_units(g, cfg, ec, vk.capabilities().combined_gu);
+    (weight_arena_floor(&units, cost), cost.staging)
+}
+
+/// The per-side KV dtypes a fit/footprint estimate must price: the user's explicit
+/// `INFR_KV_TYPE_K`/`_V` when set, else the default ladder (legacy `INFR_KV_Q8`, then a
+/// placement-pinned or candidate auto-q8, then f16) — the same ladder `parse_kv_fmt` walks in
+/// the runner. ESTIMATE ONLY in one direction: the runner additionally gates each format on
+/// backend/alignment and falls back to f16, so a gated-out low-bit request under-estimates
+/// here and the alloc-time VRAM guard backstops it.
+pub(crate) fn kv_fit_fmts(cfg: &Config, ec: &EngineConfig, auto_q8: bool) -> (DType, DType) {
+    let side = |want: Option<DType>| match want {
+        Some(dt) => dt,
+        None if ec.kv.force_q8 || auto_q8 => DType::Q8_0,
+        None => DType::F16,
+    };
+    let k = side(ec.kv.type_k);
+    (k, kv_v_fmt(cfg, k, side(ec.kv.type_v)))
+}
+
 /// Device memory a live session commits AFTER its KV cache is allocated, which therefore has to be
 /// held back from [`reclamp_ctx_to_live_room`]'s budget: the compute pipelines, descriptor pools
 /// and command buffers the driver builds while recording the first forwards. It is the driver's
@@ -2238,6 +2343,236 @@ pub(crate) fn weight_arena_floor(units: &[u64], cost: infr_vulkan::WeightLoadCos
 /// pipelines is what left the guard nothing to cushion with and turned a 2 MiB overshoot into a
 /// failed request.
 pub(crate) const POST_KV_DEVICE_RESERVE: u64 = 256 * 1024 * 1024;
+
+/// The device memory a spilled cache leaves free for what the run allocates after it, term by
+/// term ([`kv_spill_reserve_terms`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct KvSpillReserve {
+    /// The activation reserve the fit prices ([`dense_act_reserve_at`]).
+    pub(crate) activations: u64,
+    /// The layer-major prefill's residual stream, where placement prices one
+    /// ([`layer_major_act_bytes`]).
+    pub(crate) layer_major: u64,
+    /// [`POST_KV_DEVICE_RESERVE`].
+    pub(crate) driver: u64,
+    /// The user's extra margin (`kv.overflow_reserve_mb`, [`infr_core::budget::reserve_bytes`]).
+    pub(crate) margin: u64,
+}
+
+impl KvSpillReserve {
+    pub(crate) fn total(&self) -> u64 {
+        self.activations
+            .saturating_add(self.layer_major)
+            .saturating_add(self.driver)
+            .saturating_add(self.margin)
+    }
+}
+
+/// The terms of [`kv_spill_reserve`] at window `ctx` and prefill chunk `ubatch`, for a session
+/// whose weights stream (`streamed`) or not. The layer-major term is the one placement prices: on
+/// a streamed session unless `paging.layer_major` is off, on a resident one only when it is forced
+/// on.
+pub(crate) fn kv_spill_reserve_terms(
+    cfg: &Config,
+    ec: &EngineConfig,
+    ctx: usize,
+    ubatch: usize,
+    streamed: bool,
+) -> KvSpillReserve {
+    let layer_major = if streamed {
+        stream_layer_major_bytes(cfg, ec, ctx, ubatch)
+    } else if ec.paging.layer_major == Some(true) {
+        layer_major_act_bytes(cfg, ctx, ubatch)
+    } else {
+        0
+    };
+    KvSpillReserve {
+        activations: dense_act_reserve_at(cfg, ctx, ubatch),
+        layer_major,
+        driver: POST_KV_DEVICE_RESERVE,
+        margin: infr_core::budget::reserve_bytes(ec.kv.overflow_reserve_mb),
+    }
+}
+
+/// The device memory a spilled cache leaves free for what the run allocates after it
+/// ([`kv_spill_reserve_terms`], summed). The one figure placement's spill rung, the re-clamp
+/// after the load and the backend's KV placement (`Backend::set_kv_spill_reserve`) hold back for
+/// a spill.
+pub(crate) fn kv_spill_reserve(
+    cfg: &Config,
+    ec: &EngineConfig,
+    ctx: usize,
+    ubatch: usize,
+    streamed: bool,
+) -> u64 {
+    kv_spill_reserve_terms(cfg, ec, ctx, ubatch, streamed).total()
+}
+
+/// The prefill chunk a spilled session runs at: the one the user pinned (`INFR_UBATCH`), else the
+/// shortest [`ubatch_candidates`] allows. A spilled cache already gave up device memory, and a
+/// shorter chunk shrinks the activations it must leave room for, so it takes the cheapest height
+/// prefill can run at rather than the one placement would pick for a resident cache.
+pub(crate) fn spill_ubatch(ec: &EngineConfig) -> usize {
+    if user_pinned_ubatch(ec) {
+        ubatch_rows(ec)
+    } else {
+        ubatch_candidates(ec)
+            .into_iter()
+            .min()
+            .expect("ubatch_candidates is never empty")
+    }
+}
+
+/// How a spilled KV cache divides between device memory and system RAM, in bytes, each buffer at
+/// what the device commits for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct KvSplit {
+    pub(crate) vram: u64,
+    pub(crate) host: u64,
+}
+
+/// How `n_slots` caches of `ctx` tokens divide under `kv.overflow` when `room` bytes of device
+/// memory are free before the first buffer, `reserve` ([`kv_spill_reserve`]) must stay free and
+/// `cap` ([`kv_spill_cap`]) bounds what the cache places in device memory:
+/// every buffer of [`kv_slot_allocs`], slot after slot, in the order the runner allocates them,
+/// through the backend's own placement rule ([`infr_vulkan::kv_vram_bytes`]). The one answer to
+/// "how much of this cache goes to VRAM" for the fit before the load, placement and the re-clamp
+/// after it, each passing the room as it knows it; the allocation applies the same rule to the
+/// live budget, buffer by buffer.
+///
+/// The recurrent-state snapshots come last, as in [`kv_slot_allocs`], priced against the room the
+/// init buffers leave. A slot allocates them on first use, during its first generation rather than
+/// at its cold init, when the run's activations may hold part of that room: a snapshot this prices
+/// in device memory can land in system RAM, never the other way (the reserve it must leave is the
+/// same either way).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn kv_spill_split(
+    cfg: &Config,
+    ctx: usize,
+    ring: bool,
+    ubatch: usize,
+    align: KvAlign,
+    k_fmt: DType,
+    v_fmt: DType,
+    n_slots: usize,
+    room: u64,
+    reserve: u64,
+    cap: Option<u64>,
+) -> KvSplit {
+    let buffers = || {
+        (0..n_slots.max(1)).flat_map(move |_| {
+            kv_slot_allocs(cfg, ctx, ring, ubatch, align.rows, k_fmt, v_fmt)
+                .flat_map(|(k, v)| [k, v])
+                .map(move |b| (b as u64, align.commit.committed(b as u64)))
+        })
+    };
+    let vram = infr_vulkan::kv_vram_bytes(buffers(), room, reserve, cap);
+    KvSplit {
+        vram,
+        host: buffers().map(|(_, c)| c).sum::<u64>() - vram,
+    }
+}
+
+/// The diagnostic cap `kv.overflow_vram_mb` puts on a spilled cache's device memory
+/// ([`infr_vulkan::kv_overflow_vram_cap`]), which the allocation applies: every split passes it.
+pub(crate) fn kv_spill_cap(ec: &EngineConfig) -> Option<u64> {
+    infr_vulkan::kv_overflow_vram_cap(ec)
+}
+
+/// Refuse a spilled cache whose system-RAM part does not fit the host: `Err`, naming the sizes,
+/// when `split.host` exceeds what the host can spare a run of `host_free`, the memory it reports
+/// it could commit ([`infr_core::hostmem::available_bytes`]; `None` where it cannot say, which
+/// refuses nothing). The spilled buffers are anonymous memory the OS cannot reclaim, so they take
+/// the headroom the repo's host arenas leave ([`infr_core::hostmem::spare_bytes`]), after
+/// `committed`: what the run already holds there that the probe does not see, the weight-streaming
+/// host tier ([`host_tier_bytes`]).
+pub(crate) fn refuse_unhostable_kv(
+    ctx: usize,
+    split: KvSplit,
+    host_free: Option<u64>,
+    committed: u64,
+    k_fmt: DType,
+    v_fmt: DType,
+) -> AResult<()> {
+    let Some(free) = host_free else {
+        return Ok(());
+    };
+    let spare = infr_core::hostmem::spare_bytes(free, committed);
+    if split.host <= spare {
+        return Ok(());
+    }
+    let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+    Err(anyhow!(
+        "context {ctx} cannot be served even with its KV cache spilled to system RAM \
+         (INFR_KV_OVERFLOW): {:.2} GiB of its {k_fmt:?}/{v_fmt:?} cache does not fit the device \
+         ({:.2} GiB does), and of the {:.2} GiB the host reports it could commit, {:.2} GiB is \
+         left for it after the {:.2} GiB the weights' host tier takes and the {:.2} GiB kept for \
+         the rest of the machine. Ask for a smaller window (--ctx N / INFR_CTX=N), quantize the \
+         cache (INFR_KV_TYPE_K=q8_0 INFR_KV_TYPE_V=q8_0), or free host memory.",
+        gib(split.host),
+        gib(split.vram),
+        gib(free),
+        gib(spare),
+        gib(committed),
+        gib(free.saturating_sub(committed).saturating_sub(spare)),
+    ))
+}
+
+/// The host-memory check for the `n_forks` slots an engine forks off `slot` once its cold init has
+/// placed it (`ParallelSeam::init_slots`), taken before the first fork is allocated: under an
+/// armed spill, every fork goes through the backend's placement past the reserve the cold init
+/// left set, so the part of the `n_forks` caches that would spill
+/// ([`kv_spill_split`] against the room the device reports now) must fit what the host can spare
+/// ([`refuse_unhostable_kv`]). Nothing to check on a backend that does not spill or cannot report
+/// a room. The diagnostic cap is counted from the first fork, where the allocation counts what
+/// `slot` already placed against it too, so under the cap this prices the forks' host part low.
+pub(crate) fn refuse_unhostable_forks(
+    be: &dyn Backend,
+    cfg: &Config,
+    ec: &EngineConfig,
+    slot: &SeamKv,
+    n_forks: usize,
+) -> AResult<()> {
+    if n_forks == 0 || !be.kv_spill_armed() {
+        return Ok(());
+    }
+    let Some(room) = be.device_alloc_room() else {
+        return Ok(());
+    };
+    let reserve = kv_spill_reserve(cfg, ec, slot.max_ctx, slot.ubatch, be.dense_paged());
+    let split = kv_spill_split(
+        cfg,
+        slot.max_ctx,
+        slot.kv_ring,
+        slot.ubatch,
+        KvAlign::of(be),
+        slot.k_fmt,
+        slot.v_fmt,
+        n_forks,
+        room,
+        reserve,
+        kv_spill_cap(ec),
+    );
+    refuse_unhostable_kv(
+        slot.max_ctx,
+        split,
+        infr_core::hostmem::available_bytes(),
+        host_tier_bytes(),
+        slot.k_fmt,
+        slot.v_fmt,
+    )
+}
+
+/// What [`reclamp_ctx_to_live_room`] settled on: the window and formats to allocate, and whether
+/// the cache is spilled (the ladder's `Spill` rung), so the runner holds the spill reserve back
+/// from this cache's own buffers only when it is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LiveCtx {
+    pub(crate) ctx: usize,
+    pub(crate) k_fmt: DType,
+    pub(crate) v_fmt: DType,
+    pub(crate) spilled: bool,
+}
 
 /// Re-decide the session's context against what the device says is LEFT, now that the weights are
 /// resident — the runner's cold init calls this between the weight upload and the KV allocation.
@@ -2271,9 +2606,15 @@ pub(crate) fn reclamp_ctx_to_live_room(
     want_ctx: usize,
     k_fmt: DType,
     v_fmt: DType,
-) -> AResult<(usize, DType, DType)> {
+) -> AResult<LiveCtx> {
+    let served = |ctx: usize, k_fmt: DType, v_fmt: DType| LiveCtx {
+        ctx,
+        k_fmt,
+        v_fmt,
+        spilled: false,
+    };
     let Some(room) = be.device_alloc_room() else {
-        return Ok((want_ctx, k_fmt, v_fmt));
+        return Ok(served(want_ctx, k_fmt, v_fmt));
     };
     let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
     let budget = room.saturating_sub(POST_KV_DEVICE_RESERVE);
@@ -2288,6 +2629,12 @@ pub(crate) fn reclamp_ctx_to_live_room(
     // MoE: the pager's arenas are already allocated by the binder at this point, so the live room
     // has them netted out and the flat `total/12` stand-in would double-count. The dense reserve
     // is what an MoE forward's activations actually need beside them.
+    //
+    // The fit prices a session the same whether or not its cache can spill (`kv.overflow` only
+    // decides what happens to a window that does not fit), so arming the spill changes no window
+    // served whole; a spilled one is held to the spill reserve below.
+    let spill = be.kv_spill_armed();
+    let streamed = be.dense_paged();
     let at = |ub: usize, k: DType, v: DType| {
         kv_fit_ctx_in_budget(cfg, ec, budget, None, &[ub], align, k, v)
     };
@@ -2304,7 +2651,7 @@ pub(crate) fn reclamp_ctx_to_live_room(
         }))
     };
     let Some((chunk, fit)) = walk(k_fmt, v_fmt) else {
-        return Ok((want_ctx, k_fmt, v_fmt));
+        return Ok(served(want_ctx, k_fmt, v_fmt));
     };
     let explicit = ec.device.ctx.is_some();
     // q8_0 is tried only where the pre-load ladder may pick it on its own (`may_auto_q8`) and the
@@ -2312,7 +2659,7 @@ pub(crate) fn reclamp_ctx_to_live_room(
     let q8_allowed =
         be.name() == "vulkan" && (k_fmt, v_fmt) == (DType::F16, DType::F16) && may_auto_q8(cfg, ec);
     let mut q8_walk = None;
-    let decision = post_load_ctx(want_ctx, explicit, ec.kv.overflow, fit, || {
+    let decision = post_load_ctx(want_ctx, explicit, spill, fit, || {
         q8_walk = q8_allowed.then(|| walk(DType::Q8_0, DType::Q8_0)).flatten();
         q8_walk.map(|(_, fit)| fit)
     });
@@ -2320,6 +2667,9 @@ pub(crate) fn reclamp_ctx_to_live_room(
     // is `window + chunk` rows, and the reserve the fit was priced with is that height's.
     let chunk = match (decision, q8_walk) {
         (CtxRung::ServeQ8(_), Some((q8_chunk, _))) => q8_chunk,
+        // Nothing fits at any height, so the walk's pick says nothing: a spilled session runs at
+        // its own chunk, and its reserve is priced there.
+        (CtxRung::Spill(_), _) => spill_ubatch(ec),
         _ => chunk,
     };
     if chunk < ubatch_rows(ec) {
@@ -2351,7 +2701,7 @@ pub(crate) fn reclamp_ctx_to_live_room(
                     gib(room),
                 );
             }
-            Ok((want_ctx, k_fmt, v_fmt))
+            Ok(served(want_ctx, k_fmt, v_fmt))
         }
         CtxRung::Serve(ctx) => {
             tracing::warn!(
@@ -2367,7 +2717,7 @@ pub(crate) fn reclamp_ctx_to_live_room(
                 gib(dense_act_reserve_at(cfg, ctx, ubatch)),
                 gib(POST_KV_DEVICE_RESERVE),
             );
-            Ok((ctx, k_fmt, v_fmt))
+            Ok(served(ctx, k_fmt, v_fmt))
         }
         CtxRung::ServeQ8(ctx) => {
             // Under the session's placement scope, so every later call of this session reads q8_0
@@ -2382,19 +2732,82 @@ pub(crate) fn reclamp_ctx_to_live_room(
                  only {fit} tokens of context, below the usable minimum; serving {ctx} tokens in \
                  q8_0 (decode is ~10-16% slower on q8). Set INFR_KV_TYPE_K/V=f16 to force f16."
             );
-            Ok((ctx, DType::Q8_0, DType::Q8_0))
+            Ok(served(ctx, DType::Q8_0, DType::Q8_0))
         }
         CtxRung::Spill(ctx) => {
+            let terms = kv_spill_reserve_terms(cfg, ec, ctx, ubatch, streamed);
+            let reserve = terms.total();
+            let split = kv_spill_split(
+                cfg,
+                ctx,
+                ring,
+                ubatch,
+                align,
+                k_fmt,
+                v_fmt,
+                1,
+                room,
+                reserve,
+                kv_spill_cap(ec),
+            );
+            // The room measured, not estimated: a spilled cache can give the run nothing, so the
+            // weights (and on a streamed session the arenas) must have left the reserve itself.
+            // Placement admitted the session against a lower bound on the weights' arena, so it
+            // can land short; refuse it here, before a KV buffer is allocated, rather than have
+            // an activation refused mid-forward.
+            if room < reserve {
+                return Err(anyhow!(
+                    "context {ctx} cannot be served on this device even with its KV cache in \
+                     system RAM (INFR_KV_OVERFLOW): after its weights are resident the device \
+                     reports {:.2} GiB allocatable, and the run needs {:.2} GiB of it after the \
+                     cache ({:.2} GiB of activations at a {ubatch}-row chunk, {:.2} GiB of \
+                     layer-major prefill, {:.2} GiB held for the driver's own later allocations, \
+                     {:.2} GiB of kv.overflow_reserve_mb), {:.2} GiB more than is left. Free \
+                     device memory held by other applications, or use a smaller quant of the \
+                     model.",
+                    gib(room),
+                    gib(reserve),
+                    gib(terms.activations),
+                    gib(terms.layer_major),
+                    gib(terms.driver),
+                    gib(terms.margin),
+                    gib(reserve - room),
+                ));
+            }
+            refuse_unhostable_kv(
+                ctx,
+                split,
+                infr_core::hostmem::available_bytes(),
+                host_tier_bytes(),
+                k_fmt,
+                v_fmt,
+            )?;
             tracing::warn!(
                 requested_ctx = want_ctx,
                 fits_ctx = fit,
+                kv_vram_bytes = split.vram,
+                kv_host_bytes = split.host,
+                kv_snapshot_bytes = (0..cfg.n_layer)
+                    .filter_map(|l| kv_recurrent_alloc_bytes(cfg, l))
+                    .map(|(k, v)| (k + v) as u64)
+                    .sum::<u64>(),
                 "ctx overflow (measured): only {fit} tokens fit the {:.2} GiB the device reports \
-                 free after the weights; keeping a {ctx}-token context, with the part of its KV \
-                 cache that does not fit in VRAM placed in system RAM (INFR_KV_OVERFLOW) and read \
-                 over PCIe",
+                 free after the weights; keeping a {ctx}-token context with {:.2} GiB of its KV \
+                 cache in VRAM and {:.2} GiB in system RAM (INFR_KV_OVERFLOW), read over PCIe, \
+                 leaving {:.2} GiB free for the activations and the driver's own later \
+                 allocations (a recurrent-state snapshot is priced last and placed when first \
+                 taken, which can move it to system RAM)",
                 gib(room),
+                gib(split.vram),
+                gib(split.host),
+                gib(reserve),
             );
-            Ok((ctx, k_fmt, v_fmt))
+            Ok(LiveCtx {
+                ctx,
+                k_fmt,
+                v_fmt,
+                spilled: true,
+            })
         }
         CtxRung::Refuse => {
             let floor = want_ctx.min(MIN_SESSION_CTX);
@@ -2451,8 +2864,9 @@ pub(crate) enum CtxRung {
 
 /// The rule the fit before the load applies to a session's window, given `fit`, the largest window
 /// the session's formats hold per cache, and `q8_fit`, asked only when `fit` falls short: the q8_0
-/// cache's fit where the auto-q8 policy allows q8_0 for this session, else `None`. It is the
-/// ladder plan 13 decided for B62, in order:
+/// cache's fit where the auto-q8 policy allows q8_0 for this session, else `None`; `overflow` is
+/// whether the cache can spill (`Backend::kv_spill_armed`). It is the ladder plan 13 decided for
+/// B62, in order:
 ///
 /// 1. A window that fits is served as asked.
 /// 2. One a q8_0 cache holds whole is served as asked, in q8_0.
@@ -2488,13 +2902,15 @@ pub(crate) fn preload_ctx(
 
 /// The rule [`reclamp_ctx_to_live_room`] applies once the weights are resident, given `fit`, the
 /// largest window the session's formats hold now, and `q8_fit`, asked only when needed: the q8_0
-/// cache's fit where the auto-q8 policy allows q8_0 for this session, else `None`.
+/// cache's fit where the auto-q8 policy allows q8_0 for this session, else `None`. `overflow` is
+/// whether the cache can spill (`Backend::kv_spill_armed`).
 ///
-/// A window that fits, or that the user set (`explicit`, taken verbatim), is served as asked. Else
-/// it is cut to the fit, but never below the minimum: `MIN_SESSION_CTX`, or the window itself when
-/// it asked for less. Below that, a q8_0 cache that holds the minimum is served at what it holds,
-/// up to the window, as the pre-load clamp's rung does; then `kv.overflow` keeps the minimum with
-/// the cache spilled (B62); then it is refused.
+/// A window that fits is served as asked; one that the user set (`explicit`, taken verbatim) and
+/// does not fit is kept with its cache spilled under `overflow`, else served as asked. Else it is
+/// cut to the fit, but never below the minimum: `MIN_SESSION_CTX`, or the window itself when it
+/// asked for less. Below that, a q8_0 cache that holds the minimum is served at what it holds, up
+/// to the window, as the pre-load clamp's rung does; then `overflow` keeps the minimum with the
+/// cache spilled (B62); then it is refused.
 pub(crate) fn post_load_ctx(
     want: usize,
     explicit: bool,
@@ -2502,8 +2918,15 @@ pub(crate) fn post_load_ctx(
     fit: usize,
     q8_fit: impl FnOnce() -> Option<usize>,
 ) -> CtxRung {
-    if fit >= want || explicit {
+    if fit >= want {
         return CtxRung::Serve(want);
+    }
+    if explicit {
+        return if overflow {
+            CtxRung::Spill(want)
+        } else {
+            CtxRung::Serve(want)
+        };
     }
     clamp_rung(want, overflow, fit, q8_fit)
 }
@@ -2647,16 +3070,21 @@ pub(crate) fn dsv4_comp_allocs(
         .map(|b| (b.bytes(), 0))
 }
 
-/// The KV allocations of `sizes` the Vulkan VRAM guard will check, summed — `None` when nothing
-/// can be proven: no budget to compare against, or a configuration where the guard is not the last
-/// word (`INFR_KV_OVERFLOW` places what does not fit in system RAM; `INFR_NO_VRAM_GUARD` turns the
-/// guard off).
+/// The KV allocations of `sizes` the Vulkan VRAM guard will check, summed — `None` when nothing can
+/// be proven: no budget to compare against, or a configuration where the guard is not the last word
+/// (`spill`, `Backend::kv_spill_armed`: `INFR_KV_OVERFLOW` places what does not fit in system RAM;
+/// `INFR_NO_VRAM_GUARD` turns the guard off).
 ///
 /// A LOWER bound on what the guard will see, never an over-estimate: a sub-MiB request is skipped
 /// even though its aligned size may reach the guard, and the guard checks `requirements.size`,
 /// which is never below the request.
-fn kv_guarded_bytes(sizes: &[(usize, usize)], room: Option<u64>, ec: &EngineConfig) -> Option<u64> {
-    if room.is_none() || ec.kv.overflow || ec.kernels.vulkan.no_vram_guard {
+fn kv_guarded_bytes(
+    sizes: &[(usize, usize)],
+    room: Option<u64>,
+    ec: &EngineConfig,
+    spill: bool,
+) -> Option<u64> {
+    if room.is_none() || spill || ec.kernels.vulkan.no_vram_guard {
         return None;
     }
     let total = sizes
@@ -2672,6 +3100,7 @@ fn kv_guarded_bytes(sizes: &[(usize, usize)], room: Option<u64>, ec: &EngineConf
 /// path before any weight loads (pricing [`kv_floor_alloc_bytes`] against the whole device), and the
 /// runner between the weight upload and the KV allocation (pricing the exact buffers against what
 /// the device reports is left). `fit` supplies the window to suggest instead, when one is known.
+/// `spill` is whether the cache can spill (`Backend::kv_spill_armed`), which refuses nothing.
 ///
 /// Provable, so it can never refuse a run that would have worked: it counts only the buffers the
 /// guard checks ([`kv_guarded_bytes`]), against the guard's own ceiling, with no weights and no
@@ -2681,6 +3110,7 @@ fn kv_guarded_bytes(sizes: &[(usize, usize)], room: Option<u64>, ec: &EngineConf
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn refuse_unallocatable_kv(
     ec: &EngineConfig,
+    spill: bool,
     sizes: &[(usize, usize)],
     room: Option<u64>,
     want_ctx: usize,
@@ -2689,7 +3119,7 @@ pub(crate) fn refuse_unallocatable_kv(
     room_is: &str,
     fit: impl FnOnce() -> Option<usize>,
 ) -> AResult<()> {
-    let Some(need) = kv_guarded_bytes(sizes, room, ec) else {
+    let Some(need) = kv_guarded_bytes(sizes, room, ec, spill) else {
         return Ok(());
     };
     let room = room.expect("kv_guarded_bytes is None without a room");
@@ -2749,6 +3179,17 @@ fn chunk_covered_dense_tensor(name: &str) -> bool {
         name,
         "output.weight" | "token_embd.weight" | "per_layer_token_embd.weight"
     )
+}
+
+/// The host memory the arenas of `tiers` take ([`infr_core::hostpager::HostPager::arena_bytes`]).
+fn host_arena_bytes<'a>(
+    tiers: impl IntoIterator<Item = &'a Option<std::sync::Arc<infr_core::hostpager::HostPager>>>,
+) -> u64 {
+    tiers
+        .into_iter()
+        .flatten()
+        .map(|t| t.arena_bytes() as u64)
+        .sum()
 }
 
 /// Decide this model's MoE expert placement, install the pager session when the decision pages
@@ -3210,6 +3651,55 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 }
             }
         }
+        // ── spill rung (`kv.overflow`, B62): no cache format fits beside the weights at any chunk
+        // height, but the weights fit without it, with the spill reserve (`kv_spill_reserve`: the
+        // activation reserve, the driver's later allocations, the user's margin) left free at the
+        // spilled session's chunk (`spill_ubatch`). Keep them resident and let the cache take what
+        // device memory is left, the rest in system RAM (`kv_spill_split`): reading the spilled
+        // rows costs PCIe in proportion to the depth reached, where streaming re-reads every
+        // streamed weight each token. The weights are priced at the least the arena commits for
+        // them and the upload staging (`resident_load_held`), as the fit before the load prices
+        // them; what first-fit strands past that bound and the driver's own memory are not, so a
+        // session this keeps resident can still be refused by the re-clamp's measured check.
+        let spill = vk.kv_spill_armed() && cache_override.is_none();
+        if !resident && spill {
+            let (held, staging) = resident_load_held(vk, g, cfg, ec);
+            let room = vram
+                .alloc_room()
+                .saturating_sub(held.saturating_add(staging));
+            let ubatch = spill_ubatch(ec);
+            let reserve = kv_spill_reserve(cfg, ec, want_ctx, ubatch, false);
+            if room >= reserve {
+                repin_ubatch_lower(ubatch);
+                let (k, v) = kv_fit_fmts(cfg, ec, kv_auto_q8());
+                let ring = placement_ring(cfg, ec, k, v);
+                let split = kv_spill_split(
+                    cfg,
+                    want_ctx,
+                    ring,
+                    ubatch,
+                    align,
+                    k,
+                    v,
+                    1,
+                    room,
+                    reserve,
+                    kv_spill_cap(ec),
+                );
+                let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+                tracing::warn!(
+                    requested_ctx = want_ctx,
+                    kv_vram_bytes = split.vram,
+                    kv_host_bytes = split.host,
+                    "dense placement: weights resident, KV cache spilled — no {k:?}/{v:?} cache of \
+                     {want_ctx} tokens fits beside the weights, so {:.2} GiB of it is placed in \
+                     VRAM and {:.2} GiB in system RAM (INFR_KV_OVERFLOW), at a {ubatch}-row chunk",
+                    gib(split.vram),
+                    gib(split.host),
+                );
+                resident = true;
+            }
+        }
         // Slot stride (`dense_stream_slot_stride`): the group's raw bytes padded to a whole
         // number of quant blocks AND to the dtype's slot alignment (u32 words for the native
         // kernels, the resident arena's placement for the float ones), so every slot base is
@@ -3218,6 +3708,51 @@ pub(crate) fn vulkan_moe_binder<'a>(
         // so the streaming-chunk sweep below can price the full-arena need with the exact
         // strides the pools use.
         let stride_of = infr_vulkan::linear::dense_stream_slot_stride;
+        // Pools keyed by (dtype, stride); blocks assigned ids in layer order per pool.
+        let mut pools: Vec<(infr_core::DType, usize, usize)> = Vec::new(); // (dt, stride, n_blocks)
+        let mut planned: Vec<(Vec<String>, usize, u32)> = Vec::new(); // (comps, pool, block_id)
+        for (comps, dt, raw, _numel) in &eligible {
+            let stride = stride_of(*dt, *raw);
+            let pool = match pools.iter().position(|&(d, s, _)| d == *dt && s == stride) {
+                Some(i) => i,
+                None => {
+                    pools.push((*dt, stride, 0));
+                    pools.len() - 1
+                }
+            };
+            let block_id = pools[pool].2 as u32;
+            pools[pool].2 += 1;
+            planned.push((comps.clone(), pool, block_id));
+        }
+        // The pools' slot floor (`DensePoolSpec`s below): the least arena streaming can run in.
+        let floor_slots = |nb: usize| 2.min(nb).max(1);
+        let stream_floor: u64 = pools
+            .iter()
+            .map(|&(_, s, nb)| (floor_slots(nb) * s) as u64)
+            .sum();
+        // Whether a streaming budget holds the floor once its own upload ring is out of it.
+        let holds_floor = |b: u64| {
+            b.saturating_sub(infr_core::pager::ring_bytes(b, vk.cfg().paging.ring) as u64)
+                >= stream_floor
+        };
+        // The weights that stay resident beside the streamed ones, as the arena commits them at
+        // the least (`weight_arena_floor` over their `weight_upload_units_of`, as the fit before
+        // the load prices the whole set), for the budget a wholly spilled cache leaves: that cache
+        // gives the run nothing back, so the room the spill reserve needs must really be there
+        // after the load, and the bare footprint left it short by the arena's block rounding
+        // (Qwen3-1.7B, RX 7900 XTX: about 52 MB). Priced once, and only where the spill is armed.
+        let resident_held = spill.then(|| {
+            let streamed: std::collections::HashSet<&str> = eligible
+                .iter()
+                .flat_map(|(comps, ..)| comps.iter().map(String::as_str))
+                .collect();
+            let units = weight_upload_units_of(g, cfg, ec, vk.capabilities().combined_gu, |n| {
+                !streamed.contains(n)
+            });
+            weight_arena_floor(&units, vk.weight_load_cost()).max(fp.total() - streamable_resident)
+        });
+        // Set when the streaming budget below is the one a wholly spilled cache leaves.
+        let mut stream_spills = false;
         let budget = match cache_override {
             Some(spec) => Some(paging_cache_budget(spec, &vram)),
             None if resident => None,
@@ -3264,26 +3799,36 @@ pub(crate) fn vulkan_moe_binder<'a>(
                         pin_ubatch(pick);
                     }
                 }
-                Some(budget_at(ubatch_rows(ec)))
+                let budget = budget_at(ubatch_rows(ec));
+                // `kv.overflow`: when the cache leaves the arenas less than their floor, stream
+                // with the whole cache in system RAM instead — the spill comes after the stream.
+                let spilled = resident_held.map(|held| {
+                    dense_stream_spill_budget_at(
+                        cfg,
+                        ec,
+                        held,
+                        vk.weight_load_cost().staging,
+                        &vram,
+                        want_ctx,
+                        spill_ubatch(ec),
+                    )
+                });
+                if let Some(spilled) = spilled.filter(|&b| !holds_floor(budget) && holds_floor(b)) {
+                    repin_ubatch_lower(spill_ubatch(ec));
+                    tracing::warn!(
+                        requested_ctx = want_ctx,
+                        "dense placement: weights streamed, KV cache spilled — the weights do not \
+                         fit resident and the cache leaves the streaming arenas less than their \
+                         floor, so the whole cache is placed in system RAM (INFR_KV_OVERFLOW)"
+                    );
+                    stream_spills = true;
+                    Some(spilled)
+                } else {
+                    Some(budget)
+                }
             }
         };
         if let (Some(mut budget), false) = (budget, eligible.is_empty()) {
-            // Pools keyed by (dtype, stride); blocks assigned ids in layer order per pool.
-            let mut pools: Vec<(infr_core::DType, usize, usize)> = Vec::new(); // (dt, stride, n_blocks)
-            let mut planned: Vec<(Vec<String>, usize, u32)> = Vec::new(); // (comps, pool, block_id)
-            for (comps, dt, raw, _numel) in &eligible {
-                let stride = stride_of(*dt, *raw);
-                let pool = match pools.iter().position(|&(d, s, _)| d == *dt && s == stride) {
-                    Some(i) => i,
-                    None => {
-                        pools.push((*dt, stride, 0));
-                        pools.len() - 1
-                    }
-                };
-                let block_id = pools[pool].2 as u32;
-                pools[pool].2 += 1;
-                planned.push((comps.clone(), pool, block_id));
-            }
             // The pinned upload ring lives in the same VRAM the arenas do — subtract it first.
             let ring_bytes = infr_core::pager::ring_bytes(budget, vk.cfg().paging.ring);
             budget = budget.saturating_sub(ring_bytes as u64);
@@ -3297,6 +3842,34 @@ pub(crate) fn vulkan_moe_binder<'a>(
             let classes: Vec<(usize, usize)> = pools.iter().map(|&(_, s, nb)| (s, nb)).collect();
             dense_host =
                 vulkan_host_tier(ec, g, "dense", &classes, vk.capabilities().unified_memory)?;
+            if stream_spills {
+                // The whole cache goes to system RAM beside the host tier just sized from the
+                // same memory: refused here, before a weight is uploaded, when it does not fit.
+                let (k, v) = kv_fit_fmts(cfg, ec, kv_auto_q8());
+                let ub = ubatch_rows(ec);
+                let ring = placement_ring(cfg, ec, k, v);
+                let split = kv_spill_split(
+                    cfg,
+                    want_ctx,
+                    ring,
+                    ub,
+                    align,
+                    k,
+                    v,
+                    1,
+                    0,
+                    0,
+                    kv_spill_cap(ec),
+                );
+                refuse_unhostable_kv(
+                    want_ctx,
+                    split,
+                    infr_core::hostmem::available_bytes(),
+                    host_arena_bytes(&dense_host),
+                    k,
+                    v,
+                )?;
+            }
             let specs: Vec<infr_vulkan::pager::DensePoolSpec> = pools
                 .iter()
                 .enumerate()
@@ -3312,8 +3885,8 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     // e.g. Scout's 6.57 GB role pools).
                     let share =
                         (budget as u128 * (stride * nb) as u128 / total_bytes as u128) as u64;
-                    let floor = 2.min(nb).max(1);
-                    let budget_slots = ((share / stride as u64) as usize).clamp(floor, nb);
+                    let budget_slots =
+                        ((share / stride as u64) as usize).clamp(floor_slots(nb), nb);
                     infr_vulkan::pager::DensePoolSpec {
                         dtype,
                         slot_bytes: stride,
@@ -3342,6 +3915,34 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     k,
                     v,
                 );
+                if let Some(held) = resident_held {
+                    let spilled = dense_stream_spill_budget_at(
+                        cfg,
+                        ec,
+                        held,
+                        vk.weight_load_cost().staging,
+                        &vram,
+                        want_ctx,
+                        spill_ubatch(ec),
+                    );
+                    let spilled = spilled
+                        .saturating_sub(
+                            infr_core::pager::ring_bytes(spilled, vk.cfg().paging.ring) as u64,
+                        );
+                    let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+                    return Err(anyhow!(
+                        "context {want_ctx} cannot be served on this device: even with its whole \
+                         KV cache ({:.2} GiB in {k:?}/{v:?}) in system RAM (INFR_KV_OVERFLOW), \
+                         the activation reserve and the driver's own later allocations leave \
+                         {:.2} GiB for streaming the {:.2} GiB of dense weights, below the \
+                         streaming floor ({:.2} GiB) — use a smaller quant of the model, free \
+                         device memory, or run on the CPU backend (INFR_DEV=cpu)",
+                        gib(kv),
+                        gib(spilled),
+                        gib(fp.total()),
+                        gib(stream_floor),
+                    ));
+                }
                 return Err(anyhow!(
                     "context {want_ctx} does not fit this device: after its KV cache ({:.2} GB in \
                      {k:?}/{v:?}) and the activation reserve, {:.2} GB is left for streaming the \
@@ -3375,6 +3976,14 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 dense_plan.insert(comps[0].clone(), (pool, block_id, comps));
             }
         }
+    }
+
+    // What the session's host tiers take of host memory, for the post-load re-clamp's spill check
+    // (their arenas fill on first touch, so the live host probe does not see them yet).
+    if first_load {
+        pin_host_tier_bytes(
+            host_arena_bytes(&dense_host) + host_arena_bytes(moe_host.iter().map(|(_, _, h)| h)),
+        );
     }
 
     // A resident weight's mapped pages are released once its bytes are in VRAM. Not on a
@@ -6601,6 +7210,10 @@ mod seam_helper_tests {
     struct RoomOnly {
         room: Option<u64>,
         name: &'static str,
+        /// Whether it reports its weights streamed (`Backend::dense_paged`).
+        streamed: bool,
+        /// Whether it reports the KV spill armed (`Backend::kv_spill_armed`).
+        armed: bool,
     }
 
     impl RoomOnly {
@@ -6609,6 +7222,8 @@ mod seam_helper_tests {
             Self {
                 room,
                 name: "room-only",
+                streamed: false,
+                armed: false,
             }
         }
 
@@ -6617,6 +7232,21 @@ mod seam_helper_tests {
             Self {
                 room: Some(room),
                 name: "vulkan",
+                streamed: false,
+                armed: false,
+            }
+        }
+
+        /// This backend with the spill armed or not.
+        fn armed(self, armed: bool) -> Self {
+            Self { armed, ..self }
+        }
+
+        /// [`RoomOnly::vulkan`] reporting its weights streamed.
+        fn streaming(room: u64) -> Self {
+            Self {
+                streamed: true,
+                ..Self::vulkan(room)
             }
         }
     }
@@ -6668,6 +7298,12 @@ mod seam_helper_tests {
         fn device_alloc_room(&self) -> Option<u64> {
             self.room
         }
+        fn dense_paged(&self) -> bool {
+            self.streamed
+        }
+        fn kv_spill_armed(&self) -> bool {
+            self.armed
+        }
     }
 
     /// The post-load re-clamp only ever SHRINKS, and only a context the session chose. Each arm is
@@ -6683,10 +7319,14 @@ mod seam_helper_tests {
         let (k, v) = (DType::F16, DType::F16);
         let want = 32768;
         let call = |be: &dyn infr_core::backend::Backend, ec: &EngineConfig| {
-            let (ctx, k_got, v_got) =
-                super::reclamp_ctx_to_live_room(be, &cfg, ec, want, k, v).expect("reclamp");
-            assert_eq!((k_got, v_got), (k, v), "no backend here takes a q8_0 pin");
-            ctx
+            let live = super::reclamp_ctx_to_live_room(be, &cfg, ec, want, k, v).expect("reclamp");
+            assert_eq!(
+                (live.k_fmt, live.v_fmt),
+                (k, v),
+                "no backend here takes a q8_0 pin"
+            );
+            assert!(!live.spilled, "nothing spills without kv.overflow");
+            live.ctx
         };
 
         // No budget to report: the caller's window survives untouched.
@@ -6740,10 +7380,579 @@ mod seam_helper_tests {
         );
     }
 
+    /// `post_load_ctx` as it stood before B62's spill reached the explicit window (HEAD 21c005f6),
+    /// transcribed, for the equivalence check below.
+    fn post_load_ctx_before_b62(
+        want: usize,
+        explicit: bool,
+        overflow: bool,
+        fit: usize,
+        q8_fit: Option<usize>,
+    ) -> super::CtxRung {
+        use super::CtxRung::{Refuse, Serve, ServeQ8, Spill};
+        if fit >= want || explicit {
+            return Serve(want);
+        }
+        let floor = want.min(super::MIN_SESSION_CTX);
+        if fit >= floor {
+            return Serve(fit);
+        }
+        if let Some(q8) = q8_fit.filter(|&q8| q8 >= floor) {
+            return ServeQ8(q8.min(want));
+        }
+        if overflow {
+            return Spill(floor);
+        }
+        Refuse
+    }
+
+    /// The re-clamp's rule is the one it was wherever the spill is not armed, over every window,
+    /// fit and q8_0 fit at and around each boundary (zero, the minimum, the window), both window
+    /// kinds; with the spill armed only an explicit window that does not fit changes, from
+    /// "served as asked" to "spilled as asked", the same window either way.
+    #[test]
+    fn post_load_ctx_changes_only_the_armed_explicit_spill() {
+        use super::CtxRung::{Serve, Spill};
+        let min = super::MIN_SESSION_CTX;
+        let wants = [1, min / 2, min - 1, min, min + 1, 4 * min, 40 * min];
+        let mut points: Vec<usize> = vec![0, 1, 2];
+        for &w in &wants {
+            points.extend([w.saturating_sub(1), w, w + 1]);
+        }
+        points.sort_unstable();
+        points.dedup();
+        let mut checked = 0usize;
+        for &want in &wants {
+            for &fit in &points {
+                let q8s = std::iter::once(None).chain(points.iter().map(|&q| Some(q)));
+                for q8 in q8s {
+                    for explicit in [false, true] {
+                        for overflow in [false, true] {
+                            let now = super::post_load_ctx(want, explicit, overflow, fit, || q8);
+                            let was = post_load_ctx_before_b62(want, explicit, overflow, fit, q8);
+                            let case = format!(
+                                "want {want}, fit {fit}, q8_0 {q8:?}, explicit {explicit}, \
+                                 overflow {overflow}"
+                            );
+                            if overflow && explicit && fit < want {
+                                assert_eq!((was, now), (Serve(want), Spill(want)), "{case}");
+                            } else {
+                                assert_eq!(now, was, "{case}");
+                            }
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked > 5000, "only {checked} cases checked");
+    }
+
+    /// A spilled session runs at the shortest chunk the ladder allows when `INFR_UBATCH` is not
+    /// pinned, and its reserve is priced there: where nothing fits at any height, a room holding
+    /// the reserve at that chunk opens spilled and pins the chunk, and a byte less is refused.
+    /// With the chunk pinned, the pinned height is the one priced.
+    #[test]
+    fn a_spilled_session_takes_the_shortest_chunk() {
+        let cfg = gemma3_12b();
+        let (k, v) = (DType::F16, DType::F16);
+        let want = 8192;
+        for pinned in [None, Some(512)] {
+            let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
+            let mut ec = EngineConfig::default();
+            ec.kv.overflow = true;
+            ec.device.ctx = Some(infr_core::SizeSpec::Bytes(want as u64));
+            ec.device.ubatch = pinned;
+            ec.device.ubatch_specified = pinned.is_some();
+            let chunk = pinned.unwrap_or_else(|| {
+                super::ubatch_candidates(&ec)
+                    .into_iter()
+                    .min()
+                    .expect("a ladder")
+            });
+            assert!(
+                pinned.is_some() || chunk < super::ubatch_rows(&ec),
+                "a ladder to walk"
+            );
+            let reserve = super::kv_spill_reserve(&cfg, &ec, want, chunk, false);
+            let reclamp = |room: u64| {
+                let be = RoomOnly::vulkan(room).armed(true);
+                super::reclamp_ctx_to_live_room(&be, &cfg, &ec, want, k, v)
+            };
+            reclamp(reserve - 1).expect_err("a byte under the reserve at its chunk is refused");
+            let live = reclamp(reserve).expect("the reserve at the spilled chunk opens");
+            assert!(live.spilled, "pinned {pinned:?}: {live:?}");
+            assert_eq!(super::ubatch_rows(&ec), chunk, "pinned {pinned:?}");
+        }
+    }
+
+    /// After the load, a spilled session whose measured room is under the spill reserve it holds
+    /// is refused, naming the sizes, before a KV buffer is allocated; at the reserve it opens
+    /// spilled. Driven through the re-clamp with a backend that reports a chosen room
+    /// (`RoomOnly`), the test seam for "the weights landed just short": a real device cannot be
+    /// steered to a room within a byte of the reserve. Both kinds of window: an explicit one,
+    /// kept spilled, and an auto-sized one, spilled at the minimum.
+    #[test]
+    fn a_spilled_session_short_of_its_reserve_is_refused_after_the_load() {
+        let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
+        let cfg = gemma3_12b();
+        let (k, v) = (DType::F16, DType::F16);
+        let ub = 512;
+        let want = 8192;
+        for explicit in [true, false] {
+            let mut ec = EngineConfig::default();
+            ec.kv.overflow = true;
+            ec.device.ubatch = Some(ub);
+            ec.device.ubatch_specified = true;
+            if explicit {
+                ec.device.ctx = Some(infr_core::SizeSpec::Bytes(want as u64));
+            }
+            let ctx = if explicit {
+                want
+            } else {
+                super::MIN_SESSION_CTX
+            };
+            let reserve = super::kv_spill_reserve(&cfg, &ec, ctx, ub, false);
+            let reclamp = |room: u64| {
+                let be = RoomOnly::vulkan(room).armed(true);
+                super::reclamp_ctx_to_live_room(&be, &cfg, &ec, want, k, v)
+            };
+            let live = reclamp(reserve).expect("a room at the reserve opens spilled");
+            assert_eq!(
+                live,
+                super::LiveCtx {
+                    ctx,
+                    k_fmt: k,
+                    v_fmt: v,
+                    spilled: true
+                },
+                "explicit {explicit}"
+            );
+            let err = reclamp(reserve - 1).expect_err("one byte under the reserve is refused");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(&format!("context {ctx} cannot be served")) && msg.contains("GiB"),
+                "explicit {explicit}: the refusal names the window and the sizes: {msg}"
+            );
+        }
+    }
+
+    /// Arming the spill changes no window the re-clamp serves: for an auto-sized session, every
+    /// room where the re-clamp without `kv.overflow` serves a window (in the session's formats or
+    /// in q8_0) gives the same window and formats with it, on a resident and on a streamed session,
+    /// over every `paging.layer_major` setting, with and without `kv.overflow_reserve_mb`; where
+    /// it refuses, the armed one spills the minimum or refuses. Rooms from below the minimum's
+    /// need to past the window's.
+    #[test]
+    fn arming_the_spill_serves_the_windows_it_served() {
+        let cfg = gemma3_12b();
+        let (k, v) = (DType::F16, DType::F16);
+        let ub = 512;
+        let want = 16384;
+        let mut checked = 0usize;
+        for streamed in [false, true] {
+            for layer_major in [None, Some(true), Some(false)] {
+                for margin in [None, Some(64)] {
+                    let config = |overflow: bool| {
+                        let mut ec = EngineConfig::default();
+                        ec.kv.overflow = overflow;
+                        ec.kv.overflow_reserve_mb = margin;
+                        ec.device.ubatch = Some(ub);
+                        ec.device.ubatch_specified = true;
+                        ec.paging.layer_major = layer_major;
+                        ec
+                    };
+                    let (off, on) = (config(false), config(true));
+                    let ring = super::placement_ring(&cfg, &off, k, v);
+                    let need = |ctx: usize| {
+                        super::kv_bytes_estimate_fmt(
+                            &cfg,
+                            ctx,
+                            ring,
+                            ub,
+                            super::KvAlign::NONE,
+                            k,
+                            v,
+                        ) + super::dense_act_reserve_at(&cfg, ctx, ub)
+                            + super::POST_KV_DEVICE_RESERVE
+                    };
+                    let (lo, hi) = (need(super::MIN_SESSION_CTX / 2), need(want) + (1 << 30));
+                    for i in 0..=48u64 {
+                        let room = lo + (hi - lo) * i / 48;
+                        let be = |armed: bool| {
+                            let be = if streamed {
+                                RoomOnly::streaming(room)
+                            } else {
+                                RoomOnly::vulkan(room)
+                            };
+                            be.armed(armed)
+                        };
+                        let case = format!(
+                            "streamed {streamed}, layer_major {layer_major:?}, margin {margin:?}, \
+                             room {room}"
+                        );
+                        // Each in its own placement scope: a q8_0 pin one makes is the session's.
+                        let reclamp = |armed: bool, ec: &EngineConfig| {
+                            let _scope = PlacementScope::enter(Default::default());
+                            super::reclamp_ctx_to_live_room(&be(armed), &cfg, ec, want, k, v)
+                        };
+                        let (was, now) = (reclamp(false, &off), reclamp(true, &on));
+                        match was {
+                            Ok(was) => assert_eq!(now.ok(), Some(was), "{case}"),
+                            Err(_) => assert!(
+                                now.as_ref()
+                                    .map_or(true, |l| l.spilled && l.ctx == super::MIN_SESSION_CTX),
+                                "{case}: refused without the flag, {now:?} with it"
+                            ),
+                        }
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked > 500, "only {checked} rooms checked");
+    }
+
+    /// The spill is armed exactly when the flag is on, the device is not unified memory and its
+    /// driver reports a live budget: one of the eight cases.
+    #[test]
+    fn kv_spill_is_armed_only_with_a_live_budget_off_unified_memory() {
+        for overflow in [false, true] {
+            for unified in [false, true] {
+                for live in [false, true] {
+                    assert_eq!(
+                        infr_vulkan::kv_spill_armed(overflow, unified, live),
+                        (overflow, unified, live) == (true, false, true),
+                        "overflow {overflow}, unified {unified}, live budget {live}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The KV refuse rung reads the spill flag it is handed where it read `kv.overflow` before:
+    /// with the flag off nothing changes, over buffers past, at and under the room, with and
+    /// without the guard, on either kind of device; with it on, only a unified-memory device (where
+    /// nothing spills) now refuses, and exactly what the rung refuses without the flag.
+    #[test]
+    fn kv_refuse_rung_reads_the_armed_spill() {
+        let (k, v) = (DType::F16, DType::F16);
+        let mib = 1usize << 20;
+        let sizes = vec![(64 * mib, 64 * mib); 4];
+        let need = 512 * (mib as u64);
+        // `refuse_unallocatable_kv` as it stood at HEAD 21c005f6: whether it refused.
+        let before = |room: Option<u64>, ec: &EngineConfig| {
+            room.is_some_and(|r| !ec.kv.overflow && !ec.kernels.vulkan.no_vram_guard && need > r)
+        };
+        for room in [None, Some(0), Some(need - 1), Some(need), Some(need + 1)] {
+            for overflow in [false, true] {
+                for no_guard in [false, true] {
+                    for unified in [false, true] {
+                        let mut ec = EngineConfig::default();
+                        ec.kv.overflow = overflow;
+                        ec.kernels.vulkan.no_vram_guard = no_guard;
+                        let spill = infr_vulkan::kv_spill_armed(overflow, unified, true);
+                        let refused = super::refuse_unallocatable_kv(
+                            &ec,
+                            spill,
+                            &sizes,
+                            room,
+                            32768,
+                            k,
+                            v,
+                            "here",
+                            || None,
+                        )
+                        .is_err();
+                        let case = format!(
+                            "room {room:?}, overflow {overflow}, no guard {no_guard}, \
+                             unified {unified}"
+                        );
+                        if overflow && unified {
+                            let mut off = ec.clone();
+                            off.kv.overflow = false;
+                            assert_eq!(refused, before(room, &off), "{case}");
+                        } else {
+                            assert_eq!(refused, before(room, &ec), "{case}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The backend's placement rule, buffer by buffer: a buffer stays in device memory exactly when
+    /// it and the reserve fit what is left, so at the boundary it stays and one byte past it does
+    /// not; one that does not fit goes to system RAM and a smaller one after it can still stay; a
+    /// reserve past the room keeps nothing. Exhaustive over small rooms, reserves and buffer lists,
+    /// against the rule written out longhand.
+    #[test]
+    fn kv_vram_bytes_keeps_the_reserve_free() {
+        let none = infr_core::budget::SpillTally::default();
+        let stays = |used, budget, reserve, c| {
+            infr_vulkan::kv_stays_in_vram(used, budget, reserve, c, &none, None, c)
+        };
+        let vram = |list: &[u64], room, reserve| {
+            infr_vulkan::kv_vram_bytes(list.iter().map(|&b| (b, b)), room, reserve, None)
+        };
+        assert!(stays(10, 100, 30, 60));
+        assert!(!stays(10, 100, 30, 61));
+        assert!(!stays(0, 100, u64::MAX, 1));
+        assert!(!stays(u64::MAX, 100, 0, 1));
+        assert_eq!(vram(&[60, 50, 10], 100, 30), 70);
+        assert_eq!(vram(&[10, 20], 5, 10), 0);
+        let sizes = [0u64, 1, 2, 3, 5];
+        let mut lists: Vec<Vec<u64>> = vec![vec![]];
+        for _ in 0..4 {
+            let longer: Vec<Vec<u64>> = lists
+                .iter()
+                .filter(|l| l.len() == lists.last().map_or(0, |l| l.len()))
+                .flat_map(|l| {
+                    sizes.iter().map(move |&b| {
+                        let mut l = l.clone();
+                        l.push(b);
+                        l
+                    })
+                })
+                .collect();
+            lists.extend(longer);
+        }
+        let mut checked = 0usize;
+        for list in &lists {
+            for room in 0..=12u64 {
+                for reserve in 0..=6u64 {
+                    let mut left = room;
+                    let mut kept = 0;
+                    for &b in list {
+                        if b + reserve <= left {
+                            left -= b;
+                            kept += b;
+                        }
+                    }
+                    let got = vram(list, room, reserve);
+                    assert_eq!(got, kept, "{list:?}, room {room}, reserve {reserve}");
+                    assert!(
+                        got == 0 || room - got >= reserve,
+                        "{list:?}, room {room}, reserve {reserve}: {got} kept"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 50_000, "only {checked} cases checked");
+    }
+
+    /// A spilled cache's split: device memory and system RAM add up to the cache as the device
+    /// commits it, a room with the reserve and the whole cache spare spills nothing, a room at or
+    /// below the reserve keeps nothing in device memory, every room in between keeps the reserve
+    /// free, and n slots split as n caches one after another.
+    #[test]
+    fn kv_spill_split_divides_the_cache_it_prices() {
+        let cfg = gemma3_12b();
+        let (k, v) = (DType::F16, DType::F16);
+        let align = super::KvAlign {
+            rows: 1,
+            commit: infr_core::backend::KvAllocCost::new(4096, 2 << 20, 1 << 20, 4096),
+        };
+        let ctx = 8192;
+        let ub = 512;
+        let total =
+            |slots: u64| slots * super::kv_bytes_estimate_fmt(&cfg, ctx, true, ub, align, k, v);
+        let reserve = 300 << 20;
+        let split = |slots: usize, room: u64| {
+            super::kv_spill_split(&cfg, ctx, true, ub, align, k, v, slots, room, reserve, None)
+        };
+        for slots in [1usize, 2, 3] {
+            let whole = total(slots as u64);
+            let all = split(slots, whole + reserve);
+            assert_eq!(
+                all,
+                super::KvSplit {
+                    vram: whole,
+                    host: 0
+                },
+                "{slots} slots"
+            );
+            assert!(split(slots, whole + reserve - 1).host > 0, "{slots} slots");
+            for room in [0, 1, reserve - 1, reserve] {
+                assert_eq!(
+                    split(slots, room),
+                    super::KvSplit {
+                        vram: 0,
+                        host: whole
+                    },
+                    "{slots} slots, room {room}"
+                );
+            }
+            for i in 0..=64u64 {
+                let room = reserve + whole * i / 64;
+                let s = split(slots, room);
+                assert_eq!(s.vram + s.host, whole, "{slots} slots, room {room}");
+                assert!(
+                    room - s.vram >= reserve,
+                    "{slots} slots, room {room}: {s:?}"
+                );
+            }
+        }
+        // Two slots in twice the room of one keep at least what one keeps, and at most twice it.
+        let one = split(1, reserve + total(1) / 2);
+        let two = split(2, reserve + total(1));
+        assert!(
+            two.vram >= one.vram && two.vram <= 2 * one.vram + total(1),
+            "{one:?} {two:?}"
+        );
+    }
+
+    /// The diagnostic cap (`kv.overflow_vram_mb`) is part of the split as it is of the allocation:
+    /// on a device with room for the whole cache, the split keeps in device memory exactly the
+    /// buffers whose requested bytes, added in allocation order, stay within the cap (one that
+    /// would pass it goes to system RAM and a smaller one after it can still fit), priced at what
+    /// they commit; a cap of zero keeps nothing, none keeps everything. Every cap from zero past
+    /// the whole cache in steps, against the rule written out longhand.
+    #[test]
+    fn kv_spill_split_keeps_to_the_cap() {
+        let cfg = gemma3_12b();
+        let (k, v) = (DType::F16, DType::F16);
+        let align = super::KvAlign {
+            rows: 1,
+            commit: infr_core::backend::KvAllocCost::new(4096, 2 << 20, 1 << 20, 4096),
+        };
+        let (ctx, ub, reserve) = (8192, 512, 300u64 << 20);
+        let buffers: Vec<u64> = super::kv_slot_allocs(&cfg, ctx, true, ub, 1, k, v)
+            .flat_map(|(a, b)| [a as u64, b as u64])
+            .collect();
+        let raw: u64 = buffers.iter().sum();
+        let whole: u64 = buffers.iter().map(|&b| align.commit.committed(b)).sum();
+        let room = whole + reserve;
+        let split =
+            |cap| super::kv_spill_split(&cfg, ctx, true, ub, align, k, v, 1, room, reserve, cap);
+        assert_eq!(split(None).vram, whole);
+        assert_eq!(split(Some(0)).vram, 0);
+        for i in 0..=40u64 {
+            let cap = raw * i / 32;
+            let (mut placed, mut kept) = (0u64, 0u64);
+            for &b in &buffers {
+                if placed + b <= cap {
+                    placed += b;
+                    kept += align.commit.committed(b);
+                }
+            }
+            let got = split(Some(cap));
+            assert_eq!(got.vram, kept, "cap {cap}");
+            assert_eq!(got.vram + got.host, whole, "cap {cap}");
+        }
+    }
+
+    /// The spill reserve's terms at known values, on gemma-3-12b at 8192 tokens and a 512-row
+    /// chunk: the layer-major stream is 16 chunks of 512 rows of 3840 f32s (125 829 120 bytes)
+    /// where placement prices one — streamed unless `paging.layer_major` is off, resident only when
+    /// it is forced on — the driver's reserve 256 MiB, the margin `kv.overflow_reserve_mb` in
+    /// bytes, and the total their sum with the activation reserve: dropping any term from the
+    /// total, or pricing one where placement does not, fails.
+    #[test]
+    fn kv_spill_reserve_is_its_terms() {
+        const LAYER_MAJOR: u64 = 125_829_120;
+        const DRIVER: u64 = 268_435_456;
+        let cfg = gemma3_12b();
+        let (ctx, ub) = (8192, 512);
+        let act = super::dense_act_reserve_at(&cfg, ctx, ub);
+        assert!(act > 0);
+        for (layer_major, margin, streamed, want_lm, want_margin) in [
+            (None, None, false, 0, 0),
+            (None, None, true, LAYER_MAJOR, 0),
+            (Some(true), Some(64), false, LAYER_MAJOR, 67_108_864),
+            (Some(true), Some(64), true, LAYER_MAJOR, 67_108_864),
+            (Some(false), Some(0), false, 0, 0),
+            (Some(false), Some(1), true, 0, 1_048_576),
+        ] {
+            let mut ec = EngineConfig::default();
+            ec.paging.layer_major = layer_major;
+            ec.kv.overflow_reserve_mb = margin;
+            let case =
+                format!("layer_major {layer_major:?}, margin {margin:?}, streamed {streamed}");
+            let terms = super::kv_spill_reserve_terms(&cfg, &ec, ctx, ub, streamed);
+            assert_eq!(
+                (terms.layer_major, terms.driver, terms.margin),
+                (want_lm, DRIVER, want_margin),
+                "{case}"
+            );
+            assert_eq!(
+                super::kv_spill_reserve(&cfg, &ec, ctx, ub, streamed),
+                act + want_lm + DRIVER + want_margin,
+                "{case}"
+            );
+        }
+    }
+
+    /// A spilled cache's system-RAM part is refused exactly when it exceeds what the host can spare
+    /// a run once `committed` (the weights' host tier) is off, by the headroom rule the repo's host
+    /// arenas follow (`infr_core::hostmem::spare_bytes`), and never by an arena's
+    /// worth-building floor: a small spilled part fits a small spare. Never when the host cannot
+    /// say. Expected values are written out for hosts with 4 and 64 GiB free, where the headroom is
+    /// half of what is free; then every boundary of the rule, from free memory at and around the
+    /// headroom's minimum, with and without a host tier; the refusal names the sizes.
+    #[test]
+    fn unhostable_kv_is_refused_past_what_a_run_may_take() {
+        const GIB: u64 = 1 << 30;
+        const MIB: u64 = 1 << 20;
+        let (k, v) = (DType::F16, DType::F16);
+        let split = |host: u64| super::KvSplit {
+            vram: 7 * MIB,
+            host,
+        };
+        let refused = |host: u64, free: u64, committed: u64| {
+            super::refuse_unhostable_kv(4096, split(host), Some(free), committed, k, v).is_err()
+        };
+        // 4 GiB free leaves 2 GiB; with a 1800 MiB tier, 248 MiB: an 86 MB spill fits it.
+        assert!(!refused(86_000_000, 4 * GIB, 1800 * MIB));
+        assert!(!refused(248 * MIB, 4 * GIB, 1800 * MIB));
+        assert!(refused(248 * MIB + 1, 4 * GIB, 1800 * MIB));
+        // 64 GiB free leaves 32 GiB.
+        assert!(!refused(32 * GIB, 64 * GIB, 0));
+        assert!(refused(32 * GIB + 1, 64 * GIB, 0));
+        let mut checked = 0usize;
+        for free in [
+            0,
+            1,
+            GIB,
+            2 * GIB - 1,
+            2 * GIB,
+            2 * GIB + 1,
+            3 * GIB,
+            64 * GIB,
+        ] {
+            for committed in [0, MIB, GIB, 3 * GIB] {
+                let spare = infr_core::hostmem::spare_bytes(free, committed);
+                for host in [0, 1, spare.saturating_sub(1), spare, spare + 1, 4 * GIB] {
+                    assert!(
+                        super::refuse_unhostable_kv(4096, split(host), None, committed, k, v)
+                            .is_ok()
+                    );
+                    let got =
+                        super::refuse_unhostable_kv(4096, split(host), Some(free), committed, k, v);
+                    assert_eq!(
+                        got.is_err(),
+                        host > spare,
+                        "host part {host}, free {free}, committed {committed}, spare {spare}"
+                    );
+                    if let Err(e) = got {
+                        let msg = e.to_string();
+                        assert!(
+                            msg.contains("context 4096") && msg.contains("GiB"),
+                            "the refusal names the window and the sizes: {msg}"
+                        );
+                    }
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 150, "only {checked} cases checked");
+    }
+
     /// The post-load rule, case by case: a window is never cut below the minimum —
     /// `MIN_SESSION_CTX`, or the window itself when it asked for less — and below it the q8_0 cache
-    /// is tried (only then), then the spill, then the refusal. An explicit window is served as
-    /// asked whatever fits.
+    /// is tried (only then), then the spill, then the refusal. An explicit window is kept as asked
+    /// whatever fits: served without the spill armed, spilled with it when it does not fit.
     #[test]
     fn post_load_ctx_never_serves_below_the_minimum() {
         use super::CtxRung::{Refuse, Serve, ServeQ8, Spill};
@@ -6785,6 +7994,12 @@ mod seam_helper_tests {
         assert_eq!(post(8192, false, false, 64, Some(min - 1)), Refuse);
         // The spill keeps the minimum, after q8_0 and before the refusal.
         assert_eq!(post(8192, false, true, 64, None), Spill(min));
+        // An explicit window that does not fit is spilled as asked; one that fits is served.
+        assert_eq!(post(8192, true, true, 64, None), Spill(8192));
+        assert_eq!(
+            super::post_load_ctx(8192, true, true, 8192, unasked),
+            Serve(8192)
+        );
         assert_eq!(post(8192, false, true, 64, Some(3000)), ServeQ8(3000));
         assert_eq!(post(500, false, true, 64, None), Spill(500));
     }
@@ -6927,13 +8142,13 @@ mod seam_helper_tests {
                                 }
                             };
                             assert_eq!(kept, ctx, "{case}: opened {pre:?}, re-clamped {post:?}");
-                            if !explicit {
-                                assert_eq!(
-                                    matches!(pre, Spill(_)),
-                                    matches!(post, Spill(_)),
-                                    "{case}: opened {pre:?}, re-clamped {post:?}"
-                                );
-                            }
+                            // Both sides spill the same windows, an explicit one included: the
+                            // re-clamp prices a spilled cache as the fit before the load did.
+                            assert_eq!(
+                                matches!(pre, Spill(_)),
+                                matches!(post, Spill(_)),
+                                "{case}: opened {pre:?}, re-clamped {post:?}"
+                            );
                             checked += 1;
                         }
                     }
@@ -6990,9 +8205,13 @@ mod seam_helper_tests {
         let want = 32768;
 
         let scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
-        let (ctx, k, v) =
-            super::reclamp_ctx_to_live_room(&RoomOnly::vulkan(room), &cfg, &ec, want, f16.0, f16.1)
-                .expect("q8_0 holds the minimum");
+        let super::LiveCtx {
+            ctx,
+            k_fmt: k,
+            v_fmt: v,
+            ..
+        } = super::reclamp_ctx_to_live_room(&RoomOnly::vulkan(room), &cfg, &ec, want, f16.0, f16.1)
+            .expect("q8_0 holds the minimum");
         assert_eq!((k, v), q8);
         assert!(
             (min..want).contains(&ctx),
@@ -7126,7 +8345,10 @@ mod seam_helper_tests {
         let sizes = vec![(64 * mib, 64 * mib); 4]; // 512 MiB in guarded buffers
         let need = 512 * mib as u64;
         let call = |sizes: &[(usize, usize)], room: Option<u64>, ec: &EngineConfig| {
-            super::refuse_unallocatable_kv(ec, sizes, room, 32768, k, v, "here", || Some(1024))
+            let spill = infr_vulkan::kv_spill_armed(ec.kv.overflow, false, true);
+            super::refuse_unallocatable_kv(ec, spill, sizes, room, 32768, k, v, "here", || {
+                Some(1024)
+            })
         };
         let ec = EngineConfig::default();
 
@@ -7147,6 +8369,21 @@ mod seam_helper_tests {
         let mut overflow = EngineConfig::default();
         overflow.kv.overflow = true;
         call(&sizes, Some(1), &overflow).expect("INFR_KV_OVERFLOW must not refuse");
+        // ...except on a unified-memory device, where the spill takes from the same budget.
+        let unified = infr_vulkan::kv_spill_armed(overflow.kv.overflow, true, true);
+        assert!(!unified, "a unified-memory device cannot spill");
+        super::refuse_unallocatable_kv(
+            &overflow,
+            unified,
+            &sizes,
+            Some(1),
+            32768,
+            k,
+            v,
+            "",
+            || None,
+        )
+        .expect_err("a unified-memory spill must refuse what the guard would");
         let mut unguarded = EngineConfig::default();
         unguarded.kernels.vulkan.no_vram_guard = true;
         call(&sizes, Some(1), &unguarded).expect("INFR_NO_VRAM_GUARD must not refuse");

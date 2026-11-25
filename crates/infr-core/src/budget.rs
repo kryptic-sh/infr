@@ -15,9 +15,9 @@
 //!   [`kv_bytes_per_elem`] — the same thing as a fractional per-element rate, which is what the
 //!   context-fit ESTIMATES divide by. The two must agree; a test pins them against each other.
 //! - [`flag_from`] / [`mib_bytes`] / [`reserve_bytes`] — the grammars and accessors the spill
-//!   knobs share (`empty`/`0` = off; a MiB count → bytes; the 12%-of-VRAM-floored-at-2-GiB
-//!   reserve). The VALUES come from the backend's [`Config`](crate::config::Config); nothing here
-//!   reads the environment (R3).
+//!   knobs share (`empty`/`0` = off; a MiB count → bytes; the KV spill's extra reserve). The VALUES
+//!   come from the backend's [`Config`](crate::config::Config); nothing here reads the environment
+//!   (R3).
 //! - [`SpillTally`] / [`SpillCounts`] / [`spill_report_line`] — the VRAM-first placement
 //!   bookkeeping and its banner. The counters and the message SKELETON are shared; every noun and
 //!   every device-specific clause is passed in ([`SpillNouns`]), and so is the byte formatter,
@@ -26,7 +26,7 @@
 //! What is deliberately NOT here (device facts that only look shared):
 //!
 //! - The placement itself. Whether VRAM has room is a device question (Vulkan's live
-//!   `VK_EXT_memory_budget` heap probe minus a guard headroom, in `vram_budget_fits`). Only the
+//!   `VK_EXT_memory_budget` heap probe minus a guard headroom, in `kv_stays_in_vram`). Only the
 //!   cumulative *cap* gate ([`SpillTally::admits`]), which is pure arithmetic over the tally, is
 //!   shared.
 //! - The human-readable byte formatter. Vulkan prints MiB to one decimal; unifying the spellings
@@ -137,19 +137,12 @@ pub fn mib_bytes(mib: Option<u64>) -> Option<u64> {
     mib.map(|mb| mb.saturating_mul(1024 * 1024))
 }
 
-/// VRAM headroom a VRAM-first spill keeps free below the live free-byte figure, so the consumers
-/// that allocate AFTER the spilled class (per-forward activation scratch, dequant caches, BLAS
-/// workspace, a paged-MoE arena) still have room. Default 12% of total VRAM floored at 2 GiB —
-/// enough for a several-hundred-row prefill on a large-vocab model — overridden by the knob's
-/// config field (`kv.overflow_reserve_mb`, in MiB).
-///
-/// Over-reserving costs residency; under-reserving OOMs mid-forward in an allocator that is
-/// infallible by contract, so the floor is deliberate.
-pub fn reserve_bytes(total_vram: u64, override_mib: Option<u64>) -> u64 {
-    if let Some(bytes) = mib_bytes(override_mib) {
-        return bytes;
-    }
-    (total_vram / 100 * 12).max(2 * 1024 * 1024 * 1024)
+/// Device memory, in bytes, a `kv.overflow` KV spill leaves free on top of what the run is priced
+/// to need after its cache (the activation reserve, the driver's later allocations): the config
+/// field `kv.overflow_reserve_mb`, in MiB. Unset is `0`: the priced terms are the reserve, and this
+/// is only the user's extra margin over them.
+pub fn reserve_bytes(override_mib: Option<u64>) -> u64 {
+    mib_bytes(override_mib).unwrap_or(0)
 }
 
 // ── VRAM-first spill bookkeeping + banner ────────────────────────────────────
@@ -473,49 +466,22 @@ mod tests {
         assert_eq!(mib_bytes(cfg.kv.overflow_vram_mb), Some(512 * 1024 * 1024));
     }
 
-    /// 12% of total, floored at 2 GiB, override in MiB — verbatim from the inline copy
-    /// (`kv_overflow_vram_reserve`), over explicit values so the case sweep needs no environment.
-    ///
-    /// This used to run over a `&str` façade (`reserve_from`) purely to keep the environment out of
-    /// the sweep, which [`reserve_bytes`] already does. An unparseable override is `None` by the
-    /// time it reaches here — `config::env` decides that — and `None` is the first case below, so
-    /// the deleted `Some("abc")` row is the same assertion spelled twice.
+    /// The extra margin is the field in bytes, and nothing when unset; read off the config, so the
+    /// env layer's spelling reaches it.
     #[test]
-    fn reserve_bytes_matches_the_inline_formula() {
-        const GIB: u64 = 1024 * 1024 * 1024;
-        // Below the crossover (2 GiB / 0.12 ≈ 16.67 GiB) the floor wins.
-        assert_eq!(reserve_bytes(8 * GIB, None), 2 * GIB);
-        assert_eq!(reserve_bytes(16 * GIB, None), 2 * GIB);
-        // Above it, 12% — computed as `total / 100 * 12`, the shipped (truncating) order.
-        assert_eq!(reserve_bytes(24 * GIB, None), 24 * GIB / 100 * 12);
-        assert_eq!(reserve_bytes(0, None), 2 * GIB);
-        // The override wins outright, including below the floor and at zero.
-        assert_eq!(reserve_bytes(24 * GIB, Some(128)), 128 * 1024 * 1024);
-        assert_eq!(reserve_bytes(24 * GIB, Some(0)), 0);
-    }
-
-    /// The same policy driven off the CONFIG field (MiB) — the plumbing, where the test above is
-    /// the formula.
-    #[test]
-    fn reserve_bytes_takes_the_override_from_the_config() {
+    fn reserve_bytes_is_the_config_field_in_bytes() {
         use crate::config::Config;
-        const GIB: u64 = 1024 * 1024 * 1024;
-        assert_eq!(reserve_bytes(24 * GIB, None), 24 * GIB / 100 * 12);
-        assert_eq!(reserve_bytes(8 * GIB, None), 2 * GIB);
-        assert_eq!(reserve_bytes(24 * GIB, Some(128)), 128 * 1024 * 1024);
-        assert_eq!(reserve_bytes(24 * GIB, Some(0)), 0);
-        // Unset in the shipped config ⇒ the formula.
+        assert_eq!(reserve_bytes(None), 0);
+        assert_eq!(reserve_bytes(Some(0)), 0);
+        assert_eq!(reserve_bytes(Some(128)), 128 * 1024 * 1024);
         let d = Config::default();
-        assert_eq!(d.kv.overflow_reserve_mb, None);
+        assert_eq!(reserve_bytes(d.kv.overflow_reserve_mb), 0);
         let layer = crate::config::env::parse(&|k| {
             (k == "INFR_KV_OVERFLOW_RESERVE_MB").then(|| "128".to_string())
         })
         .expect("env layer");
         let cfg = Config::load_from_layers(&[layer]);
-        assert_eq!(
-            reserve_bytes(24 * GIB, cfg.kv.overflow_reserve_mb),
-            128 * 1024 * 1024
-        );
+        assert_eq!(reserve_bytes(cfg.kv.overflow_reserve_mb), 128 * 1024 * 1024);
     }
 
     /// A MiB count large enough to overflow the byte product must SATURATE, not wrap.
@@ -545,7 +511,7 @@ mod tests {
         assert_eq!(mib_bytes(Some(512)), Some(512 * MIB));
         // `reserve_bytes` reads the same helper, so its override saturates too rather than
         // wrapping to a tiny (or zero) reserve, which would under-reserve and OOM mid-forward.
-        assert_eq!(reserve_bytes(24 * 1024 * MIB, Some(u64::MAX)), u64::MAX);
+        assert_eq!(reserve_bytes(Some(u64::MAX)), u64::MAX);
     }
 
     /// The cumulative cap admits up to and including the cap, and `Some(0)` admits nothing —

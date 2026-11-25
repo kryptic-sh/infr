@@ -1415,12 +1415,9 @@ pub(crate) fn generate_dense_backend_bound(
         // Shrinks only, and never a context the user pinned. See `reclamp_ctx_to_live_room`. It
         // may also switch an f16 cache that would leave less than a usable window to q8_0, which
         // nothing has been sized in yet: both formats ring alike, so `kv_ring` above still holds.
-        let want_ctx = {
-            let (ctx, k, v) =
-                crate::seam::reclamp_ctx_to_live_room(be, c, ec, want_ctx, k_fmt, v_fmt)?;
-            (k_fmt, v_fmt) = (k, v);
-            ctx
-        };
+        let live = crate::seam::reclamp_ctx_to_live_room(be, c, ec, want_ctx, k_fmt, v_fmt)?;
+        (k_fmt, v_fmt) = (live.k_fmt, live.v_fmt);
+        let want_ctx = live.ctx;
         // A model infr only matches the reference over a bounded context gets no larger cache.
         // Sessions arrive already capped (`SeamModel::session_ctx`); this is the one-shot paths'
         // cap (they size `prompt + max_new + 1`). The load already warned.
@@ -1452,8 +1449,10 @@ pub(crate) fn generate_dense_backend_bound(
         .collect();
         let kv_sizes = &guarded[..c.n_layer];
         let room = be.device_alloc_room();
+        let spill = be.kv_spill_armed();
         crate::seam::refuse_unallocatable_kv(
             ec,
+            spill,
             &guarded,
             room,
             want_ctx,
@@ -1474,6 +1473,26 @@ pub(crate) fn generate_dense_backend_bound(
                 )
             },
         )?;
+        // `kv.overflow` (where it can spill): a KV buffer that would take the memory the rest of
+        // the run is priced to need after the cache goes to system RAM instead, so no later
+        // allocation is refused for want of it — the one figure the spill was priced with
+        // (`kv_spill_split`). A cache the ladder spilled is allocated under it. One it served
+        // whole was fitted as without the flag, so its own buffers are allocated with no reserve,
+        // as without the flag. Everything allocated after it (a fork, a recurrent-state snapshot,
+        // the next slot's cold init) is held to the reserve, which `restore` puts back however
+        // this allocation exits.
+        struct RestoreReserve<'a>(&'a dyn Backend, u64);
+        impl Drop for RestoreReserve<'_> {
+            fn drop(&mut self) {
+                self.0.set_kv_spill_reserve(self.1);
+            }
+        }
+        let restore = spill
+            .then(|| crate::seam::kv_spill_reserve(c, ec, want_ctx, ubatch, be.dense_paged()))
+            .map(|reserve| {
+                be.set_kv_spill_reserve(if live.spilled { reserve } else { 0 });
+                RestoreReserve(be, reserve)
+            });
         let mut kbufs: Vec<Box<dyn Buffer>> = Vec::new();
         let mut vbufs: Vec<Box<dyn Buffer>> = Vec::new();
         for &(k_bytes, v_bytes) in kv_sizes {
@@ -1487,6 +1506,7 @@ pub(crate) fn generate_dense_backend_bound(
             );
         }
         let cbufs = super::weights::alloc_dsv4_comp_bufs(be, c, want_ctx, k_fmt)?;
+        drop(restore);
         // What the allocations above took from the device's budget, as the device reports it: the
         // buffers themselves plus whatever the driver committed around them (on Vulkan each
         // buffer's own allocation, rounded up by the driver). One driver query, made only when

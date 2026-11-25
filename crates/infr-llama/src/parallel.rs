@@ -289,6 +289,22 @@ impl ParallelSeam {
         // of forking off a garbage prefix.
         slot0.reset();
 
+        // Under `kv.overflow`, the forks below place past the reserve the warmup's cold init left
+        // set; refuse here, before the first, when the part of them that spills does not fit the
+        // host.
+        crate::seam::refuse_unhostable_forks(
+            &self.vk,
+            self.model.config(),
+            self.model.engine_cfg(),
+            &slot0,
+            n_slots - 1,
+        )
+        .map_err(|e| {
+            anyhow!(
+                "{e}\n  The {} slots forked off the first: lower --parallel.",
+                n_slots - 1
+            )
+        })?;
         let mut slots = Vec::with_capacity(n_slots);
         for i in 1..n_slots {
             // A fork shares the `Arc<SeamWeights>` — it costs only its own KV + IO buffers. If VRAM

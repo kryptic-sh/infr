@@ -712,8 +712,6 @@ and otherwise refuses (`seam::post_load_ctx`). Left:
   the driver's own memory during the load (the 0.3 MB above on the RX 7900 XTX,
   none on the integrated GPU), and memory another process takes meanwhile. Each
   makes the pre-load window larger than the re-clamp's, which cuts it as before.
-- **The overflow spill spends the driver reserve.** Observed 2026-11-25 on both
-  GPUs; B62 has the runs and the options.
 - **More memory can give fewer tokens.** The default ladder's policy pins q8_0
   only for a full rescue or for the minimum, so a room where f16 holds the
   minimum gets f16 at fewer tokens than a slightly smaller room that fell to
@@ -3044,45 +3042,21 @@ milliseconds against seconds of load. Four more `tensors().iter().find` scans in
 infr-llama mean indexing `resolve` alone would not remove the cost. Worth doing
 only after measuring total name-lookup time on a model with about 2000 tensors.
 
-### B62 — the overflow spill does not yet give a working run on a dense model (2026-11-25)
+### B62 — what the overflow spill still leaves open (2026-11-25)
 
-**Tag:** vram · kv · **Blocked on:** a decision, and an infr-vulkan change
+**Tag:** vram · kv · **Blocked on:** nothing
 
-Plan 13 S3 made the ladder SWA → q8 → clamp → stream → spill (decided
-2026-11-13): `seam::preload_ctx` is the rule before the load and agrees with
-`seam::post_load_ctx` for the same room
-(`preload_and_post_load_agree_for_the_same_room`), and under `kv.overflow` an
-auto-sized window is now clamped, not kept whole
-(`overflow_clamps_an_auto_sized_ctx`, both GPUs). The two places the ladder
-SPILLS still do not reach a working run. Both observed 2026-11-25 with
-Qwen3-0.6B Q4_K_M under `INFR_VRAM_LIMIT`, on the integrated GPU and the RX 7900
-XTX, with throwaway tests that were not kept:
+The spill itself ships: under `kv.overflow` an explicit window no cache format
+fits beside the weights, and the auto-sized minimum when nothing fits, open and
+run with the part of the cache that does not fit in system RAM. One rule says
+how much of a cache goes to device memory (`seam::kv_spill_split` over
+`infr_vulkan::kv_vram_bytes`, the rule the allocation applies buffer by buffer,
+`kv_stays_in_vram`), one figure says what it leaves free
+(`seam::kv_spill_reserve`), and the fit before the load, dense placement's spill
+rung, the re-clamp and the backend (`Backend::set_kv_spill_reserve`) all read
+them. GPU tests in `vram_limit_tests` (`overflow_*`,
+`spilled_kv_gives_the_logits_of_a_resident_one`). Left:
 
-- **Dense placement ignores `kv.overflow`.** `vulkan_moe_binder` prices the KV
-  cache wholly in VRAM, so a window whose cache does not fit beside the weights
-  is streamed, and one whose cache alone leaves less than the streaming floor is
-  refused with "below the streaming floor" instead of spilled. Seen for an
-  explicit `--ctx 40960` at 1880 MiB of room (integrated GPU) and for the
-  auto-sized minimum (`CtxRung::Spill`, 1024 tokens) at 700 MiB (both) and 800
-  MiB (integrated GPU). Before S3 the auto-sized window under `kv.overflow`
-  failed the same way at 1880 MiB on both GPUs (it kept the trained window).
-- **The spilled cache takes the memory later allocations need.** Where placement
-  keeps the weights resident, the VRAM-first KV placement
-  (`VulkanBackend::make_alloc`'s `KvCache` arm, `vram_budget_fits`) fills VRAM
-  up to the allocation guard's headroom, so the first forward's next allocation
-  is refused: the explicit window dense placement still takes resident
-  (`explicit_ctx_short_of_the_room_after_the_weights_is_refused`'s, in f16) at
-  1880 MiB, and the minimum at 900 and 1000 MiB (and 800 on the RX 7900 XTX),
-  each refused "256 MiB requested (the new shared block a 16 KiB buffer opens)",
-  or a 121.7 MiB request, past the budget.
-- **`kv.overflow_reserve_mb` (`INFR_KV_OVERFLOW_RESERVE_MB`) is read by
-  nothing.** `infr_core::budget::reserve_bytes` computes the "headroom left for
-  everything else" that `infr.example.toml` documents (default max(12% of VRAM,
-  2 GiB)), and has no caller outside its tests; it is what the spill above
-  lacks.
-- **On a unified-memory device the spill moves nothing.** The integrated GPU's
-  budget counts every heap, so system RAM taken by a spilled buffer is charged
-  to the same budget the device memory is.
 - **The two sides read "explicit" from different places** (read in code, not
   run). Before the load it is which entry point was called:
   `SeamModel::vulkan_session_on` and the token-count arm of
@@ -3102,17 +3076,71 @@ XTX, with throwaway tests that were not kept:
 - **The ladder covers single-slot, auto-sized sessions only** (read in code, not
   run). `vulkan_slot_ctx` with more than one slot, or with a percentage, divides
   the fit by the slot count and floors it at `MIN_SESSION_CTX` without
-  `preload_ctx`: no q8_0 rung, no refusal, and `kv.overflow` is not read, so a
-  slot opens at the minimum whether or not it fits.
-
-Options: (a) hold a reserve in the KV spill (the activation reserve plus
-`POST_KV_DEVICE_RESERVE`, or wire `reserve_bytes`), an infr-vulkan change; (b)
-under `kv.overflow`, let dense placement keep the weights resident when they fit
-without the cache and price only what of the cache fits, so the rest spills
-(faster than streaming weights at the floor, which re-reads them every token,
-but against the stream-before-spill order); (c) refuse before the load under
-`kv.overflow` too when (a) and (b) are not done, since the run fails anyway. Not
-covered by a test: no GPU test runs a spill, because none passes today.
+  `preload_ctx`: no q8_0 rung, no refusal, and `kv.overflow` is not read before
+  the load, so a slot opens at the minimum whether or not it fits. An explicit
+  token count with N slots does go through the ladder (`fit_explicit_ctx` with
+  `n_slots`), and under `kv.overflow` the forks spill past the one reserve the
+  backend holds (`overflow_spills_a_second_slot_past_the_reserve`, RX 7900 XTX).
+- **Some refusals come at the first generation, not at session open.** The
+  streaming-floor refusal is before any weight is uploaded (dense placement runs
+  first; `overflow_refuses_what_cannot_stream_before_the_load` checks the room
+  did not move), but the session object opened, so `infr serve` reports it at
+  its warmup or first request. Moving it to the open needs the streaming floor
+  priced before the load: the binder's pool grouping (`vulkan_moe_binder`'s
+  `pools`, `stream_floor`) factored into a function the fit before the load can
+  call. The re-clamp's two spill checks (the measured room under the spill
+  reserve; the spilled part past what the host may give it beside the weights'
+  host tier) come after the weight upload and before any KV buffer: they catch
+  what the pricing before the load cannot see, first-fit tails past
+  `weight_arena_floor` and the driver's own memory, so they cannot move earlier
+  without pricing those.
+- **The host check before the load counts no host tier.** Placement sizes one
+  only for streamed weights, after the fit; it and the re-clamp check the spill
+  again with the tier counted (`host_tier_bytes`). The tier is sized with half
+  of what is free left alone and does not know about the spill, so a streamed
+  spill can be refused where a smaller tier would have let it run; sizing the
+  tier net of the spilled part would fix that.
+- **The streamed spill's window is narrow.** Qwen3-1.7B Q4_K_M, ctx 40960, RX
+  7900 XTX, 2026-11-25: 1800 MiB of room left the arenas short of their floor,
+  1850 and 1900 streamed with the whole cache in system RAM, 1950 kept the
+  weights resident. The test derives its room from the spill rung's own pricing
+  (`spill_resident_room`) and skips, saying so, where no window exists. The
+  reserve's layer-major term is priced at the whole window, which a short prompt
+  never uses.
+- **Forks after startup are not host-checked.** `ParallelSeam::init_slots`
+  checks the forks it makes at boot (`refuse_unhostable_forks`); a fork
+  `SlotPool::pick` makes on demand is not, and a host allocation it cannot get
+  fails the fork, which `pick` already degrades to recycling a slot. The check
+  also counts the diagnostic cap (`kv.overflow_vram_mb`) from the first fork,
+  where the allocation counts what the first slot placed too.
+- **The fork check over-counts a touched host tier.** After the warmup
+  generation part of the weights' host tier is touched and visible to the host
+  probe, and `host_tier_bytes` still counts all of it (doc of
+  `PlacementPins::host_tier_bytes`). Conservative; traced in code, not run.
+- **Spill before stream is unmeasured** (plan 13 S3's departure). Measure decode
+  speed of a resident-weights session with a spilled cache against the same
+  model streaming its weights with the cache resident, at shallow and deep
+  context (for example Qwen3-1.7B at 512 and 32768 tokens of depth, at a room
+  where both are possible), in a quiet window; if streaming wins at depth, the
+  rung should choose by the window.
+- **The spill at the minimum keeps the session's own format.** An auto-sized
+  window below the minimum in both formats spills f16 (`clamp_rung` tries q8_0
+  only for a whole fit), so more of it goes to system RAM than a q8_0 cache
+  would send. Measured 2026-11-25, Qwen3-0.6B at 1188 MiB of room on the RX 7900
+  XTX: 31 MB of the f16 minimum in VRAM, 86 MB in system RAM. Worth deciding
+  together with S3's "more memory can give fewer tokens" (B-PRELOAD-CLAMP).
+- **Multi-device sessions and MoE.** The multi-device wrappers (`tp`, `ep`,
+  `pipeline`) do not forward `set_kv_spill_reserve`, nor `device_alloc_room`, so
+  under `kv.overflow` their KV still fills each device to the guard. MoE
+  placement prices the whole cache in VRAM (`moe_expert_budget`) and has no
+  spill rung; the runner's reserve still applies to an MoE session's cache. Not
+  run on either.
+- **The refusal messages still suggest `INFR_KV_OVERFLOW=1` on a unified-memory
+  device**, where it changes no context decision.
+- **Not measured:** decode or prefill speed with a spilled cache (no hot path
+  changed: the KV read seam was always by device address; a spilled run reads
+  the spilled layers over PCIe), and the integrated GPU's behaviour under a real
+  (not `INFR_VRAM_LIMIT`) memory shortage.
 
 ### B63 — deep-context performance is unmeasured across the whole model matrix (2026-08-12)
 
@@ -4117,7 +4145,7 @@ pool. These were confirmed and left:
   host sampler, and the decode sampler needs a perf check afterwards.
 - **UMA budget drift.** On a unified-memory device without
   `VK_EXT_memory_budget`, spilled bytes are never added to `device_used` while
-  the total counts every heap (`vram_budget_fits`). Both GPUs here expose the
+  the total counts every heap (`budget_snapshot`). Both GPUs here expose the
   extension, so no test can fail here.
 - **The replay guard is silent.** A replay whose bound buffers differ from the
   recording now drops the tape and records again (`execute`) or declines

@@ -571,6 +571,23 @@ pub trait Backend: Send + Sync {
     /// loop, so the user sees the resident/spilled split. Default no-op (backends without host spill,
     /// or with the flag off, print nothing).
     fn kv_overflow_report(&self) {}
+    /// The device memory a VRAM-first KV spill (the Vulkan `INFR_KV_OVERFLOW` path) must leave
+    /// free: from now on a `BufferUsage::KvCache` buffer is placed in device memory only when the
+    /// room left after it is at least `bytes`, and in system RAM otherwise. One value per backend,
+    /// whatever number of sessions or slots allocate on it: the last call wins, and the backend
+    /// never resets it. The runner sets it around each cold init of a spill-armed session — to the
+    /// reserve for a cache the ladder spilled, to `0` while it allocates one the ladder served
+    /// whole (fitted with the reserve already left over), and back to the reserve after, for what
+    /// is allocated later (forks, recurrent-state snapshots). One figure serves every slot of a
+    /// session because slots take turns on the device step by step and a step's activations are
+    /// released with it. Default no-op (a backend without a spill has nothing to hold back).
+    fn set_kv_spill_reserve(&self, _bytes: u64) {}
+    /// Whether this backend spills KV buffers to system RAM under `kv.overflow` at all, which the
+    /// context ladder reads so it spills only a cache the backend will place that way. `false` by
+    /// default (no spill); the Vulkan backend's rule is `infr_vulkan::kv_spill_armed`.
+    fn kv_spill_armed(&self) -> bool {
+        false
+    }
     /// Bytes a new device-local allocation may still take RIGHT NOW, as this backend's own
     /// allocation guard sees it — the live answer to "what is left?", including everything a
     /// pre-load estimate cannot know: allocator block tails, retained upload staging, the driver's

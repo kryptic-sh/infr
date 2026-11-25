@@ -616,8 +616,8 @@ impl SeamModel {
         // placement scope, as in `vulkan_session_default_on`.
         let pins = std::sync::Arc::new(crate::seam::PlacementPins::default());
         let scope = crate::seam::PlacementScope::enter(pins.clone());
-        self.fit_explicit_ctx(&vk, max_ctx, 1);
-        let refused = self.refuse_explicit_ctx(&vk, max_ctx, 1);
+        let rung = self.fit_explicit_ctx(&vk, max_ctx, 1);
+        let refused = self.refuse_explicit_ctx(&vk, max_ctx, 1, rung);
         drop(scope);
         refused?;
         Ok(DenseVulkanSession {
@@ -634,7 +634,8 @@ impl SeamModel {
     /// the VRAM budget — a long-context model's trained window (128k+) would otherwise allocate
     /// a KV cache that blows VRAM at startup or on the first request. Explicit contexts
     /// (INFR_CTX → `vulkan_session(ctx)`) are NEVER clamped: they get a q8_0 cache when only
-    /// that fits (`fit_explicit_ctx`), and one whose KV cache cannot fit at all is
+    /// that fits (`fit_explicit_ctx`), under `kv.overflow` one neither format fits keeps its
+    /// window with the cache spilled, and otherwise one whose KV cache cannot fit at all is
     /// refused before it is allocated (`refuse_unallocatable_kv`).
     pub fn vulkan_session_default(&self) -> Result<DenseVulkanSession> {
         self.vulkan_session_default_on(None)
@@ -711,8 +712,10 @@ impl SeamModel {
     ///     log, whether or not `kv.overflow` is on: the clamp comes before the spill (B62).
     ///  4. **q8_0 serves the minimum where f16 does not** → pin auto-q8 and clamp to what q8_0
     ///     holds: the choice is "slower cache vs no session at all".
-    ///  5. **`kv.overflow`** → keep the minimum with the part of the cache that does not fit VRAM
-    ///     in system RAM.
+    ///  5. **`kv.overflow`** (not on a unified-memory device, where a spill frees nothing) → keep
+    ///     the minimum with the part of the cache that does not fit VRAM in system RAM, refused
+    ///     here when that part does not fit the host
+    ///     ([`refuse_unhostable_ctx`](Self::refuse_unhostable_ctx)).
     ///  6. **Nothing else** → `Err`. The weights leave no room for a usable cache on this device,
     ///     so refusing with the numbers beats a session that errors at its first activation alloc.
     ///
@@ -735,8 +738,9 @@ impl SeamModel {
         let mut fit_q8 = None;
         // The SAME flag the backend's own KV placement reads (`kv.overflow`, off the `Config` the
         // backend was built with), so the ladder and the allocator agree on whether the spill is
-        // armed.
-        let rung = crate::seam::preload_ctx(want, false, vk.cfg().kv.overflow, fit, || {
+        // armed; never on a unified-memory device, where it frees nothing.
+        let spill = infr_core::backend::Backend::kv_spill_armed(vk);
+        let rung = crate::seam::preload_ctx(want, false, spill, fit, || {
             fit_q8 = self
                 .may_auto_q8()
                 .then(|| self.kv_fit_ctx_fmt(vk, true))
@@ -775,6 +779,7 @@ impl SeamModel {
                 Ok(ctx)
             }
             CtxRung::Spill(ctx) => {
+                self.refuse_unhostable_ctx(vk, ctx, 1)?;
                 let (k_fmt, v_fmt) = self.kv_fit_fmts(crate::seam::kv_auto_q8());
                 tracing::warn!(
                     requested_ctx = want,
@@ -855,15 +860,20 @@ impl SeamModel {
     /// land at all is refused by `crate::seam::refuse_unallocatable_kv` (here, by
     /// [`refuse_explicit_ctx`](Self::refuse_explicit_ctx), and again once the weights are
     /// resident). The window itself is never changed, so the caller opens `want`.
-    fn fit_explicit_ctx(&self, vk: &infr_vulkan::VulkanBackend, want: usize, n_slots: usize) {
+    fn fit_explicit_ctx(
+        &self,
+        vk: &infr_vulkan::VulkanBackend,
+        want: usize,
+        n_slots: usize,
+    ) -> Option<crate::seam::CtxRung> {
         let Some(fit) = self.kv_fit_ctx(vk) else {
-            return; // pure recurrent-state arch: no per-token KV to size.
+            return None; // pure recurrent-state arch: no per-token KV to size.
         };
         let mut fit_q8 = None;
         let rung = explicit_ctx_rung(
             want,
             n_slots,
-            vk.cfg().kv.overflow,
+            infr_core::backend::Backend::kv_spill_armed(vk),
             fit,
             self.may_auto_q8(),
             || {
@@ -884,19 +894,25 @@ impl SeamModel {
                  (decode is ~10-16% slower on q8)"
             );
         }
+        Some(rung)
     }
 
     /// The refuse rung for a context the USER chose, taken before any weight is loaded: `Err` when
     /// even the smallest KV cache `n_slots` windows of `want` tokens could still allocate
-    /// (`crate::seam::kv_floor_alloc_bytes`) cannot fit the device at all. Runs after
-    /// [`fit_explicit_ctx`](Self::fit_explicit_ctx), under the same placement scope, so a q8_0 pin
-    /// it just made is what gets priced.
+    /// (`crate::seam::kv_floor_alloc_bytes`) cannot fit the device at all, or, when
+    /// [`fit_explicit_ctx`](Self::fit_explicit_ctx)'s `rung` spills the cache, when the part that
+    /// spills does not fit the host ([`refuse_unhostable_ctx`](Self::refuse_unhostable_ctx)). Runs
+    /// after it, under the same placement scope, so a q8_0 pin it just made is what gets priced.
     fn refuse_explicit_ctx(
         &self,
         vk: &infr_vulkan::VulkanBackend,
         want: usize,
         n_slots: usize,
+        rung: Option<crate::seam::CtxRung>,
     ) -> Result<()> {
+        if let Some(crate::seam::CtxRung::Spill(ctx)) = rung {
+            self.refuse_unhostable_ctx(vk, ctx, n_slots)?;
+        }
         let (k_fmt, v_fmt) = self.kv_fit_fmts(crate::seam::kv_auto_q8());
         let sizes = crate::seam::kv_floor_alloc_bytes(
             &self.cfg,
@@ -909,6 +925,7 @@ impl SeamModel {
         );
         crate::seam::refuse_unallocatable_kv(
             &self.ecfg,
+            infr_core::backend::Backend::kv_spill_armed(vk),
             &sizes,
             Some(vk.alloc_room()),
             want,
@@ -986,36 +1003,78 @@ impl SeamModel {
                 reserve: 0,
             };
         }
-        let cost = vk.weight_load_cost();
-        let units = crate::seam::weight_upload_units(
-            &self.gguf,
-            &self.cfg,
-            &self.ecfg,
-            vk.capabilities().combined_gu,
-        );
+        let (weights, staging) =
+            crate::seam::resident_load_held(vk, &self.gguf, &self.cfg, &self.ecfg);
         PreloadHeld {
-            weights: crate::seam::weight_arena_floor(&units, cost),
-            staging: cost.staging,
+            weights,
+            staging,
             reserve: crate::seam::POST_KV_DEVICE_RESERVE,
         }
     }
 
-    /// The per-side KV dtypes a fit/footprint estimate must price: the user's explicit
-    /// `INFR_KV_TYPE_K`/`_V` when set, else the default ladder (legacy `INFR_KV_Q8`, then a
-    /// placement-pinned or candidate auto-q8, then f16) — the same ladder `parse_kv_fmt` walks in
-    /// the runner. ESTIMATE ONLY in one direction: the runner additionally gates each format on
-    /// backend/alignment and falls back to f16, so a gated-out low-bit request under-estimates
-    /// here and the alloc-time VRAM guard backstops it.
+    /// The per-side KV dtypes a fit/footprint estimate must price ([`crate::seam::kv_fit_fmts`]).
     fn kv_fit_fmts(&self, auto_q8: bool) -> (DType, DType) {
-        let side = |want: Option<DType>| match want {
-            Some(dt) => dt,
-            None if self.ecfg.kv.force_q8 || auto_q8 => DType::Q8_0,
-            None => DType::F16,
-        };
-        let k = side(self.ecfg.kv.type_k);
-        (
-            k,
-            crate::seam::kv_v_fmt(&self.cfg, k, side(self.ecfg.kv.type_v)),
+        crate::seam::kv_fit_fmts(&self.cfg, &self.ecfg, auto_q8)
+    }
+
+    /// How `n_slots` caches of `ctx` tokens would divide between device memory and system RAM
+    /// under `kv.overflow`, priced before the load: the room [`preload_held`](Self::preload_held)'s
+    /// weights and staging leave, less the spill reserve ([`crate::seam::kv_spill_split`]), in the
+    /// formats the runner will allocate.
+    fn preload_spill_split(
+        &self,
+        vk: &infr_vulkan::VulkanBackend,
+        ctx: usize,
+        n_slots: usize,
+    ) -> (crate::seam::KvSplit, DType, DType) {
+        let held = self.preload_held(vk);
+        let (k_fmt, v_fmt) = self.kv_fit_fmts(crate::seam::kv_auto_q8());
+        let ubatch = crate::seam::spill_ubatch(&self.ecfg);
+        let split = crate::seam::kv_spill_split(
+            &self.cfg,
+            ctx,
+            crate::seam::placement_ring(&self.cfg, &self.ecfg, k_fmt, v_fmt),
+            ubatch,
+            crate::seam::KvAlign::of(vk),
+            k_fmt,
+            v_fmt,
+            n_slots,
+            vk.alloc_room()
+                .saturating_sub(held.weights.saturating_add(held.staging)),
+            crate::seam::kv_spill_reserve(&self.cfg, &self.ecfg, ctx, ubatch, false),
+            crate::seam::kv_spill_cap(&self.ecfg),
+        );
+        (split, k_fmt, v_fmt)
+    }
+
+    /// The spill rung's refusal before the load: `Err` when the part of `n_slots` caches of `ctx`
+    /// tokens that would spill ([`preload_spill_split`](Self::preload_spill_split)) does not fit
+    /// what a run may take of the memory the host reports free
+    /// ([`crate::seam::refuse_unhostable_kv`]). Placement checks it again beside a host tier it
+    /// sizes, and the re-clamp after the load against the measured room.
+    fn refuse_unhostable_ctx(
+        &self,
+        vk: &infr_vulkan::VulkanBackend,
+        ctx: usize,
+        n_slots: usize,
+    ) -> Result<()> {
+        let (split, k_fmt, v_fmt) = self.preload_spill_split(vk, ctx, n_slots);
+        tracing::debug!(
+            ctx,
+            n_slots,
+            kv_vram_bytes = split.vram,
+            kv_host_bytes = split.host,
+            "kv overflow: the spilled cache priced before the load"
+        );
+        // No host tier is sized yet (placement sizes one only for weights that stream, and
+        // re-checks the spill against it then), so nothing is committed beside the spill here.
+        crate::seam::refuse_unhostable_kv(
+            ctx,
+            split,
+            infr_core::hostmem::available_bytes(),
+            0,
+            k_fmt,
+            v_fmt,
         )
     }
 
@@ -1174,8 +1233,8 @@ impl SeamModel {
         // the cache to q8_0 when that is what it takes to fit.
         if let Some(infr_core::SizeSpec::Bytes(c)) = want {
             let ctx = self.session_ctx((c as usize).max(1));
-            self.fit_explicit_ctx(vk, ctx, n_slots);
-            self.refuse_explicit_ctx(vk, ctx, n_slots)?;
+            let rung = self.fit_explicit_ctx(vk, ctx, n_slots);
+            self.refuse_explicit_ctx(vk, ctx, n_slots, rung)?;
             return Ok(ctx);
         }
         let trained = self.session_ctx(self.cfg.n_ctx_train);

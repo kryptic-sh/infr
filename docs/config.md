@@ -231,7 +231,17 @@ On `serve` these are the server defaults — a per-request OpenAI
 **`[kv]`** — cache element format (`type_k` / `type_v`, plus the legacy
 `force_q8` alias), prefix-cache `slots`, the sliding-window `ring`, and the
 host-overflow trio (`overflow`, `overflow_vram_mb`, `overflow_reserve_mb`) that
-spills KV to system RAM when VRAM runs out.
+spills KV to system RAM when VRAM runs out. Under `overflow` an explicit context
+that no cache format fits beside the weights keeps its window with the part of
+the cache that does not fit in system RAM, and an auto-sized one is clamped
+first and spills only at the 1024-token minimum; a window that fits is sized
+exactly as without the flag. A spilled cache leaves free the device memory the
+rest of the run is priced to need, plus `overflow_reserve_mb` (unset: nothing
+extra), and runs at the shortest prefill chunk unless `INFR_UBATCH` pins one.
+`overflow_vram_mb` caps the cache's device memory, to force a spill on a model
+that fits. `overflow` does nothing on a unified-memory GPU, which counts system
+RAM in the same budget, nor on a driver without `VK_EXT_memory_budget`, where
+the free memory measured after the load does not see what infr has allocated.
 
 **`[paging]`** — the MoE expert cache and dense layer streaming: `cache` sizes
 the paged VRAM budget (and forces paging even when the weights would have fit),

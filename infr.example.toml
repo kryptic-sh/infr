@@ -107,13 +107,21 @@ ring = true
 inline_decode = false
 coopmat_bda = false
 
-# Spill the KV cache to host RAM when VRAM runs out (VRAM-first). Note the
-# grammar of the env twin: INFR_KV_OVERFLOW="" and ="0" are OFF.
+# Spill the KV cache to host RAM when VRAM runs out (VRAM-first, Vulkan). An
+# explicit context neither cache format fits beside the weights is kept with
+# the part that does not fit in host RAM; an auto-sized one is clamped first and
+# spilled only at the 1024-token minimum. A spilled cache leaves free what the
+# rest of the run is priced to need. Nothing spills on a unified-memory GPU,
+# where host RAM is the same memory, nor on a driver without
+# VK_EXT_memory_budget. Note the grammar of the env twin: INFR_KV_OVERFLOW="" and
+# ="0" are OFF.
 overflow = false
-# VRAM ceiling for the KV cache, in MiB. Default: unset = the fit calculation.
+# Diagnostic cap on the KV cache's VRAM, in MiB, to force a spill on a model
+# that fits. Default: unset = no cap.
 # overflow_vram_mb = 512
-# Headroom left for everything else, in MiB. Default: max(12% of VRAM, 2 GiB).
-# overflow_reserve_mb = 2048
+# Extra VRAM, in MiB, a spilled cache leaves free beyond what the run is priced
+# to need after it. Default: unset = none.
+# overflow_reserve_mb = 256
 
 # ── paging (MoE expert cache + dense layer streaming) ────────────────────────
 

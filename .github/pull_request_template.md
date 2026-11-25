@@ -22,6 +22,11 @@ The reasons are in `AGENTS.md`, "Before opening a pull request".
       config key, the README for a server route or request field, the tuning
       docs for a tuning parameter
 - [ ] A fix has a test that fails without it, and I saw it fail
+- [ ] A performance change shows its output is unchanged, or no further from the
+      CPU reference than before
+- [ ] New GPU tests use tolerance testing against a reference (the tolerance
+      harness, or a host reference for one op), not a stored hash or golden
+      value
 - [ ] Model math is compared with llama.cpp on the same input
 - [ ] A server feature is tested against a real small model
 - [ ] Every site with the same defect is fixed, and shared code is reused

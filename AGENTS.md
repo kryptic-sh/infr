@@ -42,9 +42,14 @@
 
 ## What to work on
 
-- Correctness is the top priority, and performance matters just as much: a
-  change that buys one must not quietly cost the other. Both come before
-  anything else in improvement work.
+- Accuracy comes first. A performance change is accepted only when it has no
+  accuracy drawback: its output is unchanged, or at least as close to the CPU
+  reference as before, and the change shows that with a bit-identity check or
+  the tolerance harness. Fast and wrong is not an option.
+- Performance comes next, ahead of everything else in improvement work. Where
+  accuracy costs speed, take the accuracy, then look for a way to win the speed
+  back without giving it up. An accuracy gap that exists today is a defect to
+  investigate and close, not a cost that was accepted.
 - Do not shy away from a large refactor when it is worth it for correctness, for
   performance, or for both. Say what it buys, and verify it: a test that can
   fail for correctness, a measurement for performance.
@@ -90,11 +95,24 @@ missed in a pull request we then had to correct by hand:
 
 **Tests**
 
+- A performance change shows that its output did not change, or did not move
+  away from the CPU reference: the bit-identity check or the tolerance rows it
+  was held to. See "What to work on".
 - A fix comes with a test that fails without it, and the test exercises the line
   that changed. Say in the pull request that you saw it fail.
 - GPU tests are `#[ignore]`d and CI has no GPU, so a green run says nothing
   about a shader or kernel change. Say which ignored tests you ran and on which
   device.
+- GPU tests use tolerance testing, not hash goldens. A new test of what a GPU
+  kernel or a GPU run of a model produces compares it with a reference within a
+  stated bound: the tolerance harness
+  (`crates/infr-llama/tests/gpu_tolerance.rs`, scored against the CPU reference)
+  for a model, a host reference for a single op. Do not add a GPU test that pins
+  a stored hash, digest or byte-exact golden value, and do not add or re-bless a
+  golden file: GPUs and drivers legitimately differ in the last bits, so such a
+  test fails on hardware that is right. Comparing two kernels bit for bit inside
+  one test, on the same device and input, is fine, and is how "this change keeps
+  the output identical" is shown.
 - Model math is compared with a reference: llama.cpp's embeddings or logits on
   the same input. Output that reads well is not evidence.
 - A server feature has a test against a real small model, not only the stub

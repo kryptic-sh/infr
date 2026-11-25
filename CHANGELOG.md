@@ -1316,6 +1316,34 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Qwen3.5 files that write `attention.head_count_kv` per block load.** The key
+  may be one entry per block, 0 on the gated-DeltaNet blocks, where infr read
+  only the scalar form. The full-attention blocks must agree on one positive
+  count, which becomes the model's KV head count; the recurrent blocks' entries
+  are not read (contributed in PR 113). A wrong-length array, a non-integer
+  entry, disagreeing attention blocks or a file with no attention block is
+  refused by name, and so is `full_attention_interval = 0`. A `recurrent_layers`
+  layout infr cannot place is reported before any of these.
+- **Every other architecture reads a per-block `attention.head_count_kv` array
+  too.** A uniform array is that one count; an array whose attention blocks
+  disagree is refused by name. Such a file used to fall back to the query head
+  count without a word.
+- **Vulkan placement prices the KV cache formats the session allocates.** Dense
+  placement priced an explicit `kv.type_k`/`kv.type_v` pair as f16 (or as q8_0
+  on its auto-q8 rung), so an f32 pair could be placed resident against half the
+  cache it then allocated and a q8_0 pair could be refused a tier it fitted
+  (contributed in PR 114). The MoE expert budget priced both sides as one format
+  in the same way (contributed in PR 116). Every estimate (the context fit, the
+  spill rung, dense placement, the MoE budget) and the runner now resolve the
+  pair through one function, so a format the runner falls back from — turbo2/3/4
+  on heads that are not a multiple of 128, q8_0 or a low-bit block quant on rows
+  that are not whole 32-element blocks, `kv.force_q8` on such rows — is priced
+  as the f16 it allocates rather than as the format named.
+- **The CPU arena budget holds back an explicit KV format.** A CPU run priced
+  its KV cache at f16 whatever `kv.type_k`/`kv.type_v` said, so an f32 cache was
+  reserved at half its size; it is now priced in the formats the CPU runner
+  allocates.
+
 - **Vulkan prefill of a MoE model whose expert width (`n_ff_exp`, or the model
   width) is not a multiple of 64 no longer gives NaN or wrong logits.** The
   batched expert GEMMs that run prefill chunks of more than `moe.small_m` rows

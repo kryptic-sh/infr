@@ -763,87 +763,12 @@ pub(crate) fn generate_dense_backend_bound(
             .is_some_and(|t| infr_vulkan::linear::embed_gather_supported(t.dtype));
 
     // KV cache dtype, chosen PER-SIDE (K and V independent, like llama's --cache-type-k /
-    // --cache-type-v). Q8_0 stores 34 bytes / 32 elems — half the f16 footprint and bandwidth.
-    //   INFR_KV_TYPE_K / INFR_KV_TYPE_V ∈ {f16, q8_0}  (per-side override)
-    //   INFR_KV_Q8=1                                    legacy alias: any side not otherwise set → q8_0
-    // Per-side KV dtype, chosen from INFR_KV_TYPE_K/V (llama's --cache-type-k/-v). The graph decl
-    // carries the dtype and the env is stable for the process, so a warm session and its rebuilt
-    // graphs always agree. Gates: Q8_0 needs each layer's KV row (n_kv*head_dim) 32-block-aligned and
-    // a backend with the Q8 read/write (cpu/vulkan/metal). TurboQuant (turbo2/3/4) is WHT-rotated,
-    // 128-elem blocks = head_dim slices, so it needs head_dim%128; it runs on cpu/vulkan/metal —
-    // natively on CPU, through a dequant→f16 prepass on both GPUs. The mainline low-bit quants
-    // (q4_0/q4_1/q5_0/q5_1/iq4_nl) + f32/bf16 run on those same three backends; the block quants
-    // need 32-alignment. All of these are footprint knobs, not speed knobs — a prepass format
-    // re-expands the whole prefix every token.
-    // The 32-block layout gate. The placement estimator's own pin gate (`kv_q8_layout_ok`) is this
-    // AND `!deepseek2`, so a pinned q8 can never be gated back to f16 here against an estimate that
-    // priced it at q8; the MLA exclusion it adds is a kernel-dtype fact, applied below per backend
-    // (`crate::seam::mla_kv_fmt`) rather than here, because the CPU's MLA arm reads every KV dtype.
-    let kv_align_ok = crate::seam::kv_row_align_ok(c);
-    let kv_q8_backend = matches!(be.name(), "metal" | "cpu" | "vulkan");
-    // TurboQuant (turbo2/3/4): CPU + Vulkan + Metal (both GPUs use a dequant→f16 prepass); needs
-    // whole 128-element WHT groups in every cache row (`crate::seam::kv_turbo_align_ok`).
-    let kv_turbo_ok =
-        matches!(be.name(), "cpu" | "vulkan" | "metal") && crate::seam::kv_turbo_align_ok(c);
-    // Mainline low-bit block quants (q4_0/…/iq4_nl): CPU + Vulkan + Metal; need 32-block alignment.
-    let blk_ok = matches!(be.name(), "cpu" | "vulkan" | "metal") && kv_align_ok;
-    // Dense f32/bf16 KV: CPU + Vulkan + Metal. Metal reads f32 natively (see the mixed-format clamp
-    // below). Vulkan reads both through a prepass into an f16 scratch for its f16 attention (f32
-    // via the `store_f16` cast, bf16 via `dequant_kv_f16`), so there an f32 cache yields the f16
-    // cache's numerics.
-    let dense_ok = matches!(be.name(), "cpu" | "vulkan" | "metal");
-    // The requested format's NAME is parsed by the shared grammar (`infr_core::budget`, the same
-    // table the placement estimator prices with); only the per-format CAPABILITY gates below are
-    // the runner's, since they turn on this backend and this model's layout. A request that fails
-    // its gate — or a name nothing recognizes — falls through to the default ladder exactly as
-    // the old inline match did.
-    // `want` is the config's already-parsed dtype (`budget::parse_kv_dtype`, applied once in the
-    // env/file/CLI layer). A name nothing recognizes yields `None` here AND leaves `*_specified`
-    // true, which is exactly today's split: it falls through to the ladder below
-    // while still having suppressed auto-q8 up in the placement.
-    let parse_kv_fmt = |want: Option<DType>| -> DType {
-        match want {
-            Some(dt @ (DType::Turbo2 | DType::Turbo3 | DType::Turbo4)) if kv_turbo_ok => dt,
-            Some(DType::Q8_0) if kv_align_ok && kv_q8_backend => DType::Q8_0,
-            Some(dt @ (DType::Q4_0 | DType::Q4_1 | DType::Q5_0 | DType::Q5_1 | DType::Iq4Nl))
-                if blk_ok =>
-            {
-                dt
-            }
-            Some(dt @ (DType::Bf16 | DType::F32)) if dense_ok => dt,
-            Some(DType::F16) => DType::F16,
-            // unset/unknown/gated-out → legacy `kv.force_q8` alias (both sides q8) or f16.
-            _ if ec.kv.force_q8 && kv_align_ok && kv_q8_backend => DType::Q8_0,
-            // Placement-pinned auto-q8 (see `crate::seam::PlacementPins`): the Vulkan placement
-            // chose a q8 cache to stay resident / keep the default ctx. Vulkan-gated — the pin
-            // is a Vulkan placement decision and must not leak into a CPU/Metal session (e.g.
-            // the CPU oracle of a parity test) running in the same process. The pin is only ever
-            // set when `kv_env_unset()` and `kv_q8_layout_ok` held, so the alignment/backend
-            // gates here re-check what already passed; the env being unset means no earlier arm
-            // can shadow this one.
-            _ if crate::seam::kv_auto_q8() && be.name() == "vulkan" && kv_align_ok => DType::Q8_0,
-            _ => DType::F16,
-        }
-    };
-    let mut k_fmt = parse_kv_fmt(ec.kv.type_k);
-    // deepseek4 has no V cache, so its V format follows K before anything below reads it (the
-    // ring gate, Metal's clamp, the allocation): `crate::seam::kv_v_follows_k`.
-    let mut v_fmt = crate::seam::kv_v_fmt(c, k_fmt, parse_kv_fmt(ec.kv.type_v));
-    // Metal's Q8 and F32 KV use native-read attention that reads BOTH sides as one dtype, so a
-    // mixed request with q8/f32 on one side would misread the other — clamp those to coupled f16.
-    // The prepass formats (block quants / bf16 / turbo) expand each side to its own f16 scratch, so
-    // they compose freely with each other and with a native-f16 side (per-side, like Vulkan/CPU).
-    if be.name() == "metal" && k_fmt != v_fmt {
-        let native_read = |dt| matches!(dt, DType::Q8_0 | DType::F32);
-        if native_read(k_fmt) || native_read(v_fmt) {
-            k_fmt = DType::F16;
-            v_fmt = DType::F16;
-        }
-    }
-    // DeepSeek2 (MLA) on a GPU backend: the attention kernel reads the compressed KV row as f16
-    // unconditionally, so the pair is forced to f16 — and a NAMED non-f16 format is refused here
-    // rather than silently downgraded. `crate::seam::mla_kv_fmt` owns the rule and its argument.
-    (k_fmt, v_fmt) = crate::seam::mla_kv_fmt(c, be.name(), ec, k_fmt, v_fmt)?;
+    // --cache-type-v). The graph decl carries the dtype and the config is stable for the process,
+    // so a warm session and its rebuilt graphs always agree. `crate::seam::kv_session_fmts` owns
+    // every gate (backend support, row alignment, Metal's coupled clamp, the MLA rule), and the
+    // placement estimates price through the same ladder, so the cache they reserve is this one.
+    let (mut k_fmt, mut v_fmt) =
+        crate::seam::kv_session_fmts(c, ec, be.name(), crate::seam::kv_auto_q8())?;
 
     // SWA ring KV: window layers allocate `min(want_ctx, window + ubatch)` rows and the backend
     // writes/reads position p at row `p % rows` (see `crate::seam::kv_rows_at` for the sizing and

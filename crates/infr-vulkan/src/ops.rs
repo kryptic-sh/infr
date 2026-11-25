@@ -668,7 +668,8 @@ impl VulkanBackend {
         push[16..20].copy_from_slice(&theta.to_ne_bytes());
         push[20..24].copy_from_slice(&0u32.to_ne_bytes()); // pos_offset
         push[24..28].copy_from_slice(&0u32.to_ne_bytes()); // out_base (eager: write at row 0)
-        self.run_kernel(k, &[x], t * n_heads * hd, &push, (t * n_heads) as u32)
+        let groups = (t * n_heads).div_ceil(crate::recorder::ROPE_WG) as u32;
+        self.run_kernel(k, &[x], t * n_heads * hd, &push, groups)
     }
 
     /// SwiGLU activation: `y[i] = silu(gate[i]) * up[i]`.
@@ -956,7 +957,9 @@ mod tests {
     #[ignore = "requires a Vulkan GPU"]
     fn rope_matches_host() {
         let be = VulkanBackend::new().unwrap();
-        let (t, nh, hd, rd, theta) = (4usize, 2usize, 8usize, 8usize, 10000.0f32);
+        // More (token, head) pairs than one workgroup holds, the last workgroup ragged, so a grid
+        // sized short of them leaves rows un-roped.
+        let (t, nh, hd, rd, theta) = (13usize, 11usize, 8usize, 8usize, 10000.0f32);
         let x: Vec<f32> = (0..t * nh * hd).map(|i| (i as f32) * 0.03).collect();
         let got = be.rope(&x, t, nh, hd, rd, theta).unwrap();
         // host reference (ggml NORM interleaved)

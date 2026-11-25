@@ -252,13 +252,11 @@ fn exps_layer(name: &str) -> Option<usize> {
 /// The context is `device.ctx` when set, else the trained context capped at
 /// [`CPU_BUDGET_CTX`] — a CPU generation sizes its cache to its own prompt and output, which is
 /// unknown when the arena is sized once for every generation the model will serve. The cache is
-/// priced at f16, the CPU default, without the sliding-window ring, which only shrinks it.
+/// priced by [`cpu_kv_bytes`].
 fn cpu_committed_bytes(ec: &EngineConfig, g: &Gguf, cfg: &Config) -> u64 {
     let ctx = crate::chat::cfg_ctx(ec, cfg.n_ctx_train)
         .unwrap_or_else(|| cfg.n_ctx_train.min(CPU_BUDGET_CTX));
-    // No backend exists when the arena is budgeted. The CPU backend rounds its cache neither way,
-    // which `cpu_kv_alloc_is_the_estimate_without_the_snapshot` checks on `CpuBackend` itself.
-    let kv = kv_bytes_estimate(cfg, ctx, false, 1, KvAlign::NONE, false);
+    let kv = cpu_kv_bytes(cfg, ec, ctx);
     let small: u64 = g
         .tensors()
         .iter()
@@ -268,6 +266,16 @@ fn cpu_committed_bytes(ec: &EngineConfig, g: &Gguf, cfg: &Config) -> u64 {
     kv + small
         + CPU_ACTIVATION_RESERVE
         + cpu_repack_reserve(ec, g.tensors(), infr_cpu::q4k_expert_repack_available())
+}
+
+/// The KV cache a CPU run of `ctx` tokens allocates, as the arena budget holds it back: in the
+/// formats the runner resolves on the CPU backend ([`kv_ladder_fmts`], which never takes the
+/// Vulkan-only auto-q8 pin), without the sliding-window ring, which only shrinks it. No backend
+/// exists when the arena is budgeted; the CPU backend rounds its cache neither way, which
+/// `cpu_kv_alloc_is_the_estimate_without_the_snapshot` checks on `CpuBackend` itself.
+fn cpu_kv_bytes(cfg: &Config, ec: &EngineConfig, ctx: usize) -> u64 {
+    let (k, v) = kv_ladder_fmts(cfg, ec, "cpu", false);
+    kv_bytes_estimate_fmt(cfg, ctx, false, 1, KvAlign::NONE, k, v)
 }
 
 /// What a layer-major prefill over the CPU's host arena holds between layers at most: one
@@ -1977,21 +1985,6 @@ impl KvAlign {
     }
 }
 
-/// [`kv_bytes_estimate_fmt`] with one format for both sides: `q8` prices them Q8_0, else f16. The
-/// pricing helper the CPU arena budget reads, so it reserves the cache the runner will allocate, a
-/// pinned auto-q8 cache included. A caller pricing a pair the user chose reads [`moe_kv_estimate`].
-pub(crate) fn kv_bytes_estimate(
-    cfg: &Config,
-    want_ctx: usize,
-    ring: bool,
-    ubatch: usize,
-    align: KvAlign,
-    q8: bool,
-) -> u64 {
-    let side = if q8 { DType::Q8_0 } else { DType::F16 };
-    kv_bytes_estimate_fmt(cfg, want_ctx, ring, ubatch, align, side, side)
-}
-
 /// Bytes of device memory one session slot's KV cache takes: every buffer of [`kv_slot_allocs`],
 /// each priced at what the device commits for it (`align.commit`), so the figure every fit and
 /// placement decision compares against a budget is the allocation itself and not a model of it.
@@ -2168,6 +2161,24 @@ pub(crate) fn dense_placement_fits(
     dense_resident_need(cfg, weights, want_ctx, ring, ubatch, align, k_fmt, v_fmt)
         .saturating_add(lm)
         <= vram.alloc_room()
+}
+
+/// Dense placement's residency check at one chunk height: [`dense_placement_fits`] at the KV pair
+/// the runner will allocate ([`kv_fit_fmts`]), `q8` being the auto-q8 pin or the candidate a rung
+/// prices. An explicit side is priced as the user set it, so a pinned f32 pair cannot be placed
+/// against an f16-sized cache, nor a pinned q8_0 pair refused a tier it fits.
+pub(crate) fn dense_resident_fits(
+    cfg: &Config,
+    ec: &EngineConfig,
+    weights: u64,
+    vram: &infr_vulkan::VramInfo,
+    want_ctx: usize,
+    ubatch: usize,
+    align: KvAlign,
+    q8: bool,
+) -> bool {
+    let (k, v) = kv_fit_fmts(cfg, ec, q8);
+    dense_placement_fits(cfg, ec, weights, vram, want_ctx, ubatch, align, k, v)
 }
 
 /// The TALLEST [`ubatch_candidates`] rung at which this dense session fits resident, or `None` when
@@ -2490,30 +2501,92 @@ pub(crate) fn resident_load_held(
     (weight_arena_floor(&units, cost), cost.staging)
 }
 
-/// The per-side KV dtypes a fit/footprint estimate must price: the user's explicit
-/// `INFR_KV_TYPE_K`/`_V` when set, else the default ladder (legacy `INFR_KV_Q8`, then a
-/// placement-pinned or candidate auto-q8, then f16) — the same ladder `parse_kv_fmt` walks in
-/// the runner. ESTIMATE ONLY in one direction: the runner additionally gates each format on
-/// backend/alignment and falls back to f16, so a gated-out low-bit request under-estimates
-/// here and the alloc-time VRAM guard backstops it.
-pub(crate) fn kv_fit_fmts(cfg: &Config, ec: &EngineConfig, auto_q8: bool) -> (DType, DType) {
+/// The (K, V) cache formats a session on `backend` allocates for `ec`'s KV settings, short of the
+/// MLA rule [`kv_session_fmts`] adds. The runner's choice and every footprint estimate
+/// ([`kv_fit_fmts`], [`cpu_kv_bytes`]) go through this one ladder, so a format the runner gates
+/// out is priced as the format it falls back to rather than as the one that was asked for.
+///
+/// Each side takes its requested format when `backend` reads it and the model's rows fit it:
+/// - turbo2/3/4 need whole 128-element WHT groups in every cache row ([`kv_turbo_align_ok`]);
+/// - q8_0 and the low-bit block quants need 32-element blocks ([`kv_row_align_ok`]);
+/// - f32/bf16 need only a backend that reads them (Vulkan converts both to an f16 scratch for its
+///   f16 attention, so there an f32 cache yields the f16 cache's numerics).
+///
+/// Every one of those runs on cpu, vulkan and metal only. A side left unset, named with a word
+/// nothing parses, or gated out falls to the default ladder: the legacy `kv.force_q8` alias, then
+/// `auto_q8` (the placement's q8 pin or a candidate it is pricing, honoured on Vulkan alone — the
+/// pin is a Vulkan placement decision and must not leak into a CPU oracle in the same process),
+/// then f16. The `*_specified` flags play no part here: an unparsed name still suppresses the
+/// auto-q8 pin ([`kv_unset`]), it just allocates f16.
+///
+/// deepseek4's V side follows K ([`kv_v_fmt`]). Metal's q8 and f32 attention reads BOTH sides as
+/// one dtype, so there a mixed pair with either on one side is coupled to f16; the prepass formats
+/// expand each side to its own f16 scratch and compose freely.
+pub(crate) fn kv_ladder_fmts(
+    cfg: &Config,
+    ec: &EngineConfig,
+    backend: &str,
+    auto_q8: bool,
+) -> (DType, DType) {
+    let backend_ok = matches!(backend, "cpu" | "vulkan" | "metal");
+    let align_ok = kv_row_align_ok(cfg);
+    let blk_ok = backend_ok && align_ok;
+    let turbo_ok = backend_ok && kv_turbo_align_ok(cfg);
     let side = |want: Option<DType>| match want {
-        Some(dt) => dt,
-        None if ec.kv.force_q8 || auto_q8 => DType::Q8_0,
-        None => DType::F16,
+        Some(dt @ (DType::Turbo2 | DType::Turbo3 | DType::Turbo4)) if turbo_ok => dt,
+        Some(
+            dt @ (DType::Q8_0
+            | DType::Q4_0
+            | DType::Q4_1
+            | DType::Q5_0
+            | DType::Q5_1
+            | DType::Iq4Nl),
+        ) if blk_ok => dt,
+        Some(dt @ (DType::Bf16 | DType::F32)) if backend_ok => dt,
+        Some(DType::F16) => DType::F16,
+        _ if ec.kv.force_q8 && blk_ok => DType::Q8_0,
+        _ if auto_q8 && backend == "vulkan" && align_ok => DType::Q8_0,
+        _ => DType::F16,
     };
     let k = side(ec.kv.type_k);
-    (k, kv_v_fmt(cfg, k, side(ec.kv.type_v)))
+    let v = kv_v_fmt(cfg, k, side(ec.kv.type_v));
+    let native_read = |dt| matches!(dt, DType::Q8_0 | DType::F32);
+    if backend == "metal" && k != v && (native_read(k) || native_read(v)) {
+        return (DType::F16, DType::F16);
+    }
+    (k, v)
+}
+
+/// The (K, V) cache formats the runner allocates for a session on `backend`: [`kv_ladder_fmts`],
+/// then the MLA rule ([`mla_kv_fmt`]), which forces f16 on a GPU deepseek2 session and refuses a
+/// non-f16 format the user named there rather than downgrading it.
+pub(crate) fn kv_session_fmts(
+    cfg: &Config,
+    ec: &EngineConfig,
+    backend: &str,
+    auto_q8: bool,
+) -> AResult<(DType, DType)> {
+    let (k, v) = kv_ladder_fmts(cfg, ec, backend, auto_q8);
+    mla_kv_fmt(cfg, backend, ec, k, v)
+}
+
+/// The per-side KV dtypes a Vulkan fit/footprint estimate prices: [`kv_session_fmts`] on `vulkan`,
+/// with `auto_q8` the placement's pin or the q8 candidate a rung is pricing, so every session the
+/// runner opens is priced at the formats it opens with.
+///
+/// A request the runner refuses (a non-f16 format named for a GPU deepseek2 session) opens no
+/// session and allocates nothing; the runner reports that refusal itself, before any cache is
+/// allocated, so until then the estimate prices the ladder's pair.
+pub(crate) fn kv_fit_fmts(cfg: &Config, ec: &EngineConfig, auto_q8: bool) -> (DType, DType) {
+    let ladder = kv_ladder_fmts(cfg, ec, "vulkan", auto_q8);
+    kv_session_fmts(cfg, ec, "vulkan", auto_q8).unwrap_or(ladder)
 }
 
 /// The KV bytes the MoE expert-placement budget holds back: [`kv_bytes_estimate_fmt`] at the pair
-/// the runner will allocate ([`kv_fit_fmts`]), in the backend's own rounding.
-///
-/// [`kv_bytes_estimate`] prices both sides as ONE format, which is only right while the user set
-/// neither side: an explicit `INFR_KV_TYPE_K`/`_V` pair (f32 both sides, or q8_0 on one) priced a
-/// cache the runner never allocates. Over-reserving pages experts for room the cache never took;
-/// under-reserving spends the difference and lands in the alloc-time VRAM guard mid-load, which is
-/// a backstop against over-commit, not a placement decision.
+/// the runner will allocate ([`kv_fit_fmts`]), in the backend's own rounding. Over-reserving pages
+/// experts for room the cache never takes; under-reserving spends the difference and lands in the
+/// alloc-time VRAM guard mid-load, which is a backstop against over-commit, not a placement
+/// decision.
 pub(crate) fn moe_kv_estimate(
     cfg: &Config,
     ec: &EngineConfig,
@@ -2872,7 +2945,7 @@ fn reclamp_ctx_with_host(
     };
     let explicit = ec.device.ctx.is_some();
     // q8_0 is tried only where the pre-load ladder may pick it on its own (`may_auto_q8`) and the
-    // runner reads a q8_0 pin (`parse_kv_fmt`'s placement arm is Vulkan-only).
+    // runner reads a q8_0 pin (`kv_ladder_fmts`'s auto-q8 arm is Vulkan-only).
     let q8_allowed =
         be.name() == "vulkan" && (k_fmt, v_fmt) == (DType::F16, DType::F16) && may_auto_q8(cfg, ec);
     let mut q8_walk = None;
@@ -2938,7 +3011,7 @@ fn reclamp_ctx_with_host(
         }
         CtxRung::ServeQ8(ctx) => {
             // Under the session's placement scope, so every later call of this session reads q8_0
-            // too (`parse_kv_fmt`); nothing is allocated in either format yet.
+            // too (`kv_ladder_fmts`); nothing is allocated in either format yet.
             pin_kv_auto_q8();
             tracing::warn!(
                 requested_ctx = want_ctx,
@@ -3477,11 +3550,8 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 // Per-layer rows: SWA layers ring at window+ubatch rows (see `kv_rows_at`), so a
                 // mostly-SWA model's KV prices far below n_layer * ctx.
                 let ring = kv_ring_wanted(cfg, ec);
-                // Price the pair the runner will allocate: `kv_fit_fmts` walks the same ladder
-                // `parse_kv_fmt` does, so an explicit format reserves its own bytes instead of a
-                // single-format guess. That guess over-reserved ~2× for an explicit q8_0 pair
-                // (avoidable expert paging) and under-reserved the same for f32, leaving the
-                // alloc-time guard to refuse the real cache mid-load.
+                // Price the pair the runner will allocate (`moe_kv_estimate`): an explicit format
+                // reserves its own bytes, a gated-out one its fallback's.
                 let kv_bytes: u64 =
                     moe_kv_estimate(cfg, ec, want_ctx, ring, ubatch_rows(ec), align);
                 // Budgeted against the ALLOCATOR's ceiling (`VramInfo::alloc_room`), like the
@@ -3765,8 +3835,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
         let vram = vk.vram();
         // Per-layer rows ring at window+ubatch rows (see `kv_rows_at`) — what lets a mostly-SWA
         // model (gemma-4-31B: 50/60 layers SWA) price its KV small enough to take the try-resident
-        // tier at real contexts instead of streaming. Explicit K/V formats must match the runner,
-        // so the pair comes from `kv_fit_fmts` (`q8` only fills a side the user left unset).
+        // tier at real contexts instead of streaming.
         let kv_fmts = |q8: bool| kv_fit_fmts(cfg, ec, q8);
         // Does weights + KV + the honest activation reserve fit at this (chunk, fmt)? Through the
         // SHARED predicate, so this decision and `kv_fit_ctx_for`'s price the same session against
@@ -3775,8 +3844,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
         // VRAM guard will refuse, and the two ladders picked different rungs (gemma-3-12b @131072:
         // the fit math validated the context at 256 rows while this went resident at 512).
         let fits = |ubatch: usize, q8: bool| {
-            let (k, v) = kv_fmts(q8);
-            dense_placement_fits(cfg, ec, fp.total(), &vram, want_ctx, ubatch, align, k, v)
+            dense_resident_fits(cfg, ec, fp.total(), &vram, want_ctx, ubatch, align, q8)
         };
         // Try-resident-first: a dense model goes FULLY RESIDENT (the exact pre-streaming fast
         // path) whenever weights + this session's KV + an HONEST dense activation estimate fit
@@ -6392,66 +6460,217 @@ mod seam_helper_tests {
         assert!(!super::kv_unset(&Config::default(), &q8));
     }
 
-    /// Dense placement prices the KV formats the runner will ALLOCATE, not a hardcoded pair: an
-    /// explicit side wins and only a side the user left unset falls to auto-q8, else f16. The
-    /// stale closure this replaces never read the config: `q8 = true` gave q8_0/q8_0 and
-    /// `q8 = false` gave f16/f16, right only where those two happened to agree. An explicit
-    /// format never pins auto-q8, so every pinned pair took the f16 arm — a pinned `f32` pair
-    /// priced at HALF the cache the runner allocates (a tier chosen against a cache that does not
-    /// fit), a pinned `q8_0` pair at nearly twice it (tiers refused that it did fit).
+    /// An `EngineConfig` with these KV sides named (`None` leaves a side unset).
+    fn kv_ec(k: Option<DType>, v: Option<DType>) -> EngineConfig {
+        EngineConfig {
+            kv: infr_core::config::KvCfg {
+                type_k: k,
+                type_k_specified: k.is_some(),
+                type_v: v,
+                type_v_specified: v.is_some(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// A one-format-per-layer dense model whose rows are `n_kv * head_dim` wide.
+    fn kv_geometry(n_kv: usize, head_dim: usize) -> Config {
+        Config {
+            n_layer: 2,
+            n_embd: 256,
+            n_head: 4,
+            n_kv,
+            head_dim,
+            ..Default::default()
+        }
+    }
+
+    /// Dense placement's residency check prices the KV pair the runner allocates: an explicit
+    /// side as the user set it, only an unset side falling to auto-q8 or f16. A pinned `f32` pair
+    /// priced as f16 is placed against half the cache the runner then allocates; a pinned `q8_0`
+    /// pair priced as f16 is refused a tier it fits.
     #[test]
     fn dense_placement_prices_explicit_kv_formats() {
-        let cfg = Config::default();
-        let explicit_q8 = EngineConfig {
+        let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
+        let cfg = qwen3_14b();
+        let vram = xtx(XTX_FREE);
+        let (ctx, ub, align) = (32768usize, 256usize, super::KvAlign::NONE);
+        let need =
+            |k: DType, v: DType| super::dense_resident_need(&cfg, 0, ctx, false, ub, align, k, v);
+        let fits = |ec: &EngineConfig, weights: u64| {
+            super::dense_resident_fits(&cfg, ec, weights, &vram, ctx, ub, align, false)
+        };
+
+        // Weights that leave exactly an f16 cache's room.
+        let f16_room = XTX_ROOM - need(DType::F16, DType::F16);
+        assert!(fits(&EngineConfig::default(), f16_room), "unset: f16 fits");
+        assert!(
+            !fits(&kv_ec(Some(DType::F32), Some(DType::F32)), f16_room),
+            "an f32 pair needs twice the f16 cache"
+        );
+
+        // Weights that leave exactly a q8_0 cache's room.
+        let q8_room = XTX_ROOM - need(DType::Q8_0, DType::Q8_0);
+        assert!(
+            !fits(&EngineConfig::default(), q8_room),
+            "unset: f16 does not fit"
+        );
+        assert!(
+            fits(&kv_ec(Some(DType::Q8_0), Some(DType::Q8_0)), q8_room),
+            "a q8_0 pair fits the room its own cache needs"
+        );
+        assert!(
+            !fits(&kv_ec(Some(DType::Q8_0), None), q8_room),
+            "V left unset stays f16, so the pair needs more than two q8_0 sides"
+        );
+    }
+
+    /// A format the runner gates out is priced as the format the runner falls back to. Row
+    /// widths: 2 x 64 = 128 is whole 32-blocks but its 64-wide heads are not whole 128-element WHT
+    /// groups; 1 x 40 is neither; 2 x 128 is both.
+    #[test]
+    fn kv_fit_fmts_prices_a_gated_out_format_as_its_fallback() {
+        let (no_turbo, no_blocks, aligned) =
+            (kv_geometry(2, 64), kv_geometry(1, 40), kv_geometry(2, 128));
+        let both = |dt| kv_ec(Some(dt), Some(dt));
+        let fmts = |cfg: &Config, ec: &EngineConfig| super::kv_fit_fmts(cfg, ec, false);
+        let f16 = (DType::F16, DType::F16);
+
+        for turbo in [DType::Turbo2, DType::Turbo3, DType::Turbo4] {
+            assert_eq!(
+                fmts(&no_turbo, &both(turbo)),
+                f16,
+                "{turbo:?} on 64-wide heads"
+            );
+            assert_eq!(
+                fmts(&aligned, &both(turbo)),
+                (turbo, turbo),
+                "{turbo:?} aligned"
+            );
+        }
+        for blk in [DType::Q8_0, DType::Q4_0, DType::Q5_1, DType::Iq4Nl] {
+            assert_eq!(fmts(&no_blocks, &both(blk)), f16, "{blk:?} on 40-wide rows");
+            assert_eq!(fmts(&aligned, &both(blk)), (blk, blk), "{blk:?} aligned");
+        }
+        let force_q8 = EngineConfig {
             kv: infr_core::config::KvCfg {
-                type_k: Some(DType::Q8_0),
-                type_k_specified: true,
-                type_v: Some(DType::Q8_0),
-                type_v_specified: true,
+                force_q8: true,
                 ..Default::default()
             },
             ..Default::default()
         };
         assert_eq!(
-            super::kv_fit_fmts(&cfg, &explicit_q8, false),
-            (DType::Q8_0, DType::Q8_0)
+            fmts(&no_blocks, &force_q8),
+            f16,
+            "the legacy alias is gated too"
+        );
+        assert_eq!(
+            super::kv_fit_fmts(&no_blocks, &EngineConfig::default(), true),
+            f16,
+            "and so is the auto-q8 candidate"
         );
 
-        let explicit_k_only = EngineConfig {
+        // In bytes, through the MoE budget: the gated-out turbo request reserves the f16 cache.
+        let price = |ec: &EngineConfig| {
+            super::moe_kv_estimate(&no_turbo, ec, 1000, false, 512, super::KvAlign::NONE)
+        };
+        assert_eq!(
+            price(&both(DType::Turbo3)),
+            price(&EngineConfig::default()),
+            "turbo3 on 64-wide heads allocates, and so prices, f16"
+        );
+    }
+
+    /// The placement estimate's formats are the runner's (`kv_session_fmts` on Vulkan, which the
+    /// runner calls) for every session the runner opens, across formats, alignments, the legacy
+    /// alias, the auto-q8 candidate and the MLA and V-follows-K architectures. Both sides call
+    /// the one resolver today, so this holds by construction; it is here to fail the day an
+    /// estimate stops going through it.
+    #[test]
+    fn kv_fit_fmts_match_the_runner_resolution() {
+        let mut dsv4 = kv_geometry(1, 128);
+        dsv4.deepseek4 = true;
+        let models = [
+            kv_geometry(2, 128),
+            kv_geometry(2, 64),
+            kv_geometry(1, 40),
+            deepseek_v2_lite_kv(),
+            dsv4,
+        ];
+        let unparsed = EngineConfig {
             kv: infr_core::config::KvCfg {
-                type_k: Some(DType::Q8_0),
                 type_k_specified: true,
                 ..Default::default()
             },
             ..Default::default()
         };
-        assert_eq!(
-            super::kv_fit_fmts(&cfg, &explicit_k_only, false),
-            (DType::Q8_0, DType::F16),
-            "V was left unset, so it takes the ladder's f16 (auto-q8 off)"
+        let named = [
+            None,
+            Some(DType::F16),
+            Some(DType::F32),
+            Some(DType::Bf16),
+            Some(DType::Q8_0),
+            Some(DType::Q4_0),
+            Some(DType::Turbo3),
+        ];
+        let mut ecs = vec![unparsed];
+        for k in named {
+            for v in named {
+                for force_q8 in [false, true] {
+                    let mut ec = kv_ec(k, v);
+                    ec.kv.force_q8 = force_q8;
+                    ecs.push(ec);
+                }
+            }
+        }
+        let mut opened = 0;
+        for cfg in &models {
+            for ec in &ecs {
+                for auto_q8 in [false, true] {
+                    if let Ok(runner) = super::kv_session_fmts(cfg, ec, "vulkan", auto_q8) {
+                        opened += 1;
+                        assert_eq!(
+                            super::kv_fit_fmts(cfg, ec, auto_q8),
+                            runner,
+                            "{:?}/{:?} force_q8={} auto_q8={auto_q8} on {}x{}",
+                            ec.kv.type_k,
+                            ec.kv.type_v,
+                            ec.kv.force_q8,
+                            cfg.n_kv,
+                            cfg.head_dim
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            opened > ecs.len(),
+            "the matrix opened sessions on several models"
         );
+    }
 
-        // The wrong-tier direction: f32 KV is 4 B/elem on both sides and the runner honours it,
-        // so a placement that priced f16 would reserve half the cache it then allocates.
-        let explicit_f32 = EngineConfig {
-            kv: infr_core::config::KvCfg {
-                type_k: Some(DType::F32),
-                type_k_specified: true,
-                type_v: Some(DType::F32),
-                type_v_specified: true,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
+    /// The CPU arena budget holds back the cache the CPU runner allocates, an explicit f32 pair at
+    /// twice the f16 default and a gated-out format at its fallback.
+    #[test]
+    fn cpu_arena_prices_the_kv_formats_the_cpu_runner_allocates() {
+        let cfg = kv_geometry(2, 128);
+        let ctx = 1000;
+        let bytes = |ec: &EngineConfig| super::cpu_kv_bytes(&cfg, ec, ctx);
+        let f16 = bytes(&EngineConfig::default());
+        let fmt_bytes =
+            |k, v| super::kv_bytes_estimate_fmt(&cfg, ctx, false, 1, super::KvAlign::NONE, k, v);
+        assert_eq!(f16, fmt_bytes(DType::F16, DType::F16));
+        assert_eq!(bytes(&kv_ec(Some(DType::F32), Some(DType::F32))), 2 * f16);
         assert_eq!(
-            super::kv_fit_fmts(&cfg, &explicit_f32, false),
-            (DType::F32, DType::F32)
+            bytes(&kv_ec(Some(DType::Q8_0), None)),
+            fmt_bytes(DType::Q8_0, DType::F16)
         );
-
+        let no_turbo = kv_geometry(2, 64);
         assert_eq!(
-            super::kv_fit_fmts(&cfg, &EngineConfig::default(), true),
-            (DType::Q8_0, DType::Q8_0),
-            "nothing specified: the auto-q8 candidate fills both sides"
+            super::cpu_kv_bytes(&no_turbo, &kv_ec(Some(DType::Turbo3), None), ctx),
+            super::cpu_kv_bytes(&no_turbo, &EngineConfig::default(), ctx),
+            "turbo3 on 64-wide heads allocates f16 on the CPU too"
         );
     }
 
@@ -7627,7 +7846,7 @@ mod seam_helper_tests {
             }
         }
 
-        /// A backend named as Vulkan, whose runner reads a q8_0 pin (`parse_kv_fmt`).
+        /// A backend named as Vulkan, whose runner reads a q8_0 pin (`kv_ladder_fmts`).
         fn vulkan(room: u64) -> Self {
             Self {
                 room: Some(room),

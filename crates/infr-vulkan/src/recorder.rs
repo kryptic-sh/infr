@@ -317,6 +317,11 @@ fn assert_native_k(kernel: &str, in_f: usize) {
     );
 }
 
+/// Threads per `rope.comp` workgroup, one per (token, head): a rope grid is this many times fewer
+/// workgroups than the (token, head) pairs it covers. MIRRORS the shader's `local_size_x`;
+/// `rope_wg_matches_shader` fails on a drift.
+pub(crate) const ROPE_WG: usize = 64;
+
 /// 32-element blocks `quant_q8.comp` quantizes per workgroup, one subgroup each. MIRRORS the
 /// shader's `QUANT_Q8_BLOCKS_PER_WG`; `quant_q8_blocks_per_wg_matches_shader` fails on a drift.
 pub(crate) const QUANT_Q8_BLOCKS_PER_WG: usize = 8;
@@ -5553,7 +5558,7 @@ impl<'a> Recorder<'a> {
                     &[Self::vkb(x), Self::vkb(ff), Self::vkb(y)],
                     1,
                     &push,
-                    (t * n_heads).div_ceil(64) as u32,
+                    (t * n_heads).div_ceil(ROPE_WG) as u32,
                 );
             }
             None => {
@@ -5571,7 +5576,7 @@ impl<'a> Recorder<'a> {
                     &[Self::vkb(x), Self::vkb(y)],
                     1,
                     &push,
-                    (t * n_heads).div_ceil(64) as u32,
+                    (t * n_heads).div_ceil(ROPE_WG) as u32,
                 );
             }
         }
@@ -5614,7 +5619,7 @@ impl<'a> Recorder<'a> {
                     &[Self::vkb(x), Self::vkb(ff), Self::vkb(y)],
                     1,
                     &push,
-                    (t * n_heads).div_ceil(64) as u32,
+                    (t * n_heads).div_ceil(ROPE_WG) as u32,
                 );
             }
             None => {
@@ -5626,7 +5631,7 @@ impl<'a> Recorder<'a> {
                     &[Self::vkb(x), Self::vkb(y)],
                     1,
                     &push,
-                    (t * n_heads).div_ceil(64) as u32,
+                    (t * n_heads).div_ceil(ROPE_WG) as u32,
                 );
             }
         }
@@ -5667,7 +5672,7 @@ impl<'a> Recorder<'a> {
                     &[Self::vkb(x), Self::vkb(params), Self::vkb(ff), Self::vkb(y)],
                     1,
                     &push,
-                    (t * n_heads).div_ceil(64) as u32,
+                    (t * n_heads).div_ceil(ROPE_WG) as u32,
                 );
             }
             None => {
@@ -5679,7 +5684,7 @@ impl<'a> Recorder<'a> {
                     &[Self::vkb(x), Self::vkb(params), Self::vkb(y)],
                     1,
                     &push,
-                    (t * n_heads).div_ceil(64) as u32,
+                    (t * n_heads).div_ceil(ROPE_WG) as u32,
                 );
             }
         }
@@ -6707,7 +6712,7 @@ impl<'a> Recorder<'a> {
                     &[Self::vkb(x), Self::vkb(ff), Self::vkb(y)],
                     1,
                     &push,
-                    (t * n_heads).div_ceil(64) as u32,
+                    (t * n_heads).div_ceil(ROPE_WG) as u32,
                 );
             }
             None => {
@@ -6719,7 +6724,7 @@ impl<'a> Recorder<'a> {
                     &[Self::vkb(x), Self::vkb(y)],
                     1,
                     &push,
-                    (t * n_heads).div_ceil(64) as u32,
+                    (t * n_heads).div_ceil(ROPE_WG) as u32,
                 );
             }
         }
@@ -6765,7 +6770,7 @@ impl<'a> Recorder<'a> {
                     &[Self::vkb(x), Self::vkb(params), Self::vkb(ff), Self::vkb(y)],
                     1,
                     &push,
-                    (t * n_heads).div_ceil(64) as u32,
+                    (t * n_heads).div_ceil(ROPE_WG) as u32,
                 );
             }
             None => {
@@ -6780,7 +6785,7 @@ impl<'a> Recorder<'a> {
                     &[Self::vkb(x), Self::vkb(params), Self::vkb(y)],
                     1,
                     &push,
-                    (t * n_heads).div_ceil(64) as u32,
+                    (t * n_heads).div_ceil(ROPE_WG) as u32,
                 );
             }
         }
@@ -12176,6 +12181,13 @@ mod tests {
     }
 
     #[test]
+    fn rope_wg_matches_shader() {
+        let src = include_str!("../shaders/rope.comp");
+        let want = format!("layout(local_size_x = {ROPE_WG}, local_size_y = 1, local_size_z = 1)");
+        assert!(src.contains(&want), "rope.comp lacks `{want}`");
+    }
+
+    #[test]
     fn quant_q8_hi_ratio_matches_shader() {
         let src = include_str!("../shaders/quant_q8.comp");
         let want = format!("#define QUANT_Q8_HI_RATIO {QUANT_Q8_HI_RATIO:.1}");
@@ -12507,7 +12519,9 @@ mod tests {
         // Not a multiple of the workgroup width or of `SPLIT_AT`, so the split grid has a ragged
         // last workgroup and padding workgroups after it.
         const N: usize = 64 * 10 + 5;
-        // Row-shaped cases.
+        // Row-shaped cases. The rope family takes ROWS tokens of W heads: one thread per (token,
+        // head) pair in `ROPE_WG`-wide workgroups, so its grid is N threads like the elementwise
+        // kernels'.
         const ROWS: usize = 5;
         const W: usize = 129;
         const _: () = assert!(ROWS * W == N);
@@ -12520,7 +12534,7 @@ mod tests {
         const NQ8: usize = 32 * 11;
         // `quant_q8`: QUANT_Q8_BLOCKS_PER_WG blocks per workgroup, the last workgroup ragged.
         const NQ8B: usize = 32 * (QUANT_Q8_BLOCKS_PER_WG * 4 + 3);
-        // Workgroup-per-unit kernels (rope family, attention, qk_norm_rope, linear_bf16).
+        // Workgroup-per-unit kernels (attention, qk_norm_rope, linear_bf16).
         const HD: usize = 64;
         const UNITS: usize = 5;
         // `linear_f32_mo` outputs.

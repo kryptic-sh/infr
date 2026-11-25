@@ -46,32 +46,74 @@ Provenance tags point at the finding that opened the item:
    is not applied. Reported and not confirmed by us: the first image request
    dequantises the whole token-embedding table to host RAM. It adds `gemm` and
    `image` as always-on dependencies of `infr-llama`.
-3. **Bugs found in the #109 fork that are still on `main`** (offered to the
-   author as PRs on the issue; fix here and credit them if none arrives):
-   - `vulkan_moe_binder`'s `kv_fmts` closure prices the KV cache from
-     `kv_auto_q8()` alone and ignores an explicit `kv.type_k`/`type_v`, so a
-     q8_0 cache is priced as f16 (their `a300d038`).
-   - `attention.head_count_kv` stored as a per-layer array is read through
-     `meta_u64`, which answers nothing for an array, so `n_kv` silently becomes
-     `n_head` on such a Qwen3.5 file (config half of their `5e513b96`).
-   - `rope.comp` dispatches a 64-thread workgroup per (token, head) pair
-     (`dispatch_wide(..., t * n_heads)` in `recorder.rs`); performance only,
-     prefill unmeasured (their `15149a26`).
-4. **Plan 15 slice R0:** confirm with a run, then fix, that a spilled KV cache
+3. **Plan 15 slice R0:** confirm with a run, then fix, that a spilled KV cache
    is refused at load when the weights stream and the host tier sizes itself
    (read from code only).
-5. **Plan 14 slices L and W** (placement label; bounded wait at start-up).
-6. **Owner decisions still open:** the defaults of `quant_q8.experts_hi` (now
+4. **Plan 14 slices L and W** (placement label; bounded wait at start-up).
+5. **Owner decisions still open:** the defaults of `quant_q8.experts_hi` (now
    about 1% of MoE prefill) and `mmv_mw.moe_float` (free on Qwen3-30B-A3B, 3.3%
-   of decode on ERNIE on the RX 7900 XTX, 18.4% on the integrated GPU); whether
-   to run `rustup update stable` (local 1.98.1 against CI's newer stable).
-7. Then B-DECISIONS-2026-11-25 from item 3 on.
+   of decode on ERNIE on the RX 7900 XTX, 18.4% on the integrated GPU).
+6. Then B-DECISIONS-2026-11-25 from item 3 on.
+
+Not verified in the follow-ups to PRs 113–116 (one KV format resolver,
+`seam::kv_ladder_fmts`; per-block `head_count_kv`; the eager rope grid): no
+Qwen3.5 GGUF with a per-block `head_count_kv` array was available, so the array
+path ran on synthetic fixtures only (both cached Qwen3.5 files write the
+scalar); the NextN block's entry is held to the attention blocks' count, which
+no real file has confirmed; Metal's coupled-f16 clamp moved into the resolver
+unrun on Metal; the rope grid change was not measured for prefill.
 
 Not verified in the slice pushed as `54448f08`: the pipeline, tensor-parallel
 and expert-parallel paths with `mmv_mw.moe_float` on (only the shared cut,
 `multi::segment`, is tested); the layer-span mark in the seam's graph builder;
 the MTP draft head keeps int8 GEMVs with the switch on (a choice, not checked
 for effect on acceptance); nothing ran on Windows or Metal.
+
+### B-IMAGE-INPUT — image input for vision models: how it is to be built (2026-11-26)
+
+**Kind:** planned feature, not started; the owner's direction, given on PR #110.
+
+PR #110 (Gemma 4 image input, an outside contribution) was not taken: its vision
+encoder was a separate CPU forward pass on new dependencies (`gemm`, `image`),
+unverified against a reference. The direction, posted on the PR:
+
+- **The vision encoder and projector run on the seam**, as a graph, so CPU,
+  Vulkan and Metal all run it, it has a CPU reference and tolerance rows, and it
+  sits in the memory budget. No matrix-multiply dependency.
+- **Image files go through `crcbl-image`** (our crate, another repo) behind an
+  optional cargo feature: PNG, JPEG, WebP and BMP decoders written for untrusted
+  input, and `data_url::parse` for the `data:` URI. Requested from the crcbl
+  session on 2026-11-26 and queued there, to ship as one version: a Pillow-style
+  bicubic resize (`resize_pillow`, matching llama.cpp byte for byte on opaque
+  input per that session's check), header-only dimensions with format sniffing,
+  normalised float output (interleaved RGB, `(u8/255 - mean) / std`), EXIF
+  orientation applied by default with an opt-out, and GIF at lowest priority.
+- **For parity with llama.cpp when wiring it in:** make the image opaque before
+  resizing (alpha set to 255, colour unchanged: llama.cpp drops alpha at load),
+  resize with the bicubic filter, and pass the EXIF opt-out so stored pixels are
+  kept. Whether infr should later honour orientation is undecided.
+- **What the PR's review found, which any version must get right:** image spans
+  need non-causal attention and must not be split across prefill chunks
+  (`mtmd_decode_use_non_causal` is true for GEMMA4V); each vision block's output
+  is multiplied by a per-layer scale (`ls_out_w` in `clip.cpp`); embeddings and
+  then logits must be compared with llama.cpp's; only the image rows of the
+  token embedding need replacing, never a host copy of the whole table; KV reuse
+  should not stop at the first image; and limits should not count images the
+  client resends from earlier turns.
+
+### B-KQ-FMA-BW-IGPU — `kq_fma_mrow_bw` trips the integrated GPU's watchdog (2026-11-26)
+
+**Kind:** failing ignored test, on `main` before and after PR #111; not
+diagnosed.
+
+`INFR_DEV=Vulkan1 cargo test --release -p infr-vulkan --test kq_fma_gemv -- --include-ignored kq_fma_mrow_bw`
+fails on the Ryzen integrated GPU (RADV): after printing its bandwidth table the
+backend reports that a segment of 32 `native_mrow_q4k` dispatches was signalled
+complete without its closing timestamp (the driver reset the GPU). It is a
+bandwidth bench, ignored by default, and the other tests of that file pass. Not
+known: whether the bench's dispatches bypass the work-bounded submit splitter
+that keeps production forwards inside the watchdog. It passes on the RX 7900
+XTX.
 
 ### B-DECISIONS-2026-11-25 — owner's decisions, and the slices they queue (2026-11-25)
 
@@ -2353,14 +2395,14 @@ only its routed experts (`CpuBackend::moe_banks`). Left:
   MiB by default) whenever the fused Q4_K expert path can fill it, though the
   packs a run actually keeps may be fewer; not measured on a paged Q4_K MoE
   model (qwen35moe, gemma4's MoE).
-- **`cpu_committed_bytes` prices the KV cache at f16**, the CPU default; a
-  user-named f32 KV is under-priced. It goes through `kv_bytes_estimate`, the
-  function the GPU fit uses, so V4's compressed caches are priced at what the
-  session allocates for them (`dsv4_comp_allocs`, each buffer
-  `Dsv4CompBuf::bytes`), and the raw cache is priced at the whole context
-  without the sliding-window ring the CPU uses, which over-prices it
-  (conservative). The 1 GiB activation reserve is a reserve, not a measurement
-  per model.
+- **`cpu_committed_bytes` prices the KV cache without the sliding-window ring**
+  (`cpu_kv_bytes`): in the formats the runner resolves on the CPU
+  (`kv_ladder_fmts`), through `kv_bytes_estimate_fmt`, the function the GPU fit
+  uses, so V4's compressed caches are priced at what the session allocates for
+  them (`dsv4_comp_allocs`, each buffer `Dsv4CompBuf::bytes`), but the raw cache
+  is priced at the whole context without the ring the CPU uses, which
+  over-prices it (conservative). The 1 GiB activation reserve is a reserve, not
+  a measurement per model.
 - **A V4 prompt of several chunks now prefills layer-major and reads each routed
   expert once (2026-11-17); what that left.** `docs/deepseek.md` § "Layer-major
   prefill on the CPU" has the design, the tests and the runs. On the real file a

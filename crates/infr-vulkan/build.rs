@@ -3629,16 +3629,28 @@ fn main() {
                 dst_stem.to_string(),
                 defines.iter().map(|d| d.to_string()).collect::<Vec<_>>(),
             );
+            let mut out = vec![base.clone()];
+            // Packed-metadata Q4_K twin of the OUTS4 int8 decode/verify layout (`-DQ4K_PACKED_META`):
+            // one aligned 16-byte header load per sub-block instead of the byte/half loads of d,
+            // dmin and the twelve packed scale bytes. Same dots, same lane layout — the scalar build
+            // stays beside it for an exact A/B. The fused-quant builds are left alone because they
+            // are not measured: `mmv_q4k_meta` is opt-in on the builds that were.
+            let f = &base.2;
+            if base.0 == "native_mmv_mrow"
+                && f.iter().any(|d| d == "-DFMT_Q4K")
+                && f.iter().any(|d| d == "-DOUTS4")
+                && !f.iter().any(|d| d == "-DFUSE_QUANT")
+            {
+                let mut meta = base.2.clone();
+                meta.push("-DQ4K_PACKED_META".to_string());
+                out.push((base.0.clone(), format!("{}_packed_meta", base.1), meta));
+            }
             if SG16_SOURCES.contains(src_stem) {
                 let mut sg_defines = base.2.clone();
                 sg_defines.push("-DSG=16".to_string());
-                vec![
-                    base.clone(),
-                    (src_stem.to_string(), format!("{dst_stem}_sg16"), sg_defines),
-                ]
-            } else {
-                vec![base]
+                out.push((src_stem.to_string(), format!("{dst_stem}_sg16"), sg_defines));
             }
+            out
         })
         .collect();
     // STREAMED weight builds (resident-BDA): the `-DSTREAMED` build reads the weight from a

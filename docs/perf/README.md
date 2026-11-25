@@ -23,6 +23,9 @@ headline.
 - **[kernels.md](kernels.md)** — cross-backend fast-kernel coverage: which
   weight-quant formats have a native kernel on CPU / Vulkan / Metal, and each
   backend's decode strategy.
+- **[vulkan-q4k-packed-meta.md](vulkan-q4k-packed-meta.md)** — the Q4_K decode
+  GEMV's packed 16-byte header load: what the prequantized microbench buys, why
+  decode on a discrete card gains nothing from it, and why it ships opt-in.
 - **[cpu.md](cpu.md)** — the CPU backend's perf notes: the two-regime model
   (decode DRAM-bound, prefill cache-bound) and the native int8-quant landing
   history. Open items are in `backlog.md` § B101.

@@ -24,6 +24,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   request draws from the same distribution, but on a backend that samples on the
   GPU or runs MTP it may not reproduce the tokens the same seed gives without
   `logprobs`.
+- **`infr_core::config::VulkanCfg` gains `mmv_q4k_meta`** (off by default,
+  `INFR_MMV_Q4K_META`), the packed Q4_K header load in the four-output int8
+  decode GEMV, so a struct literal of it must set it or use
+  `..Default::default()`.
 - **`infr_core::graph::Op` gains `AttnTemp`**, the position-dependent attention
   temperature, so an exhaustive match on `Op` must handle it.
 - **`infr_cpu::op_tap::TappedOp` gains `Mla`, `MulVec` and `AttnTemp`**, so an

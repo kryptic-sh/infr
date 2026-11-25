@@ -236,6 +236,7 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     v.mmv = presence_inv(get, "INFR_NO_MMV");
     v.mmv_decode = presence(get, "INFR_MMV_DECODE");
     v.mmv_m4 = presence_inv(get, "INFR_NO_MMV_M4");
+    v.mmv_q4k_meta = presence(get, "INFR_MMV_Q4K_META");
     v.mmv_o4 = presence_inv(get, "INFR_NO_MMV_O4");
     // Tri-state: "0" ⇒ force off, any other value ⇒ force on, unset ⇒ the vendor default.
     v.mmv_mw = get("INFR_MMV_MW").map(|s| Some(s != "0"));

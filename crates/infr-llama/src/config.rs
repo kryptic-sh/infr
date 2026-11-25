@@ -452,6 +452,51 @@ fn positive_array_model_dimension(
     positive_model_dimension(&format!("{key}[{index}]"), value).map(Some)
 }
 
+fn qwen35_kv_heads(
+    g: &dyn WeightSource,
+    key: &str,
+    n_layer_all: usize,
+    n_layer: usize,
+    full_attn_interval: usize,
+    fallback: usize,
+) -> Result<usize> {
+    let Some(value) = g.metadata().get(key) else {
+        return Ok(fallback);
+    };
+    let MetaValue::Arr(values) = value else {
+        let value = value
+            .as_u64()
+            .with_context(|| format!("{key} must be an integer or per-layer array"))?;
+        return positive_model_dimension(key, value);
+    };
+    if values.len() != n_layer_all {
+        bail!(
+            "{key} has {} entries; block_count is {n_layer_all}",
+            values.len()
+        );
+    }
+
+    let mut full_attention_heads = None;
+    for (layer, value) in values.iter().take(n_layer).enumerate() {
+        let value = value
+            .as_u64()
+            .with_context(|| format!("{key}[{layer}] must be an integer"))?;
+        if full_attn_interval > 0 && (layer + 1).is_multiple_of(full_attn_interval) {
+            let heads = positive_model_dimension(&format!("{key}[{layer}]"), value)?;
+            if let Some(expected) = full_attention_heads {
+                if heads != expected {
+                    bail!("{key} has inconsistent KV head counts on full-attention layers");
+                }
+            } else {
+                full_attention_heads = Some(heads);
+            }
+        } else if value != 0 {
+            bail!("{key}[{layer}] must be zero on a recurrent layer");
+        }
+    }
+    full_attention_heads.context("Qwen3.5 has no full-attention KV head count")
+}
+
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl Config {
     /// Whether layer `il` uses sliding-window (vs full) attention. gemma interleaves SWA with full
@@ -1147,6 +1192,11 @@ impl Config {
             );
         }
         let n_layer = n_layer_all - n_layer_nextn;
+        let full_attn_interval = if qwen35 {
+            meta_u64(g, &mk("full_attention_interval")).unwrap_or(4) as usize
+        } else {
+            0
+        };
         // ── DeepSeek V4 hyperparameters (`deepseek4.cpp::load_arch_hparams`) ──────────────────
         // Everything here is read with a plain `get_key` in the reference, so absence is a broken
         // file rather than an older revision to default around: V4 shipped with all of them.
@@ -1312,6 +1362,15 @@ impl Config {
         // DeepSeek2 MLA: n_kv is always 1 (single key head shared by all query heads).
         let n_kv = if deepseek2 {
             1
+        } else if qwen35 {
+            qwen35_kv_heads(
+                g,
+                &mk("attention.head_count_kv"),
+                n_layer_all,
+                n_layer,
+                full_attn_interval,
+                n_head,
+            )?
         } else {
             match meta_u64(g, &mk("attention.head_count_kv")) {
                 Some(value) => positive_model_dimension(&mk("attention.head_count_kv"), value)?,
@@ -1619,11 +1678,6 @@ impl Config {
         // qwen35 (gated-DeltaNet hybrid) extras — ports of the old seam's `qwen35::Cfg::from_gguf`.
         // These metadata keys sit directly under `qwen35.*` (NOT `qwen35.attention.*`), matching the
         // old seam's parser exactly.
-        let full_attn_interval = if qwen35 {
-            meta_u64(g, &mk("full_attention_interval")).unwrap_or(4) as usize
-        } else {
-            0
-        };
         if qwen35 {
             check_recurrent_layers(
                 g,
@@ -3522,6 +3576,54 @@ mod tests {
         );
         // One scalar for every block: all-recurrent is not the interval's layout.
         assert!(with("q35-recr-scalar", Meta::Bool(true)).is_err());
+    }
+
+    #[test]
+    fn qwen35_per_layer_kv_heads_use_full_attention_values() {
+        let mut keys = QWEN35_BASE_KEYS.to_vec();
+        keys.iter_mut()
+            .find(|(key, _)| *key == "attention.head_count")
+            .unwrap()
+            .1 = 4;
+        keys.iter_mut()
+            .find(|(key, _)| *key == "block_count")
+            .unwrap()
+            .1 = 4;
+        keys.push(("full_attention_interval", 2));
+        keys.push(("ssm.conv_kernel", 4));
+        let mut model = arch_fixture("qwen35", &keys);
+        model.meta.push((
+            "qwen35.attention.head_count_kv".into(),
+            Meta::U32Arr(vec![0, 2, 0, 2]),
+        ));
+
+        let cfg = config_from_fixture("q35-layer-kv", &model).unwrap();
+        assert_eq!(cfg.n_head, 4);
+        assert_eq!(cfg.n_kv, 2);
+    }
+
+    /// The scalar form stays accepted for qwen35: one KV head count for every attention layer.
+    #[test]
+    fn qwen35_scalar_kv_heads_still_parse() {
+        let mut keys = QWEN35_BASE_KEYS.to_vec();
+        keys.iter_mut()
+            .find(|(key, _)| *key == "attention.head_count")
+            .unwrap()
+            .1 = 4;
+        keys.iter_mut()
+            .find(|(key, _)| *key == "block_count")
+            .unwrap()
+            .1 = 4;
+        keys.push(("full_attention_interval", 2));
+        keys.push(("ssm.conv_kernel", 4));
+        let mut model = arch_fixture("qwen35", &keys);
+        model
+            .meta
+            .push(("qwen35.attention.head_count_kv".into(), Meta::U32(2)));
+
+        let cfg = config_from_fixture("q35-scalar-kv", &model).unwrap();
+        assert_eq!(cfg.n_head, 4);
+        assert_eq!(cfg.n_kv, 2);
     }
 
     /// B133: a shared gemma4 layer reads its K/V from an earlier own-KV layer

@@ -205,11 +205,12 @@ Now both run one function, `adapter::quant_linear`, with the weight given as an
 address plus the resident buffer when there is one. A streamed slot skips only
 the opt-in tiers whose kernel binds the weight buffer (`_cm8`, fp8, int8 Q8_0
 and bf16 coopmat), reads the narrow Q4_K mmq through its arena-addressed build,
-and keeps the chunked per-row GEMV for a weight past the u32 addressing cap or a
-non-coopmat grid past the device's x limit (`tiled_gemm_fits`). A resident
-weight takes that GEMV too at up to the multi-row band's 16 rows, where the
-multi-row GEMVs, which are not chunked, used to take a breaching weight; past 16
-rows the resident Linear still fails loudly, as before. With `INFR_CM_8X8`,
+and keeps the chunked per-row GEMV for a weight past the u32 addressing cap
+(`bda_weight_breaches`). A non-coopmat grid past the x limit stays on its tiled
+GEMM, which splits it (`dispatch_wide`, since plan 13 S9). A resident weight
+takes that GEMV too at up to the multi-row band's 16 rows, where the multi-row
+GEMVs, which are not chunked, used to take a breaching weight; past 16 rows the
+resident Linear still fails loudly, as before. With `INFR_CM_8X8`,
 `INFR_F8_COOPMAT`, `INFR_I8_COOPMAT` or `INFR_BF16_COOPMAT` set, a streamed
 Linear takes the next tier down from its resident twin, so the bit-identity
 below holds on the default configuration only. The quantised-activation memo is

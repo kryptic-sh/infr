@@ -632,6 +632,10 @@ pub(crate) struct KernelLimits {
     pub(crate) workgroup_invocations: u32,
     /// `maxComputeWorkGroupSize`.
     pub(crate) workgroup_size: [u32; 3],
+    /// `maxComputeWorkGroupCount[0]`: the widest grid a dispatch may name in x. Read by the
+    /// batched-MoE expert GEMMs, whose grid cannot be split (`Recorder::expert_grid_x_or_refuse`);
+    /// `Recorder::dispatch_wide` still splits at the guaranteed minimum.
+    pub(crate) workgroup_count_x: u32,
 }
 
 impl KernelLimits {
@@ -640,6 +644,7 @@ impl KernelLimits {
             push_constants: limits.max_push_constants_size,
             workgroup_invocations: limits.max_compute_work_group_invocations,
             workgroup_size: limits.max_compute_work_group_size,
+            workgroup_count_x: limits.max_compute_work_group_count[0],
         }
     }
 
@@ -1450,6 +1455,7 @@ mod tests {
             push_constants: 128,
             workgroup_invocations: 128,
             workgroup_size: [128, 128, 64],
+            workgroup_count_x: 65_535,
         };
         let desktop = KernelLimits {
             workgroup_invocations: 1024,

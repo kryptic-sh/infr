@@ -78,8 +78,13 @@ float wload(uint e) { return uintBitsToFloat(NWD(e)); }
 void main() {
     w_ptr = (uint64_t(pc.arena_hi) << 32) | uint64_t(pc.arena_lo); // resident tensor base byte address
     uint tilesN = pc.n / BN;
-    uint wgRow = (gl_WorkGroupID.x / tilesN) * BM;
-    uint wgCol = (gl_WorkGroupID.x % tilesN) * BN;
+    // `Recorder::dispatch_wide`'s flat index: a tile grid wider than `Recorder::MAX_GROUP_COUNT_X`
+    // arrives as rows of gl_NumWorkGroups.x tiles, and the padding tiles of its last row exit
+    // here. The exit is uniform across the workgroup, so no barrier is left half-reached.
+    uint tile = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    if (tile >= ((pc.m + BM - 1u) / BM) * tilesN) { return; }
+    uint wgRow = (tile / tilesN) * BM;
+    uint wgCol = (tile % tilesN) * BN;
     uint li = gl_LocalInvocationIndex;
     uint tr = li / (BN / TN);
     uint tc = li % (BN / TN);

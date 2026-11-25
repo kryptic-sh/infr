@@ -766,13 +766,35 @@ fn embed_gather_folds(vocab: usize, ne: usize, row_stride: usize, caps: (u64, u6
     (vocab as u64) * (ne as u64) >= elem_cap || (vocab as u64) * (row_stride as u64) >= byte_cap
 }
 
-/// The flat workgroup grid of the non-coopmat prefill GEMMs ([`Recorder::matmul_mmq_at`],
-/// [`Recorder::matmul_fma_at`]): one workgroup per square output tile of the kernels' BM = BN,
-/// indexed by `gl_WorkGroupID.x` alone. The adapter's grid-limit guard reads the same count.
+/// The flat workgroup grid of the dense tiled GEMMs without matrix units
+/// ([`Recorder::matmul_mmq_at`], [`Recorder::matmul_fma_at`], [`Recorder::matmul_mmq_q4k`],
+/// [`Recorder::matmul_mmq_q6k`]): one workgroup per square output tile of the kernels' BM = BN.
+/// Recorded through `Recorder::dispatch_wide`, so a count past the x limit takes the 2-D split
+/// and the shaders rebuild the flat tile index.
 pub(crate) fn nc_gemm_groups(m: usize, n: usize) -> usize {
     /// The kernels' output tile edge (`native_gemm_mmq*` / `native_gemm_fma.comp`).
     const TILE: usize = 64;
     m.div_ceil(TILE) * (n / TILE)
+}
+
+/// The x workgroup count of the batched-MoE expert GEMMs' grid ([`Recorder::matmul_mmq_experts`]
+/// and its paged twin) — `rows` worst-case row tiles of `bm` times the `bn`-wide column tiles of
+/// `n` — or, as the error, that count when it is past `max_x`. Their `.y` is the expert id, so
+/// that grid cannot take `dispatch_wide`'s 2-D split, and a wider one must be refused rather than
+/// truncated by a driver that enforces the limit.
+fn expert_grid_x(
+    rows: usize,
+    bm: usize,
+    n: usize,
+    bn: usize,
+    max_x: u32,
+) -> std::result::Result<u32, usize> {
+    let gx = rows.div_ceil(bm) * (n / bn);
+    if gx <= max_x as usize {
+        Ok(gx as u32)
+    } else {
+        Err(gx)
+    }
 }
 
 /// `(elem_cap, byte_cap)` from a backend's Vulkan config. `None` (unset, or a value below 2, which
@@ -1029,7 +1051,8 @@ pub struct Recorder<'a> {
     /// against the buffer's measured GPU time (`crate::work::WorkModel::calibrate`).
     seg_work: RefCell<crate::work::SegmentWork>,
     /// An error met while recording that a dispatch method cannot return: a submit made in the
-    /// middle of an op failed ([`Self::rollover`]). The open command buffer is then never
+    /// middle of an op failed ([`Self::rollover`]), or an expert GEMM's grid was refused
+    /// ([`Self::expert_grid_x_or_refuse`]). The open command buffer is then never
     /// submitted, and finishing the recorder returns this.
     failed: RefCell<Option<infr_core::error::Error>>,
     /// Command buffers this recorder already submitted itself, oldest first: a dispatch cut into
@@ -2862,9 +2885,9 @@ impl<'a> Recorder<'a> {
         push[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(k as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
-        let groups = (m.div_ceil(64) * (n / 64)) as u32;
-        self.tag_gemm(crate::work::Family::Int8, m, k, n);
-        self.dispatch(
+        let groups = nc_gemm_groups(m, n) as u32;
+        self.tag_gemm_wide(crate::work::Family::Int8, m, k, n);
+        self.dispatch_wide(
             kern,
             &[
                 Self::vkb(qa),
@@ -3454,9 +3477,9 @@ impl<'a> Recorder<'a> {
         push[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(k as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
-        let groups = (m.div_ceil(64) * (n / 64)) as u32;
-        self.tag_gemm(crate::work::Family::Int8, m, k, n);
-        self.dispatch(
+        let groups = nc_gemm_groups(m, n) as u32;
+        self.tag_gemm_wide(crate::work::Family::Int8, m, k, n);
+        self.dispatch_wide(
             kern,
             &[Self::vkb(qa), Self::vkb(dact), Self::vkb(w), Self::vkb(c)],
             1,
@@ -3531,13 +3554,13 @@ impl<'a> Recorder<'a> {
         push[16..20].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
         push[20..24].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
         let groups = nc_gemm_groups(m, n) as u32;
-        self.tag_gemm(crate::work::Family::Int8, m, k, n);
+        self.tag_gemm_wide(crate::work::Family::Int8, m, k, n);
         let mut bufs = vec![Self::vkb(qa), Self::vkb(dact)];
         if needs_sact {
             bufs.push(Self::vkb(sact));
         }
         bufs.extend_from_slice(&[Self::vkb(qa), Self::vkb(c)]);
-        self.dispatch(kern, &bufs, 1, &push, groups);
+        self.dispatch_wide(kern, &bufs, 1, &push, groups);
     }
 
     /// Arena-addressed body of [`Self::matmul_fma`] (see `crate::gemm::native_gemm_fma_spv`):
@@ -3569,8 +3592,8 @@ impl<'a> Recorder<'a> {
         push[16..20].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
         push[20..24].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
         let groups = nc_gemm_groups(m, n) as u32;
-        self.tag_gemm(crate::work::Family::FloatTile, m, k, n);
-        self.dispatch(
+        self.tag_gemm_wide(crate::work::Family::FloatTile, m, k, n);
+        self.dispatch_wide(
             kern,
             &[Self::vkb(a), Self::vkb(a), Self::vkb(c)],
             1,
@@ -10115,6 +10138,34 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// The x workgroup count of the expert GEMM `name` ([`expert_grid_x`] at this device's
+    /// `maxComputeWorkGroupCount[0]`, `KernelLimits::workgroup_count_x`), or `None` once the
+    /// refusal is kept for finishing the recorder to return: the dispatch is not recorded, and the
+    /// open command buffer never runs.
+    fn expert_grid_x_or_refuse(
+        &self,
+        name: &str,
+        dtype: infr_core::DType,
+        rows: usize,
+        bm: usize,
+        n: usize,
+        bn: usize,
+    ) -> Option<u32> {
+        let max_x = self.be.kernel_limits().workgroup_count_x;
+        match expert_grid_x(rows, bm, n, bn, max_x) {
+            Ok(gx) => Some(gx),
+            Err(gx) => {
+                self.fail(be(format!(
+                    "vulkan recorder: batched-MoE expert GEMM {name} (rows={rows}, n={n}, \
+                     {dtype:?}) needs {gx} workgroups in one grid dimension, past this device's \
+                     maxComputeWorkGroupCount[0] of {max_x} — run prefill in smaller batches (a \
+                     smaller INFR_UBATCH)"
+                )));
+                None
+            }
+        }
+    }
+
     /// ALL experts' mmq GEMMs in ONE dispatch (`gl_WorkGroupID.y` = expert): activation rows are
     /// packed by expert (bucket layout, segment e = offsets\[e\]..+counts\[e\]); the weight bank is
     /// indexed `w_base + e·stride`. Grid x covers the worst-case row tiles (`ceil(rows/BM)` — the
@@ -10182,7 +10233,6 @@ impl<'a> Recorder<'a> {
         let arena_addr = w
             .device_addr()
             .expect("resident-BDA weight: matmul_mmq_experts requires a u64 BDA device address");
-        self.label_next(stage);
         let avg_rows = rows.saturating_mul(n_used) / n_expert.max(1);
         let small_tile = avg_rows <= MOE_EXPERT_SMALL_TILE_AVG_ROWS;
         let wide_bn = n.is_multiple_of(128)
@@ -10214,6 +10264,11 @@ impl<'a> Recorder<'a> {
         } else {
             desc.xp
         };
+        // Checked before any label is set, so a refused dispatch leaves none pending.
+        let Some(gx) = self.expert_grid_x_or_refuse(name, dtype, rows, bm, n, bn) else {
+            return;
+        };
+        self.label_next(stage);
         // INFR_PROF_OP_SHAPES: itemize the stage label by tile kernel and shape
         // (`expert_down:native_gemm_mmq_q6k_xp:1536x2560`) — a model mixing down dtypes across
         // layers otherwise lands every layer in one `expert_down` bucket.
@@ -10231,7 +10286,6 @@ impl<'a> Recorder<'a> {
         push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
         push[16..20].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
         push[20..24].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
-        let gx = (rows.div_ceil(bm) * (n / bn)) as u32;
         let mut bufs = vec![Self::vkb(qa), Self::vkb(dact)];
         if let Some(sa) = sact {
             bufs.push(Self::vkb(sa));
@@ -10287,7 +10341,6 @@ impl<'a> Recorder<'a> {
         n_used: usize,
     ) {
         assert_native_k("matmul_mmq_experts_paged", k);
-        self.label_next(stage);
         let avg_rows = rows.saturating_mul(n_used) / n_expert.max(1);
         let small_tile = avg_rows <= MOE_EXPERT_SMALL_TILE_AVG_ROWS;
         let bm: usize = if small_tile { 32 } else { 64 };
@@ -10303,6 +10356,11 @@ impl<'a> Recorder<'a> {
             )
         });
         let (name, spv) = if small_tile { desc.xpg32 } else { desc.xpg };
+        // Checked before any label is set, so a refused dispatch leaves none pending.
+        let Some(gx) = self.expert_grid_x_or_refuse(name, dtype, rows, bm, n, 64) else {
+            return;
+        };
+        self.label_next(stage);
         let nb = desc.resident_nb + 1;
         let kern = self.be.kernel(name, spv, nb, 28);
         let mut push = [0u8; 28];
@@ -10316,7 +10374,6 @@ impl<'a> Recorder<'a> {
         push[16..20].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
         push[20..24].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
         push[24..28].copy_from_slice(&slot_bytes.to_ne_bytes());
-        let gx = (rows.div_ceil(bm) * (n / 64)) as u32;
         let mut bufs = vec![Self::vkb(qa), Self::vkb(dact)];
         if let Some(sa) = sact {
             bufs.push(Self::vkb(sa));
@@ -12840,69 +12897,291 @@ mod tests {
         }
     }
 
-    /// The non-coopmat prefill GEMMs (`matmul_mmq_at`, `matmul_fma_at`) index their tile grid by
-    /// `gl_WorkGroupID.x` alone, so a tile count past the guaranteed x limit must be refused by
-    /// name, not dispatched. With the split point lowered, each nc arm the device offers must run
-    /// a GEMM whose grid sits exactly at the limit and refuse one a single tile past it.
+    /// The dense tiled GEMMs without matrix units (`matmul_mmq_at` for every
+    /// `MOE_MMQ_DTYPES` build, `matmul_fma_at`, the resident `matmul_mmq_q4k` / `matmul_mmq_q6k`)
+    /// record through `dispatch_wide`, and their shaders rebuild the flat tile index from the 2-D
+    /// grid. With the split point lowered, each must take the split and write exactly the bytes
+    /// the unsplit grid writes, with `GUARD` sentinel bytes past every buffer left unchanged by
+    /// both runs. One shape's tile count is a multiple of the split width; the other's is not, so
+    /// its split grid ends in padding workgroups, which must exit without writing.
     #[test]
     #[ignore = "requires a Vulkan GPU"]
-    fn nc_gemm_grid_past_the_x_limit_is_refused() {
-        use infr_core::backend::Bindings;
-        use infr_core::graph::{Graph, Op};
-        use infr_core::tensor::TensorDesc;
+    fn nc_gemm_split_grid_matches_unsplit() {
         use infr_core::DType;
+        use std::cell::Cell;
         // Lowered split point; the GEMM tile is 64x64.
         const SPLIT_AT: u32 = 3;
-        const IN_F: usize = 64;
-        let be = be_with(|v| v.coopmat = false);
-        assert!(!be.caps().f16_coopmat(), "the nc tier needs coopmat off");
-        let run = |dt: DType, m: usize, out_f: usize| -> infr_core::error::Result<()> {
-            let mut g = Graph::new();
-            let x = g.input(TensorDesc::new(vec![m, IN_F], DType::F32));
-            let w = g.weight(TensorDesc::new(vec![out_f, IN_F], dt));
-            let y = g.output(TensorDesc::new(vec![m, out_f], DType::F32));
-            g.push(Op::Linear {
-                x,
-                weight: w,
-                dst: y,
-                m: m as u32,
-                in_f: IN_F as u32,
-                out_f: out_f as u32,
-                w_off: 0,
-            });
-            let (blk_elems, blk_bytes) = infr_core::decode_spec::block_layout(dt);
-            let xb = be.alloc(m * IN_F * 4, BufferUsage::Activations)?;
-            let wb = be.alloc(out_f * IN_F / blk_elems * blk_bytes, BufferUsage::Weights)?;
-            let yb = be.alloc(m.div_ceil(64) * 64 * out_f * 4, BufferUsage::Activations)?;
-            let mut bind = Bindings::new();
-            bind.bind(x, xb.as_ref())
-                .bind(w, wb.as_ref())
-                .bind(y, yb.as_ref());
-            WIDE_SPLIT_AT.with(|c| c.set(Some(SPLIT_AT)));
-            let res = be
-                .compile(&g)
-                .and_then(|plan| be.execute(plan.as_ref(), &bind));
+        const K: usize = 256;
+        const N: usize = 2 * 64;
+        // 3 and 4 row tiles of 2 column tiles: 6 tiles (two whole rows of the split grid) and 8
+        // (a third row holding one padding workgroup). Neither is a whole number of row tiles.
+        const MS: [usize; 2] = [2 * 64 + 5, 3 * 64 + 5];
+        const _: () = assert!((MS[0].div_ceil(64) * (N / 64)).is_multiple_of(SPLIT_AT as usize));
+        const _: () = assert!(!(MS[1].div_ceil(64) * (N / 64)).is_multiple_of(SPLIT_AT as usize));
+        const GUARD: usize = 1024;
+        const SENTINEL: u32 = 0xDEAD_BEEF;
+
+        let be = be_with(|_| {});
+        // Every byte below 0x61, so each f16 / bf16 / fp8 / E8M0 scale and float weight built from
+        // them is finite, and an output is a number a misplaced tile would change.
+        let fill = |bytes: usize, salt: usize| -> Vec<u8> {
+            (0..bytes)
+                .map(|i| ((i * 37 + salt * 11) % 97) as u8)
+                .collect()
+        };
+        let alloc = |data: &[u8], usage: BufferUsage| {
+            let b = be.alloc(data.len() + GUARD, usage).unwrap();
+            let mut init = data.to_vec();
+            init.extend(SENTINEL.to_ne_bytes().iter().cycle().take(GUARD));
+            be.upload(b.as_ref(), &init).unwrap();
+            b
+        };
+        type Gemm<'a> = Box<dyn Fn(&Recorder, &[&dyn Buffer], usize) + 'a>;
+        type Sizes = Box<dyn Fn(usize) -> Vec<usize>>;
+        // (name, the device can run it, bytes of each buffer at m rows — the output last, call)
+        let mut cases: Vec<(String, bool, Sizes, Gemm)> = Vec::new();
+        let i8 = be.caps().i8_dot;
+        // qa (int8 rows), dact, sact (f16 per 32-block), weight, c: the activation rows and the
+        // output padded to whole 64-row tiles, as the mmq callers allocate them.
+        let mmq_bufs = |dt: DType| -> Sizes {
+            let (be_, bb) = infr_core::decode_spec::block_layout(dt);
+            Box::new(move |m: usize| {
+                let mpad = m.div_ceil(64) * 64;
+                vec![
+                    mpad * K,
+                    mpad * K / 32 * 2,
+                    mpad * K / 32 * 2,
+                    N * K / be_ * bb,
+                    mpad * N * 4,
+                ]
+            })
+        };
+        for &dt in infr_core::tensor::MOE_MMQ_DTYPES {
+            cases.push((
+                format!("matmul_mmq_at {dt:?}"),
+                i8,
+                mmq_bufs(dt),
+                Box::new(move |r: &Recorder, b: &[&dyn Buffer], m: usize| {
+                    let w = b[3].device_addr().unwrap();
+                    r.matmul_mmq_at(dt, b[0], b[1], b[2], w, 0, b[4], m, K, N)
+                }),
+            ));
+        }
+        cases.push((
+            "matmul_mmq_q4k".into(),
+            i8,
+            mmq_bufs(DType::Q4K),
+            Box::new(|r: &Recorder, b: &[&dyn Buffer], m: usize| {
+                r.matmul_mmq_q4k(b[0], b[1], b[2], b[3], 0, b[4], m, K, N)
+            }),
+        ));
+        cases.push((
+            "matmul_mmq_q6k".into(),
+            i8,
+            mmq_bufs(DType::Q6K),
+            Box::new(|r: &Recorder, b: &[&dyn Buffer], m: usize| {
+                r.matmul_mmq_q6k(b[0], b[1], b[3], 0, b[4], m, K, N)
+            }),
+        ));
+        for dt in [DType::F16, DType::Bf16, DType::F32] {
+            cases.push((
+                format!("matmul_fma_at {dt:?}"),
+                true,
+                // a (f32 rows; the kernel stages rows >= m as zeros), weight, c.
+                Box::new(move |m: usize| {
+                    vec![
+                        m * K * 4,
+                        N * K * dt.dense_bytes(1).unwrap(),
+                        m.div_ceil(64) * 64 * N * 4,
+                    ]
+                }),
+                Box::new(move |r: &Recorder, b: &[&dyn Buffer], m: usize| {
+                    let w = b[1].device_addr().unwrap();
+                    r.matmul_fma_at(dt, b[0], w, 0, b[2], m, K, N)
+                }),
+            ));
+        }
+        let run = |sizes: &[usize], gemm: &Gemm, m: usize, split: Option<u32>| {
+            let live: Vec<_> = sizes
+                .iter()
+                .enumerate()
+                .map(|(j, &bytes)| {
+                    let usage = if j + 1 == sizes.len() {
+                        BufferUsage::Activations
+                    } else {
+                        BufferUsage::Weights
+                    };
+                    alloc(&fill(bytes, j), usage)
+                })
+                .collect();
+            WIDE_SPLIT_AT.with(|c| c.set(split));
+            WIDE_SPLITS.with(|c| c.set(0));
+            let rec = be.recorder().unwrap();
+            let refs: Vec<&dyn Buffer> = live.iter().map(|b| b.as_ref()).collect();
+            gemm(&rec, &refs, m);
+            rec.finish().unwrap();
             WIDE_SPLIT_AT.with(|c| c.set(None));
+            let out: Vec<Vec<u8>> = live
+                .iter()
+                .zip(sizes)
+                .map(|(b, bytes)| {
+                    let mut v = vec![0u8; bytes + GUARD];
+                    be.download(b.as_ref(), &mut v).unwrap();
+                    v
+                })
+                .collect();
+            (out, WIDE_SPLITS.with(Cell::get))
+        };
+        let mut ran = 0;
+        for (name, offered, sizes, gemm) in &cases {
+            if !offered {
+                eprintln!("skip: {name} needs packed int8 dot");
+                continue;
+            }
+            for m in MS {
+                let sizes = sizes(m);
+                let (whole, n_whole) = run(&sizes, gemm, m, None);
+                let (split, n_split) = run(&sizes, gemm, m, Some(SPLIT_AT));
+                assert_eq!(n_whole, 0, "{name} m={m}: the grid split below the limit");
+                assert!(n_split > 0, "{name} m={m}: the grid was never split");
+                for (i, (w, s)) in whole.iter().zip(&split).enumerate() {
+                    for (run_name, v) in [("whole", w), ("split", s)] {
+                        let (tail, _) = v[sizes[i]..].as_chunks::<4>();
+                        assert!(
+                            tail.iter().all(|t| *t == SENTINEL.to_ne_bytes()),
+                            "{name} m={m}: the {run_name} grid wrote past buffer {i}"
+                        );
+                    }
+                }
+                // The output is the last buffer of every case: `c` at index 4 for the mmq GEMMs
+                // (after qa, dact, sact, weight) and at index 2 for `matmul_fma_at` (after a,
+                // weight). Only its first `sizes[c]` bytes are the GEMM's; the guard follows.
+                let c = sizes.len() - 1;
+                assert!(
+                    whole[c][..sizes[c]] != fill(sizes[c], c)[..],
+                    "{name} m={m}: the GEMM left its output as it was"
+                );
+                assert!(
+                    whole[c] == split[c],
+                    "{name} m={m}: the split grid wrote different bytes"
+                );
+                ran += 1;
+            }
+        }
+        assert!(ran > 0, "no GEMM ran");
+    }
+
+    /// The batched-MoE expert GEMMs' grid puts the expert id on `.y`, so its x count is refused
+    /// one tile past the device's limit rather than split, and the limit itself is accepted.
+    /// Known values: Llama 4 Scout's expert up GEMM (`n` = 8192 on 64x64 tiles, 128 column tiles)
+    /// passes the spec minimum past 511 row tiles, so a 32,767-row chunk (512 row tiles) is
+    /// refused there and runs on a device reporting a higher limit (RADV's is `u32::MAX`).
+    #[test]
+    fn expert_grid_x_refuses_one_tile_past_the_limit() {
+        let spec_min = Recorder::MAX_GROUP_COUNT_X;
+        assert_eq!(expert_grid_x(511 * 64, 64, 8192, 64, spec_min), Ok(65_408));
+        assert_eq!(
+            expert_grid_x(511 * 64 + 1, 64, 8192, 64, spec_min),
+            Err(65_536)
+        );
+        assert_eq!(expert_grid_x(32_767, 64, 8192, 64, spec_min), Err(65_536));
+        // 65,535 = 3 * 5 * 17 * 257: 255 row tiles of 257 column tiles is the limit exactly.
+        assert_eq!(
+            expert_grid_x(255 * 32, 32, 257 * 64, 64, spec_min),
+            Ok(spec_min)
+        );
+        assert_eq!(
+            expert_grid_x(255 * 32 + 1, 32, 257 * 64, 64, spec_min),
+            Err(65_792)
+        );
+        // The wide 128-column tile halves the column count.
+        assert_eq!(expert_grid_x(1024, 64, 2048, 128, spec_min), Ok(256));
+
+        // A higher limit runs what the spec minimum refuses, and is itself one tile from refusal.
+        let higher = 1 << 20;
+        assert_eq!(expert_grid_x(32_767, 64, 8192, 64, higher), Ok(65_536));
+        assert_eq!(expert_grid_x(8192 * 64, 64, 8192, 64, higher), Ok(higher));
+        assert_eq!(
+            expert_grid_x(8192 * 64 + 1, 64, 8192, 64, higher),
+            Err(higher as usize + 128)
+        );
+        assert_eq!(expert_grid_x(32_767, 64, 8192, 64, u32::MAX), Ok(65_536));
+    }
+
+    /// `matmul_mmq_experts` refuses its grid against the limit the device reports
+    /// (`KernelLimits::workgroup_count_x`, played smaller here through `TEST_KERNEL_LIMITS`): at
+    /// the grid's own x count the recording finishes, one group below it the finish returns the
+    /// refusal by name. Every bucket count is zero, so an accepted dispatch's workgroups all exit.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn expert_grid_refusal_follows_the_device_limit() {
+        use infr_core::DType;
+        let be = be_with(|_| {});
+        if !be.caps().i8_dot {
+            eprintln!("skip: the expert mmq GEMMs need packed int8 dot");
+            return;
+        }
+        // One expert, one used: every row is that expert's, so the 64-row tile is taken. Four
+        // row tiles of one column tile.
+        const ROWS: usize = 3 * 64 + 1;
+        const K: usize = 32;
+        const N: usize = 64;
+        const GX: u32 = 4;
+        let (blk_elems, blk_bytes) = infr_core::decode_spec::block_layout(DType::Q8_0);
+        let alloc = |bytes: usize, usage| {
+            let b = be.alloc(bytes, usage).unwrap();
+            be.upload(b.as_ref(), &vec![0u8; bytes]).unwrap();
+            b
+        };
+        let qa = alloc(ROWS.div_ceil(64) * 64 * K, BufferUsage::Activations);
+        let dact = alloc(
+            ROWS.div_ceil(64) * 64 * K / 32 * 2,
+            BufferUsage::Activations,
+        );
+        let w = alloc(N * K / blk_elems * blk_bytes, BufferUsage::Weights);
+        let counts = alloc(4, BufferUsage::Activations);
+        let offsets = alloc(4, BufferUsage::Activations);
+        let c = alloc(ROWS * N * 4, BufferUsage::Activations);
+        let run = |limit: u32| {
+            crate::TEST_KERNEL_LIMITS.with(|l| {
+                l.set(Some(crate::caps::KernelLimits {
+                    workgroup_count_x: limit,
+                    ..be.shared.kernel_limits
+                }))
+            });
+            let rec = be.recorder().unwrap();
+            rec.matmul_mmq_experts(
+                DType::Q8_0,
+                "expert_gateup",
+                qa.as_ref(),
+                dact.as_ref(),
+                None,
+                w.as_ref(),
+                0,
+                N * K,
+                counts.as_ref(),
+                offsets.as_ref(),
+                c.as_ref(),
+                ROWS,
+                K,
+                N,
+                1,
+                1,
+            );
+            let res = rec.finish();
+            crate::TEST_KERNEL_LIMITS.with(|l| l.set(None));
             res
         };
-        let mut arms = vec![DType::F16];
-        if be.caps().i8_dot {
-            arms.push(DType::Q8_0);
-        } else {
-            eprintln!("skip: the dp4a mmq arm needs packed int8 dot");
-        }
-        for dt in arms {
-            let at_limit = SPLIT_AT as usize;
-            run(dt, 64 * at_limit, 64)
-                .unwrap_or_else(|e| panic!("{dt:?}: a grid at the limit must still run: {e}"));
-            let e = run(dt, 64 * (at_limit + 1), 64)
-                .expect_err(&format!("{dt:?}: a grid past the limit was dispatched"))
-                .to_string();
-            assert!(
-                e.contains("non-coopmat prefill GEMM") && e.contains("needs 4 workgroups"),
-                "{dt:?}: refused for another reason: {e}"
-            );
-        }
+        run(GX).expect("a grid at the device's limit must run");
+        let e = run(GX - 1)
+            .expect_err("a grid past the device's limit was dispatched")
+            .to_string();
+        assert!(
+            e.contains("batched-MoE expert GEMM")
+                && e.contains(&format!("needs {GX} workgroups"))
+                && e.contains(&format!("maxComputeWorkGroupCount[0] of {}", GX - 1)),
+            "refused for another reason: {e}"
+        );
     }
 
     /// #1 drift guard: `kernels.vulkan.gemv` must resolve, for any env state, EXACTLY what the

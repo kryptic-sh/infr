@@ -119,11 +119,17 @@ void main() {
 #else
     uint wbase = pc.w_base + ex * pc.m;
 #endif
-#else
-    uint wgRow = (gl_WorkGroupID.x / tilesN) * BM;
-    uint wbase = pc.w_base;
-#endif
     uint wgCol = (gl_WorkGroupID.x % tilesN) * BN;
+#else
+    // `Recorder::dispatch_wide`'s flat index: a tile grid wider than `Recorder::MAX_GROUP_COUNT_X`
+    // arrives as rows of gl_NumWorkGroups.x tiles, and the padding tiles of its last row exit
+    // here. The exit is uniform across the workgroup, so no barrier is left half-reached.
+    uint tile = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    if (tile >= ((pc.m + BM - 1u) / BM) * tilesN) { return; }
+    uint wgRow = (tile / tilesN) * BM;
+    uint wbase = pc.w_base;
+    uint wgCol = (tile % tilesN) * BN;
+#endif
     uint li = gl_LocalInvocationIndex;
     uint tr = li / (BN / TN);
     uint tc = li % (BN / TN);

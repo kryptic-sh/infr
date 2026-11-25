@@ -104,12 +104,25 @@ impl<'a> Recorder<'a> {
     /// `gl_WorkGroupID` (`work::Split::Flat`, checked against its SPIR-V when it is cut). A
     /// single-row GEMM is left untagged.
     pub(super) fn tag_gemm(&self, family: crate::work::Family, m: usize, k: usize, n: usize) {
+        self.tag_gemm_as(family, m, k, n, crate::work::Split::Flat);
+    }
+
+    /// [`Self::tag_gemm`] for a GEMM recorded through `Recorder::dispatch_wide`, whose shader
+    /// recovers its flat tile index from the 2-D grid (`work::Split::WideGrid`).
+    pub(super) fn tag_gemm_wide(&self, family: crate::work::Family, m: usize, k: usize, n: usize) {
+        self.tag_gemm_as(family, m, k, n, crate::work::Split::WideGrid);
+    }
+
+    fn tag_gemm_as(
+        &self,
+        family: crate::work::Family,
+        m: usize,
+        k: usize,
+        n: usize,
+        split: crate::work::Split,
+    ) {
         if m > 1 {
-            self.work_next(
-                family,
-                crate::work::gemm_flops(m, k, n),
-                crate::work::Split::Flat,
-            );
+            self.work_next(family, crate::work::gemm_flops(m, k, n), split);
         }
     }
 
@@ -372,7 +385,7 @@ impl<'a> Recorder<'a> {
     }
 
     /// Keep the first error met while recording, for finishing to return (see `Recorder::failed`).
-    fn fail(&self, e: infr_core::error::Error) {
+    pub(super) fn fail(&self, e: infr_core::error::Error) {
         let mut f = self.failed.borrow_mut();
         if f.is_none() {
             *f = Some(e);

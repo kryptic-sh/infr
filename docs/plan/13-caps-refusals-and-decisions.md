@@ -171,12 +171,21 @@ generation, the `SeamModel` fit helpers) check both (`debug_assert_scope_for`).
 - Test: a two-rank world on one device against single-device, which runs on the
   integrated GPU alone.
 
-### S9 — the non-coopmat GEMM past the workgroup limit (S–M)
+### S9 — the non-coopmat GEMM past the workgroup limit — done 2026-11-25
 
-- The `.y` workgroup dimension is the expert id only under `EXPERT_GRID`; the
-  dense builds index by `.x` alone **[R]**, so the existing `dispatch_wide`
-  split applies. Delete the adapter refusal; turn its test into a
-  split-vs-unsplit byte comparison.
+Shipped; what it left is backlog B-EXPERT-GRID-Z.
+
+Departs from the slice as planned in two places. The dense builds did index by
+`.x` alone, but that did not make `dispatch_wide` apply as they stood: its
+paired shaders rebuild the flat index from the 2-D grid, so the dense arm of
+every `native_gemm_mmq_*` shader and `native_gemm_fma.comp` had to learn to (the
+`EXPERT_GRID` builds compile to the same SPIR-V as before). And the
+`EXPERT_GRID` grid can also pass the limit, at a user-set prefill chunk far
+above the default; it is refused by name, against the limit the device reports
+(`caps::KernelLimits::workgroup_count_x`), rather than split, and the split is
+the backlog entry. The resident Q4_K mmq GEMM (`matmul_mmq_q4k`, the Q4_K-mmq
+arm on a coopmat device) shares those shaders and had no guard at all; it takes
+the split too, as does its Q6_K twin `matmul_mmq_q6k`, which only tests call.
 
 ### S10 — bounded all-reduce wait (M)
 

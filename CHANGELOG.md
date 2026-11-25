@@ -541,6 +541,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **A batched-MoE prefill chunk whose expert GEMM grid passes the device's
+  workgroup limit is refused by name.**
+  `vulkan recorder: batched-MoE expert GEMM … needs N workgroups in one grid dimension, past this device's maxComputeWorkGroupCount[0] of L — run prefill in smaller batches (a smaller INFR_UBATCH)`.
+  The limit is the one the device reports, so a driver with a higher limit (RADV
+  reports 4,294,967,295) runs every shape it ran before. On a device at the
+  65,535 the spec guarantees (Intel ANV), such a grid was an invalid dispatch
+  the driver could truncate or reject; it is now this error. Only a chunk far
+  above the default reaches it there (a Llama 4 Scout-shaped expert up
+  projection passes 65,535 above 32,704 rows).
+
 - **`INFR_KV_OVERFLOW` spills the KV cache on a dense model, and no longer keeps
   a default context that does not fit VRAM.** On Vulkan, with `kv.overflow` on,
   a context infr sizes itself (no `--ctx` / `INFR_CTX`) is clamped to what fits
@@ -1235,6 +1245,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   conversation with tools, and every conversation, respectively, and now render.
 
 ### Fixed
+
+- **A prefill on a Vulkan GPU without cooperative matrices no longer refuses a
+  wide GEMM.** The tiled GEMMs that tier runs (the int8-dot `mmq` builds of
+  every quantised format, and the float `fma` GEMM for f16 / bf16 / f32 weights)
+  failed with
+  `vulkan adapter: non-coopmat prefill GEMM (m=…, out_f=…) needs N workgroups in one grid dimension, past the 65535 every Vulkan device guarantees`
+  once `ceil(m/64) * (out_f/64)` passed that limit, which a user-set
+  `INFR_UBATCH` on a very wide projection could reach. They now split such a
+  grid in two dimensions, as the other wide kernels do, with byte-identical
+  output. The resident Q4_K `mmq` GEMM a coopmat device takes for some Q4_K
+  shapes had no check at all and could be truncated by a driver that enforces
+  the limit (Intel ANV); it splits too (as does its Q6_K twin, which only tests
+  call). Grids under the limit are dispatched as before.
 
 - **Each backend in a process gets the default prefill chunk of its own device
   class.** The default chunk came from the class of the first Vulkan device the

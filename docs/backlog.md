@@ -1516,7 +1516,7 @@ Still on a flat or tiled grid, each needing real shader rework:
 
 | Sites                                                                                                                      | Grid                                                        | Overflows when                                                                 |
 | -------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------- | ------------------------------------------------------------------------------ |
-| `matmul_proj_at`, native off / cm8 / f16a / f32a, split-K's main GEMM, mmq q4k / q6k / `mmq_at`, `fma_at`                  | tiles: ⌈m/64⌉·(n/64), or n/128 for the warp tiles, × splits | m = 1,024 with n ≥ 262,144 (only if the vocab head ran over every prefill row) |
+| `matmul_proj_at`, native off / cm8 / f16a / f32a, split-K's main GEMM                                                      | tiles: ⌈m/64⌉·(n/64), or n/128 for the warp tiles, × splits | m = 1,024 with n ≥ 262,144 (only if the vocab head ran over every prefill row) |
 | i8cm (three variants)                                                                                                      | ⌈m/128⌉·(n/16)                                              | m = 1,024 with n > 131,070                                                     |
 | f8cm (two variants), bf16cm                                                                                                | tiles                                                       | not computed                                                                   |
 | `attention_kv_split_impl`                                                                                                  | rows·nh·4, shared memory                                    | rows·nh > 16,383 (small-m decode path)                                         |
@@ -2398,12 +2398,13 @@ actually has such limits. What is left:
   256-thread build, so such a device is refused at the first norm. Vulkan only
   guarantees 128; desktop drivers report 1024 or more. A 128-thread twin would
   close it if such a device ever matters.
-- **`maxComputeWorkGroupCount[0]`** is not read: `Recorder::MAX_GROUP_COUNT_X`
-  stays at the spec minimum, so every dispatch wider than that takes the 2-D
-  split (`dispatch_wide`) even on RDNA3, whose limit is far higher. Correct
-  everywhere; whether the split costs anything measurable has never been
-  profiled, and that measurement is the blocker. The flat grids that do not go
-  through `dispatch_wide` at all are B65.
+- **`maxComputeWorkGroupCount[0]`** is read (`KernelLimits::workgroup_count_x`)
+  only by the batched-MoE expert GEMMs' refusal (B-EXPERT-GRID-Z):
+  `Recorder::MAX_GROUP_COUNT_X` stays at the spec minimum for `dispatch_wide`,
+  so every dispatch wider than that takes the 2-D split (`dispatch_wide`) even
+  on RDNA3, whose limit is far higher. Correct everywhere; whether the split
+  costs anything measurable has never been profiled, and that measurement is the
+  blocker. The flat grids that do not go through `dispatch_wide` at all are B65.
 - **`minStorageBufferOffsetAlignment`** is not queried: 256, the spec's maximum
   for it, is used everywhere (`BDA_WEIGHT_ALIGN`, `vkb`'s ranges). Correct on
   every device; the over-alignment's cost is unmeasured.
@@ -4645,6 +4646,38 @@ they cannot show:
 - A kernel refused at build still panics (the kernel cache is infallible until
   B98 threads a `Result` through); only the lock is released first.
 
+### B-EXPERT-GRID-Z — the batched-MoE expert GEMM grid is refused past the x limit, not split (2026-11-25)
+
+Plan 13 S9 split the dense tiled GEMMs without matrix units past the workgroup
+limit (`dispatch_wide`). The batched-MoE expert GEMMs (`matmul_mmq_experts`,
+`matmul_mmq_experts_paged`) put the expert id on `gl_WorkGroupID.y`, so that
+split cannot apply; their x count is refused by name instead, against the limit
+the device reports (`caps::KernelLimits::workgroup_count_x`, read by
+`Recorder::expert_grid_x_or_refuse`; predicate `expert_grid_x`): the dispatch is
+not recorded, the open command buffer is never submitted, and finishing the
+recorder returns the error. Both RADV devices here report 4,294,967,295, so the
+refusal can only fire on a device with a lower limit (Intel ANV reports the
+spec's 65,535). The refusal has run on both GPUs here only against a limit
+played smaller through `TEST_KERNEL_LIMITS`
+(`expert_grid_refusal_follows_the_device_limit`, resident twin only); the paged
+twin shares the check but no test drives it, and no real driver at the limit has
+been seen to refuse.
+
+Arithmetic, not measured: the x count is `ceil(rows/bm) * (n/bn)` with `rows`
+the chunk's token count. At the default chunk (1024 rows) it needs `n` past
+131,008 columns on 32-row tiles (262,080 on 64-row tiles), which no shipped
+expert width approaches. A Llama 4 Scout-shaped expert up projection (`n` =
+8192, `k` = 5120, 16 experts with one used: `bm` = 64 and `bn` = 64 by the tile
+rules in `matmul_mmq_experts`) passes the spec's 65,535 above 32,704 rows, so
+only a user-set `INFR_UBATCH` that large reaches it, and only on such a device.
+
+To lift it: put the extra rows on `.z` (the expert stays on `.y`) in the
+`EXPERT_GRID` arm of every `native_gemm_mmq_*` shader, rebuilding the x tile as
+`gl_WorkGroupID.x + gl_WorkGroupID.z * gl_NumWorkGroups.x`, with a matching 3-D
+split in both recorders; the work splitter's `Split::WideGrid` cuts only a grid
+of under two dimensions, so it would need a rule for this one. Test it as S9's
+`nc_gemm_split_grid_matches_unsplit` does, through `WIDE_SPLIT_AT`.
+
 ### B-PINS-CLASS — what moving the device class into the pins left (2026-11-25)
 
 Plan 13 S4 made the default prefill chunk a field of `seam::PlacementPins`, set
@@ -4691,16 +4724,6 @@ recorder dispatches from, `mmv_mrow_variant`); the rmsnorm family and
 `QkNormRope` head dim, `Sample` top-k range, Q8_0 `WriteKv` row width, the `Mla`
 cache dtype). Left:
 
-- **The non-coopmat GEMM (`matmul_mmq_at`, `matmul_fma_at`) refuses a grid past
-  the limit instead of splitting it.** Its mmq builds already use the y
-  dimension for the expert id, so the flat-index trick does not apply. No
-  default shape reaches it (it needs an output width of 262,144 at a 1024-row
-  chunk, and the prefill head runs on the last row only); a user-set
-  `INFR_UBATCH` on a very wide FFN can, on a discrete GPU without cooperative
-  matrices. Options if it matters: fall back to the per-row GEMV tier, or split
-  by m-tile across several dispatches. The guard repeats the recorder's
-  `ceil(m/64) * (n/64)` with its own literals; it should read the tile size from
-  one place.
 - **Refusals for shapes nothing emits today:** `QkNormRope` with both `x_stride`
   and `freq_factors`; a record-once `Rope` or interleaved `QkNormRope` writing K
   into a cache a sliding-window attention reads (those two kernels have no ring
@@ -5063,9 +5086,10 @@ was re-read at its site afterwards; the rest is the reviewer's account.
   at small m) are gone; the opt-in tiers a streamed slot skips are in B193.
   Verified on `Vulkan0` and `Vulkan1` by `tests/streamed_nc_gemm.rs`. Not
   verified: Intel Arc; a device without int8 dot (the fma arm only); a whole
-  streamed model with bf16 weights; the oversized-grid fallback on a GPU (only
-  the host-side `tiled_gemm_fits` test covers the predicate, and nothing
-  dispatches a grid past the x limit).
+  streamed model with bf16 weights. A non-coopmat grid past the x limit no
+  longer leaves the tiled GEMM (plan 13 S9: it takes `dispatch_wide`'s split,
+  covered by `nc_gemm_split_grid_matches_unsplit` at a lowered split point); no
+  grid past the real limit has been dispatched on a GPU.
 - **Correctness, conditional, confirmed by re-reading:
   `native_gemv_rm_v2.comp`'s `VARIANT_REG` sizes `reg_part` for subgroups of at
   least 16** (`THREADS / 16u` slots, written by `gl_SubgroupID`), and

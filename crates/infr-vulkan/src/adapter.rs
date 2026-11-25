@@ -6167,29 +6167,6 @@ fn nc_gemm_choice(be_: &VulkanBackend, dt: infr_core::DType, gemm_ok: bool) -> O
     }
 }
 
-/// The nc GEMMs index their tile by `gl_WorkGroupID.x` alone (the mmq builds already spend `.y` on
-/// the expert id of the batched-MoE twin), so their flat tile grid cannot take `dispatch_wide`'s
-/// 2-D split. A grid past the guaranteed x limit would be rejected or truncated by a driver that
-/// enforces it (ANV), so refuse it by name.
-fn check_nc_gemm_grid(dt: infr_core::DType, m: usize, out_f: usize) -> Result<()> {
-    let nc_groups = crate::recorder::nc_gemm_groups(m, out_f);
-    if !nc_gemm_grid_fits(m, out_f, crate::recorder::Recorder::split_point_x()) {
-        return Err(be(format!(
-            "vulkan adapter: non-coopmat prefill GEMM (m={m}, out_f={out_f}, {dt:?}) needs \
-             {nc_groups} workgroups in one grid dimension, past the {} every Vulkan device \
-             guarantees — run prefill in smaller batches",
-            crate::recorder::Recorder::split_point_x()
-        )));
-    }
-    Ok(())
-}
-
-/// Does the nc GEMMs' flat tile grid for `(m, out_f)` fit in `max_groups_x` workgroups (the
-/// device-guaranteed x limit, `Recorder::split_point_x`)? See [`check_nc_gemm_grid`].
-fn nc_gemm_grid_fits(m: usize, out_f: usize, max_groups_x: u32) -> bool {
-    crate::recorder::nc_gemm_groups(m, out_f) <= max_groups_x as usize
-}
-
 /// A quantised `Op::Linear` weight: where its bytes start, and the buffer holding them when it
 /// is resident.
 #[derive(Clone, Copy)]
@@ -6216,8 +6193,8 @@ struct QuantWeight<'a> {
 ///    (the non-coopmat tier where `_cm8` would run);
 ///  • the narrow Q4_K dp4a GEMM reads the slot through the arena-addressed build of the same
 ///    shader (`matmul_mmq_at`);
-///  • a tiled GEMM it cannot take (a weight past the u32 addressing cap, a non-coopmat grid past
-///    the device's x limit) keeps the per-row GEMV, where the resident Linear fails loudly.
+///  • a tiled GEMM it cannot take (a weight past the u32 addressing cap) keeps the per-row GEMV,
+///    where the resident Linear fails loudly.
 ///
 /// The quantised-activation memo (`mmv_memo`, see `lower_op`) holds `quant_q8(x)` only, keyed by
 /// the activation tensor and shape, so it is independent of the weight and of where it lives.
@@ -6308,7 +6285,7 @@ fn quant_linear(
         }
     }
     // The multi-row GEMVs index the weight in u32 and are not chunked, so a weight past the
-    // addressing cap leaves this tier for the chunked per-row GEMV (see `tiled_gemm_fits` below).
+    // addressing cap leaves this tier for the chunked per-row GEMV (see `bda_weight_breaches` below).
     if (in_band(MROW_BAND) || mrow16)
         && in_f.is_multiple_of(32)
         && crate::gemm::native_mrow_kernel_name(dt).is_some()
@@ -6429,19 +6406,10 @@ fn quant_linear(
     // 64-row weight tile that can't be split into single input rows, so a breach on this
     // path (a multi-row lm_head: MTP speculative verify or all-position logits) must fail
     // loudly, never wrap. Issue #77: covered classes chunk; everything else stays loud.
-    // The nc GEMMs' grid is also capped (`check_nc_gemm_grid`).
     let vk = &be_.cfg().kernels.vulkan;
     let tiled = is_gemm || nc.is_some();
     if tiled
-        && !tiled_gemm_fits(
-            dt,
-            m,
-            in_f,
-            out_f,
-            nc.is_some(),
-            vk,
-            Recorder::split_point_x(),
-        )
+        && crate::recorder::bda_weight_breaches(dt, in_f, out_f, vk)
         && (w.buffer.is_none() || m <= MROW_BANDS[MROW16_BAND].max_m)
     {
         // The chunked per-row GEMV instead of failing: it chunks a breaching weight and has no
@@ -6451,9 +6419,6 @@ fn quant_linear(
         // that band stays loud.
         rec.linear_native_routed_at(dt, w.addr, w_off, xb, y, m, in_f, out_f);
         return Ok(());
-    }
-    if nc.is_some() {
-        check_nc_gemm_grid(dt, m, out_f)?;
     }
     if tiled && crate::recorder::bda_weight_breaches(dt, in_f, out_f, vk) {
         return Err(be(format!(
@@ -6882,24 +6847,6 @@ fn quant_linear(
     Ok(())
 }
 
-/// Can a prefill Linear at `(dt, m, in_f, out_f)` that `quant_linear` routed to a tiled GEMM take
-/// it? The tiled GEMMs cannot be output-row chunked (a `bda_weight_breaches` weight — a big-vocab
-/// lm_head at m > 1: all-position logits, speculative verify), and the non-coopmat ones (`nc`)
-/// index their grid in one dimension capped at `max_groups_x`. Where it cannot, `quant_linear`
-/// takes the chunked per-row GEMV or fails loudly.
-fn tiled_gemm_fits(
-    dt: infr_core::DType,
-    m: usize,
-    in_f: usize,
-    out_f: usize,
-    nc: bool,
-    vk: &infr_core::config::VulkanCfg,
-    max_groups_x: u32,
-) -> bool {
-    (!nc || nc_gemm_grid_fits(m, out_f, max_groups_x))
-        && !crate::recorder::bda_weight_breaches(dt, in_f, out_f, vk)
-}
-
 /// Record one tiled dp4a-mmq or fma-warptile prefill GEMM reading the weight at the 64-bit address
 /// `w_addr` (a resident weight's BDA, or a streamed slot's arena base) plus element offset `w_off`.
 /// Same padded-dst dance as every tiled tier (`with_padded_dst`): the GEMM writes ceil(m/64)*64
@@ -7078,9 +7025,6 @@ fn float_linear(
     // an f32 prefill on a coopmat device keeps the row-tiled f32 GEMV.
     let is_gemm = is_f16 && gemm_ok && be_.caps().f16_coopmat();
     let nc = nc_gemm_choice(be_, dt, gemm_ok);
-    if nc.is_some() {
-        check_nc_gemm_grid(dt, m, out_f)?;
-    }
     // The tiled GEMMs decode a 64-row weight tile that cannot be split into single input rows, so a
     // `>= 2^32`-element weight fails loudly there rather than wrap (issue #77).
     if (is_gemm || nc.is_some())
@@ -13850,23 +13794,15 @@ mod tests {
         refused(copy(DType::I32, DType::F32), "Op::Copy I32→F32");
     }
 
-    /// `tiled_gemm_fits` refuses exactly the two shapes the tiled GEMMs cannot run — a
-    /// non-coopmat grid past the x limit, a weight past the u32 addressing cap — and accepts the
-    /// rest; the grid cap applies only to the non-coopmat GEMMs.
+    /// The one shape `quant_linear` keeps off the tiled GEMMs: a weight at the u32 addressing cap
+    /// (`bda_weight_breaches`, lowered here through `bda_chunk_elems`). A grid past the x limit is
+    /// not one of them any more: those GEMMs record through `dispatch_wide`.
     #[test]
-    fn tiled_gemm_fits_refuses_an_oversized_grid_or_a_breaching_weight() {
-        let (dt, m, in_f, out_f) = (DType::Q8_0, 40, 256, 128);
+    fn tiled_gemms_refuse_only_a_breaching_weight() {
+        let (dt, in_f, out_f) = (DType::Q8_0, 256, 128);
         let mut vk = infr_core::config::Config::default().kernels.vulkan;
-        let x_limit = crate::recorder::Recorder::split_point_x();
-        assert!(tiled_gemm_fits(dt, m, in_f, out_f, true, &vk, x_limit));
-
-        let groups = crate::recorder::nc_gemm_groups(m, out_f) as u32;
-        assert!(tiled_gemm_fits(dt, m, in_f, out_f, true, &vk, groups));
-        assert!(!tiled_gemm_fits(dt, m, in_f, out_f, true, &vk, groups - 1));
-        assert!(tiled_gemm_fits(dt, m, in_f, out_f, false, &vk, groups - 1));
-
+        assert!(!crate::recorder::bda_weight_breaches(dt, in_f, out_f, &vk));
         vk.bda_chunk_elems = Some((in_f * out_f) as u64);
-        assert!(!tiled_gemm_fits(dt, m, in_f, out_f, true, &vk, x_limit));
-        assert!(!tiled_gemm_fits(dt, m, in_f, out_f, false, &vk, x_limit));
+        assert!(crate::recorder::bda_weight_breaches(dt, in_f, out_f, &vk));
     }
 }

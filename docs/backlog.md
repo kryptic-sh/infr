@@ -47,13 +47,16 @@ Queue order (the owner's): MoE routing first, then the rest in the order below.
    at only 13 to 20 selections. The dense decode GEMVs on float
    (`kernels.vulkan.mmv_mw = false`, measured, not built as a MoE-only switch)
    take 7% to 19% off the selections differing and 5% to 44% off the mean KL.
-   **For the owner:** (i) `quant_q8.experts_hi` on by default for MoE models,
-   after the prefill A/B (commands in the doc; its structural cost is 8 bytes
-   per 32 activations read and written, no extra dispatch); (ii) a MoE-only
-   float decode switch, its decode A/B first; (iii) whether the routing gap is
-   worth more (the simulation's only lever was finer blocks, 8 elements: about
-   40% fewer selections differing, a change to every int8 kernel family). The
-   real MoE rows of the tolerance table still wait for these.
+   Timed on the RX 7900 XTX (the doc's Speed tables): the parameter costs 8.7%
+   of pp512 on Qwen3-30B-A3B and 8.0% on ERNIE-21B-A3B; float dense decode GEMVs
+   cost nothing on Qwen3-30B-A3B (+0.4%) and 3.4% of tg128 on ERNIE. **For the
+   owner:** (i) `quant_q8.experts_hi` on by default for MoE models at that
+   prefill cost, or left off; (ii) a MoE-only float decode switch; (iii) whether
+   the routing gap is worth more (the simulation's only lever was finer blocks,
+   8 elements: about 40% fewer selections differing, a change to every int8
+   kernel family). Not tried: making the remainder load cheaper (a per-row "any
+   block split" flag would skip the read on nearly every row). The real MoE rows
+   of the tolerance table still wait for these.
 3. **`kv.overflow` without `VK_EXT_memory_budget`.** Stays off there
    (`kv_spill_armed`). Add a one-line load warning that the flag has no effect
    on this driver and why.
@@ -5084,6 +5087,15 @@ not explain a spread that tight over three reps). What would settle it: the same
 loop with the desktop idle, and `INFR_PROF_OPS=1` on a slow run to see whether
 every kernel is slower or one is. Until then a single prefill figure from this
 card is not a measurement; alternate and repeat.
+
+Seen again 2026-11-25 on commit `8004eefe` with nothing else building or testing
+(load average 1.1 to 4.6, desktop idle), so another busy session is not the
+cause: one Qwen3-30B-A3B `-p 512 -n 0` run of three read 848.5 t/s against
+4040.5 and 4064.0 (spread 0.2%), and one `-p 0 -n 128` run of three read 36.2
+t/s against 217.5 and 217.6 (spread 0.3%). So decode has the state too, at a
+sixth of its speed. That is two of the six plain Qwen3-30B-A3B runs; none of the
+sixteen other runs in the batch (a `--set` override, or ERNIE-21B-A3B) showed
+it, which is too few to call a pattern.
 
 ### B-MOE-EXPERT-TILE — batched expert GEMMs take only whole 64-column tiles (2026-11-25)
 

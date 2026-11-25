@@ -1979,8 +1979,8 @@ dequantizing GEMVs, everything else shipped):
   262 on Qwen3-30B-A3B (339) at 7.8e-5 (1.8e-4); on the integrated GPU 405 (425)
   and 467 (564).
 
-Decode measured the same speed with every decode GEMV float (the first
-measurement's Cost, not a quiet window). What this configuration sets,
+Decode speed with the dense GEMVs float is under Speed below (the same on
+Qwen3-30B-A3B, 3.4% slower on ERNIE). What this configuration sets,
 `kernels.vulkan.mmv_mw = false`, takes the int8 decode GEMVs off for every
 model; a MoE-only form of it does not exist and was not built (the switch would
 have to key on the graph having routed experts, in the decode `Linear` lowering
@@ -1988,8 +1988,27 @@ of `adapter.rs`).
 
 ### Speed
 
-Not timed (a shared machine; the orchestrator's A/B). Structurally, with the
-parameter on:
+Timed on the RX 7900 XTX (`Vulkan0`), Q4_K_M files, `infr bench -r 3`, runs
+alternated, nothing else building or testing on the machine (load average 1.1 to
+5.5, the bench's own threads included), commit `8004eefe`:
+
+| pp512, t/s    | shipped        | `quant_q8.experts_hi` on | change |
+| ------------- | -------------- | ------------------------ | ------ |
+| Qwen3-30B-A3B | 4040.5, 4064.0 | 3689.5, 3691.2, 3713.0   | -8.7%  |
+| ERNIE-21B-A3B | 4197.2, 4167.8 | 3863.7, 3831.7           | -8.0%  |
+
+| tg128, t/s    | shipped (int8 dense GEMVs) | `mmv_mw = false`    | change |
+| ------------- | -------------------------- | ------------------- | ------ |
+| Qwen3-30B-A3B | 217.5, 217.6               | 218.6, 218.6, 218.4 | +0.4%  |
+| ERNIE-21B-A3B | 218.2, 218.2, 218.0        | 210.9, 210.7, 210.3 | -3.4%  |
+
+Each figure is one process's mean of three reps (spreads 0.1% to 4.9%). Two
+shipped runs are left out of the table: a third Qwen3-30B-A3B prefill run read
+848.5 t/s and a third decode run 36.2 t/s, each tight across its three reps (the
+whole-process slow state of backlog B-PP-SLOW-RUNS, now seen in decode too).
+Decode with the parameter on was not timed: its kernels are the shipped ones.
+
+Structurally, with the parameter on:
 
 - **No extra dispatch or pass.** The quantizer and the expert GEMMs are the same
   dispatches; the HI quantizer adds three subgroup reductions per block and

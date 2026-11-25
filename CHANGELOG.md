@@ -99,9 +99,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   format keeps the shipped quantizer for its stage. On Qwen3-30B-A3B it takes
   the first two positions' KL against the CPU reference from 3.8e-2 to 2.5e-4 on
   the RX 7900 XTX and to 1.3e-3 on the integrated GPU (`docs/gpu-tolerance.md`,
-  "The routed experts' outlier quantizer"). Decode is unchanged; prefill speed
-  is not yet measured. `Recorder::quant_q8_with`, `quant_q8_gather_with` and
-  `matmul_mmq_experts_with` take the carried remainders as an `Option`.
+  "The routed experts' outlier quantizer"). Decode is unchanged; prefill is
+  about 8% slower with it on (RX 7900 XTX). `Recorder::quant_q8_with`,
+  `quant_q8_gather_with` and `matmul_mmq_experts_with` take the carried
+  remainders as an `Option`.
 - **`Op::AttnTemp`** on the CPU, Vulkan and Metal backends: llama.cpp's
   position-dependent attention temperature (`llm_graph_input_attn_temp`), which
   scales each row by `ln(floor((pos + offset) / floor_scale) + 1) * scale + 1`.

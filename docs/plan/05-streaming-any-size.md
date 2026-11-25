@@ -106,10 +106,12 @@ measurement in a quiet window before and after.
 
 ## D. Safety
 
-- **The per-pass file-change check is not wired**
-  (`FileBlockIo::verify_unchanged` exists, no caller; B35). Decision recorded
-  there: once per forward pass, once per request, or at each pin, and fail or
-  reload. Recommended: once per forward pass, fail the request.
+- **The file-change check runs on every block read.** `FileBlockIo::read_block`
+  re-stats each shard it read, after the read, against the stamp taken when the
+  model was mapped, and fails the read (and with it the request) by name when
+  the length or modification time moved. It reads through descriptors reopened
+  from the mapping's own, so a file renamed into place is not a change. Its cost
+  and what it leaves are backlog B35.
 
 ## Verification for the whole phase
 

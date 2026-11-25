@@ -27,35 +27,12 @@
 //! because the accidental cases, which are the ones that actually happen, all move one of the two
 //! fields.
 
+use infr_core::blockio::FileStamp;
 use infr_core::error::{Error, Result};
 use std::{
     fs::File,
     path::{Path, PathBuf},
-    time::SystemTime,
 };
-
-/// The mapped file's identity at a point in time: the two fields an accidental overwrite moves.
-///
-/// `mtime` is optional because [`std::fs::Metadata::modified`] is not available on every platform
-/// and filesystem. Where it is missing the length is still checked, which is the half that catches
-/// truncation — the case that ends in `SIGBUS` rather than merely wrong numbers.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct FileStamp {
-    len: u64,
-    mtime: Option<SystemTime>,
-}
-
-impl FileStamp {
-    /// Stamp the open descriptor — NOT the path. See the module docs: this is what makes a
-    /// rename-into-place a non-event and an in-place write a detected one.
-    fn of(file: &File) -> Result<Self> {
-        let meta = file.metadata()?;
-        Ok(FileStamp {
-            len: meta.len(),
-            mtime: meta.modified().ok(),
-        })
-    }
-}
 
 /// One watched file: its held descriptor, the path it was opened by, and its stamp at load.
 struct Watched {
@@ -78,37 +55,49 @@ pub struct WeightWatch {
 impl WeightWatch {
     /// Stamp the single file `path` as it is now.
     ///
-    /// Call this next to the `Gguf::open` whose mapping it guards. The two opens are not atomic
-    /// with respect to each other, so a rename landing exactly between them leaves this watching
-    /// the new inode while the mapping holds the old — a missed detection, never a false one, and
-    /// the window is two syscalls wide.
+    /// Opens the path a second time, beside whatever mapping it guards, so a rename landing
+    /// between the two opens leaves this watching the new inode while the mapping holds the old —
+    /// a missed detection, never a false one. [`Self::for_model`] has no such window.
     pub fn open(path: &Path) -> Result<Self> {
+        let file = File::open(path)?;
+        let at_load = FileStamp::of(&file)?;
         Ok(WeightWatch {
-            files: vec![Self::stamp(path)?],
+            files: vec![Watched {
+                file,
+                path: path.to_path_buf(),
+                at_load,
+            }],
         })
     }
 
-    /// Stamp every file of the model `path` names: the whole `gguf-split` set when `path` is one
-    /// shard of it, otherwise just `path`. The set comes from [`crate::Gguf::open`] itself, so it
-    /// is exactly the files the model's mapping reads, found the same way.
-    pub fn open_model(path: &Path) -> Result<Self> {
-        let model = crate::Gguf::open(path)?;
+    /// Watch the files `model` is mapped from — through its own descriptors, against the stamps it
+    /// took when it mapped them ([`crate::Gguf::shard_handles`]). So this watches exactly the
+    /// files the mapping reads, a `gguf-split` set whole, and a change that landed between the
+    /// load and this call already shows on the first [`Self::check`].
+    pub fn for_model(model: &crate::Gguf) -> Result<Self> {
         let files = model
-            .shards()
+            .shard_handles()
             .into_iter()
-            .map(|(p, _)| Self::stamp(p))
+            .map(|h| {
+                Ok(Watched {
+                    file: h.file.try_clone()?,
+                    path: h.path.to_path_buf(),
+                    at_load: h.stamp,
+                })
+            })
             .collect::<Result<_>>()?;
         Ok(WeightWatch { files })
     }
 
-    fn stamp(path: &Path) -> Result<Watched> {
-        let file = File::open(path)?;
-        let at_load = FileStamp::of(&file)?;
-        Ok(Watched {
-            file,
-            path: path.to_path_buf(),
-            at_load,
-        })
+    /// Stamp every file of the model `path` names: the whole `gguf-split` set when `path` is one
+    /// shard of it, otherwise just `path`. The set comes from [`crate::Gguf::open`] itself, so it
+    /// is exactly the files a mapping of that path reads, found the same way.
+    ///
+    /// That is a mapping of its OWN, not the one a model loaded elsewhere holds: a file replaced
+    /// by rename between that load and this call leaves the two on different inodes. Where the
+    /// model's [`crate::Gguf`] is at hand, [`Self::for_model`] watches its mapping instead.
+    pub fn open_model(path: &Path) -> Result<Self> {
+        Self::for_model(&crate::Gguf::open(path)?)
     }
 
     /// `Ok(())` while every watched file is byte-identical in the ways this can see; a described
@@ -123,11 +112,7 @@ impl WeightWatch {
             if now == w.at_load {
                 continue;
             }
-            let what = if now.len != w.at_load.len {
-                format!("size changed {} -> {} bytes", w.at_load.len, now.len)
-            } else {
-                "contents were rewritten in place (mtime moved, size unchanged)".to_owned()
-            };
+            let what = w.at_load.describe_change(&now);
             return Err(Error::Loader(format!(
                 "weight file {:?} changed while mapped: {what}. The loaded weights are no longer \
                  trustworthy — any output produced since may be wrong, and a shrunk file can fault \
@@ -143,6 +128,7 @@ impl WeightWatch {
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::time::SystemTime;
 
     /// A file written once and left alone must never trip the check, however often it is asked.
     #[test]
@@ -197,7 +183,11 @@ mod tests {
         let err = watch
             .check()
             .expect_err("an in-place rewrite must be reported");
-        assert!(err.to_string().contains("rewritten in place"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("modification time moved, size unchanged"),
+            "{err}"
+        );
     }
 
     /// The design decision, pinned: a rename INTO place is not a corruption. The old inode stays

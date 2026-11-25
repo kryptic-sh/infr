@@ -652,9 +652,10 @@ Superseded, kept so they are not re-argued:
    (§4), and the tier engages whenever placement rejects residency, sized by
    §4.1's probe.
 2. ~~Sharded GGUF is out of scope for v1.~~ Shipped:
-   `infr_core::blockio::FileBlockIo::open_shards` serves a `gguf-split` set, and
-   `cpu_paged_store` / `vulkan_host_tier` in `infr-llama/src/seam/mod.rs` open
-   it from `Gguf::shards()`.
+   `infr_core::blockio::FileBlockIo::from_handles` serves a `gguf-split` set,
+   and `cpu_paged_store` / `vulkan_host_tier` in `infr-llama/src/seam/mod.rs`
+   build it from `Gguf::shard_handles()` — the descriptors the model was mapped
+   from, never its paths.
 3. ~~Windows host-memory probe.~~ Shipped: `infr_core::hostmem` delegates to
    `infr_plat::mem::available`, which has Linux (cgroup-clamped), macOS
    (`host_statistics64`) and Windows (Job-Object-clamped) arms; CI runs all

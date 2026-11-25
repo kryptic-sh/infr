@@ -97,9 +97,9 @@ fn resident_verdict(unified: bool, available: Option<u64>, model_bytes: u64) -> 
 fn model_file_bytes(path: &std::path::Path) -> u64 {
     infr_gguf::Gguf::open(path)
         .expect("open gguf")
-        .shards()
+        .shard_handles()
         .iter()
-        .map(|&(_, len)| len)
+        .map(|h| h.stamp.len)
         .sum()
 }
 

@@ -95,6 +95,57 @@ pub fn write_all_at(file: &File, buf: &[u8], offset: u64) -> io::Result<()> {
     }
 }
 
+/// Open `file` again, for positioned reads, as a handle of its own onto the SAME file — never by
+/// path, so it cannot land on a file that has since been renamed into the old one's place.
+///
+/// **Windows**: `ReOpenFile`, which makes a new file object. A duplicated handle
+/// (`File::try_clone`) shares the original's file object, and Windows runs the reads of a
+/// synchronous file object one at a time, so readers that want to run concurrently each need one
+/// of these. Read access and the share mode `File::open` uses (read, write and delete), so the
+/// reopened handle stops nobody the original would not have stopped — a mapping of the file, or
+/// another reader. **Unix**: `try_clone` (`dup`), which shares the original's open file
+/// description; positioned reads carry their own offset and run concurrently on it, so nothing
+/// more is needed. **Other targets**: an `Unsupported` error.
+pub fn reopen_for_reads(file: &File) -> io::Result<File> {
+    #[cfg(unix)]
+    {
+        file.try_clone()
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::{AsRawHandle, FromRawHandle};
+        use windows::Win32::Foundation::{GENERIC_READ, HANDLE};
+        use windows::Win32::Storage::FileSystem::{
+            ReOpenFile, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+            FILE_SHARE_WRITE,
+        };
+
+        // SAFETY: the handle is open for the borrow of `file`, and the call takes no pointers.
+        let reopened = unsafe {
+            ReOpenFile(
+                HANDLE(file.as_raw_handle()),
+                GENERIC_READ.0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                // No flags: a synchronous handle, as `File::open` makes, which is what `seek_read`
+                // expects.
+                FILE_FLAGS_AND_ATTRIBUTES(0),
+            )
+        }
+        .map_err(|_| io::Error::last_os_error())?;
+        // SAFETY: `ReOpenFile` returned a new, valid handle that nothing else owns; the `File`
+        // takes ownership and closes it on drop.
+        Ok(unsafe { File::from_raw_handle(reopened.0) })
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = file;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "reopening a file needs unix or windows",
+        ))
+    }
+}
+
 /// Prepare `file` for writes that arrive in any order, as a download split into ranges makes them.
 ///
 /// **Windows**: marks the file sparse (`FSCTL_SET_SPARSE`). Without it NTFS fills everything below
@@ -180,6 +231,19 @@ mod tests {
         let mut buf = [0u8; 8];
         let err = read_exact_at(&f, &mut buf, 6).expect_err("must not succeed past EOF");
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    /// A reopened handle reads the same file, and stays open on its own: closing the original
+    /// must not close it (a handle that shared the original's lifetime would fail here).
+    #[test]
+    fn a_reopened_file_reads_the_same_bytes_after_the_original_closes() {
+        let (_d, path) = scratch(b"0123456789");
+        let f = File::open(&path).expect("open");
+        let again = reopen_for_reads(&f).expect("reopen");
+        drop(f);
+        let mut buf = [0u8; 4];
+        read_exact_at(&again, &mut buf, 5).expect("read the reopened handle");
+        assert_eq!(&buf, b"5678");
     }
 
     #[test]

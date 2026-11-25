@@ -13,6 +13,7 @@ pub mod dequant;
 pub mod watch;
 
 use infr_core::{
+    blockio::{FileStamp, ShardHandle},
     error::{Error, Result},
     gguf_split::{parse_shard, shard_set},
     loader::{MetaValue, Metadata, TensorInfo},
@@ -97,8 +98,14 @@ pub struct Gguf {
 /// One shard's mapping and where its bytes sit in the set's concatenated address space.
 struct ShardFile {
     mmap: Arc<Mmap>,
-    /// The path this shard was opened from, for a reader that wants the FILE rather than this
-    /// mapping — see [`Gguf::shards`].
+    /// The descriptor `mmap` was made from, held for the model's life so a second reader of the
+    /// file (the pager's disk tier, the weight watch) reads THIS file rather than whatever the
+    /// path names by then — see [`Gguf::shard_handles`].
+    file: File,
+    /// `file` as it was just before it was mapped.
+    stamp: FileStamp,
+    /// The path this shard was opened from, for messages and for the extra handles a Windows
+    /// reader opens — see [`Gguf::shard_handles`].
     path: PathBuf,
     /// Offset of this shard's first byte in the concatenated address space: the sum of every
     /// earlier shard's file length. Zero for the first shard, hence for every single-file model.
@@ -141,7 +148,7 @@ impl TensorBytes {
     /// For a single-file model the offset is a plain file offset, because `Gguf::open` maps the
     /// whole file from byte 0 so the mapping and the file agree; `mapping_covers_the_whole_file`
     /// pins that. For a shard set it is that offset PLUS the lengths of the earlier shards, which
-    /// is the same space `infr_core::blockio::FileBlockIo::open_shards` reads.
+    /// is the same space `infr_core::blockio::FileBlockIo::from_handles` reads.
     pub fn file_range(&self) -> (u64, usize) {
         (self.file_base + self.off as u64, self.len)
     }
@@ -656,6 +663,8 @@ impl Gguf {
         for part in parts {
             let ShardParts {
                 mmap,
+                file,
+                stamp,
                 metadata: md,
                 tensors: mut ts,
                 data_region_start,
@@ -682,6 +691,8 @@ impl Gguf {
             metadata.get_or_insert(md);
             shards.push(ShardFile {
                 mmap: Arc::new(mmap),
+                file,
+                stamp,
                 path,
                 file_base: this_base,
             });
@@ -732,8 +743,21 @@ impl Gguf {
     /// into a model, whether the model is one file or a shard set.
     fn map_and_parse(path: &Path) -> Result<ShardParts> {
         let file = File::open(path)?;
+        // Stamped BEFORE mapping, so any write that lands after it — including one between here
+        // and the map — moves the stamp and is caught by whoever checks it later.
+        let stamp = FileStamp::of(&file)?;
         // SAFETY: the file is not modified while this Mmap is live — see the invariant above.
         let mmap = unsafe { Mmap::map(&file) }?;
+        // A length that moved between the stamp and the map would leave the stamp describing a
+        // file the mapping does not cover, and every later check comparing against the wrong size.
+        if mmap.len() as u64 != stamp.len {
+            return Err(Error::Loader(format!(
+                "GGUF: {} changed while it was being mapped: {} bytes when opened, {} mapped",
+                path.display(),
+                stamp.len,
+                mmap.len()
+            )));
+        }
 
         // Best-effort madvise hints. All are advisory: `advise()` returns an
         // `io::Result`, but a rejected/unsupported hint must never fail the load —
@@ -913,6 +937,8 @@ impl Gguf {
 
         Ok(ShardParts {
             mmap,
+            file,
+            stamp,
             metadata,
             tensors,
             data_region_start,
@@ -942,28 +968,32 @@ impl Gguf {
     /// every mapped read, so a descriptor built from this can never name bytes outside the model.
     ///
     /// For a single file the offset IS a file offset. For a shard set the shards are addressed end
-    /// to end in `split.no` order, and `infr_core::blockio::FileBlockIo::open_shards` — given the
-    /// same files in the same order by [`Self::shards`] — maps an offset back to the shard that
-    /// holds it. A tensor never straddles that boundary: each lives wholly inside one shard.
+    /// to end in `split.no` order, and `infr_core::blockio::FileBlockIo::from_handles` — given the
+    /// same files in the same order by [`Self::shard_handles`] — maps an offset back to the shard
+    /// that holds it. A tensor never straddles that boundary: each lives wholly inside one shard.
     pub fn tensor_file_range(&self, name: &str) -> Result<(u64, usize)> {
         let (shard, off, len) = self.resolve(name)?;
         Ok((shard.file_base + off as u64, len))
     }
 
-    /// The files this model was opened from, in shard order, each with the byte length its offsets
-    /// were computed against — what a second reader (the pager's disk tier) opens.
+    /// The files this model was mapped from, in shard order: each one's open descriptor, the path
+    /// it was opened by, and its [`FileStamp`] as of the mapping, whose length is the one every
+    /// offset was computed against. What a second reader of the files — the pager's disk tier
+    /// (`infr_core::blockio::FileBlockIo::from_handles`), the weight watch
+    /// ([`watch::WeightWatch::for_model`]) — is built from.
     ///
-    /// Paths, not descriptors, and that is a real difference: re-opening one can land on a
-    /// DIFFERENT inode if the model was replaced meanwhile. `infr_core::blockio::FileBlockIo`
-    /// stamps whatever it opens and re-checks that, so a mid-run replacement is caught rather than
-    /// silently read (the same guarantee, and the same blind spot, as `watch::WeightWatch`). The
-    /// lengths are what makes that check possible ACROSS a shard set: a shard whose size changed
-    /// would shift every offset in every later shard, so `open_shards` refuses a file whose length
-    /// is no longer the one these offsets were built on.
-    pub fn shards(&self) -> Vec<(&Path, u64)> {
+    /// Descriptors, not paths, and that is the point: re-opening a path can land on a DIFFERENT
+    /// file if the model was replaced since it was mapped (`infr pull` renames into place), and a
+    /// same-size replacement read at these offsets is other weights with no error. The stamp
+    /// covers what a descriptor cannot: the same file rewritten in place.
+    pub fn shard_handles(&self) -> Vec<ShardHandle<'_>> {
         self.shards
             .iter()
-            .map(|s| (s.path.as_path(), s.mmap.len() as u64))
+            .map(|s| ShardHandle {
+                file: &s.file,
+                path: &s.path,
+                stamp: s.stamp,
+            })
             .collect()
     }
 
@@ -1007,6 +1037,8 @@ impl Gguf {
 /// still relative to its OWN data region.
 struct ShardParts {
     mmap: Mmap,
+    file: File,
+    stamp: FileStamp,
     metadata: Metadata,
     tensors: Vec<TensorInfo>,
     /// Absolute byte offset into `mmap` where this shard's tensor data begins.
@@ -1226,7 +1258,7 @@ mod tests {
     }
 
     /// The pager's disk tier reads a tensor by `(offset, len)` taken from
-    /// [`Gguf::tensor_file_range`] and opens the files [`Gguf::shards`] names. Both halves must
+    /// [`Gguf::tensor_file_range`] through the files [`Gguf::shard_handles`] hands out. Both halves must
     /// land on exactly the bytes the MAPPING serves — an off-by-one against `data_region_start`
     /// here is weights shifted by a few bytes, which decodes to plausible garbage rather than
     /// failing.
@@ -1238,8 +1270,7 @@ mod tests {
         let gguf = Gguf::open(tmp.path()).expect("open fixture");
 
         // A single-file model is one shard, at base 0, of its own full length.
-        assert_eq!(gguf.shards().len(), 1);
-        assert_eq!(gguf.shards()[0], (tmp.path(), bytes.len() as u64));
+        assert_eq!(shard_list(&gguf), vec![(tmp.path(), bytes.len() as u64)]);
 
         let mapped = gguf.tensor_bytes("tensor0").expect("tensor_bytes").to_vec();
         let (off, len) = gguf
@@ -1247,7 +1278,7 @@ mod tests {
             .expect("tensor_file_range");
         assert_eq!(len, mapped.len());
 
-        let mut f = std::fs::File::open(gguf.shards()[0].0).expect("re-open by path");
+        let mut f = std::fs::File::open(gguf.shard_handles()[0].path).expect("re-open by path");
         let mut from_file = vec![0u8; len];
         f.seek(std::io::SeekFrom::Start(off)).expect("seek");
         f.read_exact(&mut from_file).expect("read");
@@ -1801,6 +1832,14 @@ mod tests {
             .collect()
     }
 
+    /// Each shard's path and the length its offsets were computed against, in shard order.
+    fn shard_list(g: &Gguf) -> Vec<(&Path, u64)> {
+        g.shard_handles()
+            .into_iter()
+            .map(|h| (h.path, h.stamp.len))
+            .collect()
+    }
+
     fn open_err(path: &Path) -> String {
         match Gguf::open(path).map(|_| ()) {
             Err(Error::Loader(msg)) => msg,
@@ -1839,7 +1878,7 @@ mod tests {
         // Both shards are mapped, laid end to end at their own file lengths.
         let shard1_len = std::fs::metadata(&paths[0]).unwrap().len();
         assert_eq!(
-            gguf.shards(),
+            shard_list(&gguf),
             vec![
                 (paths[0].as_path(), shard1_len),
                 (
@@ -1858,7 +1897,7 @@ mod tests {
     }
 
     /// The pager's disk tier reads those same concatenated offsets through
-    /// `FileBlockIo::open_shards`. This is the seam where a disagreement about the address space
+    /// `FileBlockIo::from_handles`. This is the seam where a disagreement about the address space
     /// would surface as silently wrong weights, so it is checked end to end: the bytes the block
     /// reader returns for a shard-2 tensor must be the bytes the mapping serves.
     #[test]
@@ -1866,7 +1905,7 @@ mod tests {
         use infr_core::blockio::{BlockDesc, BlockExtent, BlockIo, FileBlockIo};
         let (_dir, paths) = two_shard_fixture();
         let gguf = Gguf::open(&paths[0]).expect("open shard 1");
-        let io = FileBlockIo::open_shards(&gguf.shards()).expect("open shard set");
+        let io = FileBlockIo::from_handles(&gguf.shard_handles()).expect("open shard set");
 
         for name in ["a", "b", "c"] {
             let mapped = gguf.tensor_bytes(name).expect("mapped").to_vec();
@@ -1885,6 +1924,77 @@ mod tests {
                 "block read for '{name}' must match the mapping"
             );
         }
+    }
+
+    /// The block reader and the watch are built from the descriptors the model was MAPPED from,
+    /// not from its paths. A same-size shard renamed into place after the load leaves the path
+    /// naming other bytes — at the offsets the model was loaded against — so a reader that
+    /// re-opened it would serve them as weights, and a watch that re-opened it would vouch for
+    /// them. Both must keep to the mapped file, which still holds exactly what the mapping serves.
+    #[test]
+    fn the_reader_and_the_watch_follow_the_mapping_through_a_rename() {
+        use infr_core::blockio::{BlockDesc, BlockExtent, BlockIo, FileBlockIo, HANDLES_PER_FILE};
+        let (dir, paths) = two_shard_fixture();
+        let gguf = Gguf::open(&paths[0]).expect("open shard 1");
+        let original = std::fs::read(&paths[1]).expect("read shard 2");
+
+        // Same tensor name, shape and dtype, so the replacement is the same length; other values.
+        let other = build_split_shard(1, 2, 3, &[("c", &[70.0, 80.0, 90.0])]);
+        assert_eq!(other.len() as u64, shard_list(&gguf)[1].1);
+        let next = dir.path().join("next.gguf");
+        std::fs::write(&next, &other).expect("write");
+        // Windows may refuse to replace a mapped file. That refusal is the property in its own
+        // right (the OS protecting what the model reads), so it is asserted rather than failed on,
+        // and the reads below must return the loaded bytes either way.
+        match std::fs::rename(&next, &paths[1]) {
+            Ok(()) => assert_eq!(
+                std::fs::read(&paths[1]).expect("read the path"),
+                other,
+                "the path must name the replacement, or this test proves nothing"
+            ),
+            Err(e) if cfg!(windows) && is_windows_refusal(&e) => assert_eq!(
+                std::fs::read(&paths[1]).expect("read the path"),
+                original,
+                "a refused rename must leave the original in place"
+            ),
+            Err(e) => panic!("rename into place: {e}"),
+        }
+
+        let io =
+            FileBlockIo::from_handles(&gguf.shard_handles()).expect("the mapped set is intact");
+        let watch = crate::watch::WeightWatch::for_model(&gguf).expect("watch the mapped set");
+        let (offset, len) = gguf.tensor_file_range("c").expect("range");
+        let desc = BlockDesc {
+            id: 0,
+            extents: vec![BlockExtent { offset, len }],
+        };
+        // Once per handle: the reader hands its handles out in turn, so a wrong one past the
+        // first would otherwise never be read.
+        for i in 0..HANDLES_PER_FILE {
+            let mut got = vec![0u8; len];
+            io.read_block(&desc, &mut got)
+                .unwrap_or_else(|e| panic!("read {i}: {e}"));
+            assert_eq!(
+                f32s(&got),
+                vec![7.0, 8.0, 9.0],
+                "read {i} came from the path, not the mapping"
+            );
+        }
+        watch
+            .check()
+            .expect("the mapped file is untouched, so the watch must stay clean");
+    }
+
+    /// The errors Windows answers a rename over an open or mapped file with: access denied (which
+    /// std reports as `PermissionDenied`), a sharing violation, or a user-mapped section.
+    fn is_windows_refusal(e: &std::io::Error) -> bool {
+        const ERROR_SHARING_VIOLATION: i32 = 32;
+        const ERROR_USER_MAPPED_FILE: i32 = 1224;
+        e.kind() == std::io::ErrorKind::PermissionDenied
+            || matches!(
+                e.raw_os_error(),
+                Some(ERROR_SHARING_VIOLATION | ERROR_USER_MAPPED_FILE)
+            )
     }
 
     /// A later shard carries no model metadata at all, so opening one alone could only ever fail.
@@ -1909,7 +2019,38 @@ mod tests {
                 "'{name}' must read identically whichever shard was opened"
             );
         }
-        assert_eq!(from_second.shards(), from_first.shards());
+        assert_eq!(shard_list(&from_second), shard_list(&from_first));
+    }
+
+    /// A watch built from the model compares against the stamp the MAPPING took, so a shard
+    /// rewritten in place between the load and the watch is reported on the first check. A watch
+    /// that stamped the file afresh would record the rewritten file as the baseline and vouch for
+    /// a mapping that is already serving other bytes.
+    #[test]
+    fn the_watch_compares_against_the_mapping_s_stamp() {
+        let (_dir, paths) = two_shard_fixture();
+        let gguf = Gguf::open(&paths[0]).expect("open shard 1");
+
+        let other = build_split_shard(1, 2, 3, &[("c", &[70.0, 80.0, 90.0])]);
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&paths[1])
+            .unwrap();
+        (&f).write_all(&other).unwrap();
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        f.set_times(std::fs::FileTimes::new().set_modified(later))
+            .unwrap();
+        drop(f);
+
+        let watch = crate::watch::WeightWatch::for_model(&gguf).expect("watch the set");
+        let err = watch
+            .check()
+            .expect_err("a shard rewritten since the load must be reported");
+        assert!(
+            err.to_string()
+                .contains("modification time moved, size unchanged"),
+            "{err}"
+        );
     }
 
     /// The weight watch covers every shard of a split model, not only the one the user named: a
@@ -2088,7 +2229,7 @@ mod tests {
         std::fs::write(&p, build_fixture()).expect("write");
         let gguf = Gguf::open(&p).expect("a plain GGUF must load whatever it is named");
         assert_eq!(gguf.tensors().len(), 1);
-        assert_eq!(gguf.shards().len(), 1);
+        assert_eq!(gguf.shard_handles().len(), 1);
     }
 
     // ── gated real-model test (skipped offline) ───────────────────────────────

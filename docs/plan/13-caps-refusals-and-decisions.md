@@ -197,9 +197,14 @@ the split too, as does its Q6_K twin `matmul_mmq_q6k`, which only tests call.
 ### S11 — small independent slices
 
 - **B35:** `fstat` each touched shard inside `FileBlockIo::read_block` and fail
-  the request on a mismatch.
+  the request on a mismatch — done 2026-11-25. The check runs after the read, so
+  a change landing during it is caught too; what it left is backlog B35.
 - **B30:** keep and share the descriptor that was mapped (`Gguf::shard_handles`,
-  `FileBlockIo::from_handles`, `WeightWatch::for_model`).
+  `FileBlockIo::from_handles`, `WeightWatch::for_model`) — done 2026-11-25.
+  Every reader handle is reopened from the mapped descriptor
+  (`infr_plat::fileio::reopen_for_reads`, `ReOpenFile` on Windows). The CLI's
+  watches still open the model a second time (`WeightWatch::open_model`); that
+  is backlog B30.
 - **B103:** a `dist` artifact check counting VEX against legacy-SSE
   instructions, proven able to fail with a `target-cpu=native` build.
 - **B-HWDET-VENDOR-RULES:** `INFR_COOPMAT_FORCE` next to `INFR_NO_COOPMAT`.

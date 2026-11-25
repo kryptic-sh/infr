@@ -68,6 +68,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `Capabilities::compute_units` (`Backend::capabilities`), which is what the
   seam now sizes the default prefill chunk from.
 
+- **Weight files are read through the descriptors the model was mapped from.**
+  `infr_gguf::Gguf::shards` is replaced by `Gguf::shard_handles`, which returns
+  each shard's open `File`, path and `infr_core::blockio::FileStamp` (its length
+  and mtime when it was mapped) as an `infr_core::blockio::ShardHandle`.
+  `infr_core::blockio::FileBlockIo::open_shards` is replaced by
+  `FileBlockIo::from_handles`, and `FileBlockIo::verify_unchanged` is removed:
+  every block read now checks the file itself. `WeightWatch::check` now says
+  "modification time moved, size unchanged" where it said "contents were
+  rewritten in place". New: `infr_plat::fileio::reopen_for_reads`,
+  `infr_gguf::watch::WeightWatch::for_model`, which watches a loaded `Gguf`'s
+  own files against the stamps it took when mapping them.
+
 ### Added
 
 - **`Backend::set_kv_spill_reserve`** and **`Backend::kv_spill_armed`**; on
@@ -1245,6 +1257,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   conversation with tools, and every conversation, respectively, and now render.
 
 ### Fixed
+
+- **A weight file that changes under a streaming run now fails the read that
+  touches it, instead of serving other bytes as weights.** With host or disk
+  paging on (`INFR_DRAM_CACHE`, or the streamed Vulkan tiers), each block read
+  re-stats the shard it read and fails with
+  `model file changed while it was being streamed: <path> (size changed A -> B bytes | modification time moved, size unchanged) …`
+  when the file was truncated or rewritten in place since the model was loaded
+  (`cp new.gguf live.gguf` is both). The pager's reader also no longer re-opens
+  the model by path: a model replaced by rename (`infr pull`'s way of installing
+  a file) between the load and the first paged read used to be read at the old
+  file's offsets when the two were the same size; it now keeps reading the file
+  that was loaded, as the mapping does. A file changed between the load and the
+  reader's creation is refused with
+  `model file changed after it was loaded, before it was streamed`.
 
 - **A prefill on a Vulkan GPU without cooperative matrices no longer refuses a
   wide GEMM.** The tiled GEMMs that tier runs (the int8-dot `mmq` builds of

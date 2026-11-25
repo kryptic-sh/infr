@@ -971,9 +971,32 @@ operation infr itself performs.
 - `serve` checks per REQUEST, so a change landing mid-request is caught by the
   next one, after that response has already streamed. Post-checking would not
   un-send it.
-- `WeightWatch::open` is a second `open` beside `Gguf::open`, so a rename
-  landing exactly between them leaves the watch on the new inode and the mapping
-  on the old — a missed detection, never a false one, two syscalls wide.
+- **The CLI's watches are still a second open of the model.** Since 2026-11-25
+  `WeightWatch::for_model(&Gguf)` watches a loaded model's own descriptors
+  against the stamps `Gguf::open` took before mapping (`Gguf::shard_handles`),
+  and the pager's reader is built from the same handles
+  (`FileBlockIo::from_handles`). But every `infr-cli` caller (`run_chat`,
+  `SeamGenerator`, `ParallelGenerator`, the bench arms) still calls
+  `WeightWatch::open_model(path)`, which maps the model a second time, because
+  the model's own `Gguf` lives inside `SeamModel` (and the DiffusionGemma, Metal
+  and `ParallelSeam` paths) and none of them hands it out. So a rename landing
+  between the CLI's watch and the model's load leaves the two on different
+  inodes — a missed detection, never a false one. Closing it means exposing a
+  `WeightWatch` built from the loaded model (e.g. a `SeamModel` method) and
+  threading it through each of those paths in `infr-cli`.
+- **The Windows side of the shared descriptors has only run in CI.** Every
+  reader handle is `infr_plat::fileio::reopen_for_reads` of the mapped
+  descriptor (`ReOpenFile` on Windows, a file object of its own per handle).
+  Compiled here for `x86_64-pc-windows-msvc`; whether a rename over a mapped or
+  open file is refused or allowed there, and whether NTFS shows another handle a
+  writer's mtime change before that writer closes its handle, are both unknown
+  until the CI Windows job runs the tests (which accept either rename outcome).
+- **mtime resolution is coarser than it looks.** In the 2026-11-25 red runs a
+  file written, renamed over the original and stamped within a few milliseconds
+  on this box's filesystem carried the SAME mtime as the file it replaced, so a
+  same-length in-place rewrite landing in the load's own timer tick is invisible
+  to every stamp check here, not only one whose mtime was restored on purpose.
+  The tests move the mtime explicitly for that reason.
 
 **Considered and rejected: copying the file into an anonymous mapping.** PR #90
 did exactly that and it works, but it is not affordable. Measured on a 16 GiB
@@ -1104,14 +1127,28 @@ rediscovered:
   exposed than the CPU one — `DensePagerSession::stage` drops its pin before
   returning, so its floor is one slot per pool regardless of N — while the CPU
   interpreter holds a whole op's pins across the op.
-- **The per-pass file-change check is not wired — needs a decision.**
-  `FileBlockIo::verify_unchanged` exists and is tested; no caller runs it yet
-  (read), so a model rewritten mid-generation is read as whatever the new bytes
-  are (the same exposure as B30, now reachable through explicit reads rather
-  than the mapping). Options: check once per forward pass, once per request, or
-  at each `HostPager::pin`; and on a mismatch either fail the request or reload.
-  Each costs one `fstat` per check; which granularity is worth it is the
-  decision.
+- **The per-read file check (2026-11-25): what it costs and what it leaves.**
+  `FileBlockIo::read_block` re-stats every shard a block touched, after the
+  read, and fails it by name on a changed length or mtime. The small blocks that
+  matter are experts: `Pageable::class` (`infr-cpu/src/paged.rs`) applies
+  `MIN_PAGED_BYTES` to a whole expert bank and then cuts it per expert, so
+  expert blocks of a few hundred KiB are normal. Measured on this box (Linux,
+  warm page cache, so each read is a memcpy and the check's share is the largest
+  it gets), Qwen3-0.6B-Q4_K_M cut into equal blocks, 40 passes with the check on
+  and off interleaved in one process, three runs at load average 1.2-1.6:
+  `FileStamp::of` alone 96 ns; per block, 64 KiB +4.6% to +4.9% (about 100 ns on
+  2.1-2.2 µs), 256 KiB +0.65% to +1.24% (about 60-110 ns on 8.6-8.7 µs), 1 MiB
+  +0.02% to +0.50%. So at a realistic expert size the cost is about 1% of a
+  page-cache hit and less against a read that goes to disk. A cheaper form (stat
+  once per request or per forward pass) was not built; it would give up catching
+  a change between two reads of the same request. Windows' `metadata()`
+  (`GetFileInformationByHandle`) was not measured. What it leaves: a block
+  already resident in the DRAM arena before the change keeps being served (it
+  holds the bytes the model loaded, so it is consistent, not wrong); nothing
+  reloads, so every later request fails until a restart; and the failure has
+  only been driven by unit tests, never through `infr serve` or a paged run. A
+  failing `fstat` after a read is reported with the path and the read's own
+  error, but no test drives that path.
 
 ### B36 — paging optimizations found by review, measured but not built
 

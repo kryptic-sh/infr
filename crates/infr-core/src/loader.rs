@@ -77,7 +77,7 @@ pub struct TensorInfo {
     /// region's start already added in. A `gguf-split` model is several files, addressed end to
     /// end in shard order, so this is an offset into that concatenated space (see
     /// `infr_gguf::Gguf::tensor_file_range`, which reports it, and
-    /// `crate::blockio::FileBlockIo::open_shards`, which reads it).
+    /// `crate::blockio::FileBlockIo::from_handles`, which reads it).
     pub offset: u64,
     pub nbytes: usize,
 }

@@ -13,7 +13,7 @@
 //! performs (measured: `docs/perf/results.md`, "Weights that do not fit memory").
 //!
 //! A `gguf-split` model is several files rather than one, and they are addressed end to end in
-//! shard order ([`FileBlockIo::open_shards`]) so a [`BlockExtent`] stays one number. A single-file
+//! shard order ([`FileBlockIo::from_handles`]) so a [`BlockExtent`] stays one number. A single-file
 //! model is the one-shard case of that, at base 0, and reads exactly as it did before.
 //!
 //! That freedom is also what makes a block's read CONCURRENT rather than one syscall: an NVMe
@@ -22,23 +22,27 @@
 //! even footing with the mapping it replaces, whose faults the kernel already issues in parallel.
 //!
 //! The file can also change under a live run. A mapping makes that a `SIGBUS` or silently
-//! different bytes; explicit reads make it detectable, so [`FileBlockIo`] stamps the file at open
-//! and [`FileBlockIo::verify_unchanged`] re-checks the SAME descriptor (never the path — `infr
-//! pull` renames into place, which leaves this fd on the intact old inode; see backlog B30).
+//! different bytes; explicit reads make it detectable. So the reader is built from the very
+//! descriptors the mapping was made from ([`ShardHandle`]), never by re-opening the path, and every
+//! [`BlockIo::read_block`] re-`fstat`s each shard it touched against the [`FileStamp`] taken when
+//! that file was mapped. A rename into place is not a change — this descriptor stays on the intact
+//! old inode, which is exactly what `infr pull` relies on (backlog B30); an in-place rewrite or a
+//! truncation is, and it fails the read by name.
 
 use crate::error::{Error, Result};
 use crate::pager::BlockId;
-use infr_plat::fileio::read_exact_at;
+use infr_plat::fileio::{read_exact_at, reopen_for_reads};
 use std::fs::File;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::SystemTime;
 
 /// One contiguous byte range of the model file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BlockExtent {
     /// Absolute offset in the model's file address space (the tensor-data region's start already
     /// added in). A `gguf-split` model is several files addressed end to end in shard order — see
-    /// [`FileBlockIo::open_shards`] — and a single file is the one-shard case of that, at base 0.
+    /// [`FileBlockIo::from_handles`] — and a single file is the one-shard case of that, at base 0.
     pub offset: u64,
     pub len: usize,
 }
@@ -75,47 +79,69 @@ pub trait BlockIo: Send + Sync {
     fn read_block(&self, desc: &BlockDesc, dst: &mut [u8]) -> Result<()>;
 }
 
-/// The file identity [`FileBlockIo`] stamps at open, to notice the model being replaced under a
-/// live run. Read from the held descriptor, so it follows the inode this reader actually reads.
+/// A weight file's identity at a point in time: the two fields an accidental overwrite moves.
+///
+/// Read from an open descriptor ([`Self::of`]), never from a path, so it follows the inode that
+/// descriptor reads even after the path names another file. Shared by this reader and
+/// `infr_gguf::watch::WeightWatch`, which compare the same stamp — the one the model's mapping took
+/// when it opened the file.
+///
+/// What it cannot see: a same-length in-place write whose mtime is then restored. The only way to
+/// see that is hashing the whole file per check (backlog B30).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct FileStamp {
-    len: u64,
-    /// Modification time as (secs, nanos) since the epoch. `None` when the platform's metadata
-    /// carries no mtime, in which case only the length is compared.
-    mtime: Option<(i64, u32)>,
+pub struct FileStamp {
+    pub len: u64,
+    /// `None` where the platform or filesystem reports no modification time; then only the length
+    /// is compared, which is still the half that catches truncation.
+    pub mtime: Option<SystemTime>,
 }
 
 impl FileStamp {
-    fn of(file: &File) -> Result<Self> {
+    /// Stamp the open descriptor `file` — one `fstat` (`GetFileInformationByHandle` on Windows).
+    pub fn of(file: &File) -> Result<Self> {
         let md = file.metadata()?;
-        let mtime = md.modified().ok().map(|t| {
-            match t.duration_since(std::time::UNIX_EPOCH) {
-                Ok(d) => (d.as_secs() as i64, d.subsec_nanos()),
-                // Pre-epoch mtimes are legal; carry them as a negative second count rather than
-                // dropping the stamp (a dropped stamp silently weakens the check to length only).
-                Err(e) => {
-                    let d = e.duration();
-                    (-(d.as_secs() as i64), d.subsec_nanos())
-                }
-            }
-        });
         Ok(Self {
             len: md.len(),
-            mtime,
+            mtime: md.modified().ok(),
         })
     }
+
+    /// What moved between `self` and the later stamp `now`, in words, for an error message.
+    pub fn describe_change(&self, now: &Self) -> String {
+        if now.len != self.len {
+            format!("size changed {} -> {} bytes", self.len, now.len)
+        } else {
+            "modification time moved, size unchanged".to_owned()
+        }
+    }
+}
+
+/// One open file of a model, as the mapping that loaded it holds it — what
+/// [`FileBlockIo::from_handles`] reads through instead of re-opening `path`, which may by then name
+/// a different file. `infr_gguf::Gguf::shard_handles` hands these out.
+#[derive(Clone, Copy, Debug)]
+pub struct ShardHandle<'a> {
+    /// The descriptor the model was mapped from.
+    pub file: &'a File,
+    /// The path it was opened by, for error messages only: nothing is opened by it.
+    pub path: &'a Path,
+    /// The file as it was when the model was mapped. Its length is the one every tensor offset was
+    /// computed against.
+    pub stamp: FileStamp,
 }
 
 /// One file of the model, and where its bytes sit in the address space the extents are written in.
 struct ShardIo {
     /// [`HANDLES_PER_FILE`] handles to the same file, handed out in turn by [`Self::file`]. Each
-    /// is opened from the path separately — a duplicated handle shares the original's file object,
-    /// and with it the serialization that is the reason for more than one.
+    /// is reopened from the mapping's own descriptor ([`infr_plat::fileio::reopen_for_reads`]),
+    /// never from the path, so all of them are the mapped file; on Windows each is a file object
+    /// of its own, since one file object's reads run one at a time.
     files: Vec<File>,
     /// Which handle the next read takes.
     next: AtomicUsize,
+    /// The file as the mapping found it ([`ShardHandle::stamp`]); every read re-checks it.
     stamp: FileStamp,
-    /// Path kept for error messages only — every read and every re-stat goes through `file`.
+    /// Path kept for error messages only — every read and every re-stat goes through `files`.
     path: String,
     /// First offset of the concatenated address space this file serves. Zero for the first shard,
     /// hence for every single-file model.
@@ -130,25 +156,33 @@ pub struct FileBlockIo {
 }
 
 impl FileBlockIo {
-    /// Open a single-file model — the one-shard case of [`Self::open_shards`], with no length to
-    /// check because nothing before it computed offsets against one.
+    /// Open a single-file model by path and stamp it now. For a reader beside a model that is
+    /// already mapped, [`Self::from_handles`] is the one to use: this cannot know whether `path`
+    /// still names the file the mapping holds.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let file = Self::open_one(path.as_ref(), None, 0)?;
-        Ok(Self { shards: vec![file] })
+        let path = path.as_ref();
+        let file = File::open(path)?;
+        let stamp = FileStamp::of(&file)?;
+        Self::from_handles(&[ShardHandle {
+            file: &file,
+            path,
+            stamp,
+        }])
     }
 
-    /// Open a `gguf-split` shard set, addressing the files end to end in the given order.
+    /// Read a model through the descriptors it was mapped from, addressing a `gguf-split` set's
+    /// files end to end in the given order.
     ///
-    /// Each entry is `(path, length)` as `infr_gguf::Gguf::shards` reports it: the length its
-    /// tensor offsets were computed against. It is checked, not assumed — a shard that grew or
-    /// shrank between the load and this open shifts every offset in every LATER shard, which is
-    /// not a read that fails but a read that silently returns other weights. `verify_unchanged`
-    /// covers the same file changing after this point; this covers it having changed before.
-    pub fn open_shards(shards: &[(impl AsRef<Path>, u64)]) -> Result<Self> {
-        let mut out = Vec::with_capacity(shards.len());
+    /// Each handle's current stamp must still be the one taken at mapping time. Checked, not
+    /// assumed: a shard that grew or shrank since shifts every offset in every LATER shard, and one
+    /// rewritten in place holds other weights at the same offsets — neither is a read that fails,
+    /// both are reads that silently return the wrong bytes. [`BlockIo::read_block`] keeps checking
+    /// the same stamp afterwards.
+    pub fn from_handles(handles: &[ShardHandle<'_>]) -> Result<Self> {
+        let mut out = Vec::with_capacity(handles.len());
         let mut base = 0u64;
-        for (path, expect_len) in shards {
-            let s = Self::open_one(path.as_ref(), Some(*expect_len), base)?;
+        for h in handles {
+            let s = Self::open_one(h, base)?;
             base = base.checked_add(s.stamp.len).ok_or_else(|| {
                 Error::Loader("model shard set is larger than u64 bytes".to_string())
             })?;
@@ -157,38 +191,25 @@ impl FileBlockIo {
         Ok(Self { shards: out })
     }
 
-    fn open_one(path: &Path, expect_len: Option<u64>, base: u64) -> Result<ShardIo> {
-        let file = File::open(path)?;
-        let stamp = FileStamp::of(&file)?;
-        let mut files = vec![file];
-        while files.len() < HANDLES_PER_FILE {
-            let f = File::open(path)?;
-            // Opened by path, so a file replaced between two opens would give handles onto
-            // different contents; every handle must stamp the same as the first.
-            if FileStamp::of(&f)? != stamp {
-                return Err(Error::Loader(format!(
-                    "model file changed while it was being opened: {}",
-                    path.display()
-                )));
-            }
-            files.push(f);
-        }
-        if let Some(expect) = expect_len {
-            if stamp.len != expect {
-                return Err(Error::Loader(format!(
-                    "model shard changed size before it was streamed: {} is {} bytes, but the \
-                     weights were loaded against {expect} — every offset past it would name the \
-                     wrong bytes",
-                    path.display(),
-                    stamp.len
-                )));
-            }
+    fn open_one(h: &ShardHandle<'_>, base: u64) -> Result<ShardIo> {
+        let files = (0..HANDLES_PER_FILE)
+            .map(|_| reopen_for_reads(h.file))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        let now = FileStamp::of(&files[0])?;
+        if now != h.stamp {
+            return Err(Error::Loader(format!(
+                "model file changed after it was loaded, before it was streamed: {} ({}) — \
+                 reading it now would return bytes other than the weights the model was loaded \
+                 against. Restart against the current file",
+                h.path.display(),
+                h.stamp.describe_change(&now)
+            )));
         }
         Ok(ShardIo {
             files,
             next: AtomicUsize::new(0),
-            stamp,
-            path: path.display().to_string(),
+            stamp: h.stamp,
+            path: h.path.display().to_string(),
             base,
         })
     }
@@ -201,30 +222,6 @@ impl FileBlockIo {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
-    }
-
-    /// Fail if any of the model's files changed since it was opened.
-    ///
-    /// Callers run this at a coarse boundary (once per forward pass), not per read: it is one
-    /// `fstat` per handle, and the failure it catches — the model being rewritten mid-generation —
-    /// turns what would be silently different weights into an error. The known blind spot is a
-    /// same-length in-place write whose mtime is restored; catching that means hashing gigabytes
-    /// per check (backlog B30 records the same limit for `WeightWatch`).
-    pub fn verify_unchanged(&self) -> Result<()> {
-        for s in &self.shards {
-            for f in &s.files {
-                let now = FileStamp::of(f)?;
-                if now != s.stamp {
-                    return Err(Error::Loader(format!(
-                        "model file changed while it was being streamed: {} (was {} bytes, now \
-                         {} bytes) — weights read after this point would not match the ones \
-                         already loaded",
-                        s.path, s.stamp.len, now.len
-                    )));
-                }
-            }
-        }
-        Ok(())
     }
 
     /// The shard holding `[offset, offset + len)`, and that range's offset within it.
@@ -264,6 +261,14 @@ impl ShardIo {
     fn file(&self) -> &File {
         &self.files[self.next.fetch_add(1, Ordering::Relaxed) % self.files.len()]
     }
+
+    /// What changed in this file since it was mapped, or `None` while it still stamps the same.
+    /// One `fstat`: every handle was reopened from the mapping's descriptor, so all of them are
+    /// the same file and one speaks for all.
+    fn changed(&self) -> Result<Option<String>> {
+        let now = FileStamp::of(&self.files[0])?;
+        Ok((now != self.stamp).then(|| self.stamp.describe_change(&now)))
+    }
 }
 
 impl BlockIo for FileBlockIo {
@@ -291,12 +296,50 @@ impl BlockIo for FileBlockIo {
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
-        read_pieces(pieces, &mut dst[..need]).map_err(|(shard, e, err)| {
-            Error::Loader(format!(
+        let read = read_pieces(&pieces, &mut dst[..need]).map_err(|(shard, e, err)| {
+            format!(
                 "reading block {} at {}+{} of {}: {err}",
                 desc.id, e.offset, e.len, shard.path
-            ))
-        })
+            )
+        });
+        // Stamped AFTER the read, so a change that landed before it or while it ran is seen: a
+        // file rewritten under this read may have handed back a mix of old and new bytes that
+        // reads perfectly well. A failed read is reported alongside, since a truncation shows up
+        // first as a short read and the change is what explains it. The cost is one `fstat` per
+        // shard touched (pieces come in extent order, so skipping a repeat of the previous shard
+        // checks each once in the usual case): noise beside a weight block of a megabyte or
+        // more, but not beside a block of a few KiB (backlog B35 has the measurement).
+        let also = || {
+            read.as_ref()
+                .err()
+                .map_or(String::new(), |e| format!("; {e}"))
+        };
+        let mut prev: Option<&ShardIo> = None;
+        for &(shard, _) in &pieces {
+            if prev.is_some_and(|p| std::ptr::eq(p, shard)) {
+                continue;
+            }
+            prev = Some(shard);
+            let what = shard.changed().map_err(|e| {
+                Error::Loader(format!(
+                    "could not re-check {} after reading block {}: {e}{}",
+                    shard.path,
+                    desc.id,
+                    also()
+                ))
+            })?;
+            if let Some(what) = what {
+                return Err(Error::Loader(format!(
+                    "model file changed while it was being streamed: {} ({what}) — block {} and \
+                     every weight read after it would not match the ones already loaded. Restart \
+                     against the current file{}",
+                    shard.path,
+                    desc.id,
+                    also()
+                )));
+            }
+        }
+        read.map_err(Error::Loader)
     }
 }
 
@@ -331,8 +374,7 @@ pub const IO_FANOUT: usize = 4;
 /// - **Linux and the other Unixes, macOS included: one.** `pread` carries its own offset and the
 ///   kernel runs concurrent `pread`s on one descriptor in parallel; on Linux that is what the
 ///   [`IO_FANOUT`] figures were measured with. On macOS the same is assumed and not measured
-///   (backlog B35). More descriptors there would cost one more `fstat` each in
-///   [`FileBlockIo::verify_unchanged`] and buy nothing.
+///   (backlog B35). More descriptors there would buy nothing.
 #[cfg(windows)]
 pub const HANDLES_PER_FILE: usize = IO_FANOUT;
 // Windows serializes one handle's reads, so one handle there would make every read serial.
@@ -388,7 +430,7 @@ fn plan_pieces(extents: &[BlockExtent]) -> Vec<BlockExtent> {
 /// may complete in any order and still land where they must. Nothing is shared between them — the
 /// files are read at explicit offsets, so there is no cursor to race on.
 fn read_pieces<'a>(
-    pieces: Vec<(&'a ShardIo, BlockExtent)>,
+    pieces: &[(&'a ShardIo, BlockExtent)],
     dst: &mut [u8],
 ) -> std::result::Result<(), (&'a ShardIo, BlockExtent, std::io::Error)> {
     debug_assert_eq!(
@@ -398,7 +440,7 @@ fn read_pieces<'a>(
     );
     let mut rest = dst;
     let mut placed: Vec<(&ShardIo, BlockExtent, &mut [u8])> = Vec::with_capacity(pieces.len());
-    for (shard, e) in pieces {
+    for &(shard, e) in pieces {
         let (mine, tail) = rest.split_at_mut(e.len);
         rest = tail;
         placed.push((shard, e, mine));
@@ -565,27 +607,254 @@ mod tests {
         );
     }
 
-    /// The other half of that: an extent that WAS in range when the model was loaded, on a file
-    /// that has since been truncated. `locate` passes (it checks the length stamped at open), so
-    /// this is the path where `read_exact_at`'s EOF branch is what stops a half-filled slot.
+    /// A file opened and stamped the way `infr_gguf::Gguf::open` opens each file it maps, so a
+    /// test can hand [`FileBlockIo::from_handles`] the same thing the loader does.
+    struct Mapped {
+        file: File,
+        path: std::path::PathBuf,
+        stamp: FileStamp,
+    }
+
+    impl Mapped {
+        fn open(path: &Path) -> Self {
+            let file = File::open(path).expect("open");
+            let stamp = FileStamp::of(&file).expect("stamp");
+            Self {
+                file,
+                path: path.to_path_buf(),
+                stamp,
+            }
+        }
+
+        fn handle(&self) -> ShardHandle<'_> {
+            ShardHandle {
+                file: &self.file,
+                path: &self.path,
+                stamp: self.stamp,
+            }
+        }
+    }
+
+    /// Overwrite `path`'s bytes in place, at the same length, and move its mtime well clear of the
+    /// original: a test writes fast enough to land in the same mtime tick on a coarse filesystem,
+    /// which would make a same-size rewrite invisible for a reason that has nothing to do with the
+    /// code under test.
+    fn rewrite_in_place(path: &Path, bytes: &[u8]) {
+        let f = File::options().write(true).open(path).expect("reopen");
+        (&f).write_all(bytes).expect("rewrite");
+        let later = SystemTime::now() + std::time::Duration::from_secs(60);
+        f.set_times(std::fs::FileTimes::new().set_modified(later))
+            .expect("bump mtime");
+    }
+
+    /// Put a file of `bytes` at `path` by renaming it over whatever is there — the way `infr pull`
+    /// installs a download. The old inode lives on for anyone holding it open.
+    ///
+    /// Returns whether the rename happened. Unix always allows it. Windows may refuse to replace a
+    /// file that is open or mapped, and that refusal is a pass in its own right — the OS is
+    /// protecting the file the model reads — so it comes back as `false` (after checking the path
+    /// still holds the original), never as a failure. Any other error fails the test.
+    fn rename_into_place(path: &Path, bytes: &[u8]) -> bool {
+        let before = std::fs::read(path).expect("read the original");
+        let next = path.with_extension("next");
+        std::fs::write(&next, bytes).expect("write");
+        match std::fs::rename(&next, path) {
+            Ok(()) => true,
+            Err(e) if cfg!(windows) && is_windows_refusal(&e) => {
+                assert_eq!(
+                    std::fs::read(path).expect("read the path"),
+                    before,
+                    "a refused rename must leave the original in place"
+                );
+                false
+            }
+            Err(e) => panic!("rename into place: {e}"),
+        }
+    }
+
+    /// The errors Windows answers a rename over an open or mapped file with: access denied (which
+    /// std reports as `PermissionDenied`), a sharing violation, or a user-mapped section.
+    fn is_windows_refusal(e: &std::io::Error) -> bool {
+        const ERROR_SHARING_VIOLATION: i32 = 32;
+        const ERROR_USER_MAPPED_FILE: i32 = 1224;
+        e.kind() == std::io::ErrorKind::PermissionDenied
+            || matches!(
+                e.raw_os_error(),
+                Some(ERROR_SHARING_VIOLATION | ERROR_USER_MAPPED_FILE)
+            )
+    }
+
+    /// Read `desc` once per handle, so the round-robin hands every handle one read and a wrong
+    /// one cannot hide behind the first; each read must be `want`.
+    fn read_on_every_handle(io: &FileBlockIo, desc: &BlockDesc, want: &[u8]) {
+        for i in 0..HANDLES_PER_FILE {
+            let mut dst = vec![0u8; want.len()];
+            io.read_block(desc, &mut dst)
+                .unwrap_or_else(|e| panic!("read {i}: {e}"));
+            assert_eq!(
+                dst, want,
+                "read {i} returned other bytes than the loaded file"
+            );
+        }
+    }
+
+    fn one_extent(id: BlockId, offset: u64, len: usize) -> BlockDesc {
+        BlockDesc {
+            id,
+            extents: vec![BlockExtent { offset, len }],
+        }
+    }
+
+    /// The baseline every other file-change test departs from: a file nobody touches reads the
+    /// same bytes, read after read, with no error.
     #[test]
-    fn a_file_truncated_after_open_short_reads() {
+    fn an_unchanged_file_reads_the_same_bytes_every_time() {
+        let (f, bytes) = ramp_file(4096);
+        let io = FileBlockIo::open(f.path()).expect("open");
+        let desc = one_extent(1, 1000, 256);
+        for _ in 0..3 {
+            let mut dst = vec![0u8; 256];
+            io.read_block(&desc, &mut dst)
+                .expect("an untouched file must read");
+            assert_eq!(dst, bytes[1000..1256]);
+        }
+    }
+
+    /// An extent that WAS in range when the model was loaded, on a file since truncated below it.
+    /// `locate` passes (it checks the length stamped at open), the read hits EOF, and the error
+    /// must say both things: that the file changed, and the short read it caused.
+    #[test]
+    fn a_file_truncated_under_the_block_fails_it_by_name() {
         let (f, _) = ramp_file(512);
         let io = FileBlockIo::open(f.path()).expect("open");
-        std::fs::File::create(f.path())
+        File::create(f.path())
             .expect("truncate")
             .set_len(64)
             .expect("set_len");
-        let desc = BlockDesc {
-            id: 4,
-            extents: vec![BlockExtent {
-                offset: 256,
-                len: 128,
-            }],
-        };
         let mut dst = vec![0u8; 128];
-        let err = io.read_block(&desc, &mut dst).expect_err("must reject");
-        assert!(err.to_string().contains("short read"), "unexpected: {err}");
+        let err = io
+            .read_block(&one_extent(4, 256, 128), &mut dst)
+            .expect_err("must reject");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("changed while it was being streamed") && msg.contains("512 -> 64"),
+            "unexpected: {msg}"
+        );
+        assert!(
+            msg.contains("short read"),
+            "the read's own error is lost: {msg}"
+        );
+    }
+
+    /// A truncation that leaves this block's bytes in place still fails it: the bytes it would
+    /// return are the old ones, but the model they belong to is gone, and the next block may not
+    /// be there at all. Silently serving this read is how a half-replaced model gets used.
+    #[test]
+    fn a_truncation_that_spares_the_block_still_fails_it() {
+        let (f, _) = ramp_file(4096);
+        let io = FileBlockIo::open(f.path()).expect("open");
+        File::options()
+            .write(true)
+            .open(f.path())
+            .expect("reopen")
+            .set_len(2048)
+            .expect("truncate");
+        let mut dst = vec![0u8; 64];
+        let err = io
+            .read_block(&one_extent(5, 100, 64), &mut dst)
+            .expect_err("a truncated file must fail the read");
+        assert!(
+            err.to_string().contains("size changed 4096 -> 2048"),
+            "unexpected: {err}"
+        );
+    }
+
+    /// The `cp new.gguf live.gguf` of a same-size file: every offset still in range, every byte
+    /// different. Only the mtime moved, so that half of the stamp is load-bearing on its own.
+    #[test]
+    fn a_same_size_rewrite_fails_the_read() {
+        let (f, _) = ramp_file(4096);
+        let io = FileBlockIo::open(f.path()).expect("open");
+        rewrite_in_place(f.path(), &[0xEEu8; 4096]);
+        let mut dst = vec![0u8; 64];
+        let err = io
+            .read_block(&one_extent(6, 100, 64), &mut dst)
+            .expect_err("a rewritten file must fail the read");
+        // The whole message, as for the construction-time refusal below.
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "loader: model file changed while it was being streamed: {} (modification time \
+                 moved, size unchanged) — block 6 and every weight read after it would not match \
+                 the ones already loaded. Restart against the current file",
+                f.path().display()
+            )
+        );
+    }
+
+    /// The design decision, pinned: a rename into place is not a change. This reader holds the
+    /// old inode, which still has exactly the bytes the model was loaded from — the same bytes the
+    /// mapping serves — so it keeps reading them, with no error. Failing here would be a false
+    /// alarm on the one replacement `infr pull` itself performs.
+    #[test]
+    fn a_rename_into_place_keeps_reading_the_loaded_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("m.gguf");
+        let bytes: Vec<u8> = (0..4096usize).map(|i| i as u8).collect();
+        std::fs::write(&path, &bytes).expect("write");
+        let io = FileBlockIo::open(&path).expect("open");
+        // Either way the reader must keep serving the loaded bytes: replaced, it holds the old
+        // inode; refused (Windows), the path still names them.
+        rename_into_place(&path, &[0xEEu8; 4096]);
+        read_on_every_handle(&io, &one_extent(7, 100, 64), &bytes[100..164]);
+    }
+
+    /// The reader is built from the descriptor the model was mapped from, not from its path. A
+    /// same-size replacement renamed in between leaves the path naming other bytes; a reader that
+    /// re-opened it would serve those, at offsets computed against the old file, as weights.
+    #[test]
+    fn from_handles_reads_the_mapped_file_not_its_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("m.gguf");
+        let bytes: Vec<u8> = (0..4096usize).map(|i| i as u8).collect();
+        std::fs::write(&path, &bytes).expect("write");
+        let mapped = Mapped::open(&path);
+        let replaced = rename_into_place(&path, &[0xEEu8; 4096]);
+        if replaced {
+            assert_eq!(
+                std::fs::read(&path).expect("read the path"),
+                vec![0xEEu8; 4096],
+                "the path must name the replacement, or this test proves nothing"
+            );
+        }
+
+        let io = FileBlockIo::from_handles(&[mapped.handle()]).expect("the mapped file is intact");
+        read_on_every_handle(&io, &one_extent(8, 100, 64), &bytes[100..164]);
+    }
+
+    /// A file rewritten in place between the mapping and the reader: the descriptor is the right
+    /// one, but its bytes are not the ones the model was loaded against. Refused at construction.
+    #[test]
+    fn from_handles_refuses_a_file_changed_since_it_was_mapped() {
+        let (f, _) = ramp_file(4096);
+        let mapped = Mapped::open(f.path());
+        rewrite_in_place(f.path(), &[0xEEu8; 4096]);
+        let msg = match FileBlockIo::from_handles(&[mapped.handle()]) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a file rewritten since it was mapped must be refused"),
+        };
+        // The whole message, so a literal that loses a line continuation (and with it gains a run
+        // of spaces) fails here rather than reaching a user.
+        assert_eq!(
+            msg,
+            format!(
+                "loader: model file changed after it was loaded, before it was streamed: {} \
+                 (modification time moved, size unchanged) — reading it now would return bytes \
+                 other than the weights the model was loaded against. Restart against the current \
+                 file",
+                f.path().display()
+            )
+        );
     }
 
     /// Two shards addressed end to end: an extent past the first file's length must be read from
@@ -593,14 +862,15 @@ mod tests {
     /// resolved against the wrong file would still return readable bytes of the right length —
     /// what tells them apart here is that shard 2's ramp is offset by one.
     #[test]
-    fn open_shards_reads_across_the_join() {
+    fn from_handles_reads_across_the_shard_join() {
         let (a, a_bytes) = ramp_file(4096);
         let b_bytes: Vec<u8> = (0..4096usize).map(|i| (i + 1) as u8).collect();
         let mut b = tempfile::NamedTempFile::new().expect("temp file");
         b.write_all(&b_bytes).expect("write");
         b.flush().expect("flush");
 
-        let io = FileBlockIo::open_shards(&[(a.path(), 4096), (b.path(), 4096)]).expect("open set");
+        let (ma, mb) = (Mapped::open(a.path()), Mapped::open(b.path()));
+        let io = FileBlockIo::from_handles(&[ma.handle(), mb.handle()]).expect("open set");
         assert_eq!(
             io.len(),
             8192,
@@ -633,16 +903,12 @@ mod tests {
     fn a_read_never_spans_the_shard_join() {
         let (a, _) = ramp_file(4096);
         let (b, _) = ramp_file(4096);
-        let io = FileBlockIo::open_shards(&[(a.path(), 4096), (b.path(), 4096)]).expect("open set");
-        let desc = BlockDesc {
-            id: 3,
-            extents: vec![BlockExtent {
-                offset: 4032,
-                len: 128,
-            }],
-        };
+        let (ma, mb) = (Mapped::open(a.path()), Mapped::open(b.path()));
+        let io = FileBlockIo::from_handles(&[ma.handle(), mb.handle()]).expect("open set");
         let mut dst = vec![0u8; 128];
-        let err = io.read_block(&desc, &mut dst).expect_err("must reject");
+        let err = io
+            .read_block(&one_extent(3, 4032, 128), &mut dst)
+            .expect_err("must reject");
         assert!(
             err.to_string().contains("runs past the end of"),
             "unexpected: {err}"
@@ -653,33 +919,19 @@ mod tests {
     /// offset in every LATER shard — not a read that fails, a read that returns other weights. It
     /// must be refused at open, naming the file and both lengths.
     #[test]
-    fn open_shards_refuses_a_shard_of_the_wrong_length() {
+    fn from_handles_refuses_a_shard_of_the_wrong_length() {
         let (a, _) = ramp_file(4096);
         let (b, _) = ramp_file(4096);
-        let msg = match FileBlockIo::open_shards(&[(a.path(), 2048), (b.path(), 4096)]) {
+        let (mut ma, mb) = (Mapped::open(a.path()), Mapped::open(b.path()));
+        ma.stamp.len = 2048;
+        let msg = match FileBlockIo::from_handles(&[ma.handle(), mb.handle()]) {
             Err(e) => e.to_string(),
             Ok(_) => panic!("a resized shard must be refused"),
         };
         assert!(
-            msg.contains("changed size") && msg.contains("4096") && msg.contains("2048"),
+            msg.contains("size changed 2048 -> 4096")
+                && msg.contains(&ma.path.display().to_string()),
             "unexpected: {msg}"
-        );
-    }
-
-    /// The file-replaced check: unchanged is silent, and a rewrite through the SAME path (the
-    /// `cp new.gguf live.gguf` shape, which truncates in place) is caught.
-    #[test]
-    fn verify_unchanged_catches_a_rewrite() {
-        let (f, _) = ramp_file(4096);
-        let io = FileBlockIo::open(f.path()).expect("open");
-        io.verify_unchanged().expect("unchanged file must pass");
-
-        std::fs::write(f.path(), vec![0u8; 8192]).expect("rewrite");
-        let err = io.verify_unchanged().expect_err("rewrite must be caught");
-        assert!(
-            err.to_string()
-                .contains("changed while it was being streamed"),
-            "unexpected: {err}"
         );
     }
 

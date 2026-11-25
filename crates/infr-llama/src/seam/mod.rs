@@ -189,7 +189,8 @@ fn cpu_paged_store(
         return Ok(None);
     }
     let io = std::sync::Arc::new(
-        infr_core::blockio::FileBlockIo::open_shards(&g.shards()).map_err(|e| anyhow!("{e}"))?,
+        infr_core::blockio::FileBlockIo::from_handles(&g.shard_handles())
+            .map_err(|e| anyhow!("{e}"))?,
     );
     let trace = infr_core::pager::trace::TraceFile::for_config(ec.paging.trace.as_deref())
         .map_err(|e| anyhow!("{e}"))?;
@@ -369,7 +370,7 @@ fn vulkan_host_tier(
             // mapping, which is what lets a big model run on these machines at all.
             infr_core::hostmem::ArenaPlan::StreamOnly => {
                 let io = std::sync::Arc::new(
-                    infr_core::blockio::FileBlockIo::open_shards(&g.shards())
+                    infr_core::blockio::FileBlockIo::from_handles(&g.shard_handles())
                         .map_err(|e| anyhow!("{e}"))?,
                 );
                 tracing::info!(
@@ -436,7 +437,8 @@ fn vulkan_host_tier(
         return Ok(unpaged());
     }
     let io = std::sync::Arc::new(
-        infr_core::blockio::FileBlockIo::open_shards(&g.shards()).map_err(|e| anyhow!("{e}"))?,
+        infr_core::blockio::FileBlockIo::from_handles(&g.shard_handles())
+            .map_err(|e| anyhow!("{e}"))?,
     );
     let mut arena = 0usize;
     let mut out = Vec::with_capacity(classes.len());

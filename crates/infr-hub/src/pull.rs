@@ -897,6 +897,7 @@ mod tests {
     use super::*;
     use crate::parts;
     use crate::testhttp::TestHub;
+    use std::time::Instant;
 
     const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
@@ -1613,12 +1614,11 @@ mod tests {
     /// The chunk requests the hub honoured for `f`, as `(start, end)`, IN THE ORDER THEY ARRIVED —
     /// so a test can slice off "what the second run asked for".
     ///
-    /// The one-byte planning probe (`bytes=0-0`) is filtered out: it is how the size and the
-    /// server's range support are learned, not a piece of the file.
+    /// Only honoured ranges count. The planning probe is a `HEAD` and never appears here.
     fn chunk_spans(hub: &TestHub, f: &str) -> Vec<(u64, u64)> {
         hub.served_bodies(f)
             .into_iter()
-            .filter(|s| s.honoured && s.range != Some((0, Some(0))))
+            .filter(|s| s.honoured)
             .filter_map(|s| s.range)
             .map(|(a, b)| (a, b.expect("a chunk request is a closed range")))
             .collect()
@@ -2026,20 +2026,88 @@ mod tests {
 
     /// A file that finishes hands its connection to the one still going.
     ///
-    /// This is the tail of every shard set: once fewer files remain than there are connections, a
-    /// download that fixed its fan-out when it started would crawl on one connection while the rest
-    /// of the allowance sat idle. Here the small file takes a worker and the big one starts with
-    /// only ONE spare connection — the assertion is that the big file's OWN peak reaches the whole
-    /// bound anyway, which it can only do by picking up the permit the small file gave back.
+    /// This is a pull of FEWER files than connections, where a file already split into ranges is
+    /// still going when another finishes: a download that fixed its fan-out when it started would
+    /// crawl on what it started with while the rest of the allowance sat idle. Here the small file
+    /// takes a worker and the big one starts with only ONE spare connection — the assertion is that
+    /// the big file's OWN peak reaches the whole bound anyway, which it can only do by picking up
+    /// the permit the small file gave back.
+    ///
+    /// Each step waits on the hub's gate rather than on timing. Left to the clock, the large file's
+    /// three workers did exist but on a starved runner never sat in the hub's counted window at
+    /// the same moment, and the peak read 2. One ordering is still the scheduler's: the small
+    /// file's worker drops its permit only after its link is renamed into place and logged, so the
+    /// released workers can reach their boundary first. They then park again on two connections,
+    /// and the test releases them again until the third shows up or the deadline passes.
     #[test]
     fn a_finished_file_hands_over_its_connection() {
+        use crate::testhttp::GATE_DEADLINE;
+        /// How long the test waits for the third chunk, once the released workers are back, before
+        /// releasing them again. Only reached when they beat the small file's permit drop (or the
+        /// third worker is slow to arrive); each round spends two of the large file's cells.
+        const REGRANT_AFTER: Duration = Duration::from_secs(2);
+
         let hub = TestHub::start();
         let small = hub.add_shards("m-tail-small", 1, 1024)[0].clone();
         let large = hub.add_shards("m-tail-large", 1, big())[0].clone();
         let files = vec![small.clone(), large.clone()];
         let cache = TempRepo::new();
+        hub.hold(&small);
+        hub.hold(&large);
 
-        pull_one(&hub, &cache, &files, 3).unwrap();
+        // Every gate is opened before anything is asserted: an assertion failing while a body is
+        // still parked would leave the pull, and with it the scope's join, waiting.
+        let (started, linked, start_peak, grew, pulled) = std::thread::scope(|s| {
+            let pull = s.spawn(|| pull_one(&hub, &cache, &files, 3));
+            // The large file's first chunks stay parked from here to the first release, so this
+            // phase shares ONE deadline: no body may be held past the client's read timeout.
+            let deadline = Instant::now() + GATE_DEADLINE;
+            // The small file's body is parked, so its worker still holds its permit: the large one
+            // has to have started on its two connections with no third to take.
+            let started = hub.wait_parked(&large, 2, GATE_DEADLINE);
+            hub.open(&small);
+            // Linked is the last thing the small file's worker does before giving its permit back.
+            let link = cache.snapshot().join(&small);
+            while !link.exists() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let linked = link.exists();
+            // Every large-file chunk is still parked, so no worker of it has reached a boundary
+            // yet and this is still the fan-out it STARTED with — read as late as possible, to
+            // give a third starting worker every chance to have arrived.
+            let start_peak = hub.peak_for(&large);
+            // The parked chunks go; their workers reach a boundary with that permit free, and their
+            // next chunks park beside the first chunk of the third worker it pays for.
+            let deadline = Instant::now() + GATE_DEADLINE;
+            let grew = loop {
+                let released = hub.release(&large).max(1);
+                // Every released worker back first: releasing again while one of them is still
+                // between chunks would split it from the rest, and the three might never line up.
+                let left = deadline.saturating_duration_since(Instant::now());
+                if !hub.wait_parked(&large, released, left) {
+                    break false;
+                }
+                if hub.wait_parked(&large, 3, REGRANT_AFTER) {
+                    break true;
+                }
+                if Instant::now() >= deadline {
+                    break false;
+                }
+            };
+            hub.open(&large);
+            (started, linked, start_peak, grew, pull.join().unwrap())
+        });
+        pulled.unwrap();
+        assert!(started, "the large file never had two chunks in flight");
+        assert!(linked, "the small file was never linked");
+        assert_eq!(
+            start_peak, 2,
+            "the large file must start on exactly the one spare connection"
+        );
+        assert!(
+            grew,
+            "the large file's workers never had three chunks in flight"
+        );
 
         // Two file workers, so the large file could only take ONE spare connection at its start.
         assert_eq!(

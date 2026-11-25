@@ -1480,6 +1480,19 @@ equal to HF's `lfs.oid`. Not covered:
   last chunk cannot pick up a permit another file just released. Bounded by one
   chunk time (64 MiB, seconds), and not worth a wake-up mechanism until
   something measures it.
+- **A file that starts with no spare permit never splits.** For a fresh
+  download, `fetch_ranged` streams the whole object when `budget.available()` is
+  zero at its start, and a stream cannot take on range workers later. With at
+  least as many files as `hub.pull_jobs`, a file normally starts while every
+  other worker still holds its permit, so most of a shard set's tail does NOT
+  inherit the permits finished workers give back, whatever `fetch_all`'s doc
+  says. Two exceptions: a worker that finds the queue empty drops its permit at
+  once, so if that happens between the last file's claim and its `available()`
+  check (after the LFS `HEAD`), the last file splits; and a resumed ranged
+  partial skips the check entirely, so it runs ranged and its workers grow at
+  chunk boundaries like any other. Read in code (2026-11-25), not measured; the
+  lever would be planning a split for the last files of a set (or switching a
+  stream to ranges mid-file), at the cost of a probe request.
 - **An `ETag` that differs between CDN edges.** If one ever did, `If-Range`
   would make that chunk come back `200` and the file would restart as a single
   stream — correct, but slow, and nothing would say why beyond one `warn!`.
@@ -3080,6 +3093,32 @@ milliseconds against seconds of load. Four more `tensors().iter().find` scans in
 infr-llama mean indexing `resolve` alone would not remove the cost. Worth doing
 only after measuring total name-lookup time on a model with about 2000 tensors.
 
+### B-KV-TIERS — KV cache tiers: disk is planned, remote is not (2026-11-25)
+
+**Owner's decision, 2026-11-25** (given in answer to issue 109, "tiered KV
+cache", which asks for KV spill to system RAM and to remote stores such as
+Redis, in the manner of LMCache):
+
+- The KV cache is to have the same tiers the weights have: VRAM, system RAM and
+  disk.
+- **VRAM to system RAM is built** for dense models (`kv.overflow`; what it
+  leaves open is B62 below).
+- **The disk tier is planned and not designed.** Nothing in the tree spills or
+  persists KV rows to disk. What a design has to settle: which rows leave RAM
+  first (the oldest positions are read on every token by full attention, so a
+  disk tier is only cheap for rows a sliding window or a compressed tier no
+  longer reads, or for a parked session's whole cache), the block size and the
+  read path back (the weight path's `FileBlockIo` and `HostPager` are the
+  existing pieces to compare against), and how the three placements are priced
+  by one rule, as `kv_spill_split` does for two.
+- **A remote KV cache has no plan.** Not declined: not designed. The questions
+  put to the issue's author: network latency on a path read every token, what a
+  generation does when the store is slow or gone, and how stored state is keyed
+  and invalidated across models, quantizations and KV formats.
+
+The author has an experimental refactor on a fork that unifies the tiers; it was
+not read. Replies on the issue state the above.
+
 ### B62 — what the overflow spill still leaves open (2026-11-25)
 
 **Tag:** vram · kv · **Blocked on:** nothing
@@ -3299,13 +3338,9 @@ a hot path
   stopped without measured throughput; full timing coverage is not claimed.
 - **Default-parallel local nextest exceeds available Windows commit capacity.**
   Validation hit allocation failures and `os error 1455` (paging file too
-  small), plus a downloader concurrency-floor failure under contention
-  (`pull::tests::a_finished_file_hands_over_its_connection` failed again on
-  2026-11-13 beside a release build, and passed five times alone; on 2026-11-25
-  it failed the Ubuntu CI test job once, the large file peaking at 2 of 3
-  connections, on a commit that changed only an `infr-llama` test). The whole
-  workspace passed with `--test-threads=1`; no assertions or system memory
-  settings were changed. Revisit parallel resource scheduling separately.
+  small). The whole workspace passed with `--test-threads=1`; no assertions or
+  system memory settings were changed. Revisit parallel resource scheduling
+  separately.
 
 ### B76 — the physical-core thread default is Windows-only until Linux is measured (2026-09-23)
 

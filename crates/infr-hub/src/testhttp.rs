@@ -11,17 +11,36 @@
 //! it BEFORE the write, rather than dribbling the body out afterwards, is what keeps the count
 //! honest at the other end too: the slot is released while the client is still reading, so two
 //! strictly sequential requests can never appear to overlap.
+//!
+//! A concurrency claim that has to hold at one MOMENT cannot rest on that delay alone, though: on a
+//! starved machine the client's side of a chunk (read, `fsync`, sidecar save) can outlast it many
+//! times over, so workers that really are concurrent need not ever sit in their windows together.
+//! [`TestHub::hold`] keeps a file's bodies in the counted window until the test lets them go, which
+//! turns "were they ever in flight together" from a scheduling accident into a state the test
+//! waits for.
 
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 /// How long a request occupies a body slot before its bytes are written.
 const BODY_DELAY: Duration = Duration::from_millis(25);
+
+/// The longest any body stays parked at a gate: past it, [`park`] lifts that file's hold on its
+/// own, so a test that dies before opening its gates cannot leave a download (and the scope
+/// joining it) waiting. Tests also use it to bound their own waits, so one whose client never does
+/// what it is waiting for FAILS instead of hanging the suite. It is sized for a badly starved
+/// runner, not for how long a healthy wait takes.
+///
+/// It must stay under the download client's read timeout (`reqwest`'s blocking default, 30 s): a
+/// body parked past that is abandoned and retried on a new connection, and the abandoned one,
+/// still parked, would be counted alongside its own retry. Because [`park`] enforces it per body,
+/// that holds however many waits a test strings together while a body stays parked.
+pub(crate) const GATE_DEADLINE: Duration = Duration::from_secs(20);
 
 /// The `ETag` a freshly registered file is served with, and the `If-Range` value a resume must
 /// present to be honoured. [`TestHub::reupload`] moves a file to a new one, which is what a
@@ -90,6 +109,19 @@ struct State {
     moved: Mutex<HashMap<String, String>>,
     /// Per file, a `Content-Length` HEAD advertises in place of the real one.
     head_length: Mutex<HashMap<String, u64>>,
+    /// Files whose bodies are held at the gate (see [`TestHub::hold`]), and `gate`, signalled on
+    /// every change to them.
+    holds: Mutex<HashMap<String, Hold>>,
+    gate: Condvar,
+}
+
+/// One held file's gate.
+#[derive(Default)]
+struct Hold {
+    /// Bumped by every [`TestHub::release`]; a body waits for the generation it parked in to end.
+    generation: u64,
+    /// Bodies parked in the current generation.
+    parked: usize,
 }
 
 /// A `206` that does not describe the bytes that were asked for — what a broken proxy or mirror
@@ -307,6 +339,48 @@ impl TestHub {
         self.state.cut_until.store(usize::MAX, Ordering::SeqCst);
     }
 
+    /// Hold every body of `name` in the counted window (after its [`BODY_DELAY`]) until
+    /// [`release`](Self::release) or [`open`](Self::open). A body parked for [`GATE_DEADLINE`]
+    /// lifts the hold itself.
+    pub(crate) fn hold(&self, name: &str) {
+        self.state
+            .holds
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), Hold::default());
+    }
+
+    /// Let the bodies of `name` parked right now go, and say how many that was. Bodies that arrive
+    /// afterwards park again. A hold already lifted (see [`GATE_DEADLINE`]) releases nothing.
+    pub(crate) fn release(&self, name: &str) -> usize {
+        let mut holds = self.state.holds.lock().unwrap();
+        let Some(hold) = holds.get_mut(name) else {
+            return 0;
+        };
+        hold.generation += 1;
+        let released = std::mem::take(&mut hold.parked);
+        self.state.gate.notify_all();
+        released
+    }
+
+    /// Stop holding `name`: everything parked goes, and nothing parks again.
+    pub(crate) fn open(&self, name: &str) {
+        self.state.holds.lock().unwrap().remove(name);
+        self.state.gate.notify_all();
+    }
+
+    /// Wait until `n` bodies of the held file `name` are parked at once, and say whether that
+    /// happened within `limit`.
+    pub(crate) fn wait_parked(&self, name: &str, n: usize, limit: Duration) -> bool {
+        let holds = self.state.holds.lock().unwrap();
+        let (holds, _) = self
+            .state
+            .gate
+            .wait_timeout_while(holds, limit, |h| h.get(name).is_some_and(|h| h.parked < n))
+            .unwrap();
+        holds.get(name).is_some_and(|h| h.parked >= n)
+    }
+
     /// Answer `404` for `name` from now on.
     pub(crate) fn remove(&self, name: &str) {
         self.state
@@ -357,6 +431,9 @@ impl TestHub {
 impl Drop for TestHub {
     fn drop(&mut self) {
         self.state.stop.store(true, Ordering::Relaxed);
+        // A test that ends with bodies still parked must not leave their threads waiting forever.
+        self.state.holds.lock().unwrap().clear();
+        self.state.gate.notify_all();
         // Unblock the `accept` sitting in the listener thread so it can see the flag.
         let _ = TcpStream::connect(self.addr);
     }
@@ -394,6 +471,30 @@ fn take_one(counter: &AtomicUsize) -> bool {
         }
     }
     false
+}
+
+/// If `file` is held, wait at its gate until the generation this body parked in is released, the
+/// hold is lifted, or [`GATE_DEADLINE`] passes — which lifts the hold.
+fn park(state: &State, file: &str) {
+    let mut holds = state.holds.lock().unwrap();
+    let Some(hold) = holds.get_mut(file) else {
+        return;
+    };
+    hold.parked += 1;
+    let generation = hold.generation;
+    state.gate.notify_all();
+    let (mut holds, waited) = state
+        .gate
+        .wait_timeout_while(holds, GATE_DEADLINE, |h| {
+            h.get(file).is_some_and(|h| h.generation == generation)
+        })
+        .unwrap();
+    if waited.timed_out() {
+        // Nobody came back for it: the test has abandoned this gate, so lift the whole hold rather
+        // than park the file's next body for another full deadline.
+        holds.remove(file);
+        state.gate.notify_all();
+    }
 }
 
 /// One request/response, then close (`Connection: close`) — keep-alive would add nothing here.
@@ -596,21 +697,24 @@ fn serve(state: &State, stream: TcpStream) {
         slice
     };
 
-    // The slot is occupied for exactly the delay, and released BEFORE a byte is written — see the
-    // module header. Releasing it afterwards instead is an over-count with a real race behind it:
-    // between `flush` and the decrement this thread can be preempted, and in that window the
-    // client has already read the body, dropped its permit and started the next request, which the
-    // server accepts and counts. The peak then reads one above the budget while the budget was
-    // never exceeded. (Observed as a `the_bound_covers_files_and_ranges_together` failure on a
-    // two-core CI runner, peak 5 against a bound of 4.)
+    // The slot is occupied for the delay (and, for a held file, while it is parked), and released
+    // BEFORE a byte is written — see the module header. Releasing it afterwards instead is an
+    // over-count with a real race behind it: between `flush` and the decrement this thread can be
+    // preempted, and in that window the client has already read the body, dropped its permit and
+    // started the next request, which the server accepts and counts. The peak then reads one above
+    // the budget while the budget was never exceeded. (Observed as a
+    // `the_bound_covers_files_and_ranges_together` failure on a two-core CI runner, peak 5 against
+    // a bound of 4.)
     //
     // The counted window is therefore a subset of the interval the client holds its permit for,
     // rather than a superset — it excludes the write tail. That cannot hide a real violation here:
     // the delay is 25 ms and a test body is 32 KiB onto a loopback socket, so genuinely concurrent
-    // requests overlap inside the sleep, not in the microseconds after it.
+    // requests overlap inside the sleep, not in the microseconds after it. That argument bounds the
+    // peak from ABOVE only: a test that needs a peak to be REACHED holds the file instead.
     let now = state.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
     state.peak.fetch_max(now, Ordering::SeqCst);
     std::thread::sleep(BODY_DELAY);
+    park(state, &file);
     state.in_flight.fetch_sub(1, Ordering::SeqCst);
     state.per_file.lock().unwrap().entry(file).or_default().0 -= 1;
     let _ = out.write_all(slice);

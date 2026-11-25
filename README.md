@@ -196,8 +196,21 @@ a per-request OpenAI `temperature`/`top_p` still overrides them. See
 
 Per-request sampling fields: `temperature`, `top_p`, `top_k`, `min_p`, `seed`,
 `presence_penalty`, `frequency_penalty`, `repeat_penalty`, `logit_bias`, `stop`
-and `max_tokens` / `max_completion_tokens`. `n` above 1, `logprobs` and
-`top_logprobs` are not supported and answer `400`.
+and `max_tokens` / `max_completion_tokens`. `n` above 1 is not supported and
+answers `400`.
+
+`logprobs: true` returns each generated token's log probability and, up to
+`top_logprobs` (20 when absent), its most likely alternatives — the chat shape
+(`choices[].logprobs.content[].logprob`), on `/v1/completions` as well rather
+than the legacy `tokens`/`token_logprobs` arrays. `/v1/completions` also accepts
+that route's original spelling, an integer `"logprobs": 5`, as the count. The
+numbers come from the model's own distribution: the logits after `logit_bias`
+and the penalties, before temperature, so they do not move with `temperature`.
+A request that asks for them reads the full logits row back on the host every
+token, which turns off GPU sampling and the MTP draft loop for that request; it
+is slower, not different. A backend that cannot report them answers `400`
+naming `logprobs`, and so does a grammar-constrained request (`tool_choice` or
+`response_format`), whose constrained decode has no tap.
 
 `POST /v1/completions` serves the same models through the legacy text-completion
 shape: a raw prompt continued as text, with no chat template, which is what FIM

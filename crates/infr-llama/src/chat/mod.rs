@@ -93,6 +93,16 @@ pub trait ChatModel {
         None
     }
 
+    /// Whether this backend's decode loop can report per-token log probabilities. Default false.
+    ///
+    /// The dense seam overrides it: `DenseSeamChat` (Vulkan) and `CpuDenseChat` answer true, and so
+    /// does `CpuDenseChat::new_metal`, which drives the same decode loop through the reference
+    /// Metal backend. `MetalSeamChat` (the native Metal seam) and the diffusion backend keep the
+    /// default, and the server answers a `logprobs` request on them with a `400`.
+    fn supports_logprobs(&self) -> bool {
+        false
+    }
+
     /// Drop any persistent KV-session state so the NEXT `generate` re-prefills its prompt from
     /// scratch. The serve-side forced-tool fallback uses this: after a constrained attempt has
     /// advanced the session past the primed `<tool_call>` opener, resetting before the unconstrained
@@ -476,11 +486,88 @@ impl OaiRenderer {
             .decode(ids, false)
             .map_err(|e| anyhow::anyhow!("decode: {e}"))
     }
+
+    /// One token's decoded text and exact bytes, for the `logprobs` reply fields. A byte-fallback
+    /// token that only completes in context comes back as its raw byte with a replacement
+    /// character in the text, rather than the replacement character's own three bytes.
+    pub fn token_text(&self, id: u32) -> Option<(String, Vec<u8>)> {
+        let bytes = self.token_bytes(id)?;
+        Some((String::from_utf8_lossy(&bytes).into_owned(), bytes))
+    }
+
+    /// A token's raw bytes: the byte-level alphabet mapped back, `<0xXX>` byte-fallback tokens
+    /// unpacked, and everything else decoded through the tokenizer's decoder.
+    fn token_bytes(&self, id: u32) -> Option<Vec<u8>> {
+        if let Some(raw) = self.tokenizer.id_to_token(id) {
+            if let Some(byte) = hex_byte_token(&raw) {
+                return Some(vec![byte]);
+            }
+            if let Some(bytes) = byte_level_bytes(&raw) {
+                return Some(bytes);
+            }
+        }
+        self.tokenizer
+            .decode(&[id], true)
+            .ok()
+            .map(String::into_bytes)
+    }
+}
+
+/// A GGUF byte-fallback token (`<0xE4>`), as the single byte it stands for.
+fn hex_byte_token(raw: &str) -> Option<u8> {
+    let hex = raw.strip_prefix("<0x")?.strip_suffix('>')?;
+    if hex.len() != 2 {
+        return None;
+    }
+    u8::from_str_radix(hex, 16).ok()
+}
+
+/// GPT-2's byte-to-unicode alphabet, inverted: a byte-level BPE token's chars back to its bytes.
+/// `None` when any char is outside the alphabet (an SPM token, a literal Unicode piece), so the
+/// caller falls back to the decoder.
+fn byte_level_bytes(raw: &str) -> Option<Vec<u8>> {
+    use std::collections::HashMap;
+    use std::sync::OnceLock;
+    static INVERSE: OnceLock<HashMap<char, u8>> = OnceLock::new();
+    let inverse = INVERSE.get_or_init(|| {
+        let mut bytes: Vec<u8> = Vec::new();
+        bytes.extend(b'!'..=b'~');
+        bytes.extend(0xA1..=0xAC);
+        bytes.extend(0xAE..=0xFF);
+        let mut chars: Vec<u32> = bytes.iter().map(|&b| u32::from(b)).collect();
+        let mut next = 0u32;
+        for b in 0..=u8::MAX {
+            if !bytes.contains(&b) {
+                bytes.push(b);
+                chars.push(256 + next);
+                next += 1;
+            }
+        }
+        bytes
+            .into_iter()
+            .zip(chars)
+            .filter_map(|(b, c)| char::from_u32(c).map(|c| (c, b)))
+            .collect()
+    });
+    raw.chars().map(|c| inverse.get(&c).copied()).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn logprob_token_bytes_map_the_byte_level_alphabet() {
+        assert_eq!(hex_byte_token("<0xE4>"), Some(0xE4));
+        assert_eq!(hex_byte_token("<0x4>"), None);
+        assert_eq!(hex_byte_token("<0xZZ>"), None);
+        // GPT-2's `Ġ` is a space, and its private-use chars are the bytes with no printable form.
+        assert_eq!(byte_level_bytes("Ġhello"), Some(b" hello".to_vec()));
+        assert_eq!(byte_level_bytes("Ċ"), Some(vec![b'\n']));
+        // SentencePiece's `▁` is not in the byte-level alphabet: the decoder handles it.
+        assert_eq!(byte_level_bytes("▁hello"), None);
+        assert_eq!(byte_level_bytes("日本語"), None);
+    }
 
     /// A scripted [`ChatModel`] that records every rendered prompt and replies with a canned string
     /// (optionally wrapped in `<think>`). Proves the shared [`Chat`] orchestration WITHOUT a model:

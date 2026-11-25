@@ -101,6 +101,10 @@ pub struct RequestSampling {
     /// OpenAI `logit_bias`: `(token id, bias)` pairs added to the logits row before the penalties
     /// and before sampling, as llama.cpp's `logit_bias` sampler does. Empty = none.
     pub logit_bias: Vec<(u32, f32)>,
+    /// OpenAI `top_logprobs`: `Some(n)` asks the decode loop for this token's log probability and
+    /// up to `n` most likely alternatives. `None` = no log probabilities. A request with
+    /// `logprobs: true` and no `top_logprobs` sets `Some(20)`, matching llama.cpp.
+    pub logprobs: Option<usize>,
 }
 
 impl Default for RequestSampling {
@@ -119,6 +123,7 @@ impl Default for RequestSampling {
             repeat_last_n: 64,
             min_p: None,
             logit_bias: Vec::new(),
+            logprobs: None,
         }
     }
 }
@@ -140,6 +145,13 @@ impl RequestSampling {
         self.penalties_active() || !self.logit_bias.is_empty()
     }
 
+    /// Does this request need the logits row on the host after sampling? A logprobs request does:
+    /// the GPU-sampling paths read back only the chosen id, and the reported probabilities come
+    /// from the row itself.
+    pub fn wants_logprobs(&self) -> bool {
+        self.logprobs.is_some()
+    }
+
     /// Refuse the fields only the dense seam decode loop applies — a `logit_bias`, a non-zero
     /// `min_p` — on a backend whose decode never reads them, rather than generate as if they had
     /// been applied. `backend` names it in the error.
@@ -151,6 +163,8 @@ impl RequestSampling {
             "logit_bias"
         } else if self.min_p.is_some_and(|m| m > 0.0) {
             "min_p"
+        } else if self.wants_logprobs() {
+            "logprobs"
         } else {
             return Ok(());
         };
@@ -210,6 +224,9 @@ pub struct RequestCtx {
     cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// This sequence's turn-taking baton on the GPU (`None` = sole user, e.g. `infr run`).
     gate: Option<std::sync::Arc<StepGate>>,
+    /// Per-token log probabilities this request asked for, waiting for the text callback to take
+    /// them. `None` when the request did not ask; then the decode loop computes nothing.
+    logprobs: Option<std::sync::Mutex<Vec<infr_chat::TokenLogprob>>>,
     /// Test-only: [`aborted`](Self::aborted) answers true from this poll on, counting from zero.
     /// The prefill loop polls once before each chunk, so a test can cancel between two chunks.
     #[cfg(test)]
@@ -219,11 +236,13 @@ pub struct RequestCtx {
 impl RequestCtx {
     /// A sequence with no GPU contention (a lone request, or a `-np 1` server).
     pub fn new(sampling: RequestSampling) -> Self {
+        let logprobs = sampling.logprobs.map(|_| std::sync::Mutex::new(Vec::new()));
         Self {
             sampling,
             abort: std::sync::atomic::AtomicBool::new(false),
             cancel: None,
             gate: None,
+            logprobs,
             #[cfg(test)]
             abort_at_poll: None,
         }
@@ -232,11 +251,13 @@ impl RequestCtx {
     /// A sequence sharing the GPU with the other slots of a `-np N` server: every decode step and
     /// prefill chunk takes a turn on `gate`.
     pub fn with_gate(sampling: RequestSampling, gate: std::sync::Arc<StepGate>) -> Self {
+        let logprobs = sampling.logprobs.map(|_| std::sync::Mutex::new(Vec::new()));
         Self {
             sampling,
             abort: std::sync::atomic::AtomicBool::new(false),
             cancel: None,
             gate: Some(gate),
+            logprobs,
             #[cfg(test)]
             abort_at_poll: None,
         }
@@ -257,6 +278,22 @@ impl RequestCtx {
 
     pub fn sampling(&self) -> &RequestSampling {
         &self.sampling
+    }
+
+    /// Queue one token's log probability for the text callback to attach to the piece it belongs
+    /// to. No-op when this request did not ask for log probabilities.
+    pub fn push_logprob(&self, lp: infr_chat::TokenLogprob) {
+        if let Some(sink) = &self.logprobs {
+            sink.lock().expect("logprob sink poisoned").push(lp);
+        }
+    }
+
+    /// Take every log probability queued since the last call. Empty when none were asked for.
+    pub fn take_logprobs(&self) -> Vec<infr_chat::TokenLogprob> {
+        self.logprobs
+            .as_ref()
+            .map(|sink| std::mem::take(&mut *sink.lock().expect("logprob sink poisoned")))
+            .unwrap_or_default()
     }
 
     /// Ask the running decode loop to stop after the current token — the stop-sequence hit. Called
@@ -312,6 +349,13 @@ impl RequestCtx {
 /// multi-millisecond forward.
 pub(crate) fn abort_requested(req: Option<&RequestCtx>) -> bool {
     infr_core::shutdown::shutdown_requested() || req.is_some_and(RequestCtx::aborted)
+}
+
+/// Does this request need the decode loop's ordinary per-token sampling path rather than the MTP
+/// draft-verify loop? A `logit_bias` or a penalty rewrites the row, and logprobs need the whole
+/// row on the host; MTP's draft head does neither.
+pub(crate) fn adjusts_logits(req: Option<&RequestCtx>) -> bool {
+    req.is_some_and(|r| r.sampling().patches_logits() || r.sampling().wants_logprobs())
 }
 
 // ---------------------------------------------------------------------------
@@ -610,6 +654,12 @@ const NUCLEUS_PROBE_K: usize = 1024;
 /// `top_p >= 1` now skips the selection entirely (see [`truncated_softmax`]).
 const NUCLEUS_WIDEN: usize = 8;
 
+/// The floor a reported log probability is clamped to. A probability that underflows to 0 in
+/// binary32 has no finite logarithm, and `serde_json` writes `-inf` as `null` — a client reading
+/// `logprob` as a number would choke. llama.cpp clamps instead, and so does this: the value stays
+/// numeric and still reads as "vanishingly unlikely".
+const LOGPROB_FLOOR: f32 = -9999.0;
+
 /// Build the truncated, normalized sampling support shared by [`sample_logits`] and
 /// [`truncated_dist`]: top-k select, temperature softmax, normalize, then the top-p (nucleus)
 /// cutoff. Returns `(idx, probs)` — parallel, ALREADY truncated to the nucleus, with `probs`
@@ -857,6 +907,58 @@ pub(crate) fn truncated_dist(logits: &[f32], s: Sampler) -> Vec<(u32, f32)> {
         .collect()
 }
 
+/// One token's log probability and up to `top_n` most likely alternatives, from the full
+/// temperature-scaled softmax over the logits row. Top-k/top-p/min-p truncate the SAMPLING
+/// support, but they are not part of the model's distribution: renormalizing over the nucleus
+/// reports 0.0 for a token the model was merely the most likely to emit, which is exactly the
+/// confidence signal a logprobs client reads. `temp <= 0` (greedy) reports the raw softmax, as
+/// llama.cpp's distribution sampler does when `n_probs` is set. Text is left empty for the caller
+/// that owns the tokenizer.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn token_logprob(
+    logits: &[f32],
+    selected: u32,
+    top_n: usize,
+) -> infr_chat::TokenLogprob {
+    // The model's OWN distribution: no temperature (it is a sampling knob, applied after the
+    // distribution is fixed, and llama.cpp's `n_probs` reports without it too), and no top-k /
+    // top-p / min-p truncation, which narrows the sampling support rather than the distribution.
+    // `logits` reach here after `logit_bias` and the penalties were applied, so those ARE included.
+    // `truncated_softmax` with an open support IS the full-vocab softmax: top_k 0 keeps every
+    // token, top_p 1 skips the nucleus cut, min_p 0 cuts nothing, and its denominator is the sum
+    // over the whole row. Its `(idx, probs)` are in ascending id order.
+    let (idx, probs) = truncated_softmax(logits, 1.0, 0, 1.0, 0.0);
+    let logprob = idx
+        .iter()
+        .position(|&id| id as u32 == selected)
+        .map_or(LOGPROB_FLOOR, |j| math::ln(probs[j]).max(LOGPROB_FLOOR));
+    if top_n == 0 {
+        return infr_chat::TokenLogprob::unresolved(selected, logprob, Vec::new());
+    }
+    let mut dist: Vec<(u32, f32)> = idx
+        .into_iter()
+        .zip(probs)
+        .map(|(id, p)| (id as u32, p))
+        .collect();
+    // Select the top n in O(n), then sort only those n.
+    let cmp = |a: &(u32, f32), b: &(u32, f32)| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0));
+    if dist.len() > top_n {
+        dist.select_nth_unstable_by(top_n - 1, cmp);
+        dist.truncate(top_n);
+    }
+    dist.sort_unstable_by(cmp);
+    let top = dist
+        .into_iter()
+        .map(|(id, p)| infr_chat::TokenLogprobAlt {
+            token: id,
+            text: String::new(),
+            bytes: Vec::new(),
+            logprob: math::ln(p).max(LOGPROB_FLOOR),
+        })
+        .collect();
+    infr_chat::TokenLogprob::unresolved(selected, logprob, top)
+}
+
 /// Draw one id from a normalized `(id, prob)` distribution (as returned by [`truncated_dist`])
 /// using the shared xorshift64 uniform draw — the stochastic MTP accept rule's residual/bonus
 /// sampling (`crate::seam::model::spec_accept_stochastic`).
@@ -928,6 +1030,65 @@ mod tests {
             seed: Some(seed),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn token_logprob_reports_the_sampled_support() {
+        let logits = [0.0f32, 1.0, 2.0, 3.0];
+        // An open support AT temperature 1: what the report is taken from.
+        let open = Sampler {
+            temp: 1.0,
+            top_k: 0,
+            top_p: 1.0,
+            min_p: 0.0,
+        };
+        let lp = token_logprob(&logits, 2, 2);
+        let dist = truncated_dist(&logits, open);
+        let expected = dist.iter().find(|(id, _)| *id == 2).unwrap().1.ln();
+        assert!((lp.logprob - expected).abs() < 1e-6);
+        assert_eq!(lp.top.len(), 2);
+        assert_eq!(lp.top[0].token, 3);
+        assert!(
+            (lp.top[0].logprob - dist.iter().find(|(id, _)| *id == 3).unwrap().1.ln()).abs() < 1e-6
+        );
+
+        let only = token_logprob(&logits, 2, 0);
+        assert!(only.top.is_empty());
+        assert_eq!(only.logprob, lp.logprob);
+    }
+
+    /// The report is the model's distribution, not the sampler's: temperature scales the logits
+    /// before sampling, so a report taken from the scaled row would read near 0 for almost every
+    /// token at `temperature: 0.01` and then jump at `temperature: 0`.
+    #[test]
+    fn token_logprob_ignores_temperature() {
+        let logits = [0.0f32, 1.0, 2.0, 3.0];
+        let cold = Sampler {
+            temp: 0.01,
+            top_k: 0,
+            top_p: 1.0,
+            min_p: 0.0,
+        };
+        let scaled = truncated_dist(&logits, cold)
+            .iter()
+            .find(|(id, _)| *id == 2)
+            .unwrap()
+            .1
+            .ln();
+        assert!(
+            scaled < -10.0,
+            "a near-zero temperature would have reported {scaled}"
+        );
+        assert!(token_logprob(&logits, 2, 0).logprob > scaled);
+    }
+
+    #[test]
+    fn an_underflowing_probability_is_clamped_not_infinite() {
+        // e^0 next to e^2000 is 0 in binary32, so its logarithm does not exist.
+        let logits = [0.0f32, 2000.0];
+        let lp = token_logprob(&logits, 0, 0);
+        assert!(lp.logprob.is_finite(), "got {}", lp.logprob);
+        assert_eq!(lp.logprob, LOGPROB_FLOOR);
     }
 
     /// The PROCESS-default sampling config these tests layer their per-request overrides over —

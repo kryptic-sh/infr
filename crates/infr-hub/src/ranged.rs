@@ -16,16 +16,17 @@
 //!     sha256 for the object it belongs to, and a run that finds a different one throws the partial
 //!     away instead of continuing it. That is a content hash, so unlike an `ETag` it cannot differ
 //!     merely because a different CDN edge answered.
-//!   * **Every chunk request carries `If-Range` and must come back `206`** with a `Content-Range`
-//!     naming exactly the bytes asked for, out of a total that still matches the plan. A `200` means
-//!     the server declined the range and is offering the whole object from byte 0 — never something
-//!     to write into the middle of a file.
+//!   * **Every range request carries `If-Range` and must come back `206`** — one chunk, or a run of
+//!     them on one request — with a `Content-Range` starting at exactly the byte asked for, out of
+//!     a total that still matches the plan (it may end early; only whole chunks are kept). A `200`
+//!     means the server declined the range and is offering the whole object from byte 0 — never
+//!     something to write into the middle of a file.
 //!   * **The sha256 gate is untouched.** Everything here is about where bytes land; whether the
 //!     assembled file is the one HF advertises is still decided once, at the end, by
 //!     [`crate::download`], and a mismatch still discards the temp and refuses to link it.
 
 use crate::download::Object;
-use crate::http::{api_client, download_client, token, ConnBudget, Permit};
+use crate::http::{api_client, download_client, token, Claim, ConnBudget, Permit};
 use crate::parts::{self, Plan};
 use indicatif::{MultiProgress, ProgressBar};
 use infr_core::error::{Error, Result};
@@ -43,7 +44,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 use tracing::{debug, warn};
 
-/// What a one-byte probe learned about the object: how big it is, and the validator to present on
+/// What the probe `HEAD` learned about the object: how big it is, and the validator to present on
 /// each range request.
 pub(crate) struct Probe {
     pub(crate) total: u64,
@@ -60,9 +61,9 @@ pub(crate) struct Probe {
 /// declines the range would answer a ranged `GET` with the WHOLE object, and the client abandoning
 /// that response has still made the origin start sending 161 GB down a socket it is about to close.
 /// The cost of asking this way is that `Accept-Ranges` is an advertisement rather than a
-/// demonstration; the demonstration isevery chunk request, each of which must come back `206` naming
-/// the bytes it asked for, and a server that advertised ranges and then declines one falls back to
-/// the single stream from there.
+/// demonstration; the demonstration is every range request, each of which must come back `206`
+/// starting at the byte it asked for, and a server that advertised ranges and then declines one
+/// falls back to the single stream from there.
 pub(crate) fn probe(obj: &Object) -> Result<Option<Probe>> {
     let (url, label) = (obj.url, obj.label);
     let mut req = api_client()?.head(url);
@@ -179,18 +180,21 @@ pub(crate) enum RangedError {
 /// object.
 ///
 /// The partial is bound to [`Object::oid`] — HF's advertised LFS sha256 — which is what decides
-/// whether `existing` may be continued at all. `budget` is the pull's whole connection allowance:
-/// this call takes what is spare and gives it back as its workers finish, so the total in flight
-/// across every file of the model stays at `hub.pull_jobs`.
+/// whether `existing` may be continued at all. `claim` is this file's place in the pull's whole
+/// connection allowance: this call starts on its share of what is spare
+/// ([`Claim::take_share`]), takes more at chunk boundaries as other files give theirs back, and
+/// returns them as its workers finish, so the total in flight across every file of the model stays
+/// at `hub.pull_jobs`.
 pub(crate) fn run(
     obj: &Object,
     tmp: &Path,
     existing: Option<Plan>,
     probe: &Probe,
-    budget: &ConnBudget,
+    claim: &mut Claim<'_>,
     pb: &ProgressBar,
 ) -> std::result::Result<(), RangedError> {
     let label = obj.label;
+    let budget = claim.budget();
     // Both failures below leave the partial for the CALLER to discard: `Changed` can also come out
     // of a worker mid-download, and one owner of "throw these bytes away" is one place to get it
     // right rather than two places to get it inconsistent.
@@ -215,9 +219,10 @@ pub(crate) fn run(
     // transferred bytes; the numbers must describe THIS transfer.
     pb.reset_eta();
 
-    // One connection per remaining chunk at most, and never more than the budget has spare. The
-    // calling thread is one of the workers, so it asks for one fewer than the connections it wants.
-    let permits = budget.acquire_up_to(plan.remaining().saturating_sub(1));
+    // One connection per remaining chunk at most, and never more than this file's share of what is
+    // spare. The calling thread is one of the workers, so it asks for one fewer than the
+    // connections it wants.
+    let permits = claim.take_share(plan.remaining().saturating_sub(1));
     let conns = permits.len() + 1;
     let job = Job {
         url: obj.url,
@@ -230,6 +235,8 @@ pub(crate) fn run(
         validator: plan.validator.clone(),
         plan: Mutex::new(plan),
         cursor: AtomicUsize::new(0),
+        // The calling thread; `spawn_worker` counts each of the others in.
+        workers: AtomicUsize::new(1),
         stop: AtomicBool::new(false),
         err: Mutex::new(None),
         pb,
@@ -344,6 +351,9 @@ struct Job<'a> {
     validator: Option<String>,
     plan: Mutex<Plan>,
     cursor: AtomicUsize,
+    /// Workers running now. One means a worker may fetch past its claimed cell on the same request
+    /// (see [`span_end`]).
+    workers: AtomicUsize,
     stop: AtomicBool,
     err: Mutex<Option<RangedError>>,
     pb: &'a ProgressBar,
@@ -367,50 +377,99 @@ fn spawn_worker<'s, 'e>(
     budget: &'s ConnBudget,
     permit: Permit<'s>,
 ) {
+    // Counted before the thread exists, so no worker ever sees itself alone while another is
+    // being started.
+    job.workers.fetch_add(1, Ordering::AcqRel);
     scope.spawn(move || {
         let _permit = permit;
         worker(scope, job, budget);
     });
 }
 
+/// Start one more worker if the budget will give this download another connection and the grid
+/// has a cell nobody has claimed yet.
+///
+/// Permits come free while a download runs — most often because another file of the model
+/// finished and its worker gave one back — and a download that fixed its connection count when it
+/// started would leave them idle. That is the tail of every shard set: once fewer files remain than
+/// there are connections, the last few would otherwise crawl on one connection each while the rest
+/// of the allowance sits unused. Growth is bounded by the same budget as everything else, so it
+/// can only ever fill the allowance, never exceed it.
+fn grow<'s>(scope: &'s std::thread::Scope<'s, '_>, job: &'s Job<'s>, budget: &'s ConnBudget) {
+    if job.cursor.load(Ordering::Relaxed) < job.chunks {
+        if let Some(permit) = budget.try_grow() {
+            spawn_worker(scope, job, budget, permit);
+        }
+    }
+}
+
+/// Counts a worker out of [`Job::workers`] however it stops.
+struct Leaving<'a>(&'a AtomicUsize);
+
+impl Drop for Leaving<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// Claim cells until the grid runs out or somebody fails. One shared cursor, so each chunk is
 /// fetched by exactly one worker and the file is still filled roughly front to back.
 ///
-/// Between chunks a worker also tries to GROW the fan-out. Permits come free while a download runs
-/// — most often because another file of the model finished and its worker gave one back — and a
-/// download that fixed its connection count at its first chunk would leave them idle. That is the
-/// tail of every shard set: once fewer files remain than there are connections, the last few would
-/// otherwise crawl on one connection each while the rest of the allowance sits unused. Growth is
-/// bounded by the same budget as everything else, so it can only ever fill the allowance, never
-/// exceed it.
+/// Before each chunk a worker tries to [`grow`] the fan-out, which is how a download that started
+/// on its own connection — every connection busy on other files — ends up with the connections
+/// those files give back when they finish.
 fn worker<'s>(scope: &'s std::thread::Scope<'s, '_>, job: &'s Job<'s>, budget: &'s ConnBudget) {
+    let _leaving = Leaving(&job.workers);
+    // A cell already claimed: one this worker took at a boundary of its own request and could not
+    // continue into, because another worker had the cell between.
+    let mut claimed = None;
     // `shutdown_requested()` here stops a worker CLAIMING another chunk, without touching
     // `job.stop`. A worker already inside a chunk stops there instead (`fetch_chunk`), which does
     // set `job.stop` — but it reports `Error::Aborted`, and the first error wins, so a Ctrl-C
     // still reads as a Ctrl-C rather than as a download failure.
     while !job.stop.load(Ordering::Relaxed) && !shutdown_requested() {
-        // Only worth another connection if there is a cell for it to claim after this one.
-        if job.cursor.load(Ordering::Relaxed) + 1 < job.chunks {
-            if let Some(permit) = budget.try_acquire() {
-                spawn_worker(scope, job, budget, permit);
-            }
-        }
-        let i = job.cursor.fetch_add(1, Ordering::Relaxed);
+        let i = claimed
+            .take()
+            .unwrap_or_else(|| job.cursor.fetch_add(1, Ordering::Relaxed));
         if i >= job.chunks {
             return;
         }
         if job.plan.lock().unwrap().is_done(i) {
             continue; // landed in an earlier run
         }
-        if let Err(e) = fetch_chunk(job, i) {
-            job.stop.store(true, Ordering::Relaxed);
-            let mut slot = job.err.lock().unwrap();
-            if slot.is_none() {
-                *slot = Some(e); // first failure wins; the rest are consequences of `stop`
+        grow(scope, job, budget);
+        match fetch_chunk(scope, job, budget, i) {
+            Ok(next) => claimed = next,
+            Err(e) => {
+                job.stop.store(true, Ordering::Relaxed);
+                let mut slot = job.err.lock().unwrap();
+                if slot.is_none() {
+                    *slot = Some(e); // first failure wins; the rest are consequences of `stop`
+                }
+                return;
             }
-            return;
         }
     }
+}
+
+/// The last cell the request for cell `i` asks for.
+///
+/// While other workers share the grid that is `i` alone. A worker on its own instead asks for `i`
+/// and every cell after it up to the next one already on disk, in ONE request, and claims each of
+/// them only as its body reaches it ([`fetch_chunk_once`]). That is the common case, not an edge:
+/// a file that starts while every connection is busy on other files runs alone until one is freed,
+/// and one request per chunk would cost it a round trip (two, through HF's redirect) every
+/// [`parts::CHUNK_BYTES`]. When the worker grows, the new worker claims the next cell, and the
+/// original abandons its request at that boundary and carries on with single cells.
+fn span_end(job: &Job, i: usize) -> usize {
+    if job.workers.load(Ordering::Acquire) > 1 {
+        return i;
+    }
+    let plan = job.plan.lock().unwrap();
+    (i + 1..job.chunks)
+        .take_while(|c| !plan.is_done(*c))
+        .last()
+        .unwrap_or(i)
 }
 
 /// Tries one chunk gets before its failure ends the whole file. A transient failure — a dropped
@@ -429,8 +488,9 @@ const CHUNK_RETRY_BACKOFF: Duration = if cfg!(test) {
 /// One failed attempt at a chunk.
 enum ChunkFailure {
     /// Worth another try on a fresh connection. Carries the message the file fails with if the
-    /// tries run out.
-    Transient(String),
+    /// tries run out, and the cell the attempt failed in: a request for several cells may have
+    /// landed some of them first, and only the rest need asking for again.
+    Transient { why: String, cell: usize },
     /// Retrying cannot help: the object moved, ranges stopped working, the disk failed, or the user
     /// asked to stop.
     Permanent(RangedError),
@@ -439,13 +499,25 @@ enum ChunkFailure {
 /// Fetch chunk `i` and record it as landed, retrying a transient failure in place up to
 /// [`CHUNK_ATTEMPTS`] times before it fails the file. Another worker's failure or a Ctrl-C stops
 /// the retrying, since the file is ending anyway.
-fn fetch_chunk(job: &Job, i: usize) -> std::result::Result<(), RangedError> {
-    let mut attempt = 1;
+///
+/// A request that carried on past `i` ([`span_end`]) can fail in a later cell. The tries are then
+/// counted for THAT cell, since every cell before it landed. Returns the cell this worker claimed
+/// at a boundary and did not fetch, if any, for [`worker`] to fetch next.
+fn fetch_chunk<'s>(
+    scope: &'s std::thread::Scope<'s, '_>,
+    job: &'s Job<'s>,
+    budget: &'s ConnBudget,
+    i: usize,
+) -> std::result::Result<Option<usize>, RangedError> {
+    let (mut cell, mut attempt) = (i, 1);
     loop {
-        match fetch_chunk_once(job, i) {
-            Ok(()) => return Ok(()),
+        match fetch_chunk_once(scope, job, budget, cell) {
+            Ok(next) => return Ok(next),
             Err(ChunkFailure::Permanent(e)) => return Err(e),
-            Err(ChunkFailure::Transient(why)) => {
+            Err(ChunkFailure::Transient { why, cell: failed }) => {
+                if failed != cell {
+                    (cell, attempt) = (failed, 1);
+                }
                 if attempt >= CHUNK_ATTEMPTS
                     || job.stop.load(Ordering::Relaxed)
                     || shutdown_requested()
@@ -465,13 +537,35 @@ fn fetch_chunk(job: &Job, i: usize) -> std::result::Result<(), RangedError> {
     }
 }
 
-/// One attempt at chunk `i`: fetch it and record it as landed — in that order, and only if every
-/// byte of it arrived. A transient failure takes back the progress it had shown, because the retry
-/// counts those bytes again.
-fn fetch_chunk_once(job: &Job, i: usize) -> std::result::Result<(), ChunkFailure> {
+/// One request starting at chunk `i`: fetch each cell it covers ([`span_end`]) and record it as
+/// landed — in that order, and only if every byte of it arrived.
+///
+/// A reply that ends short of the request keeps only the cells it holds whole; the worker then
+/// asks for the rest from the next cell, as for any finished request.
+///
+/// Between two cells of the same request the worker claims the next cell. If the cursor hands it
+/// exactly that one it reads on, and tries to [`grow`]; if another worker took it, this request's
+/// remaining bytes are not this worker's to write, so the request is dropped there and the cell it
+/// was handed instead is returned. A transient failure takes back the progress shown for the cell
+/// it interrupted, because the retry counts those bytes again.
+fn fetch_chunk_once<'s>(
+    scope: &'s std::thread::Scope<'s, '_>,
+    job: &'s Job<'s>,
+    budget: &'s ConnBudget,
+    i: usize,
+) -> std::result::Result<Option<usize>, ChunkFailure> {
     use ChunkFailure::{Permanent, Transient};
-    let (start, len) = job.range(i);
-    let end = start + len - 1;
+    let mut last = span_end(job, i);
+    let start = job.range(i).0;
+    let end = {
+        let (s, l) = job.range(last);
+        s + l - 1
+    };
+    let what = if last == i {
+        format!("chunk {i}")
+    } else {
+        format!("chunks {i}..={last}")
+    };
     let mut req = download_client()
         .map_err(|e| Permanent(RangedError::Fatal(e)))?
         .get(job.url)
@@ -482,42 +576,51 @@ fn fetch_chunk_once(job: &Job, i: usize) -> std::result::Result<(), ChunkFailure
     if let Some(t) = token() {
         req = req.bearer_auth(t);
     }
-    let mut resp = req.send().map_err(|e| {
-        Transient(format!(
-            "{}: chunk {i} ({start}..={end}): {e} (partial kept for resume)",
+    let mut resp = req.send().map_err(|e| Transient {
+        why: format!(
+            "{}: {what} ({start}..={end}): {e} (partial kept for resume)",
             job.label
-        ))
+        ),
+        cell: i,
     })?;
     if resp.status() == StatusCode::OK {
         // The range was declined and the whole object is on its way — writing that at `start` is
         // exactly the splice this design exists to prevent.
         return Err(Permanent(RangedError::NoRanges(format!(
-            "{}: the server answered chunk {i} with the whole object",
+            "{}: the server answered {what} with the whole object",
             job.label
         ))));
     }
     if resp.status().is_server_error() || resp.status() == StatusCode::TOO_MANY_REQUESTS {
-        return Err(Transient(format!(
-            "{}: chunk {i}: HTTP {} (partial kept for resume)",
-            job.label,
-            resp.status()
-        )));
+        return Err(Transient {
+            why: format!(
+                "{}: {what}: HTTP {} (partial kept for resume)",
+                job.label,
+                resp.status()
+            ),
+            cell: i,
+        });
     }
     if resp.status() != StatusCode::PARTIAL_CONTENT {
         return Err(Permanent(RangedError::Fatal(Error::Other(format!(
-            "{}: chunk {i}: HTTP {}",
+            "{}: {what}: HTTP {}",
             job.label,
             resp.status()
         )))));
     }
-    // The reply must describe the bytes that were asked for, out of the size the plan was built on.
-    match resp
+    // The reply must start where it was asked to, out of the size the plan was built on. It may
+    // END early: a server or proxy is allowed to cap how much of a range it sends (RFC 9110
+    // §14.2), and a lone worker asks for the whole remaining run. Only the cells that arrived
+    // WHOLE are kept; the bytes of a cell cut short are not written, the request is dropped there,
+    // and the worker asks again from that cell. A reply too short to hold even the first cell
+    // cannot make progress by asking again, so the file falls back to one stream.
+    let served_end = match resp
         .headers()
         .get(CONTENT_RANGE)
         .and_then(|v| v.to_str().ok())
         .and_then(parse_content_range)
     {
-        Some((a, b, total)) if a == start && b == end && total == job.size => {}
+        Some((a, b, total)) if a == start && a <= b && b <= end && total == job.size => b,
         Some((a, b, total)) => {
             return Err(Permanent(RangedError::Changed(format!(
                 "{}: asked for bytes {start}-{end}/{} and was served {a}-{b}/{total}",
@@ -526,27 +629,72 @@ fn fetch_chunk_once(job: &Job, i: usize) -> std::result::Result<(), ChunkFailure
         }
         None => {
             return Err(Permanent(RangedError::NoRanges(format!(
-                "{}: chunk {i} came back 206 with no usable Content-Range",
+                "{}: {what} came back 206 with no usable Content-Range",
                 job.label
             ))));
         }
-    }
+    };
     if let Some(n) = resp.content_length() {
-        if n != len {
+        if n != served_end - start + 1 {
             return Err(Permanent(RangedError::Fatal(Error::Other(format!(
-                "{}: chunk {i} announced {n} bytes, expected {len}",
+                "{}: {what} announced {n} bytes for the span {start}-{served_end}",
                 job.label
             )))));
         }
     }
+    if served_end < end {
+        // The last cell that ends inside what was served.
+        let whole = (i..=last).take_while(|c| {
+            let (s, l) = job.range(*c);
+            s + l - 1 <= served_end
+        });
+        last = match whole.last() {
+            Some(c) => c,
+            None => {
+                return Err(Permanent(RangedError::NoRanges(format!(
+                    "{}: asked for {what} and was served only bytes {start}-{served_end}, less \
+                     than one chunk",
+                    job.label
+                ))))
+            }
+        };
+    }
 
     let mut buf = vec![0u8; 1 << 16];
+    let mut cell = i;
+    loop {
+        read_cell(job, &mut resp, &mut buf, cell)?;
+        if cell == last {
+            return Ok(None);
+        }
+        if job.stop.load(Ordering::Relaxed) || shutdown_requested() {
+            return Ok(None);
+        }
+        let next = job.cursor.fetch_add(1, Ordering::Relaxed);
+        if next != cell + 1 {
+            return Ok(Some(next));
+        }
+        cell = next;
+        grow(scope, job, budget);
+    }
+}
+
+/// Read cell `cell`'s bytes off `resp` into the partial at their offset, then record the cell as
+/// landed.
+fn read_cell(
+    job: &Job,
+    resp: &mut reqwest::blocking::Response,
+    buf: &mut [u8],
+    cell: usize,
+) -> std::result::Result<(), ChunkFailure> {
+    use ChunkFailure::{Permanent, Transient};
+    let (start, len) = job.range(cell);
     let mut at = start;
     let mut left = len;
     // A failure past this point has already advanced the bar by what landed of this attempt.
     let undo = |left: u64, why: String| {
         job.pb.dec(len - left);
-        Transient(why)
+        Transient { why, cell }
     };
     while left > 0 {
         // Between chunks is not often enough: a chunk is 64 MiB, so a worker that only checked
@@ -563,7 +711,7 @@ fn fetch_chunk_once(job: &Job, i: usize) -> std::result::Result<(), ChunkFailure
                 return Err(undo(
                     left,
                     format!(
-                        "{}: chunk {i} at {at}: {e} (partial kept for resume)",
+                        "{}: chunk {cell} at {at}: {e} (partial kept for resume)",
                         job.label
                     ),
                 ))
@@ -574,7 +722,7 @@ fn fetch_chunk_once(job: &Job, i: usize) -> std::result::Result<(), ChunkFailure
             return Err(undo(
                 left,
                 format!(
-                    "{}: chunk {i} ended {left} bytes early (partial kept for resume)",
+                    "{}: chunk {cell} ended {left} bytes early (partial kept for resume)",
                     job.label
                 ),
             ));
@@ -592,7 +740,7 @@ fn fetch_chunk_once(job: &Job, i: usize) -> std::result::Result<(), ChunkFailure
         .sync_data()
         .map_err(|e| Permanent(RangedError::Fatal(Error::from(e))))?;
     let mut plan = job.plan.lock().unwrap();
-    plan.mark_done(i);
+    plan.mark_done(cell);
     parts::save(job.tmp, &plan).map_err(|e| Permanent(RangedError::Fatal(e)))?;
     Ok(())
 }

@@ -32,16 +32,9 @@ Provenance tags point at the finding that opened the item:
 Each is a slice to run through the usual coder, reviewer and gate flow; delete a
 line when its slice ships.
 
-Queue order (the owner's): the download fan-out first, then MoE routing, then
-the rest in the order below.
+Queue order (the owner's): MoE routing first, then the rest in the order below.
+(Item 1, the download fan-out, shipped; see B-FANOUT for what it left.)
 
-1. **Download fan-out (`crates/infr-hub`).** A multi-chunk file starts in ranged
-   mode on one connection whenever the server serves ranges, so it can take
-   connections freed later (`fetch_ranged` no longer returns a stream when
-   `budget.available() == 0`); stream mode stays for `hub.pull_jobs` of 0 or 1.
-   Files that start together split the spare connections fairly rather than the
-   first taking all of them (`ranged::run`'s `acquire_up_to`). Measure a real
-   multi-shard pull before and after.
 2. **MoE routing, int8 against float (B207).** Unparked: run the investigation
    next. Router fed int8 against float activations on ERNIE-4.5-21B-A3B and
    Qwen3-30B-A3B, both GPUs, quiet window: selections differing, KL against the
@@ -1539,23 +1532,10 @@ equal to HF's `lfs.oid`. Not covered:
   sidecar; the per-chunk `If-Range` has never been seen to reject anything,
   because the CDN answered all 2 404 chunk requests `206`.
 - **A connection freed mid-chunk.** A range worker only tries to grow the
-  fan-out between chunks (`ranged::worker`), so a download already inside its
-  last chunk cannot pick up a permit another file just released. Bounded by one
-  chunk time (64 MiB, seconds), and not worth a wake-up mechanism until
-  something measures it.
-- **A file that starts with no spare permit never splits.** For a fresh
-  download, `fetch_ranged` streams the whole object when `budget.available()` is
-  zero at its start, and a stream cannot take on range workers later. With at
-  least as many files as `hub.pull_jobs`, a file normally starts while every
-  other worker still holds its permit, so most of a shard set's tail does NOT
-  inherit the permits finished workers give back, whatever `fetch_all`'s doc
-  says. Two exceptions: a worker that finds the queue empty drops its permit at
-  once, so if that happens between the last file's claim and its `available()`
-  check (after the LFS `HEAD`), the last file splits; and a resumed ranged
-  partial skips the check entirely, so it runs ranged and its workers grow at
-  chunk boundaries like any other. Read in code (2026-11-25), not measured; the
-  lever would be planning a split for the last files of a set (or switching a
-  stream to ranges mid-file), at the cost of a probe request.
+  fan-out between chunks (`ranged::grow`), so a download already inside its last
+  chunk cannot pick up a permit another file just released. Bounded by one chunk
+  time (64 MiB, seconds), and not worth a wake-up mechanism until something
+  measures it.
 - **An `ETag` that differs between CDN edges.** If one ever did, `If-Range`
   would make that chunk come back `200` and the file would restart as a single
   stream — correct, but slow, and nothing would say why beyond one `warn!`.
@@ -1584,6 +1564,92 @@ equal to HF's `lfs.oid`. Not covered:
 - **The progress block was read, not eyeballed.** One bar per file is what the
   code does (chunk workers all `inc` the same bar); the real pull ran with
   stderr redirected to a file, where bars are hidden.
+
+### B-FANOUT — what the download fan-out slice left (2026-11-25)
+
+**Tag:** B-DECISIONS-2026-11-25 item 1 · **Blocked on:** nothing; findings and
+gaps
+
+What shipped: every file of more than one chunk is fetched as ranges when the
+server serves them, even with nothing spare at its start (`fetch_ranged`), and
+files starting together divide the spare permits by `Claim::take_share`
+(`ceil(spare / files still starting)`, the claims registered in `fetch_all`
+before any file takes its share; growth through `ConnBudget::try_grow` is held
+off while a file is still starting). A ranged worker alone on its file asks for
+every missing cell up to the next landed one in one request (`ranged::span_end`)
+and abandons that request at the boundary where a new worker took the next cell.
+
+Real pull, `Qwen/Qwen2.5-7B-Instruct-GGUF:Q4_K_M` (two shards, 3.993 + 0.690
+GB), anonymous, cold cache, A = `f3cfa973`, B = this slice, alternated, load
+average under 4.2 throughout:
+
+- `hub.pull_jobs = 8`: A 58.3 / 59.3 s, B 59.0 / 64.4 s. Starting fan-outs: A
+  seven connections for the small shard and one for the big, B four each. A tie:
+  the link is the cap (about 80 MB/s, as B58/B59 found).
+- `hub.pull_jobs = 2`: A 62.3 / 91.2 s, B 64.5 / 62.7 / 64.2 s (the third B run
+  only verified the bound). A's big shard finishes on its one stream; B's takes
+  the small shard's connection when it finishes (socket sampling: one receiving
+  socket for most of A's run, two for B's tail; never more than two sockets
+  receiving at body rate, 114 of 125 samples at two). The gain depends on how
+  fast one connection happens to be: one connection ran at 44 to 64 MB/s in A's
+  tails, where `HubCfg::pull_jobs`'s doc still quotes 8.8 MB/s from 2026-08.
+
+Left open:
+
+- **Growth is greedy, not per-file fair.** When a file finishes, its permits go
+  to whichever surviving worker reaches a chunk boundary first, one permit per
+  worker per boundary, so two survivors can end up unequal. The fair split is
+  only at the start. Not required by the decision; a lever if it is ever seen to
+  matter.
+- **A starting file holds off everyone's growth while it starts.** From its
+  claim to its share it is the LFS `HEAD` (retried up to `HEAD_ATTEMPTS`), the
+  blob lock and the probe `HEAD`. Bounded by the metadata timeouts; a contended
+  lock stands the claim aside first, because another process can hold it for a
+  whole download. A late claim can still lose a permit to a growth that checked
+  just before it registered (documented on `try_grow`).
+- **A file that will not split still counts as starting until it stands aside.**
+  A one-chunk object, a range-refusing server or (only when it is found late) a
+  stream partial shrinks the first share of every file starting alongside it,
+  until growth at their chunk boundaries takes the difference back. A stream
+  partial on disk is now seen before any network call (`fetch_and_link` stands
+  its claim aside first), so in practice it no longer costs anything — but that
+  is a race between one thread start and the other files' `HEAD`s, not a
+  guarantee. The other two need a round trip to know (the LFS `HEAD` for the
+  size, the probe for ranges) and are left.
+- **What a file on one connection still pays over a stream:** one probe `HEAD`
+  (the LFS `HEAD` plus the probe took about 0.75 s together in the B logs), and
+  an `fdatasync` plus a sidecar rewrite per 64 MiB chunk. A 64 MiB `fdatasync`ed
+  write took 35–40 ms here against about 35 ms unsynced. On one connection the
+  0.69 GB shard took 14.9 / 15.6 s as a stream and 16.1 / 26.1 / 16.0 s ranged,
+  while sharing the link with the other shard, so the overhead is not isolated.
+  The lever, if it shows: sync every few chunks on the span path, at the cost of
+  re-fetching those chunks after a crash.
+- **Abandoning a span costs a connection.** When a lone worker grows, it drops
+  its request mid-body at the next boundary: one new TLS connection, and
+  whatever was in flight for the cell another worker now owns. Once per growth
+  from one worker, not per chunk. The same happens when a server answers a range
+  short (`fetch_chunk_once` keeps the whole cells and drops the rest).
+- **A dropped request's socket can outlive the next request's start.** After a
+  span is abandoned, or a reply too short for one cell is dropped, the next
+  request can start a moment before the old socket is gone. Permits are never
+  exceeded — the permit is the worker's, not the socket's — but the test hub
+  cannot show either way: it stops counting a body before writing it, so a
+  socket dropped mid-body is invisible to `peak_concurrent_bodies`, while one
+  dropped on its headers is still counted through `BODY_DELAY` and reads as an
+  extra body (which is why
+  `a_server_that_caps_range_length_still_assembles_the_file` asserts no peak for
+  its below-one-chunk case).
+- **`hub.pull_jobs` 0 or 1 with a ranged partial on disk** (left by a run at a
+  higher setting) still finishes it as ranges, one request per run of missing
+  cells, as before this slice. Streaming it instead would throw the partial
+  away. The "one request per file" promise is for a fresh download.
+- **A one-chunk LFS object no longer probes** (`obj.size` is the hub's LFS size,
+  which the probe is checked against anyway). A non-LFS file of one chunk still
+  pays the probe.
+- **Not verified:** a real server that refuses ranges (local origin only); a
+  repo with more shards than connections beyond two (the 236-shard case);
+  Windows, including `cargo clippy` for `infr-hub`, which cannot build on this
+  Linux host (a C dependency needs `lib.exe`).
 
 ### B60 — three CPU-vs-Vulkan tests still pass or fail on a whole-vocab logit cosine (2026-08-11)
 

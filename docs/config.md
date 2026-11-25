@@ -706,11 +706,22 @@ same 60-second window: 11.4 MB/s at `1`, 80.5 MB/s at the default `8`; the whole
 per axis would multiply — 8 files x 8 ranges is 64 sockets on a repo whose file
 count is the publisher's choice (`DeepSeek-V3.2-REAP` ships 236).
 
+Files that start together split the spare connections between them, and a
+connection a finished file gives back goes to the files still downloading, so
+the last file of a shard set ends up on every connection, as long as it still
+has that many 64 MiB ranges left to fetch. That is why every file larger than
+one 64 MiB range is fetched as ranges, even one that starts while every
+connection is busy: it then runs on one connection as a single request for the
+whole file, and takes more as other files finish.
+
 Ranges need the server to support them; one that does not (no `Accept-Ranges`,
 or a `200` where a `206` was asked for) falls back to a single stream, and a
 file of 64 MiB or less is never split at all. `0` and `1` both mean strictly one
-connection — the setting for a metered link, or for a proxy that objects to
-several connections from one client.
+connection, one file at a time: a fresh download is one request per file with no
+probe — the setting for a metered link, or for a proxy that objects to several
+connections from one client. A ranged partial already on disk (left by an
+interrupted run at a higher setting) is finished as ranges on that one
+connection: one request per run of missing ranges, plus the probe `HEAD`.
 
 **`[debug]`** — poison/barrier/dump switches: `coopmat` (print the enumerated
 and chosen coopmat shapes — useful on Intel Arc), `bda_chunk`, `wide_dispatch`,

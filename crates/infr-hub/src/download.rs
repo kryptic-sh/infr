@@ -6,7 +6,7 @@
 //! time, belongs to [`crate::pull`]; how one file is split across connections belongs to
 //! [`crate::ranged`], and what an interrupted split leaves on disk to [`crate::parts`].
 
-use crate::http::{download_client, token, ConnBudget};
+use crate::http::{download_client, token, Claim};
 use crate::parts;
 use crate::ranged::{self, RangedError};
 use indicatif::{MultiProgress, ProgressBar};
@@ -49,10 +49,11 @@ use tracing::{debug, info, warn};
 /// advance the same line, because "which slice of shard 3 is at 40%" is not a thing anyone wants
 /// eight lines of.
 ///
-/// `budget` is the pull's whole allowance of simultaneous connections ([`ConnBudget`]). A single
-/// large file spends what the file fan-out left over on fetching ITSELF in parallel; when there is
-/// nothing spare — `hub.pull_jobs = 1`, or a 236-shard repo with every permit already on a file —
-/// the download is one stream, exactly as before.
+/// `claim` is this file's place in the pull's allowance of simultaneous connections
+/// ([`ConnBudget`]). A file of more than one chunk is fetched as ranges whenever the server serves
+/// them, even when nothing is spare at its start — it then runs on its own connection and takes
+/// more as other files finish. Only a budget of one connection (`hub.pull_jobs` of 0 or 1) keeps
+/// every file to one stream and one request.
 ///
 /// The HF bearer token ([`crate::http::token`]) is attached when the environment carries one, so a
 /// gated repo works the same on this path as on the metadata calls.
@@ -62,7 +63,7 @@ pub(crate) fn download_to_blob(
     label: &str,
     expected: Option<&LfsOid>,
     max_bytes: Option<u64>,
-    budget: &ConnBudget,
+    mut claim: Claim<'_>,
     progress: &MultiProgress,
 ) -> Result<(PathBuf, String, u64)> {
     fs::create_dir_all(blobs).map_err(Error::from)?;
@@ -110,15 +111,23 @@ pub(crate) fn download_to_blob(
     //
     // The wait is abandoned on a shutdown request, which a blocking `flock` would not notice (see
     // `FileLock::acquire_unless`), and reported as the abort it is rather than as an I/O failure.
-    let _lock =
-        FileLock::acquire_unless(&blobs.join(format!("{partial}.lock")), shutdown_requested)
-            .map_err(|e| {
+    let lock_path = blobs.join(format!("{partial}.lock"));
+    let _lock = match FileLock::try_acquire(&lock_path) {
+        Ok(Some(lock)) => lock,
+        // Held by another process, which may keep it for the whole download. Waiting as a
+        // starting file would stop this pull's other downloads growing for that long (see
+        // `ConnBudget::try_grow`). A failed attempt waits too, and the wait reports the error.
+        _ => {
+            claim.stand_aside();
+            FileLock::acquire_unless(&lock_path, shutdown_requested).map_err(|e| {
                 if e.kind() == std::io::ErrorKind::Interrupted && shutdown_requested() {
                     Error::Aborted
                 } else {
                     Error::from(e)
                 }
-            })?;
+            })?
+        }
+    };
     // Re-check the content-addressed short-circuit now that we hold the lock: a racing process may
     // have finished this exact blob while we waited.
     if let Some(want) = expected {
@@ -127,9 +136,8 @@ pub(crate) fn download_to_blob(
         }
     }
 
-    // Ranged first when there is a ranged partial to continue, or when a fresh download has budget
-    // to split; `None` means "not this one" and falls through to the single stream below.
-    let (tmp, pb) = match fetch_ranged(&obj, &temps, max_bytes, budget, progress)? {
+    // Ranged first; `None` means "not this one" and falls through to the single stream below.
+    let (tmp, pb) = match fetch_ranged(&obj, &temps, max_bytes, claim, progress)? {
         Some(done) => done,
         None => fetch_stream(&obj, &temps, max_bytes, progress)?,
     };
@@ -233,17 +241,25 @@ fn commit(
 }
 
 /// Try to fetch the object as a grid of ranges, returning `Ok(None)` when it should be a single
-/// stream instead: no budget for a second connection, a capped (companion) download, an object of
-/// one chunk or less, or a server that will not serve ranges.
+/// stream instead: a budget of one connection, a capped (companion) download, an object of one
+/// chunk or less, or a server that will not serve ranges.
+///
+/// Nothing spare at the start is NOT a reason to stream. The ranged download then runs on this
+/// file's own connection, one request for the whole object (see [`crate::ranged`]), and takes the
+/// connections other files give back; a stream could never take them.
 ///
 /// A stream partial on disk also keeps its own mode: it is an append-only prefix, and continuing it
 /// with sparse writers is not something the sidecar can describe. Nothing is lost by that — the
 /// next fresh download of that object splits.
+///
+/// A ranged partial is continued as ranges whatever the budget, even one connection: one worker
+/// at a time fetching its missing cells keeps the bound, and streaming instead would throw away
+/// what it already has.
 fn fetch_ranged(
     obj: &Object,
     temps: &Temps,
     max_bytes: Option<u64>,
-    budget: &ConnBudget,
+    mut claim: Claim<'_>,
     progress: &MultiProgress,
 ) -> Result<Option<(PathBuf, ProgressBar)>> {
     let (label, ranged_tmp) = (obj.label, temps.ranged.as_path());
@@ -260,8 +276,15 @@ fn fetch_ranged(
         }
         parts::discard(ranged_tmp);
         let stream_have = fs::metadata(&temps.stream).map(|m| m.len()).unwrap_or(0);
-        // A capped download is a sub-1 MiB companion — one request is already the whole of it.
-        if max_bytes.is_some() || stream_have > 0 || budget.available() == 0 {
+        // A capped download is a sub-1 MiB companion — one request is already the whole of it. A
+        // budget of one connection is `hub.pull_jobs` 0 or 1, which promises one request per file:
+        // not even the probe. And an object the hub already says is one chunk would be one request
+        // either way, so it is not worth the probe's round trip either.
+        if max_bytes.is_some()
+            || stream_have > 0
+            || claim.budget().capacity() <= 1
+            || obj.size.is_some_and(|n| n <= parts::chunk_bytes())
+        {
             return Ok(None);
         }
     }
@@ -285,7 +308,7 @@ fn fetch_ranged(
     let mut existing = existing;
     let mut restarted = false;
     loop {
-        match ranged::run(obj, ranged_tmp, existing.take(), &probe, budget, &pb) {
+        match ranged::run(obj, ranged_tmp, existing.take(), &probe, &mut claim, &pb) {
             Ok(()) => return Ok(Some((ranged_tmp.to_path_buf(), pb))),
             // The object is not the one the partial belongs to — the case that must never become
             // "continue anyway". Throw those bytes away and try once from nothing.
@@ -326,7 +349,8 @@ fn fetch_ranged(
 
 /// The single-stream download: one connection, appending, resumed from the temp file's own length.
 /// Unchanged by ranged parallelism on purpose — it is what every server that will not range, every
-/// companion file, every object below the split threshold and `hub.pull_jobs = 1` still get.
+/// companion file, every object below the split threshold, every stream partial and
+/// `hub.pull_jobs` of 0 or 1 still get.
 fn fetch_stream(
     obj: &Object,
     temps: &Temps,
@@ -662,6 +686,12 @@ pub(crate) fn partial_name(label: &str) -> String {
     format!(".dl-{}", temp_stem(label))
 }
 
+/// Is there a single-stream partial of `label` in `blobs` to continue? Such a download keeps its
+/// mode (see [`fetch_ranged`]), so it is known not to split before anything is asked of the hub.
+pub(crate) fn has_stream_partial(blobs: &Path, label: &str) -> bool {
+    fs::metadata(blobs.join(partial_name(label))).is_ok_and(|m| m.len() > 0)
+}
+
 /// `label`'s RANGED partial download, and the stem its `.plan` sidecar hangs off.
 ///
 /// A different name from [`partial_name`], and that is the point rather than tidiness. The two
@@ -797,7 +827,7 @@ mod tests {
             name,
             expected.as_ref(),
             None,
-            &ConnBudget::new(1),
+            crate::http::ConnBudget::new(1).claim(),
             &progress::group(),
         );
         (dir, got)

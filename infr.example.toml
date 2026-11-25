@@ -331,7 +331,13 @@ full_barrier = false
 # the ceiling, not the link (measured here: 1 connection 8.8 MB/s, 5 connections
 # 78.7 MB/s). They go to whatever the model offers: a split model gets one file
 # per connection, a single-file model is split into byte ranges and reassembled
-# (measured on a 161 GB one-file GGUF: 11.4 MB/s at 1, 80.5 MB/s at 8). One
+# (measured on a 161 GB one-file GGUF: 11.4 MB/s at 1, 80.5 MB/s at 8). Files
+# starting together split the spare connections, and a finished file's go to the
+# files still running, so a shard set's last file ends on all of them (while it
+# has that many 64 MiB ranges left). One
 # number for both, because a bound per axis would multiply — some repos ship 236
-# shards. 0 and 1 both mean strictly one connection, never split.
+# shards. 0 and 1 both mean strictly one connection: a fresh download is one
+# request per file with no probe; a ranged partial already on disk is finished
+# as ranges on that connection (a request per run of missing ranges, plus the
+# probe HEAD).
 pull_jobs = 8

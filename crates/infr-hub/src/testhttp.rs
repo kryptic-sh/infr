@@ -99,6 +99,9 @@ struct State {
     unavailable_at: AtomicUsize,
     /// How an honoured range is misdescribed, if at all.
     range_fault: Mutex<RangeFault>,
+    /// The most bytes one honoured range is answered with; `0` means no cap. Past it the reply
+    /// ends early and says so in `Content-Range`, as a server may.
+    range_cap: AtomicUsize,
     /// HEADs still to be answered with `head_status` before they are served normally again.
     failing_heads: AtomicUsize,
     head_status: AtomicUsize,
@@ -328,6 +331,13 @@ impl TestHub {
         self.state.heads.load(Ordering::SeqCst)
     }
 
+    /// Answer every honoured range with at most `bytes` of it from now on — truthfully, in
+    /// `Content-Range` and `Content-Length` — the way a server or proxy that caps range length
+    /// does.
+    pub(crate) fn cap_ranges(&self, bytes: usize) {
+        self.state.range_cap.store(bytes, Ordering::SeqCst);
+    }
+
     /// Misdescribe every honoured range from now on (see [`RangeFault`]).
     pub(crate) fn fault_ranges(&self, fault: RangeFault) {
         *self.state.range_fault.lock().unwrap() = fault;
@@ -379,6 +389,36 @@ impl TestHub {
             .wait_timeout_while(holds, limit, |h| h.get(name).is_some_and(|h| h.parked < n))
             .unwrap();
         holds.get(name).is_some_and(|h| h.parked >= n)
+    }
+
+    /// Wait until the held files `names` have `n` bodies parked between them, and say whether that
+    /// happened within `limit`. For a claim about connections spread over several files, where
+    /// how they divide is the scheduler's business and only the total is fixed.
+    pub(crate) fn wait_parked_total(&self, names: &[&str], n: usize, limit: Duration) -> bool {
+        let total = |h: &HashMap<String, Hold>| -> usize {
+            names
+                .iter()
+                .filter_map(|f| h.get(*f))
+                .map(|h| h.parked)
+                .sum()
+        };
+        let holds = self.state.holds.lock().unwrap();
+        let (holds, _) = self
+            .state
+            .gate
+            .wait_timeout_while(holds, limit, |h| total(h) < n)
+            .unwrap();
+        total(&holds) >= n
+    }
+
+    /// Bodies of the held file `name` parked right now.
+    pub(crate) fn parked(&self, name: &str) -> usize {
+        self.state
+            .holds
+            .lock()
+            .unwrap()
+            .get(name)
+            .map_or(0, |h| h.parked)
     }
 
     /// Answer `404` for `name` from now on.
@@ -591,8 +631,12 @@ fn serve(state: &State, stream: TcpStream) {
         Some((first, last)) if honour && (first as usize) < body.len() => {
             let last = last
                 .unwrap_or(body.len() as u64 - 1)
-                .min(body.len() as u64 - 1);
-            Some((first as usize, last as usize))
+                .min(body.len() as u64 - 1) as usize;
+            let last = match state.range_cap.load(Ordering::SeqCst) {
+                0 => last,
+                cap => last.min(first as usize + cap - 1),
+            };
+            Some((first as usize, last))
         }
         _ => None,
     };

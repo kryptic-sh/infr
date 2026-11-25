@@ -782,8 +782,13 @@ cfg_struct! {
         ///   reassembled (measured on that object through `infr pull` itself, same 60-second
         ///   window: 11.4 MB/s at `1`, 80.5 MB/s at the default `8`; the whole 161 GB pull ran at
         ///   80.0 MB/s end to end);
-        /// * and the tail of a shard set, where fewer files remain than there are connections,
-        ///   gives the leftovers to the files still going.
+        /// * files that start together split the connections left over between them;
+        /// * and a connection freed by a finished file goes to the files still going, so the
+        ///   last file of a shard set ends up on every connection — as long as it still has that
+        ///   many 64 MiB ranges left to fetch; a file nearly done uses no more than its remaining
+        ///   ranges. Every file larger than one range is fetched as ranges for that reason, even
+        ///   one that starts with no connection to spare (on one connection it is still one
+        ///   request).
         ///
         /// ONE number for both because the axes MULTIPLY: a per-file bound and a per-range bound
         /// of 8 each is 64 sockets on a repo whose file count is the publisher's choice
@@ -791,9 +796,12 @@ cfg_struct! {
         /// each file holds a temp file and a progress LINE — a bar block taller than the terminal
         /// is the first of those to stop being free.
         ///
-        /// `0` and `1` both mean strictly one connection: one file at a time, never split. That is
-        /// the pre-concurrency behaviour, and the value to set when a proxy or a metered link wants
-        /// exactly one connection.
+        /// `0` and `1` both mean strictly one connection, one file at a time. A FRESH download is
+        /// then one request per file, with no probe — the pre-concurrency behaviour, and the value
+        /// to set when a proxy or a metered link wants exactly one connection. A ranged partial
+        /// already on disk (left by an interrupted run at a higher setting) is finished as ranges
+        /// on that one connection rather than thrown away: one request per run of missing ranges,
+        /// plus the probe `HEAD`.
         pull_jobs: usize = 8,
     }
 }

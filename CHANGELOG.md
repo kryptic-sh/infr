@@ -1291,6 +1291,25 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **`infr pull` gives the connections a finished file frees to the files still
+  downloading, whatever mode they started in.** A file of more than one 64 MiB
+  range now starts as ranges whenever the server serves them, even when every
+  connection is busy on other files; on one connection it is one request for the
+  whole file. It used to stream in that case, and a stream never takes a second
+  connection, so the tail of a shard set finished on one connection per file
+  while the rest of `hub.pull_jobs` sat idle. Now a file still downloading takes
+  freed connections at its chunk boundaries, up to one per 64 MiB range it has
+  left. Files that start together also split the spare connections
+  (`ceil(spare / starting files)` each) instead of the first one taking them
+  all. A server that answers a range with fewer bytes than asked keeps the whole
+  ranges it sent and is asked again for the rest. `hub.pull_jobs` of 0 or 1
+  still means one stream and one request per file for a fresh download (a ranged
+  partial already on disk is finished as ranges on that one connection).
+  Measured on `Qwen/Qwen2.5-7B-Instruct-GGUF:Q4_K_M` (4.68 GB, two shards),
+  cold, two alternated runs each: at `hub.pull_jobs = 2`, 62.3 / 91.2 s before
+  against 64.5 / 62.7 s after; at the default 8, 58.3 / 59.3 s against 59.0 /
+  64.4 s. The link (about 80 MB/s) capped both, so the gain shows only when one
+  connection is slow.
 - **A weight file that changes under a streaming run now fails the read that
   touches it, instead of serving other bytes as weights.** With host or disk
   paging on (`INFR_DRAM_CACHE`, or the streamed Vulkan tiers), each block read

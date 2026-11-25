@@ -26,13 +26,14 @@ use std::path::{Path, PathBuf};
 
 /// The grid's chunk size in production: 64 MiB.
 ///
-/// It trades two costs against each other. Each chunk is one HTTP request — and against HF each is
-/// a redirect from `huggingface.co` to the CDN as well — so a smaller chunk spends more of the
-/// transfer on request setup: a 161 GB object at 64 MiB is ~2 570 requests, which at ~100 ms of
-/// setup spread over eight connections is tens of seconds against a transfer measured in tens of
-/// minutes. A larger chunk costs the other way: an interrupted download loses the in-flight chunks,
-/// so the worst case thrown away is `pull_jobs × CHUNK_BYTES` — half a gigabyte at eight
-/// connections, seconds of re-transfer, and bounded no matter how large the object is.
+/// It trades two costs against each other. While several workers share a file each chunk is one
+/// HTTP request — and against HF each is a redirect from `huggingface.co` to the CDN as well (a
+/// file on one connection asks for all its chunks at once instead) — so a smaller chunk spends
+/// more of the transfer on request setup: a 161 GB object at 64 MiB is ~2 570 requests, which at
+/// ~100 ms of setup spread over eight connections is tens of seconds against a transfer measured
+/// in tens of minutes. A larger chunk costs the other way: an interrupted download loses the
+/// in-flight chunks, so the worst case thrown away is `pull_jobs × CHUNK_BYTES` — half a gigabyte
+/// at eight connections, seconds of re-transfer, and bounded no matter how large the object is.
 ///
 /// It is ALSO the threshold for splitting at all, and deliberately the same number rather than a
 /// second constant: an object of one chunk or less has exactly one cell in its grid, so it is

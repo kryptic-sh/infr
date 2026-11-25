@@ -7,8 +7,8 @@
 //! This module decides WHICH files a model is and how many are fetched at a time; one file's bytes
 //! are [`crate::download`]'s business.
 
-use crate::download::{download_to_blob, present_blob, LfsOid};
-use crate::http::{api_client, head_client, token, ConnBudget};
+use crate::download::{download_to_blob, has_stream_partial, present_blob, LfsOid};
+use crate::http::{api_client, head_client, token, Claim, ConnBudget};
 use crate::{model_ref::ModelRef, store::Store};
 use indicatif::MultiProgress;
 use infr_core::config::Config;
@@ -154,10 +154,15 @@ fn fetch_and_link(
     snap: &Path,
     repo: &str,
     filename: &str,
-    budget: &ConnBudget,
+    mut claim: Claim<'_>,
     progress: &MultiProgress,
 ) -> Result<PathBuf> {
     let filename = check_relative(filename)?;
+    // A stream partial keeps its mode, so this file will take no share: say so now, before the
+    // `HEAD`s below, rather than shrinking the first share of every file starting alongside it.
+    if has_stream_partial(blobs, filename) {
+        claim.stand_aside();
+    }
     let url = resolve_url(origin, repo, filename);
     // A HEAD that fails is NOT "this file is not LFS": treating it so downloads a multi-GB blob
     // with no sha256 gate at all. Retry it, and refuse the file if it never answers — unless the
@@ -195,7 +200,7 @@ fn fetch_and_link(
                 filename,
                 want.as_ref(),
                 None, // model blobs are legitimately multi-GB — never capped
-                budget,
+                claim,
                 progress,
             )?
             .1
@@ -303,11 +308,15 @@ fn names_blob(link: &Path, target: &str) -> bool {
 /// sockets on a repo whose shard count is the publisher's choice (`DeepSeek-V3.2-REAP` ships 236).
 ///
 /// How the allowance divides is decided by the work rather than by a setting. Each file worker
-/// holds one permit for its lifetime, so `min(files, jobs)` of them run and a 236-shard repo has
-/// nothing left over and splits nothing; a single-file repo starts one worker and its file takes
-/// the other seven permits as ranges; and in between, a worker that runs out of files returns its
-/// permit to whichever download is still going. Range workers only ever TRY to take a permit, so
-/// they can never keep a file worker waiting.
+/// holds one permit for its lifetime, so `min(files, jobs)` of them run. Every file of more than
+/// one chunk is fetched as ranges (when the server serves them), starting on its worker's
+/// connection plus its share of what is spare: a single-file repo's file takes every permit, files
+/// that start together split the spare ones between them ([`crate::http::Claim`]), and a 236-shard
+/// repo has nothing spare, so each file starts on one connection. A worker that runs out of files
+/// returns its permit, and the downloads still going take it at their next chunk boundary — so the
+/// last file of a shard set ends up on the whole allowance, as long as it still has that many
+/// unclaimed chunks (a worker is only started for a chunk nobody has claimed). Range workers only
+/// ever TRY to take a permit, so they can never keep a file worker waiting.
 ///
 /// The work queue is one shared cursor, so each file is handed to exactly one worker and the order
 /// is still shard 1 first. A failure sets `stop`, which keeps the other workers from CLAIMING more
@@ -315,8 +324,10 @@ fn names_blob(link: &Path, target: &str) -> bool {
 /// missing shard 1 would be followed by cheerfully downloading the other 200 GB. That matches the
 /// sequential loop this replaced, which stopped at the first `?`.
 ///
-/// `jobs = 0` and `jobs = 1` both mean strictly one connection: one file at a time, unsplit, which
-/// is the pre-concurrency behaviour and stays available for a metered link.
+/// `jobs = 0` and `jobs = 1` both mean strictly one connection, one file at a time: a fresh
+/// download is one request with no probe, which is the pre-concurrency behaviour and stays
+/// available for a metered link. A ranged partial already on disk is finished as ranges on that
+/// connection (see `HubCfg::pull_jobs`).
 fn fetch_all(
     origin: &str,
     blobs: &Path,
@@ -328,8 +339,14 @@ fn fetch_all(
 ) -> Result<()> {
     let budget = ConnBudget::new(jobs.max(1));
     // One permit per file worker, taken up front — so `workers` is what the budget actually
-    // granted rather than a number computed alongside it that could drift from it.
-    let primaries = budget.acquire_up_to(files.len().min(jobs.max(1)));
+    // granted rather than a number computed alongside it that could drift from it. Each comes with
+    // the claim its first file starts on, registered here rather than on the worker's thread so
+    // that every file starting now is counted before any of them takes its share.
+    let primaries: Vec<_> = budget
+        .acquire_up_to(files.len().min(jobs.max(1)))
+        .into_iter()
+        .map(|permit| (permit, budget.claim()))
+        .collect();
     let workers = primaries.len();
     if files.len() > 1 {
         info!(
@@ -342,20 +359,24 @@ fn fetch_all(
     let failures: Vec<Error> = std::thread::scope(|scope| {
         let handles: Vec<_> = primaries
             .into_iter()
-            .map(|permit| {
-                scope.spawn(|| {
-                    // Dropped when this worker runs out of files, handing its connection to
-                    // whichever download is still going — the tail of a shard set is one file with
-                    // the whole budget, not one file on one connection.
+            .map(|(permit, first)| {
+                let (budget, next, stop) = (&budget, &next, &stop);
+                scope.spawn(move || {
+                    // Dropped when this worker runs out of files, handing its connection to the
+                    // downloads still going, which take it at their next chunk boundary.
                     let _permit = permit;
+                    let mut first = Some(first);
                     // `shutdown_requested()` stops claiming new FILES; it does not set `stop`,
                     // which means "a worker failed" and would misreport a Ctrl-C as a failure.
                     while !stop.load(Ordering::Relaxed) && !shutdown_requested() {
+                        // Registered before the file is picked, like the first one: a claim that
+                        // finds the queue empty is dropped and counts for nothing.
+                        let claim = first.take().unwrap_or_else(|| budget.claim());
                         let Some(f) = files.get(next.fetch_add(1, Ordering::Relaxed)) else {
                             break;
                         };
                         if let Err(e) =
-                            fetch_and_link(origin, blobs, snap, repo, f, &budget, progress)
+                            fetch_and_link(origin, blobs, snap, repo, f, claim, progress)
                         {
                             stop.store(true, Ordering::Relaxed);
                             return Some(e);
@@ -812,13 +833,14 @@ fn fetch_companions(
         };
         // No connection budget: a companion is a sub-2-KB file and splitting it across ranges
         // would be more requests than bytes.
+        let none = ConnBudget::new(0);
         let dl = download_to_blob(
             &url,
             blobs,
             name,
             want.as_ref(),
             Some(MAX_COMPANION_BYTES),
-            &ConnBudget::new(0),
+            none.claim(),
             progress,
         );
         match dl.and_then(|(_, hex, _)| link_into_snapshot(snap, name, &hex)) {
@@ -2024,6 +2046,46 @@ mod tests {
         );
     }
 
+    /// Release the parked bodies of the held `files` until `want` of them are parked at once, and
+    /// say whether that happened within [`GATE_DEADLINE`](crate::testhttp::GATE_DEADLINE).
+    ///
+    /// A download grows only at a chunk boundary, and a parked worker is not at one: each release
+    /// lets the workers reach their next boundary with whatever permits have come free since, and
+    /// park again. One round is not always enough — a file worker drops its permit only after its
+    /// file is linked and logged, so released workers can reach their boundary first — hence the
+    /// rounds, each spending one cell per released worker.
+    fn regrant(hub: &TestHub, files: &[&str], want: usize) -> bool {
+        use crate::testhttp::GATE_DEADLINE;
+        /// How long to wait for `want`, once the released workers are back, before releasing
+        /// them again.
+        const REGRANT_AFTER: Duration = Duration::from_secs(2);
+        let deadline = Instant::now() + GATE_DEADLINE;
+        loop {
+            let released: usize = files.iter().map(|f| hub.release(f)).sum::<usize>().max(1);
+            // Every released worker back first: releasing again while one of them is still between
+            // chunks would split it from the rest, and they might never line up.
+            let left = deadline.saturating_duration_since(Instant::now());
+            if !hub.wait_parked_total(files, released, left) {
+                return false;
+            }
+            if hub.wait_parked_total(files, want, REGRANT_AFTER) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+        }
+    }
+
+    /// Wait for `file` to be linked into `cache`'s snapshot, and say whether it was by `deadline`.
+    fn wait_linked(cache: &TempRepo, file: &str, deadline: Instant) -> bool {
+        let link = cache.snapshot().join(file);
+        while !link.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        link.exists()
+    }
+
     /// A file that finishes hands its connection to the one still going.
     ///
     /// This is a pull of FEWER files than connections, where a file already split into ranges is
@@ -2042,10 +2104,6 @@ mod tests {
     #[test]
     fn a_finished_file_hands_over_its_connection() {
         use crate::testhttp::GATE_DEADLINE;
-        /// How long the test waits for the third chunk, once the released workers are back, before
-        /// releasing them again. Only reached when they beat the small file's permit drop (or the
-        /// third worker is slow to arrive); each round spends two of the large file's cells.
-        const REGRANT_AFTER: Duration = Duration::from_secs(2);
 
         let hub = TestHub::start();
         let small = hub.add_shards("m-tail-small", 1, 1024)[0].clone();
@@ -2078,22 +2136,7 @@ mod tests {
             let start_peak = hub.peak_for(&large);
             // The parked chunks go; their workers reach a boundary with that permit free, and their
             // next chunks park beside the first chunk of the third worker it pays for.
-            let deadline = Instant::now() + GATE_DEADLINE;
-            let grew = loop {
-                let released = hub.release(&large).max(1);
-                // Every released worker back first: releasing again while one of them is still
-                // between chunks would split it from the rest, and the three might never line up.
-                let left = deadline.saturating_duration_since(Instant::now());
-                if !hub.wait_parked(&large, released, left) {
-                    break false;
-                }
-                if hub.wait_parked(&large, 3, REGRANT_AFTER) {
-                    break true;
-                }
-                if Instant::now() >= deadline {
-                    break false;
-                }
-            };
+            let grew = regrant(&hub, &[&large], 3);
             hub.open(&large);
             (started, linked, start_peak, grew, pull.join().unwrap())
         });
@@ -2147,5 +2190,305 @@ mod tests {
             hub.served_bodies(f)
         );
         assert_eq!(fs::read(cache.snapshot().join(f)).unwrap(), hub.body(f));
+    }
+
+    /// Big enough that a download can lose several cells to release rounds and still have room to
+    /// put a cell on every connection of an eight-job budget at once.
+    fn bigger() -> usize {
+        64 * parts::chunk_bytes() as usize
+    }
+
+    /// Every file of `files` in `cache` holds exactly the bytes the hub serves for it.
+    fn assert_all_landed(hub: &TestHub, cache: &TempRepo, files: &[String]) {
+        for f in files {
+            assert_eq!(
+                fs::read(cache.snapshot().join(f)).unwrap(),
+                hub.body(f),
+                "{f} has the wrong bytes"
+            );
+            assert!(cache.blobs().join(hub.sha(f)).exists(), "{f} not addressed");
+            assert!(
+                !partial_of(&cache.blobs(), f).exists(),
+                "{f} left a partial"
+            );
+        }
+    }
+
+    /// With more files than connections, the LAST file of the set ends up on every connection
+    /// (it has more unclaimed chunks than there are connections here).
+    ///
+    /// It starts while every connection is busy on another file, so it starts on its worker's one
+    /// — as ONE request for the whole object, which is what keeps that case from paying a round
+    /// trip per chunk — and the files finishing around it hand theirs over. Before the fan-out
+    /// change such a file streamed, and a stream can never take a second connection.
+    #[test]
+    fn the_last_file_of_a_set_takes_the_whole_budget() {
+        use crate::testhttp::GATE_DEADLINE;
+        let hub = TestHub::start();
+        let mut files = hub.add_shards("m-set-small", 3, 1024);
+        let last = hub.add_shards("m-set-last", 1, bigger()).remove(0);
+        files.push(last.clone());
+        let smalls: Vec<&str> = files[..3].iter().map(String::as_str).collect();
+        let cache = TempRepo::new();
+        for f in &files {
+            hub.hold(f);
+        }
+
+        let (busy, started, start_peak, linked, grew, pulled) = std::thread::scope(|s| {
+            let pull = s.spawn(|| pull_one(&hub, &cache, &files, 3));
+            let deadline = Instant::now() + GATE_DEADLINE;
+            let left = || deadline.saturating_duration_since(Instant::now());
+            // Three workers, three small files: every connection busy.
+            let busy = smalls.iter().all(|f| hub.wait_parked(f, 1, left()));
+            // One small file goes; its worker picks up the last file with nothing spare.
+            hub.open(smalls[0]);
+            let started = hub.wait_parked(&last, 1, left());
+            let start_peak = hub.peak_for(&last);
+            // The other two go, and their workers find the queue empty.
+            hub.open(smalls[1]);
+            hub.open(smalls[2]);
+            let linked = smalls.iter().all(|f| wait_linked(&cache, f, deadline));
+            let grew = regrant(&hub, &[&last], 3);
+            hub.open(&last);
+            (
+                busy,
+                started,
+                start_peak,
+                linked,
+                grew,
+                pull.join().unwrap(),
+            )
+        });
+        pulled.unwrap();
+        assert!(busy, "the small files never all had a connection");
+        assert!(started, "the last file never started");
+        assert_eq!(
+            start_peak, 1,
+            "nothing was spare when the last file started"
+        );
+        assert!(linked, "the small files were never linked");
+        assert!(grew, "the last file never had three chunks in flight");
+        assert_eq!(hub.peak_for(&last), 3, "the last file's own peak");
+        assert!(hub.peak_concurrent_bodies() <= 3, "the bound was 3");
+        // Alone, its first request asked for the whole object rather than one chunk.
+        let first = hub.served_bodies(&last)[0];
+        assert_eq!(first.range, Some((0, Some(bigger() as u64 - 1))));
+        assert!(first.honoured);
+        assert_all_landed(&hub, &cache, &files);
+    }
+
+    /// Files that start together split the spare connections between them: three large files on
+    /// eight connections hold three, and the five spare go 2 + 2 + 1 rather than all to whichever
+    /// file got there first. When a file finishes, the connections it gives back go to the files
+    /// still running, until one file is left with all eight.
+    ///
+    /// Which file gets the short share is the scheduler's choice, so the start is asserted as the
+    /// multiset of fan-outs, and the hand-over as connections held between the survivors.
+    #[test]
+    fn files_starting_together_share_the_spare_connections() {
+        let hub = TestHub::start();
+        let files = hub.add_shards("m-share", 3, bigger());
+        let names: Vec<&str> = files.iter().map(String::as_str).collect();
+        let cache = TempRepo::new();
+        for f in &names {
+            hub.hold(f);
+        }
+
+        let (started, mut fan_outs, two_left, one_left, pulled) = std::thread::scope(|s| {
+            let pull = s.spawn(|| pull_one(&hub, &cache, &files, 8));
+            let started = hub.wait_parked_total(&names, 8, crate::testhttp::GATE_DEADLINE);
+            // Nothing can reach a chunk boundary while parked: this is the split they started on.
+            let fan_outs: Vec<usize> = names.iter().map(|f| hub.parked(f)).collect();
+            // The first file goes; the other two take its connections at their boundaries. Its
+            // link is the last thing its worker does before giving them back.
+            hub.open(names[0]);
+            let deadline = Instant::now() + crate::testhttp::GATE_DEADLINE;
+            let first_done = wait_linked(&cache, names[0], deadline);
+            let two_left = first_done && regrant(&hub, &names[1..], 8);
+            hub.open(names[1]);
+            let second_done = wait_linked(&cache, names[1], deadline);
+            let one_left = second_done && regrant(&hub, &names[2..], 8);
+            hub.open(names[2]);
+            (started, fan_outs, two_left, one_left, pull.join().unwrap())
+        });
+        pulled.unwrap();
+        assert!(started, "the three files never had eight chunks in flight");
+        fan_outs.sort_unstable();
+        assert_eq!(fan_outs, [2, 3, 3], "the spare five were not shared");
+        assert!(
+            two_left,
+            "the two survivors never took the finished file's connections"
+        );
+        assert!(one_left, "the last file never took every connection");
+        assert_eq!(hub.peak_for(names[2]), 8);
+        assert!(hub.peak_concurrent_bodies() <= 8, "the bound was 8");
+        assert_all_landed(&hub, &cache, &files);
+    }
+
+    /// `hub.pull_jobs` of 0 and 1 keep their promise with several files too, now that a file with
+    /// nothing spare is otherwise fetched as ranges: one GET per file, unranged, and no HEAD beyond
+    /// each file's LFS one.
+    #[test]
+    fn one_job_is_one_request_per_file() {
+        for jobs in [0, 1] {
+            let hub = TestHub::start();
+            let files = hub.add_shards("m-strict", 3, big());
+            let cache = TempRepo::new();
+
+            pull_one(&hub, &cache, &files, jobs).unwrap();
+
+            assert_eq!(hub.peak_concurrent_bodies(), 1, "jobs = {jobs}");
+            for f in &files {
+                let served = hub.served_bodies(f);
+                assert_eq!(served.len(), 1, "jobs = {jobs}, {f}: {served:?}");
+                assert_eq!(served[0].range, None, "jobs = {jobs}, {f}");
+            }
+            assert_eq!(
+                hub.heads_served(),
+                files.len(),
+                "jobs = {jobs}: a probe was sent"
+            );
+            assert_all_landed(&hub, &cache, &files);
+        }
+    }
+
+    /// A server that does not do ranges still gets one stream per file when there are more files
+    /// than connections — the case that used to stream without asking, and now probes first.
+    #[test]
+    fn a_range_refusing_server_streams_every_file() {
+        let hub = TestHub::start();
+        let files = hub.add_shards("m-noranges-set", 4, big());
+        hub.refuse_ranges();
+        let cache = TempRepo::new();
+
+        pull_one(&hub, &cache, &files, 2).unwrap();
+
+        for f in &files {
+            let served = hub.served_bodies(f);
+            assert_eq!(served.len(), 1, "{f}: {served:?}");
+            assert_eq!(served[0].range, None, "{f}");
+        }
+        let peak = hub.peak_concurrent_bodies();
+        assert!(peak <= 2, "peak {peak}, the bound was 2");
+        assert_all_landed(&hub, &cache, &files);
+    }
+
+    /// A stream partial stays a stream when nothing is spare, and is continued from where it
+    /// stopped rather than discarded for a ranged download.
+    #[test]
+    fn a_stream_partial_stays_a_stream() {
+        let hub = TestHub::start();
+        let files = hub.add_shards("m-stream-resume", 3, big());
+        let cache = TempRepo::new();
+        let (blobs, partial) = (cache.blobs(), &files[1]);
+        let head = 25_000;
+        fs::create_dir_all(&blobs).unwrap();
+        let stem = crate::download::partial_name(partial);
+        fs::write(blobs.join(&stem), &hub.body(partial)[..head]).unwrap();
+        fs::write(blobs.join(format!("{stem}.meta")), "\"v1\"").unwrap();
+
+        pull_one(&hub, &cache, &files, 2).unwrap();
+
+        let served = hub.served_bodies(partial);
+        assert_eq!(served.len(), 1, "{served:?}");
+        assert_eq!(served[0].range, Some((head as u64, None)));
+        assert!(served[0].honoured, "the partial must be CONTINUED");
+        assert!(hub.peak_concurrent_bodies() <= 2, "the bound was 2");
+        assert_all_landed(&hub, &cache, &files);
+    }
+
+    /// A ranged partial resumed on one connection asks for each run of missing cells in ONE
+    /// request, never for a cell it already has, and assembles the object.
+    ///
+    /// The partial is planted, not produced by a cut run, so the runs it leaves are known: cells
+    /// 0 and 3 landed, so the resume is exactly two requests, for 1..=2 and 4..=9.
+    #[test]
+    fn a_ranged_partial_resumes_missing_runs_on_one_connection() {
+        let hub = TestHub::start();
+        let files = hub.add_shards("m-ranged-resume", 1, big());
+        let f = &files[0];
+        let cache = TempRepo::new();
+        let blobs = cache.blobs();
+        fs::create_dir_all(&blobs).unwrap();
+        let tmp = partial_of(&blobs, f);
+        let chunk = parts::chunk_bytes();
+        let mut plan =
+            parts::Plan::fresh(big() as u64, chunk, Some(hub.sha(f)), Some("\"v1\"".into()));
+        let body = hub.body(f);
+        let mut partial = vec![0u8; body.len()];
+        for cell in [0, 3] {
+            let (start, len) = plan.range(cell);
+            let span = start as usize..(start + len) as usize;
+            partial[span.clone()].copy_from_slice(&body[span]);
+            plan.mark_done(cell);
+        }
+        fs::write(&tmp, &partial).unwrap();
+        parts::save(&tmp, &plan).unwrap();
+
+        // One job: no other worker can be started, so what is asked for is the span rule alone.
+        pull_one(&hub, &cache, &files, 1).unwrap();
+
+        let last = big() as u64 - 1;
+        assert_eq!(
+            chunk_spans(&hub, f),
+            vec![(chunk, 3 * chunk - 1), (4 * chunk, last)],
+            "each run of missing cells should be one request"
+        );
+        assert_eq!(hub.peak_concurrent_bodies(), 1);
+        assert_all_landed(&hub, &cache, &files);
+    }
+
+    /// A server may answer a range with less than was asked for. A file on one connection asks
+    /// for its whole remaining run, so a server that caps range length must cost only extra
+    /// requests — the whole chunks that arrived are kept and the rest asked for again — never a
+    /// restart, and never a byte of a chunk that was cut short. On several connections each
+    /// request is one chunk and fits under the cap. A cap below one chunk can make no progress as
+    /// ranges at all, and falls back to one stream per file.
+    #[test]
+    fn a_server_that_caps_range_length_still_assembles_the_file() {
+        let chunk = parts::chunk_bytes() as usize;
+        // Lone workers: two files on two connections, nothing spare.
+        let hub = TestHub::start();
+        let files = hub.add_shards("m-capped-alone", 2, big());
+        let cap = chunk * 5 / 2;
+        hub.cap_ranges(cap);
+        let cache = TempRepo::new();
+        pull_one(&hub, &cache, &files, 2).unwrap();
+        assert_all_landed(&hub, &cache, &files);
+        let asked: Vec<_> = files.iter().flat_map(|f| chunk_spans(&hub, f)).collect();
+        assert!(
+            asked.iter().any(|(a, b)| (b - a + 1) as usize > cap),
+            "no request asked for more than the cap, so nothing was capped: {asked:?}"
+        );
+        assert!(hub.peak_concurrent_bodies() <= 2, "the bound was 2");
+
+        // Several workers on one file: one chunk per request.
+        let hub = TestHub::start();
+        let files = hub.add_shards("m-capped-wide", 1, big());
+        hub.cap_ranges(cap);
+        let cache = TempRepo::new();
+        pull_one(&hub, &cache, &files, 8).unwrap();
+        assert_all_landed(&hub, &cache, &files);
+        assert_eq!(
+            chunk_spans(&hub, &files[0]).len(),
+            10,
+            "one request per chunk"
+        );
+        assert!(hub.peak_concurrent_bodies() <= 8, "the bound was 8");
+
+        // Below one chunk: every file falls back to a stream.
+        let hub = TestHub::start();
+        let files = hub.add_shards("m-capped-tiny", 2, big());
+        hub.cap_ranges(chunk / 2);
+        let cache = TempRepo::new();
+        pull_one(&hub, &cache, &files, 2).unwrap();
+        assert_all_landed(&hub, &cache, &files);
+        for f in &files {
+            let last = hub.served_bodies(f).last().copied().unwrap();
+            assert_eq!(last.range, None, "{f} did not end as a stream");
+        }
+        // No peak assertion here: the client drops a too-short reply on reading its headers, while
+        // the hub is still counting that body through `BODY_DELAY`, so the stream that replaces it
+        // reads as a third body in flight although no permit was ever exceeded.
     }
 }

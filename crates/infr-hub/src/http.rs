@@ -17,6 +17,7 @@
 use infr_core::error::{Error, Result};
 use reqwest::blocking::Client;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::{sync::OnceLock, time::Duration};
 
 /// TCP+TLS handshake budget. Generous enough for a slow link, short enough to fail rather than hang.
@@ -91,15 +92,27 @@ fn usable_token(raw: Option<String>) -> Option<String> {
 /// There are now TWO things that want to open connections — several FILES of a model at once
 /// ([`crate::pull::fetch_all`]) and several RANGES of one file ([`crate::ranged`]) — and they must
 /// not multiply. One budget shared by both is what makes the total bound `hub.pull_jobs` rather
-/// than `pull_jobs × pull_jobs`: a 236-shard repo spends every permit on files and splits nothing,
-/// a single-file repo spends them all on ranges, and the mixed case in between lands wherever the
-/// files happen to leave room.
+/// than `pull_jobs × pull_jobs`: a 236-shard repo starts every permit on a file of its own, a
+/// single-file repo spends them all on ranges of that file, and permits a finished file gives back
+/// go to whichever files are still running.
 ///
-/// Range workers only ever [`try_acquire`](ConnBudget::try_acquire) — they never wait for a permit
-/// — so the file workers, which each hold one for their whole life, can never be starved by them
-/// and nothing here can deadlock.
+/// Spare permits are handed out two ways. A file starting a ranged download takes a SHARE of what
+/// is spare ([`Claim::take_share`]): files that start together divide it between them instead of
+/// the first one taking it all. After that, a running download takes one more permit at each chunk
+/// boundary ([`try_grow`](ConnBudget::try_grow)) — and not while a file is still waiting for its
+/// share, which would otherwise be taken from under it.
+///
+/// Neither ever waits for a permit, so the file workers, which each hold one for their whole life,
+/// can never be starved by range workers and nothing here can deadlock.
 pub(crate) struct ConnBudget {
     free: AtomicUsize,
+    /// What the budget was created with: `hub.pull_jobs`, at least one.
+    capacity: usize,
+    /// Files with a worker that have not yet taken their starting share or decided not to split.
+    starting: AtomicUsize,
+    /// Held while a share is sized and taken, so two files starting at once size theirs from
+    /// counts the other has already updated.
+    sharing: Mutex<()>,
 }
 
 /// One connection's worth of the budget, returned when dropped. Held by the thread that owns the
@@ -118,13 +131,42 @@ impl ConnBudget {
     pub(crate) fn new(permits: usize) -> Self {
         ConnBudget {
             free: AtomicUsize::new(permits),
+            capacity: permits,
+            starting: AtomicUsize::new(0),
+            sharing: Mutex::new(()),
         }
     }
 
-    /// Permits available right now. Advisory only (another thread may take one a nanosecond later),
-    /// so it is used to DECIDE whether splitting a file is worth a probe request, never to reserve.
+    /// The most connections this budget ever allows at once.
+    pub(crate) fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Permits available right now. Advisory only: another thread may take one a nanosecond later.
     pub(crate) fn available(&self) -> usize {
         self.free.load(Ordering::Acquire)
+    }
+
+    /// Register one file that is about to start, so that files starting together share what is
+    /// spare (see [`Claim`]).
+    pub(crate) fn claim(&self) -> Claim<'_> {
+        self.starting.fetch_add(1, Ordering::AcqRel);
+        Claim {
+            budget: self,
+            waiting: true,
+        }
+    }
+
+    /// One more permit for a download that is already running, if one is free and no file is
+    /// waiting for its starting share. Never blocks.
+    ///
+    /// A file that registered its claim after the check can still lose a permit to this call; it
+    /// then starts with one less and grows at its own chunk boundaries like everyone else.
+    pub(crate) fn try_grow(&self) -> Option<Permit<'_>> {
+        if self.starting.load(Ordering::Acquire) > 0 {
+            return None;
+        }
+        self.try_acquire()
     }
 
     /// Take one permit if one is free. Never blocks.
@@ -157,6 +199,55 @@ impl ConnBudget {
             }
         }
         got
+    }
+}
+
+/// One file's place among the files that are starting: registered by [`ConnBudget::claim`] when
+/// a worker picks the file up, and given up when the file takes its share of the spare permits,
+/// decides not to split, or is dropped.
+///
+/// The count is what makes the split fair. Files that start together are registered before any of
+/// them takes a share, so each sizes its share against all of them rather than against whatever
+/// happened to be free when it got there first.
+pub(crate) struct Claim<'a> {
+    budget: &'a ConnBudget,
+    /// Still counted in `starting`.
+    waiting: bool,
+}
+
+impl<'a> Claim<'a> {
+    pub(crate) fn budget(&self) -> &'a ConnBudget {
+        self.budget
+    }
+
+    /// This file's share of the spare permits, at most `want`: `ceil(spare / starting files)`,
+    /// counting this one, and taken before this file stops counting as starting.
+    ///
+    /// Taken in turn, the shares add up to everything that was spare, so the last file of a group
+    /// (or a file starting alone) leaves nothing idle. A file whose claim has already been given
+    /// up — a download restarting after a changed object — counts itself in again for the sizing.
+    pub(crate) fn take_share(&mut self, want: usize) -> Vec<Permit<'a>> {
+        let budget = self.budget;
+        let _turn = budget.sharing.lock().unwrap_or_else(|e| e.into_inner());
+        let sharers = budget.starting.load(Ordering::Acquire) + usize::from(!self.waiting);
+        let share = budget.available().div_ceil(sharers).min(want);
+        let got = budget.acquire_up_to(share);
+        self.stand_aside();
+        got
+    }
+
+    /// Stop counting as a starting file without taking anything: the file is not being split, or
+    /// is about to wait for something that may take arbitrarily long.
+    pub(crate) fn stand_aside(&mut self) {
+        if std::mem::take(&mut self.waiting) {
+            self.budget.starting.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
+impl Drop for Claim<'_> {
+    fn drop(&mut self) {
+        self.stand_aside();
     }
 }
 
@@ -204,5 +295,49 @@ mod tests {
         assert_eq!(b.available(), 0);
         assert!(b.try_acquire().is_none());
         assert!(b.acquire_up_to(4).is_empty());
+        assert!(b.claim().take_share(4).is_empty());
+    }
+
+    /// Three files starting on eight connections hold three permits; the five spare are split
+    /// 2 + 2 + 1 in whatever order the files get there, and nothing is left idle. A first-come
+    /// split would hand the first file all five.
+    #[test]
+    fn files_starting_together_split_the_spare() {
+        let b = ConnBudget::new(8);
+        let _workers = b.acquire_up_to(3);
+        let mut claims: Vec<_> = (0..3).map(|_| b.claim()).collect();
+        let shares: Vec<_> = claims.iter_mut().map(|c| c.take_share(100)).collect();
+        let sizes: Vec<_> = shares.iter().map(Vec::len).collect();
+        assert_eq!(sizes, [2, 2, 1]);
+        assert_eq!(b.available(), 0);
+        // A share never exceeds what the file can use.
+        drop(shares);
+        assert_eq!(b.claim().take_share(2).len(), 2);
+    }
+
+    /// A running download cannot grow while a file is still waiting for its starting share — it
+    /// would take that share from under it — and can as soon as the file has taken it or stood
+    /// aside.
+    #[test]
+    fn growth_waits_for_starting_files() {
+        let b = ConnBudget::new(4);
+        let mut claim = b.claim();
+        assert!(b.try_grow().is_none(), "grew past a waiting file");
+        claim.stand_aside();
+        assert!(b.try_grow().is_some());
+        let late = b.claim();
+        assert!(b.try_grow().is_none());
+        drop(late);
+        assert!(b.try_grow().is_some(), "a dropped claim must stop counting");
+    }
+
+    /// A claim that already stood aside (a restarted download) counts itself in again, so alone it
+    /// takes everything spare rather than dividing by zero.
+    #[test]
+    fn a_spent_claim_takes_everything_alone() {
+        let b = ConnBudget::new(4);
+        let mut claim = b.claim();
+        claim.stand_aside();
+        assert_eq!(claim.take_share(10).len(), 4);
     }
 }

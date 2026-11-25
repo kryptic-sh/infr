@@ -1241,8 +1241,8 @@ took 223 ms, which is why a scoring task now has a minimum amount of work.
 
 The CPU prefills a V4 prompt in chunks: every position but the last in graphs of
 `INFR_UBATCH` rows (`crate::seam::ubatch_rows`, the height every model's batched
-prefill uses: 1024 unless the first Vulkan device is an integrated GPU,
-`default_ubatch_rows_for`), the last in the decode loop, as on every other
+prefill uses, the default of the backend the session opened,
+`PlacementPins::for_caps`), the last in the decode loop, as on every other
 model. Two caps apply: no model's chunk is taller than the height its session's
 sliding-window rings were sized for (below), and on a file with a CSA layer the
 chunk shrinks as the context grows (`dsv4_emit::prefill_chunk_rows`, below).

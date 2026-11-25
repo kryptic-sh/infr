@@ -231,7 +231,9 @@ impl ParallelSeam {
         // This engine's own placement pins, entered as the current scope for the whole
         // placement phase (the clamp inside `vulkan_slot_ctx` + the `init_slots` warmup, which is
         // where the binder pins the prefill chunk / auto-q8 KV). See `PlacementPins`.
-        let pins = Arc::new(crate::seam::PlacementPins::default());
+        let pins = Arc::new(crate::seam::PlacementPins::for_caps(
+            &infr_core::backend::Backend::capabilities(&vk),
+        ));
         let scope = crate::seam::PlacementScope::enter(pins.clone());
         let max_ctx = model.vulkan_slot_ctx(&vk, n_slots, want_ctx)?;
         let mut engine = Self {

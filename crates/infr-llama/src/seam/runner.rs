@@ -626,6 +626,9 @@ pub(crate) fn generate_dense_backend_bound(
     // Backend capabilities are a per-backend invariant; query ONCE (each call clones an owned
     // struct with a heap `String name`) and read fields off the cached copy below.
     let caps = be.capabilities();
+    // Every prefill chunk height this call reads (`crate::seam::ubatch_rows`) comes from the
+    // current placement pins, which must have been made for this backend's class.
+    crate::seam::debug_assert_pins_for(be);
     let (ne, nh) = (c.n_embd, c.n_head);
     // gemma4: per-layer SWA/full dims differ; size shared scratch + KV by the max over layers.
     let max_hd = c.max_head_dim();
@@ -7405,6 +7408,7 @@ mod tests {
         );
         let mut ec = EngineConfig::default();
         ec.kernels.vulkan.delta_strided = true;
+        let _scope = crate::seam::enter_backend_scope(&vk);
         let bind = crate::seam::vulkan_moe_binder(&vk, &g, &cfg, &ec, true, 64)
             .expect("vulkan weight binder");
         let got = fresh_logits(&vk, &*bind, &g, &cfg, &ec, &prompt);
@@ -7717,6 +7721,7 @@ mod tests {
         let (g, cfg) = open_synthetic(tag, model);
         check(&cfg);
         let embd = std::sync::OnceLock::new();
+        let _scope = crate::seam::enter_backend_scope(&vk);
         let bind = crate::seam::vulkan_moe_binder(&vk, &g, &cfg, &ec, true, ctx)
             .expect("vulkan weight binder");
         let run = |be: &dyn infr_core::backend::Backend,
@@ -8658,6 +8663,7 @@ mod tests {
             "vulkan device: {}",
             infr_core::backend::Backend::capabilities(&vk).name
         );
+        let _scope = crate::seam::enter_backend_scope(&vk);
         let bind = crate::seam::vulkan_moe_binder(&vk, g, cfg, &ec, true, 64)
             .expect("vulkan weight binder");
         // Cleared on the way out, panic included, so no later test on this thread inherits it.
@@ -8874,6 +8880,84 @@ mod tests {
             "a {}-token prompt takes one more prefill step at the integrated chunk ({rows} rows)",
             prompt.len()
         );
+    }
+
+    /// A one-shot of `prompt` on a [`ClassedCpu`] of the given class through the single-device
+    /// runner, in the scope `enter_backend_scope` gives it when `scoped`; returns how many
+    /// executes it took.
+    fn classed_oneshot_executes(
+        g: &Gguf,
+        cfg: &Config,
+        prompt: &[u32],
+        integrated: bool,
+        scoped: bool,
+    ) -> usize {
+        let be = ClassedCpu {
+            cpu: infr_cpu::CpuBackend::new(),
+            integrated,
+            executes: 0.into(),
+        };
+        let _scope = scoped.then(|| crate::seam::enter_backend_scope(&be));
+        let embd = std::sync::OnceLock::new();
+        super::generate_dense_backend(
+            &be,
+            &crate::seam::cpu_upload_bind(&be.cpu),
+            g,
+            cfg,
+            &EngineConfig::default(),
+            TokenEmbd::new(&embd, g),
+            None,
+            prompt,
+            1,
+            |_| {},
+            &mut None,
+            prompt.len() + 2,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("synthetic one-shot");
+        be.executes.into_inner()
+    }
+
+    /// Two backends of different classes in one process each prefill at their own default chunk,
+    /// in either order: each one-shot runs in a scope made for its own backend
+    /// (`enter_backend_scope`), where the chunk used to come from whichever Vulkan device the
+    /// process opened first.
+    #[test]
+    fn single_device_oneshot_chunks_by_the_backends_class() {
+        let (g, cfg) = open_synthetic("llama-chunk-class-1dev", &llama_gguf("llama", None));
+        let rows = infr_core::integrated_ubatch_rows(2);
+        let prompt: Vec<u32> = (0..rows as u32 + 8)
+            .map(|i| (i * 5 + 3) % Q35_VOCAB as u32)
+            .collect();
+        let run = |integrated| classed_oneshot_executes(&g, &cfg, &prompt, integrated, true);
+        let igpu_first = run(true);
+        let discrete = run(false);
+        let igpu_again = run(true);
+        assert_eq!(
+            (igpu_first, igpu_again),
+            (discrete + 1, discrete + 1),
+            "a {}-token prompt takes one more prefill step at the integrated chunk ({rows} rows), \
+             whichever class ran first",
+            prompt.len()
+        );
+    }
+
+    /// The runner's check holds an integrated backend to pins made for its class: run on the
+    /// process fallback (no scope, the CPU's class) it fails in a debug build instead of
+    /// prefilling at the discrete chunk, which on a real integrated GPU can trip the watchdog.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "made for another backend class")]
+    fn an_integrated_backend_outside_its_scope_is_caught() {
+        let (g, cfg) = open_synthetic("llama-chunk-unscoped", &llama_gguf("llama", None));
+        let prompt: Vec<u32> = (0..12u32).map(|i| (i * 5 + 3) % Q35_VOCAB as u32).collect();
+        classed_oneshot_executes(&g, &cfg, &prompt, true, false);
     }
 
     /// A context larger than `Config::faithful_ctx_limit` — even one the caller pinned — gets a KV
@@ -9337,6 +9421,7 @@ mod tests {
                     &ec,
                     &prompt,
                 );
+                let _scope = crate::seam::enter_backend_scope(&vk);
                 let bind = crate::seam::vulkan_moe_binder(&vk, &g, &cfg, &ec, true, 64)
                     .expect("vulkan weight binder");
                 let got = fresh_logits(&vk, &*bind, &g, &cfg, &ec, &prompt);

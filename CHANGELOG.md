@@ -62,6 +62,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `vram_limit`**, both public, so struct literals of either must set them (both
   structs have only public fields, so callers can build them).
 
+- **`infr_vulkan::DeviceClass` and `infr_vulkan::device_class()` are removed.**
+  The process-wide record of the first Vulkan device's class is gone; a
+  backend's class is its `Capabilities::integrated` and
+  `Capabilities::compute_units` (`Backend::capabilities`), which is what the
+  seam now sizes the default prefill chunk from.
+
 ### Added
 
 - **`Backend::set_kv_spill_reserve`** and **`Backend::kv_spill_armed`**; on
@@ -1230,6 +1236,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Each backend in a process gets the default prefill chunk of its own device
+  class.** The default chunk came from the class of the first Vulkan device the
+  process opened, so a session on an integrated GPU opened after one on a
+  discrete card (`infr multi` with a model on each) prefilled at the discrete
+  chunk, which can trip the integrated GPU's watchdog, and a CPU run after an
+  integrated GPU took the integrated GPU's smaller chunk. A process with one
+  backend gets the same chunk as before.
 - **gemma4 files whose KV-sharing layers omit their K/V tensors now load.** A
   file that declares `gemma4.attention.shared_kv_layers` may leave `attn_k`,
   `attn_v` and `attn_k_norm` out of the layers that read an earlier layer's

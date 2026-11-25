@@ -812,6 +812,7 @@ mod tests {
             let limit = used + B12_ROOM;
             let probe = load(&path, limit, None);
             let vk = open_backend(None, probe.ecfg.clone()).expect("backend");
+            let _scope = crate::seam::enter_backend_scope(&vk);
             let f16 = probe
                 .kv_fit_ctx_fmt(&vk, false)
                 .expect("an attention model");
@@ -889,6 +890,7 @@ mod tests {
             // sessions get, so the desktop moving between this reading and theirs cannot push
             // either one past its edge.
             let vk = open_backend(None, limited_cfg(limit - IN_USE_SLACK, None)).expect("backend");
+            let _scope = crate::seam::enter_backend_scope(&vk);
             let fits = probe
                 .kv_fit_ctx_fmt(&vk, false)
                 .expect("an attention model");
@@ -1213,6 +1215,7 @@ mod tests {
                     .expect("model load");
                 let want = probe.cfg.n_ctx_train;
                 let vk = open_backend(None, probe.ecfg.clone()).expect("backend");
+                let _scope = crate::seam::enter_backend_scope(&vk);
                 let f16 = probe
                     .kv_fit_ctx_fmt(&vk, false)
                     .expect("an attention model");
@@ -1269,6 +1272,7 @@ mod tests {
             let limit = settled_use(reader) + room * MIB;
             let probe = SeamModel::load_with(path, None, cfg_at(limit)).expect("model load");
             let vk = open_backend(None, probe.ecfg.clone()).expect("backend");
+            let _scope = crate::seam::enter_backend_scope(&vk);
             let q8 = probe.kv_fit_ctx_fmt(&vk, true).expect("an attention model");
             if q8 >= MIN_SESSION_CTX / 2 {
                 eprintln!("{room} MiB of room: q8_0 holds {q8} tokens");
@@ -1424,7 +1428,7 @@ mod tests {
             .encode(&long_prompt(SPILL_PROMPT_WORDS))
             .expect("encode");
         let vk = open_backend(None, model.ecfg.clone()).expect("backend");
-        let _scope = crate::seam::PlacementScope::enter(Default::default());
+        let _scope = crate::seam::enter_backend_scope(&vk);
         let bind =
             crate::seam::vulkan_moe_binder(&vk, &model.gguf, &model.cfg, &model.ecfg, true, ctx)
                 .map_err(|e| format!("placement: {e}"))?;
@@ -1632,6 +1636,7 @@ mod tests {
                 SeamModel::load_with(&path, None, overflow_cfg(limit, None, Some(DType::F16)))
                     .expect("model load");
             let vk = open_backend(None, model.ecfg.clone()).expect("backend");
+            let _scope = crate::seam::enter_backend_scope(&vk);
             let fit = model
                 .kv_fit_ctx_fmt(&vk, false)
                 .expect("an attention model");
@@ -1711,6 +1716,7 @@ mod tests {
         let model = SeamModel::load_with(path, None, overflow_cfg(limit, Some(want), None))
             .expect("model load");
         let vk = open_backend(None, model.ecfg.clone()).expect("backend");
+        let _scope = crate::seam::enter_backend_scope(&vk);
         let (held, staging) =
             crate::seam::resident_load_held(&vk, &model.gguf, &model.cfg, &model.ecfg);
         let ubatch = crate::seam::spill_ubatch(&model.ecfg);

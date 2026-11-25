@@ -172,43 +172,17 @@ fn check_extent(op: &str, role: &str, bytes: usize, size: usize) -> Result<()> {
     Ok(())
 }
 
-// ── device class (process-global) ─────────────────────────────────────────────
-
-/// The class of the Vulkan device this PROCESS opened — see [`device_class`].
-#[derive(Clone, Copy, Debug)]
-pub struct DeviceClass {
-    /// `deviceType == INTEGRATED_GPU` (see [`Capabilities::integrated`]).
-    pub integrated: bool,
-    /// Compute units, or 0 = unknown (see [`Capabilities::compute_units`]).
-    pub compute_units: u32,
-}
-
-/// Set ONCE by the first [`VulkanBackend::new`] in the process.
-static DEVICE_CLASS: std::sync::OnceLock<DeviceClass> = std::sync::OnceLock::new();
-
-/// The class of the Vulkan device this process opened, or `None` when no Vulkan backend has been
-/// constructed (a CPU/Metal run, or a GPU-less box).
-///
-/// A PROCESS-GLOBAL because its one consumer, the seam's `ubatch_rows`, is itself a process-global
-/// funnel: the prefill loop, the activation reserve, and the SWA ring sizing must all agree on ONE
-/// chunk height, and they are reached from call sites that hold no backend handle. Same shape and
-/// lifetime as the seam's existing `PINNED_UBATCH`. It is the FIRST device's class, so it speaks
-/// for a single-device process only: the multi-device wrappers ([`TensorParallelBackend`],
-/// [`ExpertParallelBackend`], [`PipelineBackend`]) report their ranks' most conservative class from
-/// `capabilities()`, and the seam sizes their prefill chunk from that instead of from here.
-pub fn device_class() -> Option<DeviceClass> {
-    DEVICE_CLASS.get().copied()
-}
+// ── descriptor range ceiling (process-global) ─────────────────────────────────
 
 /// The SMALLEST `maxStorageBufferRange` any device opened in this process reported — the real
 /// ceiling on one descriptor binding's reach, which used to be assumed at 4 GiB and checked only in
 /// debug builds.
 ///
-/// Process-global for the same reason as [`DEVICE_CLASS`]: its consumer is `Recorder::vkb`, the
-/// single choke point every descriptor binding goes through, which is reached from ~360 expression
-/// positions that hold no backend handle. Taking the MINIMUM keeps it conservative if a process
-/// ever opens two devices with different limits (a multi-GPU run) — a bind that fits the smallest
-/// device's limit fits every device's.
+/// Process-global because its consumer is `Recorder::vkb`, the single choke point every descriptor
+/// binding goes through, which is reached from ~360 expression positions that hold no backend
+/// handle. Taking the MINIMUM keeps it conservative if a process ever opens two devices with
+/// different limits (a multi-GPU run) — a bind that fits the smallest device's limit fits every
+/// device's.
 static MAX_STORAGE_BUFFER_RANGE: AtomicU32 = AtomicU32::new(u32::MAX);
 
 /// See [`MAX_STORAGE_BUFFER_RANGE`]. `u32::MAX` before any device has been opened, i.e. the check
@@ -3270,14 +3244,6 @@ impl VulkanBackend {
         // against it (see `MAX_STORAGE_BUFFER_RANGE`).
         MAX_STORAGE_BUFFER_RANGE
             .fetch_min(props.limits.max_storage_buffer_range, Ordering::Relaxed);
-
-        // Publish the device class BEFORE any caller can size a prefill chunk against it (the seam
-        // reads this in `ubatch_rows`, which runs on the first session/KV allocation — strictly
-        // after `VulkanBackend::new` returns).
-        let _ = DEVICE_CLASS.set(DeviceClass {
-            integrated: caps.integrated,
-            compute_units: caps.compute_units,
-        });
 
         // One-line device banner (stderr) — the first thing to check on a portability bug report:
         // which GPU was picked and which kernel tiers are live. `y`/`n` per capability + the

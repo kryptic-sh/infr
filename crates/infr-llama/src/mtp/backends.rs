@@ -128,6 +128,9 @@ pub fn generate_mtp_spec_vulkan_timed_on(
     max_new: usize,
     on_piece: impl FnMut(&str),
 ) -> Result<(crate::GenStats, MtpTiming)> {
+    // One placement scope over the trunk's whole draft-verify-catchup loop: every verify call
+    // reuses the session the first one sized against these pins.
+    let _scope = crate::seam::enter_backend_scope(vk);
     let cfg = model.config();
     let max_ctx = model.encode(prompt)?.len() + max_new + DEFAULT_N_MAX + 8;
     let bind: &BindWeightFn = &|_name, tb, dt, _n| {

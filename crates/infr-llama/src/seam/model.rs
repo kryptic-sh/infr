@@ -614,7 +614,7 @@ impl SeamModel {
         let vk = open_backend(dev, self.ecfg.clone())?;
         // The auto-q8 rung may pin this session's KV format, so it runs under THIS session's
         // placement scope, as in `vulkan_session_default_on`.
-        let pins = std::sync::Arc::new(crate::seam::PlacementPins::default());
+        let pins = std::sync::Arc::new(crate::seam::PlacementPins::for_caps(&vk.capabilities()));
         let scope = crate::seam::PlacementScope::enter(pins.clone());
         let rung = self.fit_explicit_ctx(&vk, max_ctx, 1);
         let refused = self.refuse_explicit_ctx(&vk, max_ctx, 1, rung);
@@ -649,7 +649,7 @@ impl SeamModel {
         let vk = open_backend(dev, self.ecfg.clone())?;
         // The clamp's auto-q8 rung may pin this session's KV format — do it under THIS session's
         // placement scope so the decision lands on its own pins, not a process-global cell.
-        let pins = std::sync::Arc::new(crate::seam::PlacementPins::default());
+        let pins = std::sync::Arc::new(crate::seam::PlacementPins::for_caps(&vk.capabilities()));
         let scope = crate::seam::PlacementScope::enter(pins.clone());
         let max_ctx = self.clamp_default_ctx(&vk, self.session_ctx(self.cfg.n_ctx_train));
         drop(scope);
@@ -681,7 +681,7 @@ impl SeamModel {
         frac: f64,
     ) -> Result<DenseVulkanSession> {
         let vk = open_backend(dev, self.ecfg.clone())?;
-        let pins = std::sync::Arc::new(crate::seam::PlacementPins::default());
+        let pins = std::sync::Arc::new(crate::seam::PlacementPins::for_caps(&vk.capabilities()));
         let scope = crate::seam::PlacementScope::enter(pins.clone());
         // A pure recurrent-state arch has no per-token KV to size a fraction of — fall back to
         // the trained context (same shape as the default path's `kv_per_tok == 0` escape).
@@ -731,6 +731,7 @@ impl SeamModel {
     /// alloc-time budget guard remains the backstop for those.
     fn clamp_default_ctx(&self, vk: &infr_vulkan::VulkanBackend, want: usize) -> Result<usize> {
         use crate::seam::CtxRung;
+        crate::seam::debug_assert_scope_for(vk);
         let Some(fit) = self.kv_fit_ctx(vk) else {
             return Ok(want); // pure recurrent-state arch: no per-token KV to size.
         };
@@ -910,6 +911,7 @@ impl SeamModel {
         n_slots: usize,
         rung: Option<crate::seam::CtxRung>,
     ) -> Result<()> {
+        crate::seam::debug_assert_scope_for(vk);
         if let Some(crate::seam::CtxRung::Spill(ctx)) = rung {
             self.refuse_unhostable_ctx(vk, ctx, n_slots)?;
         }
@@ -963,6 +965,8 @@ impl SeamModel {
     /// All the arithmetic lives in [`crate::seam::kv_fit_ctx_for`] (GPU-free, unit-tested); this
     /// only collects the device's VRAM figures, what the loaded weights will hold and the dtypes.
     fn kv_fit_ctx_fmt(&self, vk: &infr_vulkan::VulkanBackend, auto_q8: bool) -> Option<usize> {
+        // The fit walks the prefill chunk heights placement could settle on, read from the pins.
+        crate::seam::debug_assert_scope_for(vk);
         let vram = vk.vram();
         let (k_fmt, v_fmt) = self.kv_fit_fmts(auto_q8);
         // The snapshot goes in whole: `kv_fit_ctx_for` derives its budget from the allocator's OWN
@@ -1027,6 +1031,7 @@ impl SeamModel {
         ctx: usize,
         n_slots: usize,
     ) -> (crate::seam::KvSplit, DType, DType) {
+        crate::seam::debug_assert_scope_for(vk);
         let held = self.preload_held(vk);
         let (k_fmt, v_fmt) = self.kv_fit_fmts(crate::seam::kv_auto_q8());
         let ubatch = crate::seam::spill_ubatch(&self.ecfg);
@@ -1465,10 +1470,10 @@ impl SeamModel {
         let vk = infr_vulkan::VulkanBackend::new_with(self.ecfg.clone())
             .map_err(|e| anyhow!("vulkan init: {e}"))?;
         Ok(DiffusionGemmaVulkanSession {
-            be: vk,
             state: None,
             max_ctx,
-            pins: std::sync::Arc::new(crate::seam::PlacementPins::default()),
+            pins: std::sync::Arc::new(crate::seam::PlacementPins::for_caps(&vk.capabilities())),
+            be: vk,
         })
     }
 
@@ -1736,6 +1741,8 @@ impl SeamModel {
     ) -> Result<(Vec<f64>, BenchPlacement)> {
         let vk = infr_vulkan::VulkanBackend::new_with(self.ecfg.clone())
             .map_err(|e| anyhow!("vulkan init: {e}"))?;
+        // One scope over every rep: they share one session, sized against these pins.
+        let _scope = crate::seam::enter_backend_scope(&vk);
         let (p_eff, g_eff) = pg.unwrap_or((n_prompt, n_gen));
         // +16: the untimed warmup runs an 8-prompt + 2-gen turn through the SAME session, so the
         // KV must fit it even when the measured shape is tiny (pp2 with +8 sized the cache to 10
@@ -1848,8 +1855,8 @@ impl SeamModel {
             samples.push(one_rep(&mut state)?);
         }
         // Read the placement AFTER the reps: the pins are set by the binder on the first load, and
-        // the submit cap can only have moved during the runs. `bench_vulkan` holds no
-        // `PlacementScope`, so these read the process-wide fallback pins this session wrote.
+        // the submit cap can only have moved during the runs. These read the scope entered above
+        // (or the caller's), the one this session's placement wrote.
         Ok((
             samples,
             BenchPlacement {

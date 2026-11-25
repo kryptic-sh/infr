@@ -758,6 +758,7 @@ pub(crate) fn generate_dense_vulkan(
     max_new: usize,
     on_token: impl FnMut(u32),
 ) -> AResult<(Vec<u32>, GenStats)> {
+    let _scope = enter_backend_scope(vk);
     generate_dense_vulkan_session(
         vk,
         g,
@@ -801,6 +802,9 @@ pub(crate) fn generate_dense_vulkan_session(
     constraint: Option<&mut crate::grammar::Constraint>,
     req: Option<&crate::sampling::RequestCtx>,
 ) -> AResult<(Vec<u32>, GenStats)> {
+    // A caller-held `state` was sized against the pins of the scope it was made in, so the caller
+    // must hold that scope across calls: a fresh one here would forget a chunk placement pinned.
+    debug_assert_scope_for(vk);
     // Placement can allocate + upload (the pager arenas, a weight re-bind), i.e. it RECORDS on the
     // Vulkan command pool — so it takes a turn on the baton like any other GPU region. Scoped: the
     // baton is released before the runner starts stepping. See `StepGate`.
@@ -1135,8 +1139,9 @@ pub(crate) fn layer_major_segments(
 /// already builds rather than re-deriving them here (backlog B8).
 const ACT_RESERVE_PAD: (u64, u64) = (3, 2);
 
-/// Batched-prefill micro-batch: rows per prefill chunk (`device.ubatch` / `INFR_UBATCH`, default
-/// 1024 — but see [`default_ubatch_rows`] for the INTEGRATED-GPU default). ONE reader funnel — the
+/// Batched-prefill micro-batch: rows per prefill chunk (`device.ubatch` / `INFR_UBATCH`, else what
+/// placement pinned, else the default for the backend class the current [`PlacementPins`] were
+/// made for — [`default_ubatch_rows`], smaller on an INTEGRATED GPU). ONE reader funnel — the
 /// prefill loop, the activation reserve, and the SWA ring sizing below all derive from this,
 /// because the ring's correctness bound is "window + one whole prefill chunk".
 ///
@@ -1155,11 +1160,10 @@ pub(crate) fn ubatch_rows(ec: &EngineConfig) -> usize {
     ec.device.ubatch.filter(|&v| v > 0).unwrap_or_else(|| {
         with_placement_pins(
             |p| match p.ubatch.load(std::sync::atomic::Ordering::Relaxed) {
-                0 => None, // nothing pinned
-                rows => Some(rows),
+                0 => p.default_ubatch, // nothing pinned
+                rows => rows,
             },
         )
-        .unwrap_or_else(default_ubatch_rows)
     })
 }
 
@@ -1204,41 +1208,32 @@ pub(crate) fn ubatch_candidates(ec: &EngineConfig) -> Vec<usize> {
     cands
 }
 
-/// The prefill chunk when neither INFR_UBATCH nor the placement sweep pinned one: 1024 rows, EXCEPT
-/// on an integrated GPU, where a chunk that big is a single multi-second command buffer and trips
-/// the ~10 s GPU watchdog (`ring gfx_0.0.0 timeout` -> `VK_ERROR_DEVICE_LOST`). See
-/// [`infr_core::integrated_ubatch_rows`] for the measurements behind the smaller default.
+/// The prefill chunk a backend of `caps`'s class takes when neither INFR_UBATCH nor the placement
+/// sweep pinned one: 1024 rows, EXCEPT on an integrated GPU, where a chunk that big is a single
+/// multi-second command buffer and trips the ~10 s GPU watchdog (`ring gfx_0.0.0 timeout` ->
+/// `VK_ERROR_DEVICE_LOST`). See [`infr_core::integrated_ubatch_rows`] for the measurements behind
+/// the smaller default.
 ///
-/// A DISCRETE device (and a CPU/Metal run, where no Vulkan backend was constructed and
-/// `device_class()` is `None`) takes the 1024 branch — byte-identical to before this existed, so
-/// no tuned dGPU shape moves.
-fn default_ubatch_rows() -> usize {
-    match infr_vulkan::device_class() {
-        Some(d) => default_ubatch_rows_for(d.integrated, d.compute_units),
-        None => default_ubatch_rows_for(false, 0),
-    }
-}
-
-/// [`default_ubatch_rows`] for a device of the given class (`compute_units` 0 = unknown).
-fn default_ubatch_rows_for(integrated: bool, compute_units: u32) -> usize {
-    if integrated {
-        infr_core::integrated_ubatch_rows(compute_units)
+/// A DISCRETE device, and the CPU and Metal backends (neither reports `integrated`), take the 1024
+/// branch, so no tuned dGPU shape moves. [`PlacementPins::for_caps`] reads it once per session.
+fn default_ubatch_rows(caps: &infr_core::backend::Capabilities) -> usize {
+    if caps.integrated {
+        infr_core::integrated_ubatch_rows(caps.compute_units)
     } else {
         1024
     }
 }
 
 /// Enter a placement scope whose default prefill chunk is the one for `caps`, the backend this
-/// one-shot actually runs on. The multi-device wrappers need it: [`default_ubatch_rows`] reads
-/// the class of whichever Vulkan device the PROCESS opened first, and a world that mixes a
-/// discrete card with an integrated GPU must size every chunk for the integrated one (each
-/// wrapper reports its ranks' most conservative class). An explicit `device.ubatch` still wins
-/// (see [`ubatch_rows`]); a chunk or auto-q8 KV the enclosing scope already pinned carries over,
-/// the chunk lowered to the backend's default when that is smaller.
+/// one-shot actually runs on. The multi-device wrappers need it: a world that mixes a discrete
+/// card with an integrated GPU must size every chunk for the integrated one (each wrapper reports
+/// its ranks' most conservative class). An explicit `device.ubatch` still wins (see
+/// [`ubatch_rows`]); a chunk or auto-q8 KV the enclosing scope already pinned carries over, the
+/// chunk lowered to the backend's default when that is smaller.
 fn backend_chunk_scope(caps: &infr_core::backend::Capabilities) -> PlacementScope {
     use std::sync::atomic::Ordering::Relaxed;
-    let rows = default_ubatch_rows_for(caps.integrated, caps.compute_units);
-    let pins = PlacementPins::default();
+    let pins = PlacementPins::for_caps(caps);
+    let rows = pins.default_ubatch;
     with_placement_pins(|cur| {
         let pinned = cur.ubatch.load(Relaxed);
         pins.ubatch
@@ -1280,6 +1275,13 @@ pub(crate) fn ubatch_rows_parallel(ec: &EngineConfig) -> usize {
 ///     setting always wins, both directions. Policy: BOTH sides go q8_0 (coupled Q8 keeps
 ///     record-once decode replay and satisfies K>=V symmetrically); never below q8_0.
 ///
+/// Beside the two pins, the session's DEFAULT prefill chunk (`default_ubatch`): what
+/// [`ubatch_rows`] answers when nothing above pinned one, fixed when the pins are made
+/// ([`PlacementPins::for_caps`]) from the class of the backend the session runs on. It used to be
+/// a process-global published by the first Vulkan device the process opened, so a second backend
+/// of another class (a CPU run beside an iGPU, a test binary that opened the iGPU first) took the
+/// first one's chunk.
+///
 /// These were process-global `OnceLock`s, which LEAKED across models in a multi-model process
 /// (`infr multi` hosts N models, each its own `DenseVulkanSession`, and the server runs their
 /// generations CONCURRENTLY): a second model's `.set()` was a silent no-op, so it inherited model
@@ -1292,9 +1294,14 @@ pub(crate) fn ubatch_rows_parallel(ec: &EngineConfig) -> usize {
 /// before the first KV allocation, so everything that reads the height — the prefill loop, the
 /// activation reserve, the SWA ring sizing — still sees one value for the session's whole life.
 /// `0` = unpinned (see [`repin_ubatch`]).
-#[derive(Default)]
+///
+/// No `Default` outside tests: every set of pins names the backend it is for, so a Vulkan entry
+/// point cannot silently take the discrete chunk on an integrated GPU.
 pub(crate) struct PlacementPins {
     ubatch: std::sync::atomic::AtomicUsize,
+    /// The prefill chunk when nothing pinned one ([`default_ubatch_rows`] of the backend these
+    /// pins were made for). Never changes after construction.
+    default_ubatch: usize,
     kv_q8: std::sync::OnceLock<()>,
     /// Has this session already reported an activation peak above what it reserved (the runner's
     /// `activation reserve too low` warning)? The condition persists for the session's whole life —
@@ -1319,6 +1326,31 @@ pub(crate) struct PlacementPins {
     host_tier_bytes: std::sync::atomic::AtomicU64,
 }
 
+impl PlacementPins {
+    /// Fresh pins (nothing pinned) for a session on a backend reporting `caps`: its default prefill
+    /// chunk is that backend class's ([`default_ubatch_rows`]).
+    pub(crate) fn for_caps(caps: &infr_core::backend::Capabilities) -> Self {
+        Self {
+            ubatch: Default::default(),
+            default_ubatch: default_ubatch_rows(caps),
+            kv_q8: Default::default(),
+            act_over_reserve_reported: Default::default(),
+            host_tier_bytes: Default::default(),
+        }
+    }
+}
+
+/// Tests' pins: those of a backend reporting default capabilities, which is the class the CPU
+/// backend reports (discrete, so the 1024-row chunk). A test that runs a GPU backend makes its
+/// pins with [`PlacementPins::for_caps`] or [`enter_backend_scope`] instead; the runner's check
+/// ([`debug_assert_pins_for`]) fails one that does not on an integrated GPU.
+#[cfg(test)]
+impl Default for PlacementPins {
+    fn default() -> Self {
+        Self::for_caps(&infr_core::backend::Capabilities::default())
+    }
+}
+
 thread_local! {
     /// The session whose placement pins the current thread's `ubatch_rows`/`kv_auto_q8` reads and
     /// writes resolve against — set by [`PlacementScope`] for the duration of a placement + runner
@@ -1328,9 +1360,12 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// Process-wide fallback pins for callers with no active [`PlacementScope`] (one-shot run/bench,
-/// CPU/Metal, tests). Those paths host a SINGLE model per process, so a process-global is correct
-/// there and byte-identical to the old two-`OnceLock` behavior.
+/// Process-wide fallback pins for callers with no active [`PlacementScope`] (the CPU and Metal
+/// paths, tests). Made for default capabilities, the class the CPU and Metal backends report, so
+/// their default chunk is what it always was. A Vulkan backend does not run on these: each Vulkan
+/// entry point enters a scope made for its backend ([`enter_backend_scope`], the sessions' own
+/// pins), which the placement and runner checks ([`debug_assert_scope_for`],
+/// [`debug_assert_pins_for`]) hold it to.
 static FALLBACK_PINS: std::sync::OnceLock<std::sync::Arc<PlacementPins>> =
     std::sync::OnceLock::new();
 
@@ -1339,8 +1374,64 @@ static FALLBACK_PINS: std::sync::OnceLock<std::sync::Arc<PlacementPins>> =
 fn with_placement_pins<R>(f: impl FnOnce(&PlacementPins) -> R) -> R {
     CURRENT_PINS.with(|c| match c.borrow().as_ref() {
         Some(p) => f(p),
-        None => f(FALLBACK_PINS.get_or_init(|| std::sync::Arc::new(PlacementPins::default()))),
+        None => f(FALLBACK_PINS.get_or_init(|| {
+            std::sync::Arc::new(PlacementPins::for_caps(
+                &infr_core::backend::Capabilities::default(),
+            ))
+        })),
     })
+}
+
+/// Whether this thread is inside a [`PlacementScope`].
+fn in_placement_scope() -> bool {
+    CURRENT_PINS.with(|c| c.borrow().is_some())
+}
+
+/// Debug check that the pins the current thread reads its default prefill chunk from were made for
+/// a backend of `be`'s class: the scope's, or the fallback's when `be` is of the CPU's class. A
+/// Vulkan entry point that forgot its scope runs an integrated GPU at the discrete chunk, which can
+/// trip the GPU watchdog; this turns that into a failure in debug builds. Asks `be` for its
+/// capabilities only in debug builds, so a release build pays nothing.
+pub(crate) fn debug_assert_pins_for(be: &dyn Backend) {
+    if cfg!(debug_assertions) {
+        let (have, want) = (
+            with_placement_pins(|p| p.default_ubatch),
+            default_ubatch_rows(&be.capabilities()),
+        );
+        assert_eq!(
+            have,
+            want,
+            "the placement pins in force were made for another backend class than `{}`'s: enter \
+             a scope made for it (`seam::enter_backend_scope`, or a session's own pins)",
+            be.name()
+        );
+    }
+}
+
+/// [`debug_assert_pins_for`], and that a [`PlacementScope`] is active at all: the check for the
+/// Vulkan-only paths (placement, a session's generation), which never run on the fallback pins.
+pub(crate) fn debug_assert_scope_for(be: &dyn Backend) {
+    debug_assert!(
+        in_placement_scope(),
+        "a `{}` placement or session call ran outside any placement scope",
+        be.name()
+    );
+    debug_assert_pins_for(be);
+}
+
+/// The placement scope a one-shot entry point on `be` runs in: the caller's when one is active (a
+/// session's, or a test that pinned a chunk), checked to be for `be`'s class, else a fresh one
+/// made for `be` ([`PlacementPins::for_caps`]), held for the whole call so every runner step and
+/// the placement before it read the same pins.
+pub(crate) fn enter_backend_scope(be: &dyn Backend) -> Option<PlacementScope> {
+    if in_placement_scope() {
+        debug_assert_pins_for(be);
+        None
+    } else {
+        Some(PlacementScope::enter(std::sync::Arc::new(
+            PlacementPins::for_caps(&be.capabilities()),
+        )))
+    }
 }
 
 /// RAII guard binding `pins` as the current thread's placement scope. Every seam entry that runs a
@@ -3219,6 +3310,8 @@ pub(crate) fn vulkan_moe_binder<'a>(
     first_load: bool,
     want_ctx: usize,
 ) -> AResult<Box<BindWeight<'a>>> {
+    // Every height this placement prices and pins is read through the current scope's pins.
+    debug_assert_scope_for(vk);
     // ── MoE expert placement ─────────────────────────────────────────────────────────────────
     // The pager (`infr_vulkan::pager`) is the ONLY MoE offload mechanism — the legacy
     // host-visible (HostWeights/GTT) split and its INFR_NCMOE knob are gone. Tiers, in
@@ -5172,6 +5265,7 @@ pub(crate) fn verify_dense_vulkan(
     ple: Option<&PerLayerEmbd>,
     tokens: &[u32],
 ) -> AResult<Vec<f32>> {
+    let _scope = enter_backend_scope(vk);
     let mut logits = Vec::new();
     let mut state = None;
     generate_dense_backend(
@@ -5212,6 +5306,7 @@ pub(crate) fn verify_rows_vulkan(
     ple: Option<&PerLayerEmbd>,
     tokens: &[u32],
 ) -> AResult<Vec<f32>> {
+    let _scope = enter_backend_scope(vk);
     let mut logits = Vec::new();
     let mut state = None;
     generate_dense_backend(
@@ -5507,6 +5602,7 @@ pub(crate) fn forced_run_vulkan(
 ) -> AResult<ForcedLogits> {
     let vk = infr_vulkan::VulkanBackend::new_with(ec.clone())
         .map_err(|e| anyhow!("vulkan init: {e}"))?;
+    let _scope = enter_backend_scope(&vk);
     let bind = vulkan_upload_bind(&vk);
     // `moe_topk` writes a selection, not the scores it ranked by (`Op::MoeRoute::dst_scores`).
     let mut out = forced_run(
@@ -5555,6 +5651,8 @@ pub(crate) fn greedy_tail_vulkan(
 ) -> AResult<GreedyTail> {
     let vk = infr_vulkan::VulkanBackend::new_with(ec.clone())
         .map_err(|e| anyhow!("vulkan init: {e}"))?;
+    // One scope over the generation and the step after it, which reuses its session.
+    let _scope = enter_backend_scope(&vk);
     let want_ctx = prompt.len() + n + 2;
     let mut state = None;
     let (ids, stats) = generate_dense_vulkan_session(
@@ -5951,26 +6049,6 @@ mod bda_cap_tests {
 mod seam_helper_tests {
     use super::{cpu_repack_reserve, Config, DType, EngineConfig, PlacementPins, PlacementScope};
 
-    /// Whether this process's default prefill chunk is the discrete one these tests assert. The
-    /// device class is process-global and published by the first Vulkan backend any test in this
-    /// binary opens, so a GPU run on an integrated device (`INFR_DEV` naming one) moves the
-    /// default for every test after it. Such a run skips them, saying why on the harness's own
-    /// stderr; a CPU-only or discrete run checks them.
-    fn default_chunk_is_discrete(test: &str) -> bool {
-        use std::io::Write;
-        match infr_vulkan::device_class() {
-            Some(d) if d.integrated => {
-                let _ = writeln!(
-                    std::io::stderr().lock(),
-                    "skip: {test} asserts the discrete default prefill chunk, and this process \
-                     opened an integrated GPU"
-                );
-                false
-            }
-            _ => true,
-        }
-    }
-
     // NB: `parse_device_spec`'s own cases moved to `infr_core::config::tests` with the function
     // (this crate's duplicate of that grammar was deleted).
 
@@ -5980,9 +6058,6 @@ mod seam_helper_tests {
     /// placement sweeps. Collapsing them onto `Option::is_some` would silently re-enable the sweep.
     #[test]
     fn ubatch_value_and_presence_are_separate_readers() {
-        if !default_chunk_is_discrete("ubatch_value_and_presence_are_separate_readers") {
-            return;
-        }
         // Own scope: the fallback pins are process-global, and this test asserts the UNPINNED
         // default. (That this is even possible per-scope is the point of `PlacementPins`.)
         let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
@@ -6023,6 +6098,57 @@ mod seam_helper_tests {
             1024,
             "…and the height falls back"
         );
+    }
+
+    /// Two backends of different classes in one process each get their own default prefill chunk:
+    /// the class comes from the pins made for each backend, not from whichever device the process
+    /// opened first. Interleaved, nested and on two threads at once, as a test
+    /// binary runs an integrated-GPU test beside a CPU one.
+    #[test]
+    fn each_backend_class_gets_its_own_default_chunk() {
+        use infr_core::backend::{Backend, Capabilities};
+        let integrated = Capabilities {
+            integrated: true,
+            compute_units: 2,
+            ..Default::default()
+        };
+        let igpu = infr_core::integrated_ubatch_rows(integrated.compute_units);
+        let cpu = infr_cpu::CpuBackend::new();
+        // What a CPU run took when no Vulkan backend had published a device class.
+        assert_eq!(super::default_ubatch_rows(&cpu.capabilities()), 1024);
+        assert_ne!(
+            igpu, 1024,
+            "the two classes share a chunk, so this checks nothing"
+        );
+        let unset = EngineConfig::default();
+        let chunk_for = |caps: &Capabilities| {
+            let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::for_caps(caps)));
+            super::ubatch_rows(&unset)
+        };
+        assert_eq!(chunk_for(&integrated), igpu);
+        {
+            let _cpu = super::enter_backend_scope(&cpu).expect("no scope was active");
+            assert_eq!(
+                super::ubatch_rows(&unset),
+                1024,
+                "the CPU took the integrated GPU's chunk"
+            );
+            assert_eq!(
+                chunk_for(&integrated),
+                igpu,
+                "nested inside the CPU's scope"
+            );
+            assert_eq!(super::ubatch_rows(&unset), 1024, "after the nested scope");
+        }
+        let (ig, dc) = std::thread::scope(|s| {
+            let ig = s.spawn(|| chunk_for(&integrated));
+            let dc = s.spawn(|| chunk_for(&Capabilities::default()));
+            (
+                ig.join().expect("igpu thread"),
+                dc.join().expect("cpu thread"),
+            )
+        });
+        assert_eq!((ig, dc), (igpu, 1024), "on two threads at once");
     }
 
     /// The `*_specified` rule: an UNRECOGNIZED KV format name still suppresses
@@ -6707,9 +6833,6 @@ mod seam_helper_tests {
     /// 17.5 GiB of 24.0 GiB — GPU + 8 GiB of weights, so not something a unit test can host.)
     #[test]
     fn kv_fit_walks_the_placement_chunk_ladder_gemma3_12b() {
-        if !default_chunk_is_discrete("kv_fit_walks_the_placement_chunk_ladder_gemma3_12b") {
-            return;
-        }
         let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
         let cfg = gemma3_12b();
         let ec = EngineConfig::default();
@@ -6801,9 +6924,6 @@ mod seam_helper_tests {
     /// `INFR_UBATCH` collapses the list to that one height.
     #[test]
     fn dense_ubatch_ladder_is_the_only_one() {
-        if !default_chunk_is_discrete("dense_ubatch_ladder_is_the_only_one") {
-            return;
-        }
         let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
         assert_eq!(super::DENSE_UBATCH_LADDER, [512, 256, 128]);
         let unset = EngineConfig::default();
@@ -7066,9 +7186,6 @@ mod seam_helper_tests {
     /// reserve against `XTX_ROOM` — rather than from the function under test.
     #[test]
     fn fit_math_and_placement_pick_the_same_rung() {
-        if !default_chunk_is_discrete("fit_math_and_placement_pick_the_same_rung") {
-            return;
-        }
         let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
         let cfg = gemma3_12b();
         let ec = EngineConfig::default();

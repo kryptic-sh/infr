@@ -3263,7 +3263,9 @@ a hot path
   Validation hit allocation failures and `os error 1455` (paging file too
   small), plus a downloader concurrency-floor failure under contention
   (`pull::tests::a_finished_file_hands_over_its_connection` failed again on
-  2026-11-13 beside a release build, and passed five times alone). The whole
+  2026-11-13 beside a release build, and passed five times alone; on 2026-11-25
+  it failed the Ubuntu CI test job once, the large file peaking at 2 of 3
+  connections, on a commit that changed only an `infr-llama` test). The whole
   workspace passed with `--test-threads=1`; no assertions or system memory
   settings were changed. Revisit parallel resource scheduling separately.
 
@@ -4518,11 +4520,9 @@ the Apple target but were not run.
   Windows leg for the goldens is plan 11's S3.
 - **Tests that skip on an integrated GPU, and pass.** The qwen35 snapshot tests
   in `seam/runner.rs` (`with_q35_vulkan`) skip where `max_decode_chain` is 1,
-  because no chain runs and no snapshot is taken. Four prefill-chunk helper
-  tests in `seam/mod.rs` (`default_chunk_is_discrete`) skip once the process has
-  opened an integrated GPU, because the default chunk they assert follows the
-  process-global device class (see B145). Both print the reason on stderr even
-  without `--nocapture`; a run on the iGPU alone therefore checks neither.
+  because no chain runs and no snapshot is taken. They print the reason on
+  stderr even without `--nocapture`; a run on the iGPU alone therefore does not
+  check them.
 
 ### B141 — assertions weaker than the tests' names (2026-11-11)
 
@@ -4645,19 +4645,36 @@ they cannot show:
 - A kernel refused at build still panics (the kernel cache is infallible until
   B98 threads a `Result` through); only the lock is released first.
 
-### B145 — the device class is process-global, so tests see whichever GPU opened first (2026-11-12)
+### B-PINS-CLASS — what moving the device class into the pins left (2026-11-25)
 
-`infr_vulkan::device_class()` is published once, by the first `VulkanBackend`
-the process opens, and `seam::default_ubatch_rows` reads it. In a test binary
-run with `--include-ignored` on `INFR_DEV=vulkan1`, the first GPU test opens the
-iGPU and every later test sees the integrated default chunk, including pure unit
-tests that never touch a GPU. Four of them asserted the discrete default and
-failed; they now skip instead (`default_chunk_is_discrete`, B140). The coupling
-itself is left: a test's outcome depends on which device the binary opened
-before it. Options: make the chunk default a parameter the tests pass, or scope
-the device class per backend instead of per process. A design decision about
-`device_class()`'s one production reader, `default_ubatch_rows` (read); not
-attempted.
+Plan 13 S4 made the default prefill chunk a field of `seam::PlacementPins`, set
+by `PlacementPins::for_caps` from the backend's `Capabilities`, and deleted
+`infr_vulkan::device_class()`. Each Vulkan entry point enters a scope made for
+its backend (`seam::enter_backend_scope`, or a session's own pins). Left:
+
+- **The guards are debug-only, and the runner's is a class match, not a scope
+  check.** `seam::debug_assert_pins_for` (the runner, every one-shot) only
+  compares the pins' default chunk with the backend's class, so a Vulkan
+  one-shot that forgot its scope passes on a discrete GPU, whose chunk is the
+  fallback's; it then writes its placement pins into the process-wide
+  `FALLBACK_PINS`, where the next unscoped call inherits them.
+  `seam::debug_assert_scope_for` (placement, `generate_dense_vulkan_session`,
+  the `SeamModel` fit helpers) requires a scope, but only on Vulkan-only
+  functions. A release build checks neither. Requiring a scope on the CPU and
+  Metal paths too would let the fallback go, at the cost of a scope at every
+  CPU/Metal entry point and test.
+- **One-shots no longer share pins across calls.** An unscoped Vulkan one-shot
+  (`SeamModel::generate_dense_vulkan`, `generate_vulkan_ids`, the verify and
+  forced runs, `greedy_tail_vulkan`, `bench_vulkan`, the MTP driver) used to
+  read and write the process fallback, so a chunk or auto-q8 pinned by one call
+  stuck for every later one in the process; each now gets fresh pins for its own
+  backend. Traced in code, not measured on a model that pins.
+- **Not run on the integrated GPU:** the MTP driver
+  (`generate_mtp_spec_vulkan_timed_on`), `bench_vulkan`, the DiffusionGemma
+  Vulkan session, `forced_run_vulkan` and `greedy_tail_vulkan` were changed but
+  not exercised on Vulkan1 by the runs that verified the slice; the multi-device
+  wrappers (`backend_chunk_scope`) were not changed beyond building their pins
+  with `for_caps`.
 
 ### B146 — Vulkan lowering review, 2026-11-12: what was fixed, refused and left (2026-11-12)
 
@@ -4915,8 +4932,9 @@ Q4_K / Q6_K GEMV bodies read a weight row past the bank for an odd output width;
   job: on 2026-11-13 run 43369452255 failed once in `f16_native_probe`
   (`crates/infr-metal/tests/gemv_bw.rs`) with "dequant-cached f32 weight would
   exceed the GPU working set: 4.64 GiB allocated + 0.28 GiB … > 4.67 GiB
-  budget", and passed on a re-run with no code change, so the probe's memory use
-  depends on the runner it lands on. The allocation total suggests buffers
+  budget", and passed on a re-run with no code change (the same failure, at 4.54
+  GiB allocated, on 2026-11-25, passing on the next push), so the probe's memory
+  use depends on the runner it lands on. The allocation total suggests buffers
   accumulating across the probes in that test binary (not verified). The fix is
   to stop running assert-nothing probes in the CI test job, or to bound their
   allocations.

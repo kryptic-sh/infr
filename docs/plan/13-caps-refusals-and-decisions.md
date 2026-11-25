@@ -103,17 +103,18 @@ plan's account of the old behaviour was short of what a run showed: under
 dense placement's streaming floor first (Qwen3-0.6B, 1880 MiB of room, both
 GPUs).
 
-### S4 — the device class into the pins (S–M)
+### S4 — the device class into the pins — done 2026-11-25
 
-The VRAM limit knob (`INFR_VRAM_LIMIT`), its first half, shipped 2026-11-24 with
-the clamped-context and B12 tests it made possible; what it found is in backlog
-B12, B13, B-GUARD-POOLED and B-PRELOAD-CLAMP. Left:
+Shipped; what it left is backlog B-PINS-CLASS. The VRAM limit knob
+(`INFR_VRAM_LIMIT`) shipped first, 2026-11-24; what it found is in backlog B12,
+B13, B-GUARD-POOLED and B-PRELOAD-CLAMP.
 
-- Move the default prefill chunk into `PlacementPins::for_caps`; delete
-  `DeviceClass`, `DEVICE_CLASS` and `device_class()`; add scopes at the entry
-  points that relied on the global. A missed site runs an integrated GPU at the
-  discrete chunk and can trip the watchdog, so each site gets a test or a
-  `debug_assert`.
+Departs from the slice as planned in one place: not every site is held to an
+active scope. The CPU and Metal paths still run on the process fallback pins,
+which are made for their class, so the backend-generic runner checks that the
+pins in force were made for its backend's class (`debug_assert_pins_for`) rather
+than that a scope is active; the Vulkan-only functions (placement, a session's
+generation, the `SeamModel` fit helpers) check both (`debug_assert_scope_for`).
 
 ### S5 — position temperature and the MLA magnitude (M)
 

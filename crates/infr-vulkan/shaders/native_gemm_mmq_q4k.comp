@@ -51,9 +51,8 @@ layout(push_constant) uniform PC {
 #else
 layout(push_constant) uniform PC { uint m; uint n; uint k; uint w_base; } pc;
 #endif
-layout(binding = 0) readonly buffer QA { uint qa[]; };          // [m, k/4] packed int8 activations
-// The same activations viewed 16 bytes at a time: a row's block (WPB = 8 words) starts on a
-// 16-byte boundary (k%32 ⇒ kw%8), so staging issues 128-bit loads.
+// [m, k/4] packed int8 activations, read 16 bytes at a time: a row's block of WPB words starts on
+// a 16-byte boundary (k%32 ⇒ kw%8), so staging issues 128-bit loads.
 layout(binding = 0) readonly buffer QA4 { uvec4 qa4[]; };
 layout(binding = 1) readonly buffer DA { float16_t dact[]; };   // [m, nblk]
 layout(binding = 2) readonly buffer SA { float16_t sact[]; };   // [m, nblk]
@@ -194,10 +193,9 @@ void main() {
 #endif
 
     // Register prefetch: block blk+1's global loads issue BEFORE block blk's dp4a work and only
-    // reach shared after the trailing barrier, so their latency hides behind the math. On an
-    // RX 6600 XT (hardware int8 dot, no matrix units) staging rather than the dp4a bounded this
-    // kernel: with the math or the loads ablated, each alone took most of the full kernel's time.
-    // Each thread owns at most NA/NB/NH of the tile's 128-bit loads.
+    // reach shared after the trailing barrier, so their latency hides behind the math (staging,
+    // not the dp4a, bounds this kernel). Each thread owns at most NA/NB/NH of the tile's 128-bit
+    // loads. Rows past m read whatever follows them; their output is never stored.
     const uint NA = (BM * (WPB / 4u) + THREADS - 1u) / THREADS;
     const uint NB = (BN * (WPB / 4u) + THREADS - 1u) / THREADS;
     const uint NH = (BN + THREADS - 1u) / THREADS;

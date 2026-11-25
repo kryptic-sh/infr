@@ -599,6 +599,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **Faster Q4_K prefill on the int8 `mmq` kernels** (`native_gemm_mmq_q4k`, the
+  dense tier without matrix units and every batched MoE expert GEMM). A block's
+  activations, scales and weight nibbles are staged with 16-byte loads instead
+  of byte by byte, and the next block's loads are issued before the current
+  block's dot products so they overlap (contributed in PR 111). On an RX 7900
+  XTX under RADV, pp512 of Qwen3-30B-A3B Q4_K_M went from 4080 to 4340 t/s and
+  of ERNIE-4.5-21B-A3B from 4194 to 4552 t/s (means of three alternated runs,
+  load average 1.5 to 2.6); the logits are unchanged (every line of the
+  tolerance harness's ERNIE run is identical). Not measured on NVIDIA, Intel or
+  Windows.
 - **Mistral-Large-3's context is no longer capped at its
   `attention.temperature_length`.** infr now applies the model's attention
   temperature (`deepseek2.attention.temperature_scale`) the way llama.cpp does,

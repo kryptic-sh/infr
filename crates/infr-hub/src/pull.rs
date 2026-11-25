@@ -1983,14 +1983,33 @@ mod tests {
     ///
     /// An implementation that bounded the two axes separately would peak at 16 here, and one that
     /// split without a budget at 30, so the ceiling is what this asserts; the floor is asserted too,
-    /// or "never exceeded four" would also be true of a sequential download.
+    /// or "never exceeded four" would also be true of a sequential download. The bodies are held at
+    /// the gate so the floor is reached rather than sampled: three files' first bodies need not
+    /// overlap inside one 25 ms body delay on a loaded runner, which is how the floor read "peak 2:
+    /// the fan-out did not happen" on CI.
     #[test]
     fn the_bound_covers_files_and_ranges_together() {
+        use crate::testhttp::GATE_DEADLINE;
         let hub = TestHub::start();
         let files = hub.add_shards("m-bound", 3, big());
         let cache = TempRepo::new();
+        let names: Vec<&str> = files.iter().map(String::as_str).collect();
+        for f in &files {
+            hub.hold(f);
+        }
 
-        pull_one(&hub, &cache, &files, 4).unwrap();
+        let (three, pulled) = std::thread::scope(|s| {
+            let pull = s.spawn(|| pull_one(&hub, &cache, &files, 4));
+            let three = hub.wait_parked_total(&names, 3, GATE_DEADLINE);
+            // Every gate opens before anything is asserted: a failure with a body still parked
+            // would leave the pull, and with it the scope's join, waiting.
+            for f in &files {
+                hub.open(f);
+            }
+            (three, pull.join().unwrap())
+        });
+        assert!(three, "three bodies never parked together");
+        pulled.unwrap();
 
         let peak = hub.peak_concurrent_bodies();
         assert!(peak <= 4, "peak {peak} bodies in flight, bound was 4");

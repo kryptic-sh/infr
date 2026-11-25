@@ -958,6 +958,26 @@ pub(crate) fn bda_weight_breaches(
 /// The maximum output-row count of a `[out_f, in_f]` weight per addressing unit. See [`OutRowChunk`].
 const BDA_CHUNK_ROW_ALIGN: usize = 64;
 
+/// Workgroups one `native_gemm_kq_fma` dispatch records — row tiles × column tiles × k slices —
+/// or, as the error, that count when it is past `max_x`. The kernel recovers the flat id from
+/// `gl_WorkGroupID.x` alone (the k slice is the top of it), so this grid records through plain
+/// `Recorder::dispatch`, NOT `dispatch_wide`'s 2-D split: a wider one must be refused rather than
+/// truncated by a driver that enforces the limit. Same shape as [`expert_grid_x`].
+fn kq_fma_grid_x(
+    m: usize,
+    n: usize,
+    bn: usize,
+    splits: usize,
+    max_x: u32,
+) -> std::result::Result<u32, usize> {
+    let gx = m.div_ceil(128) * (n / bn).max(1) * splits;
+    if gx <= max_x as usize {
+        Ok(gx as u32)
+    } else {
+        Err(gx)
+    }
+}
+
 /// One contiguous run of output rows (weight rows / vocab logits) that a chunked dense GEMV
 /// dispatches together, plus the BYTE offset of its first row from the tensor's base address (added
 /// to the 64-bit arena base so the kernel's per-output element index stays chunk-local and u32).
@@ -3646,6 +3666,125 @@ impl<'a> Recorder<'a> {
         self.dispatch_wide(kern, &bufs, 1, &push, groups);
     }
 
+    /// One dispatch per k slice of the fp32 K-quant tile, each writing the full
+    /// `ceil(m/64)*64 x n` tile into `dst` (the same buffer bound 3×; the shader reads the slice
+    /// bounds from its push constants). `splits == 1` is the direct tile: a single dispatch into
+    /// `dst`, no partials. Returns whether the dispatch was recorded: `false` once the grid is
+    /// past the device's x limit, which fails the recording by name.
+    #[allow(clippy::too_many_arguments)]
+    fn kq_fma_slices_at(
+        &self,
+        dtype: infr_core::DType,
+        bn: usize,
+        a: &dyn Buffer,
+        arena_addr: u64,
+        w_base: usize,
+        dst: &dyn Buffer,
+        m: usize,
+        k: usize,
+        n: usize,
+        splits: usize,
+    ) -> bool {
+        let (name, spv) = crate::gemm::native_gemm_kq_fma_spv(dtype, bn)
+            .expect("kq_fma_slices_at: dtype/tile gated by native_gemm_kq_fma_spv");
+        debug_assert!(n.is_multiple_of(bn) && k.is_multiple_of(256) && w_base.is_multiple_of(256));
+        debug_assert!(splits >= 1 && k.is_multiple_of(256 * splits));
+        let max_x = self.be.kernel_limits().workgroup_count_x;
+        let groups = match kq_fma_grid_x(m, n, bn, splits, max_x) {
+            Ok(gx) => gx,
+            Err(gx) => {
+                self.fail(be(format!(
+                    "vulkan recorder: fp32 K-quant prefill GEMM {name} (m={m}, k={k}, n={n}, \
+                     t{bn}, {splits} k-slice(s)) needs {gx} workgroups in one grid dimension, past \
+                     this device's maxComputeWorkGroupCount[0] of {max_x} — run prefill in smaller \
+                     batches (a smaller INFR_UBATCH)"
+                )));
+                return false;
+            }
+        };
+        self.label_gemm(name, m, k, n);
+        self.tag_gemm(crate::work::Family::FloatTile, m, k, n);
+        let kern = self.be.kernel(name, spv, 3, 32);
+        let mut push = [0u8; 32];
+        push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(k as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
+        push[20..24].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
+        push[28..32].copy_from_slice(&(splits as u32).to_ne_bytes());
+        self.dispatch(
+            kern,
+            &[Self::vkb(a), Self::vkb(a), Self::vkb(dst)],
+            1,
+            &push,
+            groups,
+        );
+        true
+    }
+
+    /// Arena-addressed body of [`Self::matmul_kq_fma`]: the direct tile, one dispatch, no
+    /// partials. The streamed twin has no separate entry because the adapter always has the
+    /// weight's 64-bit address here (resident BDA or pool arena slot).
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_kq_fma_at(
+        &self,
+        dtype: infr_core::DType,
+        bn: usize,
+        a: &dyn Buffer,
+        arena_addr: u64,
+        w_base: usize,
+        c: &dyn Buffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        self.kq_fma_slices_at(dtype, bn, a, arena_addr, w_base, c, m, k, n, 1);
+    }
+
+    /// Split-K twin of [`Self::matmul_kq_fma_at`]: `kq_fma_slices_at` over `splits` k
+    /// slices into `partials`, then one `splitk_reduce` pass summing the planes. All slices ride
+    /// one dispatch (the slice index is the top of the workgroup id), so they stay co-resident and
+    /// overlap; a grid that underfills the device therefore still fills it.
+    /// Requires `k % (256*splits)` so every slice stays K-block aligned, and `splits > 1`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_kq_fma_splitk_at(
+        &self,
+        dtype: infr_core::DType,
+        bn: usize,
+        a: &dyn Buffer,
+        arena_addr: u64,
+        w_base: usize,
+        partials: &dyn Buffer,
+        c: &dyn Buffer,
+        m: usize,
+        k: usize,
+        n: usize,
+        splits: usize,
+    ) {
+        debug_assert!(splits > 1);
+        if !self.kq_fma_slices_at(dtype, bn, a, arena_addr, w_base, partials, m, k, n, splits) {
+            return;
+        }
+        let mpad = m.div_ceil(64) * 64;
+        self.label_gemm("splitk_reduce", m, k, n);
+        let rk = self
+            .be
+            .kernel("splitk_reduce", crate::gemm::splitk_reduce_spv(), 2, 12);
+        let n_elems = mpad * n;
+        let mut rp = [0u8; 12];
+        rp[0..4].copy_from_slice(&(n_elems as u32).to_ne_bytes());
+        rp[4..8].copy_from_slice(&(splits as u32).to_ne_bytes());
+        rp[8..12].copy_from_slice(&(n_elems as u32).to_ne_bytes());
+        self.dispatch(
+            rk,
+            &[Self::vkb(partials), Self::vkb(c)],
+            1,
+            &rp,
+            (n_elems as u32).div_ceil(64),
+        );
+    }
+
     /// Arena-addressed body of [`Self::matmul_fma`] (see `crate::gemm::native_gemm_fma_spv`):
     /// the weight read by 64-bit address `arena_addr` (a resident weight's BDA or a streamed pool
     /// slot's arena base). The vacated binding-1 slot takes a FILLER (`a`). The production entry:
@@ -3857,6 +3996,53 @@ impl<'a> Recorder<'a> {
             .device_addr()
             .expect("resident-BDA weight: matmul_fma requires a u64 BDA device address");
         self.matmul_fma_at(dtype, a, arena_addr, w_base, c, m, k, n);
+    }
+
+    /// fp32 K-quant prefill GEMM for GPUs without fast int8 dot (`native_gemm_kq_fma.comp`):
+    /// `c = a·W[w_base]ᵀ`, Q4_K/Q6_K/Q4_0 weights dequantized in-shader, `c` padded to
+    /// `ceil(m/64)*64` rows. Requires `n % bn == 0` and `k % 256 == 0`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_kq_fma(
+        &self,
+        dtype: infr_core::DType,
+        bn: usize,
+        a: &dyn Buffer,
+        w: &dyn Buffer,
+        w_base: usize,
+        c: &dyn Buffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        let arena_addr = w
+            .device_addr()
+            .expect("resident-BDA weight: matmul_kq_fma requires a u64 BDA device address");
+        self.kq_fma_slices_at(dtype, bn, a, arena_addr, w_base, c, m, k, n, 1);
+    }
+
+    /// [`Self::matmul_kq_fma`] over `splits` k slices with a reduce pass — see
+    /// [`Self::matmul_kq_fma_splitk_at`] for the shape requirements and the reason it exists.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_kq_fma_splitk(
+        &self,
+        dtype: infr_core::DType,
+        bn: usize,
+        a: &dyn Buffer,
+        w: &dyn Buffer,
+        w_base: usize,
+        partials: &dyn Buffer,
+        c: &dyn Buffer,
+        m: usize,
+        k: usize,
+        n: usize,
+        splits: usize,
+    ) {
+        let arena_addr = w
+            .device_addr()
+            .expect("resident-BDA weight: matmul_kq_fma_splitk requires a u64 BDA device address");
+        self.matmul_kq_fma_splitk_at(
+            dtype, bn, a, arena_addr, w_base, partials, c, m, k, n, splits,
+        );
     }
 
     /// Native-block dequant GEMV `y = x·Wᵀ`. Raw GGUF block bytes in `w` (padded to u32); format
@@ -13328,6 +13514,30 @@ mod tests {
             Err(higher as usize + 128)
         );
         assert_eq!(expert_grid_x(32_767, 64, 8192, 64, u32::MAX), Ok(65_536));
+    }
+
+    /// The fp32 K-quant GEMM's grid is a plain 1-D dispatch (the k slice rides the top of
+    /// `gl_WorkGroupID.x`), so past the device's limit it is refused rather than split: a 4096-row
+    /// prefill of a 131k-wide output lands one group under the guaranteed minimum, and the same
+    /// shape one row tile wider is refused.
+    #[test]
+    fn kq_fma_grid_x_refuses_a_grid_past_the_limit() {
+        let spec_min = Recorder::MAX_GROUP_COUNT_X;
+        // m=4096 is 32 row tiles of 128 rows; n is the column count in bn-wide tiles.
+        assert_eq!(kq_fma_grid_x(4096, 131_008, 64, 1, spec_min), Ok(65_504));
+        assert_eq!(kq_fma_grid_x(4096, 131_072, 64, 1, spec_min), Err(65_536));
+        assert_eq!(
+            kq_fma_grid_x(4096, 131_072, 64, 1, spec_min + 1),
+            Ok(65_536)
+        );
+        assert_eq!(kq_fma_grid_x(4352, 131_072, 64, 1, spec_min), Err(69_632));
+        // A 128-column tile halves the column count; each k slice multiplies the grid back.
+        assert_eq!(kq_fma_grid_x(4096, 131_072, 128, 1, spec_min), Ok(32_768));
+        assert_eq!(kq_fma_grid_x(4096, 131_072, 128, 2, spec_min), Err(65_536));
+        assert_eq!(kq_fma_grid_x(4096, 131_072, 128, 4, spec_min), Err(131_072));
+        // Shapes a prefill actually runs are orders of magnitude below the limit.
+        assert_eq!(kq_fma_grid_x(512, 4096, 64, 1, spec_min), Ok(256));
+        assert_eq!(kq_fma_grid_x(2, 256, 128, 4, spec_min), Ok(8));
     }
 
     /// `matmul_mmq_experts` refuses its grid against the limit the device reports

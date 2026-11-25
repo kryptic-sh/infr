@@ -471,3 +471,155 @@ fn nc_fma_gemm_parity_and_determinism() {
     // Non-zero element base (a bf16 fused-QKV slice / streamed-slot offset rides `w_base`).
     run_fma(&be, DType::Bf16, K);
 }
+
+/// One fp32 K-quant prefill GEMM (`native_gemm_kq_fma.comp`) config: `splits` picks the split-K
+/// twin over the direct tile. Three identical dispatches must agree bit for bit, the padded row
+/// range must cover the whole write, and every element must match a host f32 dot of the dequantized
+/// weight.
+#[allow(clippy::too_many_arguments)]
+fn run_kq_fma(
+    be: &VulkanBackend,
+    dt: DType,
+    bn: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+    w_base: usize,
+    splits: Option<usize>,
+) {
+    let label = format!("{dt:?} kq_fma t{bn} m{m} k{k} n{n} w_base{w_base} splits{splits:?}");
+    let bank = synth_bank(dt, w_base + n * k, 0x9c4 ^ dt as u64 ^ (k * n) as u64);
+    let w_host = infr_gguf::dequant::dequant_block(dt, &bank).unwrap();
+    let padded = pad_to_u32_align(&bank);
+    let w = be.alloc(padded.len(), BufferUsage::Weights).unwrap();
+    be.upload(w.as_ref(), &padded).unwrap();
+
+    let x: Vec<f32> = (0..m * k)
+        .map(|i| infr_core::math::sin(i as f32 * 0.13) * 0.2 - 0.01)
+        .collect();
+    let xbuf = be.alloc(m * k * 4, BufferUsage::Activations).unwrap();
+    be.upload(xbuf.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+
+    let mpad = m.div_ceil(64) * 64;
+    // One spare row past the padded range catches an epilogue overrun.
+    let outs: Vec<_> = (0..3)
+        .map(|_| {
+            let b = be
+                .alloc((mpad + 1) * n * 4, BufferUsage::Activations)
+                .unwrap();
+            be.upload(b.as_ref(), &vec![0u8; (mpad + 1) * n * 4])
+                .unwrap();
+            b
+        })
+        .collect();
+    let rec = be.recorder().unwrap();
+    let parts = splits.map(|s| {
+        be.alloc(s * mpad * n * 4, BufferUsage::Activations)
+            .unwrap()
+    });
+    for out in &outs {
+        match (&parts, splits) {
+            (Some(p), Some(s)) => rec.matmul_kq_fma_splitk(
+                dt,
+                bn,
+                xbuf.as_ref(),
+                w.as_ref(),
+                w_base,
+                p.as_ref(),
+                out.as_ref(),
+                m,
+                k,
+                n,
+                s,
+            ),
+            _ => rec.matmul_kq_fma(
+                dt,
+                bn,
+                xbuf.as_ref(),
+                w.as_ref(),
+                w_base,
+                out.as_ref(),
+                m,
+                k,
+                n,
+            ),
+        }
+    }
+    rec.finish().unwrap();
+
+    let download = |b: &dyn Buffer| {
+        let mut v = vec![0f32; (mpad + 1) * n];
+        be.download(b, bytemuck::cast_slice_mut(&mut v)).unwrap();
+        v
+    };
+    let got = download(outs[0].as_ref());
+    assert!(
+        got[mpad * n..].iter().all(|v| *v == 0.0),
+        "{label}: wrote past the padded row range"
+    );
+    for (run, out) in outs.iter().enumerate().skip(1) {
+        let other = download(out.as_ref());
+        let ndiff = got[..m * n]
+            .iter()
+            .zip(&other)
+            .filter(|(p, q)| p != q)
+            .count();
+        assert_eq!(ndiff, 0, "{label}: nondeterministic — dispatch 0 vs {run}");
+    }
+    for r in 0..m {
+        for o in 0..n {
+            let want: f32 = w_host[w_base + o * k..w_base + (o + 1) * k]
+                .iter()
+                .zip(&x[r * k..(r + 1) * k])
+                .map(|(a, b)| a * b)
+                .sum();
+            let g = got[r * n + o];
+            assert!(
+                g.is_finite() && (g - want).abs() < 1e-3 + 1e-3 * want.abs(),
+                "{label}: mismatch at row {r} col {o}: got {g} want {want}"
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn nc_kq_fma_gemm_parity_and_determinism() {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    for dt in [DType::Q4_0, DType::Q4K, DType::Q6K] {
+        for bn in [64, 128] {
+            // k=768 gives 3 blocks per row, so Q6_K columns alternate 2-byte block alignment.
+            for (m, k, n) in [
+                (2, 256, 128),
+                (100, 512, 128),
+                (130, 768, 256),
+                (512, 1024, 256),
+            ] {
+                run_kq_fma(&be, dt, bn, m, k, n, 0, None);
+            }
+            run_kq_fma(&be, dt, bn, 70, 768, 128, 256, None);
+        }
+    }
+}
+
+/// The split-K twin: same host-reference parity and run-to-run determinism as the direct tile,
+/// with the k range cut into `splits` slices plus a `splitk_reduce` pass. Shapes cover a single
+/// row tile, a partial row tile and several (m=512: 4 row tiles) across both column tiles.
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn nc_kq_fma_splitk_matches_the_direct_tile() {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    for dt in [DType::Q4_0, DType::Q4K, DType::Q6K] {
+        for bn in [64, 128] {
+            for (m, k, n, splits) in [(2, 1024, 128, 4), (130, 1024, 256, 4), (512, 1024, 256, 2)] {
+                run_kq_fma(&be, dt, bn, m, k, n, 0, Some(splits));
+            }
+        }
+    }
+}

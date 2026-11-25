@@ -293,6 +293,9 @@ pub(crate) struct Tuning {
     /// `gemm_i8cm_kq.*`: the int8 cooperative-matrix K-quant prefill GEMM.
     pub i8cm_kq_enabled: bool,
     pub i8cm_kq_l_fill_per_cu: usize,
+    /// `gemm.kq_fma`: the fp32 K-quant prefill GEMM for devices without an accelerated int8 dot
+    /// (`native_gemm_kq_fma.comp`).
+    pub gemm_kq_fma: bool,
     /// `rmsnorm.*`: the 1024-wide decode RMSNorm build.
     pub rmsnorm_wide: bool,
     pub rmsnorm_wide_min_dim: usize,

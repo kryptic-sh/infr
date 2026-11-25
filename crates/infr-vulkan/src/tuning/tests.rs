@@ -1776,3 +1776,42 @@ fn kq_fma_follows_the_dot_fact() {
     );
     assert!(!r.tuning.gemv_kq_fma);
 }
+
+/// `gemm.kq_fma` follows the same dot fact as the decode GEMVs: the fp32 K-quant prefill GEMM
+/// exists because a device without an accelerated packed int8 dot emulates the dp4a dot in ALU
+/// (measured on an RX 580 under RADV), so a device that reports an accelerated dot keeps the mmq
+/// tile. `INFR_TUNE` sets it either way.
+#[test]
+fn the_kq_fma_gemm_follows_the_dot_fact() {
+    let on = |id: &str| fixture_tuning(id).gemm_kq_fma;
+    assert!(on("rx580-gcn-radv"));
+    assert!(!on("rx7900xtx-amdwin"));
+    assert!(!on("rx7900xtx-radv"));
+    assert!(!on("raphael-igpu-amdwin"));
+    // The dot fact alone decides: matrix units do not turn it on or off.
+    let mut f = fixture("rx7900xtx-amdwin");
+    f.matrix_units = false;
+    assert!(
+        !resolve_with(&f, &Config::default(), &[], None)
+            .unwrap()
+            .tuning
+            .gemm_kq_fma
+    );
+    f.dot_accelerated = false;
+    assert!(
+        resolve_with(&f, &Config::default(), &[], None)
+            .unwrap()
+            .tuning
+            .gemm_kq_fma
+    );
+    let r = resolve_fixture(
+        "rx580-gcn-radv",
+        &env_cfg(&[("INFR_TUNE", "gemm.kq_fma=false")]),
+    );
+    assert!(!r.tuning.gemm_kq_fma);
+    let r = resolve_fixture(
+        "rx7900xtx-amdwin",
+        &env_cfg(&[("INFR_TUNE", "gemm.kq_fma=true")]),
+    );
+    assert!(r.tuning.gemm_kq_fma);
+}

@@ -1,6 +1,6 @@
 device:  Intel(R) Arc(tm) A770 Graphics (DG2) (IntelXe1, INTEL_OPEN_SOURCE_MESA)
 match:   vendor=intel arch=IntelXe1 driver=INTEL_OPEN_SOURCE_MESA integrated=false device_id=0x56a0 cu=32 subgroup=8-32 driver_version=0x0
-hash:    1d21729e
+hash:    b83407ce
 rows: none
 
 device.sg_pref               16     default
@@ -57,6 +57,7 @@ submit.prior_gflops          256    default
 split_k.fixed_grid           128    default
 split_k.fill_per_cu          4      default
 split_k.scale_by_cu          false  default
+gemm.kq_fma                  false  default
 gemm_i8cm_kq.enabled         false  default
 gemm_i8cm_kq.l_fill_per_cu   2      default
 rmsnorm.wide                 true   default

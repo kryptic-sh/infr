@@ -2498,6 +2498,9 @@ fn run_prepared(
     // sign that anything was wrong. One `fstat` per request, on the request thread. See
     // `infr_gguf::watch` for what this can and cannot see.
     be.weights().check()?;
+    // The request's images, in marker order, for the prompt encoder (`infr_llama::media`).
+    // Scoped to this call, which is where every generate below runs.
+    let _media = infr_llama::media::MediaScope::enter(params.images.clone());
     let Prepared { prompt, plan } = prepared;
     // The request's `max_tokens`/`max_completion_tokens` wins; `sampling.max_new` is the
     // server-side default for requests that don't set one (see `GenBackend::max_new_default`).

@@ -464,6 +464,8 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     p.serve.sse_keepalive_secs = num::<u64>(get, "INFR_SERVE_SSE_KEEPALIVE_SECS");
     // A zero body limit would refuse every request, so it is junk, like a zero token cap.
     p.serve.max_body_bytes = num::<u64>(get, "INFR_SERVE_MAX_BODY_BYTES").filter(|&v| v > 0);
+    p.serve.mmproj = opt_path(get, "INFR_MMPROJ");
+    p.serve.image_max_tokens = num::<usize>(get, "INFR_IMAGE_MAX_TOKENS").filter(|&v| v > 0);
 
     // ── hub ──────────────────────────────────────────────────────────────────
     // NO `> 0` filter: `0` is a MEANINGFUL value ("fetch strictly one file at a time"), so it must

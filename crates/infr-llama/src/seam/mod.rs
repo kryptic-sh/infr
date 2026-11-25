@@ -2607,6 +2607,22 @@ pub(crate) fn reclamp_ctx_to_live_room(
     k_fmt: DType,
     v_fmt: DType,
 ) -> AResult<LiveCtx> {
+    let host_free = infr_core::hostmem::available_bytes();
+    reclamp_ctx_with_host(be, cfg, ec, want_ctx, k_fmt, v_fmt, host_free)
+}
+
+/// [`reclamp_ctx_to_live_room`] against a stated `host_free` (what
+/// [`infr_core::hostmem::available_bytes`] reports) rather than the machine's own reading, so a
+/// test of the spill's host check does not depend on the memory of the machine it runs on.
+fn reclamp_ctx_with_host(
+    be: &dyn Backend,
+    cfg: &Config,
+    ec: &EngineConfig,
+    want_ctx: usize,
+    k_fmt: DType,
+    v_fmt: DType,
+    host_free: Option<u64>,
+) -> AResult<LiveCtx> {
     let served = |ctx: usize, k_fmt: DType, v_fmt: DType| LiveCtx {
         ctx,
         k_fmt,
@@ -2774,14 +2790,7 @@ pub(crate) fn reclamp_ctx_to_live_room(
                     gib(reserve - room),
                 ));
             }
-            refuse_unhostable_kv(
-                ctx,
-                split,
-                infr_core::hostmem::available_bytes(),
-                host_tier_bytes(),
-                k_fmt,
-                v_fmt,
-            )?;
+            refuse_unhostable_kv(ctx, split, host_free, host_tier_bytes(), k_fmt, v_fmt)?;
             tracing::warn!(
                 requested_ctx = want_ctx,
                 fits_ctx = fit,
@@ -7204,6 +7213,11 @@ mod seam_helper_tests {
         .is_none());
     }
 
+    /// A host with memory to spare for any cache these tests spill, handed to the re-clamp in
+    /// place of the machine's own reading: what is under test is the device-side rule, and a
+    /// runner short of memory would otherwise be refused by [`super::refuse_unhostable_kv`].
+    const ROOMY_HOST: Option<u64> = Some(1 << 40);
+
     /// A `Backend` that reports nothing but a name and a live allocation budget — enough to drive
     /// [`super::reclamp_ctx_to_live_room`], which touches no other method. `room: None` stands in
     /// for the CPU/Metal backends, which have no budget to report.
@@ -7477,7 +7491,7 @@ mod seam_helper_tests {
             let reserve = super::kv_spill_reserve(&cfg, &ec, want, chunk, false);
             let reclamp = |room: u64| {
                 let be = RoomOnly::vulkan(room).armed(true);
-                super::reclamp_ctx_to_live_room(&be, &cfg, &ec, want, k, v)
+                super::reclamp_ctx_with_host(&be, &cfg, &ec, want, k, v, ROOMY_HOST)
             };
             reclamp(reserve - 1).expect_err("a byte under the reserve at its chunk is refused");
             let live = reclamp(reserve).expect("the reserve at the spilled chunk opens");
@@ -7515,7 +7529,7 @@ mod seam_helper_tests {
             let reserve = super::kv_spill_reserve(&cfg, &ec, ctx, ub, false);
             let reclamp = |room: u64| {
                 let be = RoomOnly::vulkan(room).armed(true);
-                super::reclamp_ctx_to_live_room(&be, &cfg, &ec, want, k, v)
+                super::reclamp_ctx_with_host(&be, &cfg, &ec, want, k, v, ROOMY_HOST)
             };
             let live = reclamp(reserve).expect("a room at the reserve opens spilled");
             assert_eq!(
@@ -7594,7 +7608,15 @@ mod seam_helper_tests {
                         // Each in its own placement scope: a q8_0 pin one makes is the session's.
                         let reclamp = |armed: bool, ec: &EngineConfig| {
                             let _scope = PlacementScope::enter(Default::default());
-                            super::reclamp_ctx_to_live_room(&be(armed), &cfg, ec, want, k, v)
+                            super::reclamp_ctx_with_host(
+                                &be(armed),
+                                &cfg,
+                                ec,
+                                want,
+                                k,
+                                v,
+                                ROOMY_HOST,
+                            )
                         };
                         let (was, now) = (reclamp(false, &off), reclamp(true, &on));
                         match was {

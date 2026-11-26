@@ -251,33 +251,29 @@ Findings go through the normal coder then reviewer flow.
 
 **First part done 2026-11-26: #113, #114, #116 and our follow-up (`f492c19a`,
 `fc8511e4`).** No case was found where an estimate prices a KV format pair other
-than the one the runner allocates. To fix, none done yet:
+than the one the runner allocates. Found while fixing that part's findings and
+not fixed:
 
-1. **A KV head count that does not divide the head count is never refused**
-   (confirmed by reading: `Config` has no such check; the CPU attention computes
-   `group = nh / nkv` then `kvh = h / group`). A file with `head_count_kv` above
-   `head_count` divides by zero; `head_count` 32 with `head_count_kv` 24 indexes
-   K heads past the cache; the Vulkan shaders use the same formula. Older than
-   the pull requests, reachable from an untrusted GGUF on the scalar and the new
-   array path. Refuse it in `Config` by name, with a test per path.
-2. **gemma4 and diffusion-gemma read only two entries of a per-layer
-   `head_count_kv` array** (entry 0 and the first sliding-window layer's), never
-   check its length or the other entries, and a non-integer scalar still falls
-   back to `n_head` silently; the changelog's "every other architecture reads a
-   per-block array" overstates it. Check the whole array or correct the entry.
-3. **Doc errors:** the doc on `qwen35_kv_heads_read_the_attention_blocks` says
-   the reference reads a block's count only where it runs attention; llama.cpp
-   reads block 0's entry for every layer (`llama-graph.cpp`, `n_head_kv()` at
-   layer 0), so a per-block qwen35 array is something only infr accepts, and the
-   changelog entry should say so. B153 still lists `tower-http` and `infr-metal`
-   as open.
-4. **Tests that prove less than they look:**
-   `kv_fit_fmts_match_the_runner_resolution` compares a function with itself and
-   does not check that the runner passes its backend name and `kv_auto_q8()`; no
-   test calls `kv_ladder_fmts` for Metal's mixed-pair clamp or for the CPU with
-   an auto-q8 pin set; the qwen35 NextN entries have no fixture;
-   `moe_budget_prices_the_kv_pair_the_runner_allocates` reads the ambient
-   `kv_auto_q8()` outside a `PlacementScope`.
+- **Other model dimensions still fall back silently on a wrong-typed value:**
+  `meta_u64` returns `None` for a float or string, and keys such as
+  `attention.key_length`, `rope.dimension_count` and `context_length` then take
+  their defaults without a word. Only the KV head count readers refuse a wrong
+  type now.
+- **LFM3's `head_count_kv` refuses a negative entry as `holds I64(-1)`**
+  (`lfm3_layer_kinds`), where the other readers say "must be positive"; it is
+  refused either way. Its zeros are layer markers, so "positive" would misstate
+  that key.
+- **`qwen35::Cfg::from_gguf`** (the raw metadata parse only tests use) reads
+  `head_count_kv` as a scalar with no check; it feeds no attention, so it was
+  left.
+- **Behaviour, not a bug:** llama.cpp does not refuse a KV head count that does
+  not divide the head count at load either (`llama_hparams::n_gqa` truncates
+  `n_head / n_head_kv`); its graph build aborts instead, on the
+  `ggml_can_mul_mat` broadcast assert that both `ggml_mul_mat` and
+  `ggml_flash_attn_ext` make (`ggml/src/ggml.c`).
+
+To fix, none done yet:
+
 5. **Older, lower:** the Vulkan prefill's `kvdeq_k`/`kvdeq_v` scratch for a
    non-f16 KV side (two buffers of two bytes an element, up to the full context)
    is priced by nothing (about 128 MiB for Qwen3-14B at 32768 tokens; not
@@ -5906,15 +5902,9 @@ reading `mtp/`:
 
 Rust 1.100 (local on the Windows box on 2026-11-13; CI was still on 1.99.1 the
 day before) turned on `cargo::unused_dependencies`, and its clippy found
-`needless_range_loop` and `duplicate_attributes` sites, fixed the same day. The
-two manifest warnings are left, since neither fails `-D warnings`:
+`needless_range_loop` and `duplicate_attributes` sites, fixed the same day.
+These manifest warnings are left, since they do not fail `-D warnings`:
 
-- `tower-http` in `infr-server`: nothing under `crates/` names `tower_http`.
-  Removing it is the fix.
-- `infr-metal` in `infr-llama`: used only from macOS code, so it is unused on
-  Windows and Linux. A `[target.'cfg(target_os = "macos")'.dependencies]` entry
-  would say so, if the code that names it is gated the same way everywhere (not
-  checked).
 - `bytemuck` and `infr-prof` in `infr-core` are reported only by
   `cargo clippy -p infr-core`, not by a `--workspace` run, so their use
   presumably hangs on a feature another crate turns on (not checked).

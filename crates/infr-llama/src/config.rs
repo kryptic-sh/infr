@@ -430,66 +430,109 @@ pub struct Config {
     pub(crate) planted: Option<crate::mutation::Planted>,
 }
 
+/// A model dimension (a head count, a head dimension, a width) from `key`: positive, and within
+/// 32 bits, since the graph's ops carry their dimensions as `u32` and a wider value would
+/// truncate there (a 2^32 head count to 0).
 fn positive_model_dimension(key: &str, value: u64) -> Result<usize> {
-    let value = value as usize;
+    let Ok(value) = u32::try_from(value) else {
+        bail!("{key} = {value} does not fit 32 bits");
+    };
     if value == 0 {
         bail!("{key} must be positive");
     }
-    Ok(value)
+    Ok(value as usize)
 }
 
-fn positive_array_model_dimension(
-    values: Option<&[MetaValue]>,
-    key: &str,
-    index: usize,
-) -> Result<Option<usize>> {
-    let Some(value) = values
-        .and_then(|values| values.get(index))
-        .and_then(MetaValue::as_u64)
-    else {
-        return Ok(None);
+/// The KV head count `value` read from `entry` (the key, with the layer for a per-layer array),
+/// held to the query head count `n_head` that `head_key` names. Every backend's attention maps
+/// query head `h` to KV head `h / (n_head / n_kv)`: a count above the query head count divides by
+/// zero there, and one that does not divide it reads K and V heads past the cache. So a count that
+/// is zero, too wide for [`positive_model_dimension`], or that does not divide the query head
+/// count, is refused by name.
+fn kv_heads_count(entry: &str, value: u64, head_key: &str, n_head: usize) -> Result<usize> {
+    let n_kv = positive_model_dimension(entry, value)?;
+    if !n_head.is_multiple_of(n_kv) {
+        bail!("{entry} = {n_kv} does not divide {head_key} = {n_head}");
+    }
+    Ok(n_kv)
+}
+
+/// [`kv_heads_count`] for a metadata `value`: a negative integer is refused as not positive, and
+/// any other value that is not an unsigned integer as not being `wrong_type`.
+fn kv_heads_dimension(
+    entry: &str,
+    value: &MetaValue,
+    wrong_type: &str,
+    head_key: &str,
+    n_head: usize,
+) -> Result<usize> {
+    let value = match value {
+        MetaValue::I64(v) if *v < 0 => bail!("{entry} must be positive"),
+        v => v
+            .as_u64()
+            .with_context(|| format!("{entry} must be {wrong_type}"))?,
     };
-    positive_model_dimension(&format!("{key}[{index}]"), value).map(Some)
+    kv_heads_count(entry, value, head_key, n_head)
 }
 
-/// The model's KV head count from `{arch}.attention.head_count_kv` (`key`), read the way the
-/// reference's generic loader reads it (`llama_model::load_hparams`: `get_key_or_arr` over
-/// `block_count` entries, defaulting to the query head count): absent is `fallback`, a scalar is
-/// every layer's count, and an array has one entry per block.
+/// What `{arch}.attention.head_count_kv` (`key`) holds, read the way the reference's generic
+/// loader reads it (`llama_model::load_hparams`: `get_key_or_arr` over `n_layer` entries,
+/// defaulting to the query head count `n_head` that `head_key` names).
+enum KvHeadsKey<'a> {
+    /// Every layer's count: the scalar, or `n_head` when the key is absent.
+    Uniform(usize),
+    /// One entry per layer, its length checked, each entry still to be read with
+    /// [`kv_heads_dimension`] by the caller, which knows which layers it builds.
+    PerLayer(&'a [MetaValue]),
+}
+
+fn read_kv_heads_key<'a>(
+    g: &'a dyn WeightSource,
+    key: &str,
+    n_layer: usize,
+    head_key: &str,
+    n_head: usize,
+) -> Result<KvHeadsKey<'a>> {
+    let Some(value) = g.metadata().get(key) else {
+        return Ok(KvHeadsKey::Uniform(n_head));
+    };
+    let MetaValue::Arr(values) = value else {
+        let wrong_type = "an integer or per-layer array";
+        return kv_heads_dimension(key, value, wrong_type, head_key, n_head)
+            .map(KvHeadsKey::Uniform);
+    };
+    if values.len() != n_layer {
+        bail!(
+            "{key} has {} entries; block_count is {n_layer}",
+            values.len()
+        );
+    }
+    Ok(KvHeadsKey::PerLayer(values))
+}
+
+/// The model's KV head count from `{arch}.attention.head_count_kv` (`key`, see
+/// [`read_kv_heads_key`]) over `n_layer_all` blocks.
 ///
 /// infr builds every attention layer with one count, so an array is accepted when the blocks
-/// `attention(il)` names agree on one positive count. The other blocks' entries are not read here:
-/// a Qwen3.5 file writes 0 for its recurrent layers. That is wider than the reference accepts (its
+/// `attention(il)` names agree on one count. The other blocks' entries are not read here: a
+/// Qwen3.5 file writes 0 for its recurrent layers. That is wider than the reference accepts (its
 /// qwen35 graph shapes K and V by block 0's entry), never narrower.
 fn kv_head_count(
     g: &dyn WeightSource,
     key: &str,
     n_layer_all: usize,
     attention: impl Fn(usize) -> bool,
-    fallback: usize,
+    head_key: &str,
+    n_head: usize,
 ) -> Result<usize> {
-    let Some(value) = g.metadata().get(key) else {
-        return Ok(fallback);
+    let values = match read_kv_heads_key(g, key, n_layer_all, head_key, n_head)? {
+        KvHeadsKey::Uniform(heads) => return Ok(heads),
+        KvHeadsKey::PerLayer(values) => values,
     };
-    let MetaValue::Arr(values) = value else {
-        let value = value
-            .as_u64()
-            .with_context(|| format!("{key} must be an integer or per-layer array"))?;
-        return positive_model_dimension(key, value);
-    };
-    if values.len() != n_layer_all {
-        bail!(
-            "{key} has {} entries; block_count is {n_layer_all}",
-            values.len()
-        );
-    }
     let mut count = None;
     for (layer, value) in values.iter().enumerate().filter(|&(il, _)| attention(il)) {
         let entry = format!("{key}[{layer}]");
-        let value = value
-            .as_u64()
-            .with_context(|| format!("{entry} must be an integer"))?;
-        let heads = positive_model_dimension(&entry, value)?;
+        let heads = kv_heads_dimension(&entry, value, "an integer", head_key, n_head)?;
         match count {
             Some(first) if first != heads => {
                 bail!("{key}: attention layers with {first} and {heads} KV heads are not supported")
@@ -498,6 +541,85 @@ fn kv_head_count(
         }
     }
     count.with_context(|| format!("{key}: no attention layer"))
+}
+
+/// gemma4's and diffusion-gemma's `{arch}.attention.head_count_kv` (`key`, see
+/// [`read_kv_heads_key`]) over the model's `n_layer` layers, as `(full-attention count,
+/// sliding-window count)`.
+///
+/// The reference builds each layer at its own entry (`n_head_kv(il)`); infr builds every
+/// sliding-window layer (`window(il)`) at one count and every full-attention layer at another, so
+/// each entry must agree with the first layer of its kind, and a file whose entries do not is
+/// refused by name rather than built at counts it does not carry.
+fn gemma4_kv_heads(
+    g: &dyn WeightSource,
+    key: &str,
+    n_layer: usize,
+    window: impl Fn(usize) -> bool,
+    head_key: &str,
+    n_head: usize,
+) -> Result<(usize, usize)> {
+    let values = match read_kv_heads_key(g, key, n_layer, head_key, n_head)? {
+        KvHeadsKey::Uniform(heads) => return Ok((heads, heads)),
+        KvHeadsKey::PerLayer(values) => values,
+    };
+    let (mut full, mut swa) = (None, None);
+    for (layer, value) in values.iter().enumerate() {
+        let entry = format!("{key}[{layer}]");
+        let heads = kv_heads_dimension(&entry, value, "an integer", head_key, n_head)?;
+        let (kind, count) = if window(layer) {
+            ("sliding-window", &mut swa)
+        } else {
+            ("full-attention", &mut full)
+        };
+        match *count {
+            Some(first) if first != heads => bail!(
+                "{entry} = {heads}: {kind} layers with {first} and {heads} KV heads are not \
+                 supported"
+            ),
+            _ => *count = Some(heads),
+        }
+    }
+    // A model with layers of one kind only sizes nothing by the other's count; it takes the one
+    // count the file has.
+    let full = full.or(swa).unwrap_or(n_head);
+    Ok((full, swa.unwrap_or(full)))
+}
+
+/// gemma's per-layer `attention.sliding_window_pattern` (`key`, `true` on a sliding-window layer),
+/// held to the period infr reads from it (`pattern`, one past its first `false`): infr places
+/// sliding-window layers by that period alone ([`periodic_swa_layer`]), so an array with one
+/// entry per layer that says otherwise anywhere is refused by name, at the first entry that
+/// breaks the period, rather than built with other layers windowed than it declares.
+fn check_swa_pattern_periodic(
+    key: &str,
+    arr: &[MetaValue],
+    n_layer: usize,
+    pattern: usize,
+) -> Result<()> {
+    if arr.len() != n_layer {
+        bail!("{key} has {} entries; block_count is {n_layer}", arr.len());
+    }
+    for (il, v) in arr.iter().enumerate() {
+        let MetaValue::Bool(window) = *v else {
+            bail!("{key}[{il}] holds {v:?}, not a bool");
+        };
+        // Any positive window: only the period decides here.
+        if window != periodic_swa_layer(il, 1, pattern) {
+            bail!(
+                "{key}[{il}] = {window} breaks the period of {pattern} layers infr reads from \
+                 the array (its first `false` entry); infr places sliding-window layers by that \
+                 period only"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Whether layer `il` of a model that interleaves sliding-window attention on a fixed period is a
+/// sliding-window layer: every layer but each `swa_pattern`-th, when the model has a window.
+fn periodic_swa_layer(il: usize, swa_window: usize, swa_pattern: usize) -> bool {
+    swa_window > 0 && swa_pattern > 1 && !(il + 1).is_multiple_of(swa_pattern)
 }
 
 /// Whether qwen35 block `il` is a gated-DeltaNet (recurrent) layer by the periodic rule both
@@ -525,7 +647,7 @@ impl Config {
         if !self.swa_layers.is_empty() {
             return self.swa_window > 0 && self.swa_layers[il];
         }
-        self.swa_window > 0 && self.swa_pattern > 1 && !(il + 1).is_multiple_of(self.swa_pattern)
+        periodic_swa_layer(il, self.swa_window, self.swa_pattern)
     }
 
     /// deepseek4's per-layer compression ratio (`{arch}.attention.compress_ratios[il]`) — the
@@ -1387,38 +1509,6 @@ impl Config {
             &mk("attention.head_count"),
             meta_u64(g, &mk("attention.head_count")).context("head_count")?,
         )?;
-        // DeepSeek2 MLA: n_kv is always 1 (single key head shared by all query heads).
-        let n_kv = if deepseek2 {
-            1
-        } else if gemma4 || lfm3 {
-            // Both read their per-layer array themselves below; this is the scalar form only.
-            match meta_u64(g, &mk("attention.head_count_kv")) {
-                Some(value) => positive_model_dimension(&mk("attention.head_count_kv"), value)?,
-                None => n_head,
-            }
-        } else {
-            kv_head_count(
-                g,
-                &mk("attention.head_count_kv"),
-                n_layer_all,
-                // A qwen35 file's trailing NextN entries are not held to the trunk's count: what
-                // a converter writes there is not known from any real file.
-                |il| {
-                    !qwen35
-                        || (il < n_layer
-                            && !qwen35_recurrent_block(il, n_layer, full_attn_interval))
-                },
-                n_head,
-            )?
-        };
-        // LFM3's `attention.head_count_kv` is a per-layer array whose zeros are the
-        // short-convolution layers (`lfm3.cpp`: `is_recr = n_head_kv(il) == 0`); the attention
-        // layers' shared count is the model's `n_kv`.
-        let (n_kv, shortconv_layers) = if lfm3 {
-            lfm3_layer_kinds(g, &mk("attention.head_count_kv"), n_layer)?
-        } else {
-            (n_kv, Vec::new())
-        };
         let n_ff_layers: Vec<usize> = if let Some(arr) = g
             .metadata()
             .get(&mk("feed_forward_length"))
@@ -1572,7 +1662,19 @@ impl Config {
         let head_dim = if deepseek2 {
             key_length_mla
         } else {
-            meta_u64(g, &mk("attention.key_length")).unwrap_or((n_embd / n_head) as u64) as usize
+            let key = mk("attention.key_length");
+            match meta_u64(g, &key) {
+                Some(value) => positive_model_dimension(&key, value)?,
+                // The reference's default (`llama_model::load_hparams`), which truncates: fewer
+                // embedding columns than heads leaves no head dimension at all.
+                None if n_embd < n_head => bail!(
+                    "{} = {n_embd} gives {} = {n_head} heads no head dimension (and {key} is \
+                     absent)",
+                    mk("embedding_length"),
+                    mk("attention.head_count"),
+                ),
+                None => n_embd / n_head,
+            }
         };
         let rope_dim = if deepseek2 {
             qk_rope_dim
@@ -1624,10 +1726,18 @@ impl Config {
             .get(&mk("attention.sliding_window_pattern"))
             .and_then(MetaValue::as_arr)
         {
-            arr.iter()
+            let pattern = arr
+                .iter()
                 .position(|v| matches!(v, MetaValue::Bool(false)))
                 .map(|i| i + 1)
-                .unwrap_or(6)
+                .unwrap_or(6);
+            check_swa_pattern_periodic(
+                &mk("attention.sliding_window_pattern"),
+                arr,
+                n_layer,
+                pattern,
+            )?;
+            pattern
         } else {
             meta_u64(g, &mk("attention.sliding_window_pattern")).unwrap_or(6) as usize
         };
@@ -1652,29 +1762,79 @@ impl Config {
         } else {
             rope_theta
         };
-        let (head_dim, n_kv, rope_dim, head_dim_swa, n_kv_swa, rope_dim_swa) = if gemma4 {
-            let kv_key = mk("attention.head_count_kv");
-            let hk = g.metadata().get(&kv_key).and_then(MetaValue::as_arr);
-            let full_idx = swa_pattern.saturating_sub(1);
+        let kv_key = mk("attention.head_count_kv");
+        let head_key = mk("attention.head_count");
+        let (n_kv, n_kv_swa, shortconv_layers) = if deepseek2 {
+            // DeepSeek2 MLA: one key head shared by all query heads.
+            (1, 1, Vec::new())
+        } else if lfm3 {
+            // LFM3's `attention.head_count_kv` is a per-layer array whose zeros are the
+            // short-convolution layers (`lfm3.cpp`: `is_recr = n_head_kv(il) == 0`); the
+            // attention layers' shared count is the model's `n_kv`.
+            let (n_kv, shortconv) = lfm3_layer_kinds(g, &kv_key, n_layer, &head_key, n_head)?;
+            (n_kv, n_kv, shortconv)
+        } else if gemma4 {
+            let (full, swa) = gemma4_kv_heads(
+                g,
+                &kv_key,
+                n_layer,
+                |il| periodic_swa_layer(il, swa_window, swa_pattern),
+                &head_key,
+                n_head,
+            )?;
+            (full, swa, Vec::new())
+        } else {
+            let n_kv = kv_head_count(
+                g,
+                &kv_key,
+                n_layer_all,
+                // A qwen35 file's trailing NextN entries are not held to the trunk's count: what
+                // a converter writes there is not known from any real file.
+                |il| {
+                    !qwen35
+                        || (il < n_layer
+                            && !qwen35_recurrent_block(il, n_layer, full_attn_interval))
+                },
+                &head_key,
+                n_head,
+            )?;
+            (n_kv, n_kv, Vec::new())
+        };
+        let (head_dim, rope_dim, head_dim_swa, rope_dim_swa) = if gemma4 {
             let hd_full =
                 meta_u64(g, &mk("attention.key_length")).unwrap_or(head_dim as u64) as usize;
-            let hd_swa =
-                meta_u64(g, &mk("attention.key_length_swa")).unwrap_or(hd_full as u64) as usize;
+            let swa_key = mk("attention.key_length_swa");
+            let hd_swa = match meta_u64(g, &swa_key) {
+                Some(value) => positive_model_dimension(&swa_key, value)?,
+                None => hd_full,
+            };
             let rd_full =
                 meta_u64(g, &mk("rope.dimension_count")).unwrap_or(hd_full as u64) as usize;
             let rd_swa =
                 meta_u64(g, &mk("rope.dimension_count_swa")).unwrap_or(hd_swa as u64) as usize;
-            (
-                hd_full,
-                positive_array_model_dimension(hk, &kv_key, full_idx)?.unwrap_or(n_kv),
-                rd_full,
-                hd_swa,
-                positive_array_model_dimension(hk, &kv_key, 0)?.unwrap_or(n_kv),
-                rd_swa,
-            )
+            (hd_full, rd_full, hd_swa, rd_swa)
         } else {
-            (head_dim, n_kv, rope_dim, head_dim, n_kv, rope_dim)
+            (head_dim, rope_dim, head_dim, rope_dim)
         };
+        // The attention's rows are `heads x head dimension` wide, and the graph's ops carry those
+        // widths as `u32`; the KV rows are no wider, since a KV head count divides the head count.
+        let key_length = if deepseek2 {
+            "attention.key_length_mla"
+        } else {
+            "attention.key_length"
+        };
+        for (key, dim) in [
+            (mk(key_length), head_dim),
+            (mk("attention.key_length_swa"), head_dim_swa),
+        ] {
+            let row = n_head.checked_mul(dim).map(u32::try_from);
+            if !matches!(row, Some(Ok(_))) {
+                bail!(
+                    "{head_key} = {n_head} heads of head dimension {dim} ({key}) make a row \
+                     that does not fit 32 bits"
+                );
+            }
+        }
         let final_softcap = if gemma4 {
             g.metadata()
                 .get(&mk("final_logit_softcapping"))
@@ -2034,9 +2194,16 @@ impl Config {
 }
 
 /// LFM3's per-layer `attention.head_count_kv` (`key`): `0` marks a short-convolution layer, and
-/// every attention layer must carry the same positive count, which is returned as the model's
-/// `n_kv` beside the per-layer short-convolution flags.
-fn lfm3_layer_kinds(g: &Gguf, key: &str, n_layer: usize) -> Result<(usize, Vec<bool>)> {
+/// every attention layer must carry the same count, one that divides the query head count
+/// `head_key` names ([`kv_heads_count`]), which is returned as the model's `n_kv` beside the
+/// per-layer short-convolution flags.
+fn lfm3_layer_kinds(
+    g: &Gguf,
+    key: &str,
+    n_layer: usize,
+    head_key: &str,
+    n_head: usize,
+) -> Result<(usize, Vec<bool>)> {
     let counts: Vec<u64> = g
         .metadata()
         .get(key)
@@ -2047,6 +2214,9 @@ fn lfm3_layer_kinds(g: &Gguf, key: &str, n_layer: usize) -> Result<(usize, Vec<b
         .collect::<Result<_>>()?;
     if counts.len() != n_layer {
         bail!("{key} has {} entries for {n_layer} layers", counts.len());
+    }
+    for (layer, &count) in counts.iter().enumerate().filter(|&(_, &c)| c > 0) {
+        kv_heads_count(&format!("{key}[{layer}]"), count, head_key, n_head)?;
     }
     let mut attn = counts.iter().copied().filter(|&c| c > 0);
     let n_kv = attn
@@ -3620,8 +3790,10 @@ mod tests {
     }
 
     /// Some Qwen3.5 files write `head_count_kv` per block, 0 on the recurrent ones; the scalar
-    /// form stays accepted. As in the reference, which reads a block's count only where it runs
-    /// attention, a recurrent block's entry is never read, whatever it holds.
+    /// form stays accepted. A recurrent block's entry is never read, whatever it holds. That
+    /// array is something only infr accepts: the reference shapes every attention layer's K and V
+    /// by block 0's entry (`llm_graph_context`'s `n_head_kv`, read at layer 0), which is a
+    /// recurrent block's 0 in such a file.
     #[test]
     fn qwen35_kv_heads_read_the_attention_blocks() {
         let n_kv = |tag: &str, kv: Meta| {
@@ -3757,6 +3929,464 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "llama.attention.head_count_kv[1] must be positive"
+        );
+    }
+
+    /// The attention maps query head `h` to KV head `h / (n_head / n_kv)`, so a KV head count
+    /// above the query head count divides by zero and one that does not divide it reads K and V
+    /// heads past the cache. The generic reader refuses both by name, as a scalar and per block.
+    #[test]
+    fn generic_kv_heads_must_divide_the_head_count() {
+        let keys = [
+            ("block_count", 2),
+            ("embedding_length", 32),
+            ("attention.head_count", 4),
+            ("feed_forward_length", 16),
+        ];
+        let with = |tag: &str, kv: Meta| {
+            let mut model = arch_fixture("llama", &keys);
+            model
+                .meta
+                .push(("llama.attention.head_count_kv".into(), kv));
+            config_from_fixture(tag, &model)
+        };
+        for kv in [1, 2, 4] {
+            let cfg = with("llama-kv-divides", Meta::U32(kv)).expect("a divisor");
+            assert_eq!(cfg.n_kv, kv as usize);
+        }
+        let err = |tag: &str, kv: Meta| {
+            let Err(err) = with(tag, kv) else {
+                panic!("{tag} must be refused");
+            };
+            err.to_string()
+        };
+        assert_eq!(
+            err("llama-kv-3", Meta::U32(3)),
+            "llama.attention.head_count_kv = 3 does not divide llama.attention.head_count = 4"
+        );
+        assert_eq!(
+            err("llama-kv-8", Meta::U32(8)),
+            "llama.attention.head_count_kv = 8 does not divide llama.attention.head_count = 4"
+        );
+        assert_eq!(
+            err("llama-kv-0", Meta::U32(0)),
+            "llama.attention.head_count_kv must be positive"
+        );
+        assert_eq!(
+            err("llama-kv-arr-3", Meta::U32Arr(vec![3, 3])),
+            "llama.attention.head_count_kv[0] = 3 does not divide llama.attention.head_count = 4"
+        );
+        assert_eq!(
+            err("llama-kv-arr-8", Meta::U32Arr(vec![8, 8])),
+            "llama.attention.head_count_kv[0] = 8 does not divide llama.attention.head_count = 4"
+        );
+    }
+
+    /// qwen35's per-block array goes through the generic reader with its own block filter: an
+    /// attention block's entry is held to the query head count too.
+    #[test]
+    fn qwen35_kv_heads_must_divide_the_head_count() {
+        let Err(err) = config_from_fixture(
+            "q35-kv-3",
+            &qwen35_kv_fixture(Meta::U32Arr(vec![0, 3, 0, 3])),
+        ) else {
+            panic!("3 KV heads over 4 query heads must be refused");
+        };
+        assert_eq!(
+            err.to_string(),
+            "qwen35.attention.head_count_kv[1] = 3 does not divide qwen35.attention.head_count = 4"
+        );
+        let Err(err) = config_from_fixture("q35-kv-scalar-8", &qwen35_kv_fixture(Meta::U32(8)))
+        else {
+            panic!("8 KV heads over 4 query heads must be refused");
+        };
+        assert_eq!(
+            err.to_string(),
+            "qwen35.attention.head_count_kv = 8 does not divide qwen35.attention.head_count = 4"
+        );
+    }
+
+    /// A qwen35 file's trailing NextN block is never read for the trunk's KV head count: its
+    /// entry may hold anything, while a trunk attention block's entry is still checked.
+    #[test]
+    fn qwen35_nextn_kv_entries_are_not_read() {
+        let with = |tag: &str, kv: Vec<u32>| {
+            let mut model = qwen35_kv_fixture(Meta::U32Arr(kv));
+            for (key, value) in &mut model.meta {
+                if key == "qwen35.block_count" {
+                    *value = Meta::U32(5);
+                }
+            }
+            model
+                .meta
+                .push(("qwen35.nextn_predict_layers".into(), Meta::U32(1)));
+            config_from_fixture(tag, &model)
+        };
+        for nextn in [0, 2, 3, 8] {
+            let cfg = with("q35-nextn-kv", vec![0, 2, 0, 2, nextn])
+                .unwrap_or_else(|e| panic!("NextN entry {nextn}: {e}"));
+            assert_eq!((cfg.n_layer, cfg.n_layer_nextn, cfg.n_kv), (4, 1, 2));
+        }
+        let Err(err) = with("q35-nextn-trunk", vec![0, 2, 0, 3, 2]) else {
+            panic!("a trunk attention block's entry is still read");
+        };
+        assert_eq!(
+            err.to_string(),
+            "qwen35.attention.head_count_kv[3] = 3 does not divide qwen35.attention.head_count = 4"
+        );
+        let Err(err) = with("q35-nextn-short", vec![0, 2, 0, 2]) else {
+            panic!("the array still has one entry per block, NextN included");
+        };
+        assert_eq!(
+            err.to_string(),
+            "qwen35.attention.head_count_kv has 4 entries; block_count is 5"
+        );
+    }
+
+    /// LFM3's per-layer array: a zero is a short-convolution layer, and every other entry must
+    /// divide the query head count.
+    #[test]
+    fn lfm3_kv_heads_must_divide_the_head_count() {
+        let with = |tag: &str, kv: Vec<u32>| {
+            let mut model = arch_fixture(
+                "lfm3",
+                &[
+                    ("block_count", 4),
+                    ("embedding_length", 32),
+                    ("attention.head_count", 4),
+                    ("feed_forward_length", 16),
+                    ("attention.sliding_window", 4),
+                    ("shortconv.l_cache", 4),
+                ],
+            );
+            model.meta.extend([
+                ("lfm3.attention.head_count_kv".into(), Meta::U32Arr(kv)),
+                (
+                    "lfm3.attention.layer_norm_rms_epsilon".into(),
+                    Meta::F32(1e-5),
+                ),
+                ("lfm3.rope.freq_base_swa".into(), Meta::F32(1e4)),
+                (
+                    "lfm3.attention.sliding_window_pattern".into(),
+                    Meta::BoolArr(vec![false, true, false, true]),
+                ),
+            ]);
+            config_from_fixture(tag, &model)
+        };
+        let cfg = with("lfm3-kv-2", vec![0, 2, 0, 2]).expect("2 divides 4");
+        assert_eq!(cfg.n_kv, 2);
+        for (kv, want) in [
+            (
+                vec![0, 3, 0, 3],
+                "lfm3.attention.head_count_kv[1] = 3 does not divide lfm3.attention.head_count = 4",
+            ),
+            (
+                vec![0, 8, 0, 8],
+                "lfm3.attention.head_count_kv[1] = 8 does not divide lfm3.attention.head_count = 4",
+            ),
+        ] {
+            let Err(err) = with("lfm3-kv-bad", kv) else {
+                panic!("{want}");
+            };
+            assert_eq!(err.to_string(), want);
+        }
+    }
+
+    /// A four-layer gemma4 fixture at a window period of 2 (layers 0 and 2 sliding-window, 1 and
+    /// 3 full attention) with 4 query heads and `head_count_kv` set to `kv`.
+    fn gemma4_kv_fixture(arch: &str, kv: Meta) -> SyntheticModel {
+        let mut keys = vec![
+            ("block_count", 4),
+            ("embedding_length", 32),
+            ("attention.head_count", 4),
+            ("feed_forward_length", 16),
+            ("attention.sliding_window", 4),
+            ("attention.sliding_window_pattern", 2),
+        ];
+        if arch == "diffusion-gemma" {
+            keys.extend([("expert_count", 4), ("expert_used_count", 1)]);
+        }
+        let mut model = arch_fixture(arch, &keys);
+        model
+            .meta
+            .push((format!("{arch}.attention.head_count_kv"), kv));
+        if arch == "diffusion-gemma" {
+            model
+                .meta
+                .push(("diffusion.canvas_length".into(), Meta::U32(8)));
+        }
+        model
+    }
+
+    /// gemma4 and diffusion-gemma read the whole per-layer array: one count for the
+    /// sliding-window layers and one for the full-attention layers, every entry held to its
+    /// layer's kind and to the query head count, and the array to one entry per layer.
+    #[test]
+    fn gemma4_kv_heads_read_every_layer() {
+        for arch in ["gemma4", "diffusion-gemma"] {
+            let parse =
+                |kv: Meta| config_from_fixture(&format!("{arch}-kv"), &gemma4_kv_fixture(arch, kv));
+            let cfg = parse(Meta::U32Arr(vec![2, 1, 2, 1])).expect("two counts, one per kind");
+            assert!(cfg.is_swa_layer(0) && !cfg.is_swa_layer(1));
+            assert_eq!((cfg.n_kv_swa, cfg.n_kv), (2, 1));
+            assert_eq!(
+                (0..4).map(|il| cfg.layer_n_kv(il)).collect::<Vec<_>>(),
+                [2, 1, 2, 1]
+            );
+            let cfg = parse(Meta::U32(2)).expect("a scalar");
+            assert_eq!((cfg.n_kv_swa, cfg.n_kv), (2, 2));
+            let cfg = config_from_fixture(&format!("{arch}-kv-absent"), &{
+                let mut m = gemma4_kv_fixture(arch, Meta::U32(1));
+                m.meta.retain(|(k, _)| !k.ends_with("head_count_kv"));
+                m
+            })
+            .expect("absent");
+            assert_eq!(
+                (cfg.n_kv_swa, cfg.n_kv),
+                (4, 4),
+                "absent is the query head count"
+            );
+
+            let err = |kv: Meta| {
+                let Err(err) = parse(kv) else {
+                    panic!("{arch}: must be refused");
+                };
+                err.to_string()
+            };
+            let key = format!("{arch}.attention.head_count_kv");
+            assert_eq!(
+                err(Meta::U32Arr(vec![2, 1, 2])),
+                format!("{key} has 3 entries; block_count is 4")
+            );
+            assert_eq!(
+                err(Meta::U32Arr(vec![2, 1, 2, 1, 1])),
+                format!("{key} has 5 entries; block_count is 4")
+            );
+            assert_eq!(
+                err(Meta::U32Arr(vec![2, 1, 1, 1])),
+                format!(
+                    "{key}[2] = 1: sliding-window layers with 2 and 1 KV heads are not supported"
+                )
+            );
+            assert_eq!(
+                err(Meta::U32Arr(vec![2, 1, 2, 2])),
+                format!(
+                    "{key}[3] = 2: full-attention layers with 1 and 2 KV heads are not supported"
+                )
+            );
+            assert_eq!(
+                err(Meta::U32Arr(vec![2, 1, 2, 3])),
+                format!("{key}[3] = 3 does not divide {arch}.attention.head_count = 4")
+            );
+            assert_eq!(
+                err(Meta::U32Arr(vec![8, 1, 8, 1])),
+                format!("{key}[0] = 8 does not divide {arch}.attention.head_count = 4")
+            );
+            assert_eq!(
+                err(Meta::U32(3)),
+                format!("{key} = 3 does not divide {arch}.attention.head_count = 4")
+            );
+            assert_eq!(
+                err(Meta::U32Arr(vec![2, 0, 2, 1])),
+                format!("{key}[1] must be positive")
+            );
+            assert_eq!(
+                err(Meta::F32(2.0)),
+                format!("{key} must be an integer or per-layer array")
+            );
+            assert_eq!(
+                err(Meta::F32Arr(vec![2.0, 1.0, 2.0, 1.0])),
+                format!("{key}[0] must be an integer")
+            );
+        }
+    }
+
+    /// The head dimension the attention runs at is never zero: an explicit `key_length` (and
+    /// gemma4's `key_length_swa`) of 0 is refused, and so is the derived `n_embd / n_head` of a
+    /// file with fewer embedding columns than heads.
+    #[test]
+    fn head_dimension_must_be_positive() {
+        let with = |tag: &str, embd: u32, extra: &[(&str, u32)]| {
+            let mut keys = vec![
+                ("block_count", 1),
+                ("embedding_length", embd),
+                ("attention.head_count", 4),
+                ("feed_forward_length", 16),
+            ];
+            keys.extend_from_slice(extra);
+            config_from_fixture(tag, &arch_fixture("llama", &keys))
+        };
+        assert_eq!(with("hd-derived", 32, &[]).expect("derived").head_dim, 8);
+        let Err(err) = with("hd-derived-0", 2, &[]) else {
+            panic!("2 columns over 4 heads must be refused");
+        };
+        assert_eq!(
+            err.to_string(),
+            "llama.embedding_length = 2 gives llama.attention.head_count = 4 heads no head \
+             dimension (and llama.attention.key_length is absent)"
+        );
+        let Err(err) = with("hd-key-0", 32, &[("attention.key_length", 0)]) else {
+            panic!("key_length 0 must be refused");
+        };
+        assert_eq!(
+            err.to_string(),
+            "llama.attention.key_length must be positive"
+        );
+
+        let mut model = gemma4_kv_fixture("gemma4", Meta::U32(2));
+        model
+            .meta
+            .push(("gemma4.attention.key_length_swa".into(), Meta::U32(0)));
+        let Err(err) = config_from_fixture("hd-swa-0", &model) else {
+            panic!("key_length_swa 0 must be refused");
+        };
+        assert_eq!(
+            err.to_string(),
+            "gemma4.attention.key_length_swa must be positive"
+        );
+    }
+
+    /// The graph's ops carry head counts and head dimensions as `u32`, so a wider value is
+    /// refused rather than truncated: a head count of 2^33 over a KV head count of 2^32 divides,
+    /// yet both truncate to 0. The test kit writes no 64-bit integer key, so these call the
+    /// helpers with the values a GGUF `UINT64` key parses to.
+    #[test]
+    fn head_counts_and_dimensions_must_fit_32_bits() {
+        assert_eq!(
+            positive_model_dimension("k", u64::from(u32::MAX)).unwrap(),
+            u32::MAX as usize
+        );
+        assert_eq!(
+            positive_model_dimension("k", 1 << 33)
+                .unwrap_err()
+                .to_string(),
+            "k = 8589934592 does not fit 32 bits"
+        );
+        assert_eq!(
+            kv_heads_dimension("kv", &MetaValue::U64(1 << 32), "an integer", "h", 1 << 33)
+                .unwrap_err()
+                .to_string(),
+            "kv = 4294967296 does not fit 32 bits"
+        );
+        assert_eq!(
+            kv_heads_dimension("kv", &MetaValue::U64(2), "an integer", "h", 4).unwrap(),
+            2
+        );
+    }
+
+    /// A query row is `head_count x head dimension` wide and carried as `u32`, so a product past
+    /// 32 bits is refused even when each factor fits.
+    #[test]
+    fn head_rows_must_fit_32_bits() {
+        let with = |tag: &str, key_length: u32| {
+            let keys = [
+                ("block_count", 1),
+                ("embedding_length", 32),
+                ("attention.head_count", 65536),
+                ("attention.key_length", key_length),
+                ("feed_forward_length", 16),
+            ];
+            config_from_fixture(tag, &arch_fixture("llama", &keys))
+        };
+        let cfg = with("row-fits", 65535).expect("65536 x 65535 fits 32 bits");
+        assert_eq!((cfg.n_head, cfg.head_dim), (65536, 65535));
+        let Err(err) = with("row-wide", 65536) else {
+            panic!("65536 x 65536 is 2^32");
+        };
+        assert_eq!(
+            err.to_string(),
+            "llama.attention.head_count = 65536 heads of head dimension 65536 \
+             (llama.attention.key_length) make a row that does not fit 32 bits"
+        );
+    }
+
+    /// A negative KV head count is refused as not positive, not as a wrong type.
+    #[test]
+    fn negative_kv_heads_are_not_positive() {
+        let keys = [
+            ("block_count", 2),
+            ("embedding_length", 32),
+            ("attention.head_count", 4),
+            ("feed_forward_length", 16),
+        ];
+        let err = |tag: &str, arch: &str, kv: Meta| {
+            let mut model = if arch == "llama" {
+                arch_fixture("llama", &keys)
+            } else {
+                gemma4_kv_fixture(arch, Meta::U32(1))
+            };
+            model.meta.retain(|(k, _)| !k.ends_with("head_count_kv"));
+            model
+                .meta
+                .push((format!("{arch}.attention.head_count_kv"), kv));
+            let Err(err) = config_from_fixture(tag, &model) else {
+                panic!("{tag} must be refused");
+            };
+            err.to_string()
+        };
+        assert_eq!(
+            err("neg-llama", "llama", Meta::I32(-2)),
+            "llama.attention.head_count_kv must be positive"
+        );
+        assert_eq!(
+            err("neg-llama-arr", "llama", Meta::I32Arr(vec![2, -2])),
+            "llama.attention.head_count_kv[1] must be positive"
+        );
+        assert_eq!(
+            err("neg-gemma4", "gemma4", Meta::I32(-1)),
+            "gemma4.attention.head_count_kv must be positive"
+        );
+        assert_eq!(
+            err("neg-gemma4-arr", "gemma4", Meta::I32Arr(vec![2, 1, -2, 1])),
+            "gemma4.attention.head_count_kv[2] must be positive"
+        );
+    }
+
+    /// infr reads a gemma `sliding_window_pattern` array as a period (one past its first
+    /// `false`), so an array that is not periodic is refused by that key, at the first entry that
+    /// breaks the period, before the KV head counts are classified by it.
+    #[test]
+    fn gemma4_sliding_window_pattern_must_be_periodic() {
+        let with = |tag: &str, pattern: Meta, kv: Meta| {
+            let mut model = gemma4_kv_fixture("gemma4", kv);
+            model
+                .meta
+                .retain(|(k, _)| k != "gemma4.attention.sliding_window_pattern");
+            model
+                .meta
+                .push(("gemma4.attention.sliding_window_pattern".into(), pattern));
+            config_from_fixture(tag, &model)
+        };
+        let key = "gemma4.attention.sliding_window_pattern";
+        let cfg = with(
+            "swa-periodic",
+            Meta::BoolArr(vec![true, false, true, false]),
+            Meta::U32Arr(vec![2, 1, 2, 1]),
+        )
+        .expect("a periodic pattern");
+        assert_eq!(cfg.swa_pattern, 2);
+        // Layer 3 is declared sliding-window; the KV counts agree with that declaration, so the
+        // only thing wrong is that infr would build layer 3 as full attention.
+        let Err(err) = with(
+            "swa-aperiodic",
+            Meta::BoolArr(vec![true, false, true, true]),
+            Meta::U32Arr(vec![2, 1, 2, 2]),
+        ) else {
+            panic!("a pattern that is not periodic must be refused");
+        };
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "{key}[3] = true breaks the period of 2 layers infr reads from the array (its \
+                 first `false` entry); infr places sliding-window layers by that period only"
+            )
+        );
+        let Err(err) = with("swa-short", Meta::BoolArr(vec![true, false]), Meta::U32(1)) else {
+            panic!("a short pattern must be refused");
+        };
+        assert_eq!(
+            err.to_string(),
+            format!("{key} has 2 entries; block_count is 4")
         );
     }
 

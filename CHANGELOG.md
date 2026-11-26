@@ -1454,11 +1454,42 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   are not read (contributed in PR 113). A wrong-length array, a non-integer
   entry, disagreeing attention blocks or a file with no attention block is
   refused by name, and so is `full_attention_interval = 0`. A `recurrent_layers`
-  layout infr cannot place is reported before any of these.
-- **Every other architecture reads a per-block `attention.head_count_kv` array
-  too.** A uniform array is that one count; an array whose attention blocks
-  disagree is refused by name. Such a file used to fall back to the query head
-  count without a word.
+  layout infr cannot place is reported before any of these. Such a per-block
+  array is accepted by infr only: llama.cpp shapes every attention layer's K and
+  V by block 0's entry, which is a recurrent block's 0 in these files.
+- **The other architectures that read one KV head count read a per-block
+  `attention.head_count_kv` array too.** A uniform array is that one count; an
+  array whose attention blocks disagree is refused by name. Such a file used to
+  fall back to the query head count without a word. gemma4 and diffusion-gemma
+  read their array per layer kind and LFM3 reads its own (zeros mark its
+  short-convolution layers); the deepseek2 and deepseek32 MLA attention has one
+  KV head and reads no count.
+- **A malformed `attention.head_count_kv` is refused instead of crashing or
+  reading past the KV cache.** Attention maps query head `h` to KV head
+  `h / (head_count / head_count_kv)`, so a KV head count above
+  `attention.head_count` divided by zero and one that does not divide it (32
+  query heads over 24 KV heads) read K and V heads past the cache, on the CPU
+  and in the Vulkan shaders. Every reader of `{arch}.attention.head_count_kv`
+  (the scalar, a per-block array entry, gemma4's and diffusion-gemma's per-layer
+  array, LFM3's array) now refuses such a count when the model config is built,
+  naming the key, the layer and both values. gemma4 and diffusion-gemma used to
+  read two entries of their array (the first sliding-window layer's and the
+  first full-attention layer's) and fall back to `attention.head_count` for a
+  value that is not an integer; they now refuse an array whose length is not
+  `block_count`, an entry that disagrees with the other layers of its kind (infr
+  builds one count per kind where llama.cpp builds each layer at its own), and a
+  value of the wrong type. A zero `attention.key_length` or
+  `attention.key_length_swa`, or an `embedding_length` smaller than
+  `attention.head_count` with no `key_length`, is refused too, where it left the
+  attention a zero head dimension. So is a head count, KV head count or head
+  dimension past 32 bits, or `attention.head_count` times the head dimension
+  past 32 bits: the graph's ops carry these as `u32`, where a head count of 2^33
+  over 2^32 KV heads passed the divisibility check and truncated to 0. A gemma
+  `attention.sliding_window_pattern` array that does not repeat the period infr
+  reads from it (one past its first `false`), or has other than `block_count`
+  entries, is refused by that key, naming the first entry that breaks the
+  period; infr places sliding-window layers by that period alone, so such a file
+  was built with other layers windowed than it declares.
 - **Vulkan placement prices the KV cache formats the session allocates.** Dense
   placement priced an explicit `kv.type_k`/`kv.type_v` pair as f16 (or as q8_0
   on its auto-q8 rung), so an f32 pair could be placed resident against half the

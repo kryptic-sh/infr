@@ -9790,10 +9790,11 @@ mod tests {
         );
     }
 
-    /// Delegates to the CPU backend, summing the bytes of every `KvCache` allocation it is asked
-    /// for.
+    /// Delegates to the CPU backend under the backend name `name`, summing the bytes of every
+    /// `KvCache` allocation it is asked for.
     struct CountKv<'a> {
         cpu: &'a infr_cpu::CpuBackend,
+        name: &'a str,
         kv_bytes: std::sync::atomic::AtomicUsize,
     }
 
@@ -9808,7 +9809,7 @@ mod tests {
 
     impl infr_core::backend::Backend for CountKv<'_> {
         fn name(&self) -> &str {
-            self.cpu.name()
+            self.name
         }
         fn deltanet_strided(&self) -> bool {
             self.cpu.deltanet_strided()
@@ -9905,6 +9906,7 @@ mod tests {
             let cpu = infr_cpu::CpuBackend::new();
             let be = CountKv {
                 cpu: &cpu,
+                name: infr_core::backend::Backend::name(&cpu),
                 kv_bytes: 0.into(),
             };
             let embd = std::sync::OnceLock::new();
@@ -9984,6 +9986,88 @@ mod tests {
                 "{name}: the cold init's KV bytes and the snapshot against the estimate"
             );
         });
+    }
+
+    /// A run allocates the KV pair the placement estimates price for its backend: the runner
+    /// resolves the pair for its own backend's name and for the auto-q8 pin of the placement
+    /// scope it runs in, as `kv_fit_fmts` (Vulkan) and the CPU arena's `kv_ladder_fmts` on `cpu`
+    /// do. A CPU run under the name `vulkan` stands in for a Vulkan session (the CPU executes the
+    /// q8_0 cache that name's pin selects), so under the pin it must take q8_0 where the CPU's own
+    /// name keeps f16. Checked on the formats the slot holds and on the bytes the run asked for.
+    #[test]
+    fn runner_allocates_the_kv_pair_the_fit_prices() {
+        use infr_core::backend::Backend as _;
+        use infr_core::tensor::DType;
+        let (g, cfg) = open_synthetic("kv-fmt-runner", &llama_gguf("llama", None));
+        let ec = EngineConfig::default();
+        let ctx = 64;
+        let cpu = infr_cpu::CpuBackend::new();
+        for (name, pin, want) in [
+            ("vulkan", false, DType::F16),
+            ("vulkan", true, DType::Q8_0),
+            ("cpu", true, DType::F16),
+        ] {
+            let _scope = crate::seam::PlacementScope::enter(std::sync::Arc::new(
+                crate::seam::PlacementPins::for_caps(&cpu.capabilities()),
+            ));
+            if pin {
+                crate::seam::pin_kv_auto_q8();
+            }
+            let priced = if name == "vulkan" {
+                crate::seam::kv_fit_fmts(&cfg, &ec, crate::seam::kv_auto_q8())
+            } else {
+                crate::seam::kv_ladder_fmts(&cfg, &ec, "cpu", false)
+            };
+            assert_eq!(priced, (want, want), "{name} pin={pin}: the priced pair");
+            let be = CountKv {
+                cpu: &cpu,
+                name,
+                kv_bytes: 0.into(),
+            };
+            let embd = std::sync::OnceLock::new();
+            let mut slot = None;
+            super::generate_dense_backend(
+                &be,
+                &crate::seam::cpu_upload_bind(&cpu),
+                &g,
+                &cfg,
+                &ec,
+                TokenEmbd::new(&embd, &g),
+                None,
+                &Q35_FIRST,
+                1,
+                |_| {},
+                &mut slot,
+                ctx,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("synthetic generation");
+            let kv = slot.as_ref().expect("slot initialized");
+            assert_eq!(
+                (kv.k_fmt, kv.v_fmt),
+                priced,
+                "{name} pin={pin}: the pair the runner allocated"
+            );
+            assert_eq!(
+                be.kv_bytes.load(std::sync::atomic::Ordering::Relaxed) as u64,
+                crate::seam::kv_bytes_estimate_fmt(
+                    &cfg,
+                    kv.max_ctx,
+                    kv.kv_ring,
+                    kv.ubatch,
+                    crate::seam::KvAlign::NONE,
+                    priced.0,
+                    priced.1,
+                ),
+                "{name} pin={pin}: the bytes the runner allocated against the priced pair"
+            );
+        }
     }
 
     /// The buffers a slot adds later are the ones the estimate already counts: its recurrent-state

@@ -6586,7 +6586,9 @@ mod seam_helper_tests {
     /// runner calls) for every session the runner opens, across formats, alignments, the legacy
     /// alias, the auto-q8 candidate and the MLA and V-follows-K architectures. Both sides call
     /// the one resolver today, so this holds by construction; it is here to fail the day an
-    /// estimate stops going through it.
+    /// estimate stops going through it. That the runner calls it with its backend's name and the
+    /// scope's auto-q8 pin is checked on a real run by the runner's
+    /// `runner_allocates_the_kv_pair_the_fit_prices`.
     #[test]
     fn kv_fit_fmts_match_the_runner_resolution() {
         let mut dsv4 = kv_geometry(1, 128);
@@ -6647,6 +6649,66 @@ mod seam_helper_tests {
         assert!(
             opened > ecs.len(),
             "the matrix opened sessions on several models"
+        );
+    }
+
+    /// Metal's q8_0 and f32 attention reads both sides as one dtype, so a mixed pair with either
+    /// on one side falls to f16 on both; a matched pair, a mixed pair of prepass formats and the
+    /// same mixed pair on Vulkan or the CPU keep what was asked for.
+    #[test]
+    fn kv_ladder_couples_metal_mixed_native_pairs_to_f16() {
+        let cfg = kv_geometry(2, 128);
+        let ladder =
+            |be: &str, k, v| super::kv_ladder_fmts(&cfg, &kv_ec(Some(k), Some(v)), be, false);
+        let f16 = (DType::F16, DType::F16);
+        for (k, v) in [
+            (DType::Q8_0, DType::F16),
+            (DType::F16, DType::Q8_0),
+            (DType::F32, DType::F16),
+            (DType::F16, DType::F32),
+            (DType::Q8_0, DType::F32),
+            (DType::Q8_0, DType::Q4_0),
+            (DType::Turbo3, DType::F32),
+        ] {
+            assert_eq!(ladder("metal", k, v), f16, "metal {k:?}/{v:?}");
+            for be in ["vulkan", "cpu"] {
+                assert_eq!(ladder(be, k, v), (k, v), "{be} {k:?}/{v:?}");
+            }
+        }
+        for (k, v) in [
+            (DType::Q8_0, DType::Q8_0),
+            (DType::F32, DType::F32),
+            (DType::Q4_0, DType::F16),
+            (DType::Turbo3, DType::Q5_1),
+            (DType::Bf16, DType::F16),
+        ] {
+            assert_eq!(ladder("metal", k, v), (k, v), "metal {k:?}/{v:?}");
+        }
+    }
+
+    /// The placement's auto-q8 pin is a Vulkan decision: a CPU (or Metal) session in a scope that
+    /// carries the pin still allocates f16 for an unset pair, while a Vulkan one takes q8_0.
+    #[test]
+    fn kv_ladder_honours_the_auto_q8_pin_on_vulkan_only() {
+        let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
+        super::pin_kv_auto_q8();
+        let cfg = kv_geometry(2, 128);
+        let unset = EngineConfig::default();
+        let pinned = |be: &str| super::kv_ladder_fmts(&cfg, &unset, be, super::kv_auto_q8());
+        assert_eq!(pinned("vulkan"), (DType::Q8_0, DType::Q8_0));
+        assert_eq!(pinned("cpu"), (DType::F16, DType::F16));
+        assert_eq!(pinned("metal"), (DType::F16, DType::F16));
+        // The legacy alias is not the pin: it asks for q8_0 on every backend.
+        let force_q8 = EngineConfig {
+            kv: infr_core::config::KvCfg {
+                force_q8: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            super::kv_ladder_fmts(&cfg, &force_q8, "cpu", super::kv_auto_q8()),
+            (DType::Q8_0, DType::Q8_0)
         );
     }
 
@@ -9313,8 +9375,13 @@ mod seam_helper_tests {
     ///
     /// One plain layer of 2 KV heads x 64 is 128 elements a side, and at 1000 rows with no
     /// rounding: f16 256 000 B a side, f32 512 000, q8_0 4000 blocks x 34 = 136 000.
+    ///
+    /// The estimate reads the placement's auto-q8 pin as the runner does, from the scope in
+    /// force, so each half runs in a scope of its own: one with no pin, one with the pin set,
+    /// where an unset pair is the q8_0 pair a Vulkan session allocates.
     #[test]
     fn moe_budget_prices_the_kv_pair_the_runner_allocates() {
+        let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
         let cfg = Config {
             n_layer: 1,
             n_embd: 256,
@@ -9353,6 +9420,20 @@ mod seam_helper_tests {
             estimate(&pair(Some(DType::Q8_0), None)),
             392_000,
             "an explicit K alone leaves V at f16"
+        );
+
+        let _pinned = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
+        super::pin_kv_auto_q8();
+        assert!(super::kv_auto_q8());
+        assert_eq!(
+            estimate(&pair(None, None)),
+            272_000,
+            "an unset pair under the auto-q8 pin is the q8_0 pair"
+        );
+        assert_eq!(
+            estimate(&pair(Some(DType::F32), Some(DType::F32))),
+            1_024_000,
+            "the pin does not override an explicit pair"
         );
     }
 

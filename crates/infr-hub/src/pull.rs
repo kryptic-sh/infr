@@ -1985,8 +1985,7 @@ mod tests {
     /// split without a budget at 30, so the ceiling is what this asserts; the floor is asserted too,
     /// or "never exceeded four" would also be true of a sequential download. The bodies are held at
     /// the gate so the floor is reached rather than sampled: three files' first bodies need not
-    /// overlap inside one 25 ms body delay on a loaded runner, which is how the floor read "peak 2:
-    /// the fan-out did not happen" on CI.
+    /// overlap inside the test server's body delay on a loaded runner.
     #[test]
     fn the_bound_covers_files_and_ranges_together() {
         use crate::testhttp::GATE_DEADLINE;
@@ -2008,8 +2007,8 @@ mod tests {
             }
             (three, pull.join().unwrap())
         });
-        assert!(three, "three bodies never parked together");
         pulled.unwrap();
+        assert!(three, "three bodies never parked together");
 
         let peak = hub.peak_concurrent_bodies();
         assert!(peak <= 4, "peak {peak} bodies in flight, bound was 4");

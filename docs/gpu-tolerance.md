@@ -203,14 +203,14 @@ What it says:
   (`native_gemm_warp_*`); this class is its fine check of what still runs. With
   the tier off the kernels that serve those GEMMs are not built either
   (`splitk_reduce` and `store_f16`, on the RX 7900 XTX under RADV, with
-  `gemm.kq_fma` at its default; set, its split-K tile builds `splitk_reduce`),
-  so on a device with the tier they, like the GEMMs, are scored only under the
-  Float row. That the class runs none of them is a test
-  (`gpu_seam_tolerance_nocoopmat_runs_build_no_coopmat_gemm`: such a run builds
-  no `gemm_warp` kernel, and the Float run on the same model does wherever the
-  device has the tier). On a device without the tier, and with wave64 forced,
-  the Float configurations build the same kernels as these, and are held to the
-  Float row all the same.
+  `gemm.kq_fma` at its default; set, its split-K tile builds its own compensated
+  reduce, `splitk_reduce_kahan`), so on a device with the tier they, like the
+  GEMMs, are scored only under the Float row. That the class runs none of them
+  is a test (`gpu_seam_tolerance_nocoopmat_runs_build_no_coopmat_gemm`: such a
+  run builds no `gemm_warp` kernel, and the Float run on the same model does
+  wherever the device has the tier). On a device without the tier, and with
+  wave64 forced, the Float configurations build the same kernels as these, and
+  are held to the Float row all the same.
 - **Int8**: quantized weights through the int8-activation kernels, the shipped
   default. Dominated by the activation quantization. Where `gemv.kq_fma` is on
   (the default where the driver does not report the packed int8 dot as
@@ -282,11 +282,130 @@ On the RX 7900 XTX only gemma-3's FloatNoCoopmat runs change (its other float
 runs keep the cooperative-matrix tier); the f16 and synthetic models take no
 Q4_0/Q4_K/Q6_K Linear and do not change. gemma-3's FloatNoCoopmat row has a
 worst-KL bound of 1.8e-3: the tile passes it on the RX 7900 XTX and fails it on
-the integrated GPU, where the GEMV passes, so `gemm.kq_fma` is off there as
-well. On the other models it is about as close as the GEMV or closer. Why it is
-further out on gemma-3 is not established (a guess, untested: one f32
-accumulator per output summing the whole `k` range in order, where the GEMV
-reduces across threads).
+the integrated GPU, where the GEMV passes. On the other models it is about as
+close as the GEMV or closer. That was the tile as contributed; the cause and the
+fix follow.
+
+### Why: one f32 running sum over the whole `k` range
+
+**Per Linear, against an f64 host reference.** A probe (a throwaway test, since
+deleted) ran gemma-3-1b Q4_K_M's prompt 1 on the CPU reference with the Linear
+tap (`infr_cpu::linear_tap`), kept 11 of its 33 activation rows for every
+Linear, and fed those rows and that Linear's GGUF weight to three kernels on the
+integrated GPU: the tile (direct, both tile widths, and split-K at every slice
+count the shape allows), the per-row GEMV (`Recorder::linear_native_at`,
+`native_gemv.comp`), and, as the reference, an f64 dot of the host-dequantized
+weight (`infr_gguf::dequant::dequant_block`). The tile takes 52 of gemma-3's
+Linears: `attn_output` (Q4_K, `k` = 1024) and `ffn_down` (Q4_K and Q6_K, `k`
+= 6912) in all 26 layers; every other Linear has `in_f` = 1152, not a multiple
+of 256. The same probe ran Qwen3-0.6B Q4_K_M, whose 196 layer Linears all take
+it. Error over all of a model's Linears (RMS over each Linear's outputs, then
+RMS over Linears; max over everything), and how many Linears have an RMS error
+above the GEMV's on the same rows:
+
+| Kernel                               | gemma-3 RMS / max | above GEMV | Qwen3 RMS / max   | above GEMV |
+| ------------------------------------ | ----------------- | ---------- | ----------------- | ---------- |
+| per-row GEMV                         | 1.10e-7 / 7.97e-6 | -          | 8.02e-7 / 6.98e-4 | -          |
+| CPU reference's own f32 dot          | 2.25e-7 / 2.78e-5 | 52 of 52   | 1.64e-6 / 1.05e-3 | 196 of 196 |
+| the tile as contributed              | 7.85e-7 / 1.10e-4 | 52 of 52   | 1.00e-5 / 1.36e-2 | 196 of 196 |
+| the tile, fixed (direct)             | 9.23e-8 / 7.01e-6 | 0 of 52    | 6.56e-7 / 6.98e-4 | 0 of 196   |
+| the tile, fixed, split-K at 2 slices | 1.42e-7 / 7.97e-6 | 0 of 26    | 6.75e-7 / 6.98e-4 | 0 of 196   |
+| the tile, fixed, split-K at 4 slices | 1.38e-7 / 8.32e-6 | 0 of 26    | 7.66e-7 / 6.98e-4 | 0 of 196   |
+| the tile, fixed, split-K at 8 slices | -                 | -          | 9.93e-8 / 5.11e-6 | 0 of 28    |
+
+So the tile as contributed was about seven times further from the exact sum than
+the GEMV, per Linear, on every Linear: less accurate per op, not equally
+accurate but different. (Its Qwen3 row is the host emulation below, which
+matched it bit for bit on gemma-3.) The split-K rows cover only the Linears
+whose `k` the slice count divides (gemma-3's `attn_output` at 2 and 4, Qwen3's
+`attn_output`, `k` = 2048, at 8). The CPU reference's own dot (eight lanes of
+FMA, `Dots::dot`) is itself two to three times further out than the GEMV, so
+below about 1e-5 the gate's distance does not rank two f32 kernels.
+
+**The hypotheses, one measurement each:**
+
+- **Summation order and width: the cause.** A host emulation of one f32 FMA
+  running sum over `k` in order reproduced the tile's output bit for bit on all
+  52 gemma-3 Linears (12672 of 12672 outputs each), and an emulation of the
+  GEMV's 32-element partials and tree reproduced the GEMV bit for bit. On those
+  emulations: partials of 32 added in order cut the error to 1.72e-7, partials
+  of 256 to 2.86e-7, a Kahan sum of the products to 4.9e-8, and partials of 32
+  Kahan-added into the running sum to 9.3e-8, below the GEMV's 1.10e-7. That
+  last form, with the compensation carried as the next partial's start value
+  (9.2e-8, the same), is the fix.
+- **FMA contraction and its order: not the cause.** The tile's output matched
+  the FMA emulation bit for bit and a separate multiply-then-add emulation on
+  under a fifth of the outputs, so RADV contracts it; contraction is what the
+  GEMV and the fix do too.
+- **Dequantization: not the cause.** Read through one-hot activation rows
+  (identity blocks, so every output is one weight times 1.0, exactly), the
+  weights the tile and the GEMV decode equal `dequant_block`'s, which the CPU
+  reference uses, bit for bit, on every element of all 52 gemma-3 weights.
+- **Split-K: not the cause, and it narrowed the gap.** As contributed, 2 and 4
+  slices measured 6.47e-7 and 4.02e-7 against the direct tile's 1.06e-6 on the
+  same 26 Linears (shorter running sums). With the fixed slices, the plain
+  in-order sum of the slice planes (`splitk_reduce`) left some Linears above the
+  GEMV (gemma-3 at 4 slices: 2 of 26); the compensated build
+  (`splitk_reduce_kahan`) takes them to none (the table in `docs/backlog.md`,
+  B-SPLITK-REDUCE-KAHAN). The GPU's split-K output matched a host emulation of
+  slices plus compensated plane sum bit for bit.
+- **Activations: not the cause.** Both kernels read the same `xb` row-major
+  buffer at stride `in_f` (`nc_prefill_gemm`, `linear_native_routed_at`), and
+  the probe fed both the same rows.
+- **Other kernels: none.** The kernels the gemma-3 FloatNoCoopmat run builds
+  (`INFR_TOL_ROWS=1`, prompt 1, integrated GPU) differ with the parameter on
+  only in `native_q4k` (the per-row GEMV) giving way to
+  `native_gemm_kq_fma_q4k_t128` and `native_gemm_kq_fma_q6k_t128`, plus the
+  reduce.
+
+**The fix** (`native_gemm_kq_fma.comp`): each 32-element K tile's products go
+into a partial with explicit FMAs, and the partial is Kahan-added into the
+running sum once per tile, its compensation carried as the next tile's starting
+partial, so the tile holds two accumulator sets rather than three; `precise`
+keeps the compiler from folding the compensation away; the last carry is added
+on the write. Its split-K pass is `splitk_reduce_kahan`. Both match their host
+emulations bit for bit on the integrated GPU. Structurally that is a second set
+of accumulator registers per thread and three adds per 32 FMAs, plus three adds
+per plane in the reduce; its speed was not measured here.
+
+**Held by tests** (`crates/infr-vulkan/tests/nc_gemm_parity.rs`):
+`nc_kq_fma_gemm_is_as_accurate_as_the_gemv` and
+`nc_kq_fma_splitk_is_as_accurate_as_the_gemv` require the tile's RMS error
+against an f64 host reference to be no larger than the GEMV's on the same
+weights and activations, for Q4_0, Q4_K and Q6_K, both tile widths, at
+gemma-3-shaped and deeper `k` and at 2, 4 and 8 slices. The tile as contributed
+fails both (`k` = 6912: 8.67e-6 against 3.48e-7).
+`recorder::tests::splitk_reduce_builds_match_their_host_sums` holds the plain
+and compensated reduce builds each to a host emulation of its own sum, bit for
+bit.
+
+**Model figures, before and after.** The gate with `INFR_NO_COOPMAT=1`, worst KL
+/ largest per-phase mean KL of the `gpu-float` run over each model's prompts and
+phases (FloatNoCoopmat matches it on gemma-3; the `-ub32` and `-static` runs are
+left out), 2026-11-26:
+
+| Device      | Model         | per-row GEMV    | tile as contributed | tile, fixed     |
+| ----------- | ------------- | --------------- | ------------------- | --------------- |
+| RX 7900 XTX | gemma-3-1b    | 7.1e-4 / 3.5e-5 | 1.7e-3 / 7.9e-5     | 1.5e-4 / 7.4e-6 |
+| RX 7900 XTX | Qwen3-0.6B    | 1.3e-5 / 1.2e-6 | 1.0e-5 / 1.2e-6     | 1.4e-5 / 1.3e-6 |
+| RX 7900 XTX | Qwen3.5-0.8B  | 3.6e-7 / 3.6e-8 | 4.7e-7 / 3.9e-8     | 3.9e-7 / 3.7e-8 |
+| RX 7900 XTX | LFM3 Q4       | 2.4e-6 / 1.3e-6 | 1.3e-6 / 3.6e-7     | 2.6e-6 / 1.5e-6 |
+| RX 7900 XTX | ERNIE-0.3B Q4 | 2.2e-5 / 1.8e-6 | 1.5e-5 / 1.9e-6     | 1.5e-5 / 1.8e-6 |
+| Ryzen iGPU  | gemma-3-1b    | 7.1e-4 / 3.5e-5 | 2.7e-3 / 1.2e-4     | 3.4e-4 / 1.6e-5 |
+| Ryzen iGPU  | Qwen3-0.6B    | 1.1e-5 / 1.1e-6 | 1.1e-5 / 1.4e-6     | 1.7e-5 / 1.9e-6 |
+| Ryzen iGPU  | Qwen3.5-0.8B  | 3.8e-7 / 3.9e-8 | 3.6e-7 / 3.6e-8     | 4.1e-7 / 3.3e-8 |
+| Ryzen iGPU  | LFM3 Q4       | 2.4e-6 / 1.3e-6 | 2.0e-6 / 3.2e-7     | 2.4e-6 / 1.4e-6 |
+| Ryzen iGPU  | ERNIE-0.3B Q4 | 2.2e-5 / 1.9e-6 | 1.6e-5 / 2.1e-6     | 2.1e-5 / 1.9e-6 |
+
+gemma-3 now passes its FloatNoCoopmat row (1.8e-3) with margin on both GPUs and
+sits closer than the GEMV. On the other models every figure moves at the 1e-8 to
+1e-5 level, in either direction from phase to phase, far inside their rows;
+there the per-Linear table above, not the gate, says which kernel is closer.
+LFM3 Q4's worst is one first-token position (prompt 1) that the GEMV puts at the
+same 2.4e-6. With the parameter on, gemma-3's Int8 row still fails as described
+in "Mixing f32 and int8 prefill Linears", and further out than before (0.74 to
+1.19 on the RX 7900 XTX, 0.67 to 1.22 on the integrated GPU), so the parameter
+stays off by default.
 
 ## The greedy check
 

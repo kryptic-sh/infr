@@ -1856,6 +1856,19 @@ pub(crate) fn splitk_reduce_spv() -> &'static [u32] {
     })
 }
 
+/// SPIR-V for the compensated split-K reduce (`splitk_reduce.comp -DKAHAN`): the same planes
+/// summed with Kahan compensation, for the fp32 K-quant tile's split-K path.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn splitk_reduce_kahan_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| {
+        spv_words(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/splitk_reduce_kahan.spv"
+        )))
+    })
+}
+
 const GEMM_TILED_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/gemm_coopmat_tiled.spv"));
 const GEMM_WARP_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_warp.spv"));

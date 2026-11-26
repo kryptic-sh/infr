@@ -582,6 +582,144 @@ fn run_kq_fma(
     }
 }
 
+/// The fp32 K-quant tile's (`splits` picks split-K) and the per-row f32 dequant GEMV's
+/// (`native_gemv.comp`, the kernel the tile replaces) root-mean-square error against an f64 dot
+/// of the host-dequantized weight, on one shared input: `(tile, gemv)`.
+#[allow(clippy::too_many_arguments)]
+fn kq_fma_and_gemv_rms_error(
+    be: &VulkanBackend,
+    dt: DType,
+    bn: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+    splits: Option<usize>,
+) -> (f64, f64) {
+    let bank = synth_bank(dt, n * k, 0xacc ^ dt as u64 ^ (k * n) as u64);
+    let w_host = infr_gguf::dequant::dequant_block(dt, &bank).unwrap();
+    let padded = pad_to_u32_align(&bank);
+    let w = be.alloc(padded.len(), BufferUsage::Weights).unwrap();
+    be.upload(w.as_ref(), &padded).unwrap();
+    // Signed activations around a positive mean, so each output's running sum drifts away from
+    // zero along k the way a real layer's does.
+    let mut rng = Rng(0x5a17 ^ k as u64);
+    let x: Vec<f32> = (0..m * k)
+        .map(|_| (rng.byte() as f32 / 255.0 - 0.3) * 2.0)
+        .collect();
+    let xbuf = be.alloc(m * k * 4, BufferUsage::Activations).unwrap();
+    be.upload(xbuf.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+    let mpad = m.div_ceil(64) * 64;
+    let tile = be.alloc(mpad * n * 4, BufferUsage::Activations).unwrap();
+    let gemv = be.alloc(m * n * 4, BufferUsage::Activations).unwrap();
+    let parts = splits.map(|s| {
+        be.alloc(s * mpad * n * 4, BufferUsage::Activations)
+            .unwrap()
+    });
+    let rec = be.recorder().unwrap();
+    match (&parts, splits) {
+        (Some(p), Some(s)) => rec.matmul_kq_fma_splitk(
+            dt,
+            bn,
+            xbuf.as_ref(),
+            w.as_ref(),
+            0,
+            p.as_ref(),
+            tile.as_ref(),
+            m,
+            k,
+            n,
+            s,
+        ),
+        _ => rec.matmul_kq_fma(dt, bn, xbuf.as_ref(), w.as_ref(), 0, tile.as_ref(), m, k, n),
+    }
+    let addr = w
+        .device_addr()
+        .expect("a resident weight has a device address");
+    rec.linear_native_at(dt, addr, 0, xbuf.as_ref(), gemv.as_ref(), m, k, n);
+    rec.finish().unwrap();
+    let rms = |b: &dyn Buffer, rows: usize| {
+        let mut v = vec![0f32; rows * n];
+        be.download(b, bytemuck::cast_slice_mut(&mut v)).unwrap();
+        let mut se = 0f64;
+        for r in 0..m {
+            for o in 0..n {
+                let want: f64 = w_host[o * k..(o + 1) * k]
+                    .iter()
+                    .zip(&x[r * k..(r + 1) * k])
+                    .map(|(a, b)| *a as f64 * *b as f64)
+                    .sum();
+                let g = v[r * n + o];
+                assert!(g.is_finite(), "{dt:?} non-finite at row {r} col {o}");
+                se += (g as f64 - want).powi(2);
+            }
+        }
+        (se / (m * n) as f64).sqrt()
+    };
+    (rms(tile.as_ref(), mpad), rms(gemv.as_ref(), m))
+}
+
+/// The tile is held to the kernel it replaces: on the same weights and activations its RMS error
+/// against an f64 host reference is no larger than the per-row GEMV's. A tile summing each output
+/// in one f32 running sum over the whole k range fails this at every shape below (gemma-3-1b's
+/// `ffn_down` and `attn_output` among them); its summation is what this guards.
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn nc_kq_fma_gemm_is_as_accurate_as_the_gemv() {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    let mut worse = Vec::new();
+    for dt in [DType::Q4_0, DType::Q4K, DType::Q6K] {
+        for bn in [64, 128] {
+            for (m, k, n) in [(20, 6912, 1152), (33, 1024, 1152), (64, 4096, 256)] {
+                let (tile, gemv) = kq_fma_and_gemv_rms_error(&be, dt, bn, m, k, n, None);
+                let line = format!("{dt:?} t{bn} m{m} k{k} n{n}: tile {tile:.3e}, gemv {gemv:.3e}");
+                println!("{line}");
+                if tile > gemv {
+                    worse.push(line);
+                }
+            }
+        }
+    }
+    assert!(
+        worse.is_empty(),
+        "the tile's RMS error exceeds the per-row GEMV's:\n  {}",
+        worse.join("\n  ")
+    );
+}
+
+/// The split-K twin under the same bound as the direct tile, at the slice counts the plan picks
+/// for gemma-3-1b's `attn_output` (k = 1024) and for a deeper k.
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn nc_kq_fma_splitk_is_as_accurate_as_the_gemv() {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    let mut worse = Vec::new();
+    for dt in [DType::Q4_0, DType::Q4K, DType::Q6K] {
+        for bn in [64, 128] {
+            for (m, k, n, s) in [(33, 1024, 1152, 4), (33, 1024, 1152, 2), (20, 8192, 256, 8)] {
+                let (tile, gemv) = kq_fma_and_gemv_rms_error(&be, dt, bn, m, k, n, Some(s));
+                let line = format!(
+                    "{dt:?} t{bn} m{m} k{k} n{n} splits{s}: tile {tile:.3e}, gemv {gemv:.3e}"
+                );
+                println!("{line}");
+                if tile > gemv {
+                    worse.push(line);
+                }
+            }
+        }
+    }
+    assert!(
+        worse.is_empty(),
+        "the split-K tile's RMS error exceeds the per-row GEMV's:\n  {}",
+        worse.join("\n  ")
+    );
+}
+
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn nc_kq_fma_gemm_parity_and_determinism() {

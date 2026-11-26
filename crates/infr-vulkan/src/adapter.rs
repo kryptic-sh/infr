@@ -9025,7 +9025,7 @@ mod tests {
 
     /// The adapter's split-K route for the fp32 K-quant GEMM: `in_f` deep enough and the grid small
     /// enough that `kq_fma_plan` takes k slices, so the Linear builds the GEMM and its
-    /// `splitk_reduce` pass, sums through the pooled partials buffer, and writes its `m` rows
+    /// `splitk_reduce_kahan` pass, sums through the pooled partials buffer, and writes its `m` rows
     /// (not a multiple of 64) through the padded destination. It must match the host at the f32
     /// tile's bound.
     #[test]
@@ -9063,7 +9063,7 @@ mod tests {
         let built = be_.built_kernel_names();
         assert!(
             built.iter().any(|k| k.starts_with("native_gemm_kq_fma"))
-                && built.contains(&"splitk_reduce"),
+                && built.contains(&"splitk_reduce_kahan"),
             "{splits} k slices planned, built {built:?}"
         );
         let off = worst_of_rms(&got, &want);
@@ -9135,11 +9135,11 @@ mod tests {
         );
         let reduce: Vec<_> = grids
             .iter()
-            .filter(|(k, _)| *k == "splitk_reduce")
+            .filter(|(k, _)| *k == "splitk_reduce_kahan")
             .collect();
         assert_eq!(
             reduce,
-            [&("splitk_reduce", [max_x, groups.div_ceil(max_x), 1])]
+            [&("splitk_reduce_kahan", [max_x, groups.div_ceil(max_x), 1])]
         );
     }
 

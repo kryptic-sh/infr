@@ -132,14 +132,18 @@ Each ships alone through coder then reviewer.
 
 ## Found on the way, to fix whatever this plan does
 
-- **The f32 K-quant tile is not yet a sound base for the lineup.** With no int8
-  arm running, `native_gemm_kq_fma` puts gemma-3 outside its FloatNoCoopmat row
-  on the integrated GPU (worst KL 2.65e-3 against a bound of 1.8e-3) and passes
-  it thinly on the RX 7900 XTX (1.74e-3); the per-row f32 GEMV it replaces gives
-  7.1e-4 (`docs/gpu-tolerance.md`, "The fp32 K-quant prefill GEMM in the float
-  runs"). Why is not established (**guess:** one f32 accumulator per output over
-  the whole `k` range). It is diagnosed and fixed before S1 makes the tile
-  unconditional under Float; `gemm.kq_fma` stays default off until then.
+- **The f32 K-quant tile's float-row gap is fixed.** With no int8 arm running,
+  `native_gemm_kq_fma` had put gemma-3 outside its FloatNoCoopmat row on the
+  integrated GPU (worst KL 2.65e-3 against a bound of 1.8e-3; 1.74e-3 on the RX
+  7900 XTX; the per-row f32 GEMV gives 7.1e-4). The cause was its summation: one
+  f32 running sum per output over the whole `k` range, about 7 times the GEMV's
+  error per Linear against an f64 host reference. It now Kahan-adds 32-element
+  partials, and its split-K path sums the slices with a compensated reduce; per
+  Linear it is at least as close as the GEMV, and gemma-3 measures 3.4e-4 on the
+  integrated GPU and 1.5e-4 on the RX 7900 XTX (`docs/gpu-tolerance.md`, "The
+  fp32 K-quant prefill GEMM in the float runs"). So the tile can be the lineup's
+  base; whether `gemm.kq_fma` goes on under Float is S1's decision, taken on
+  these figures and a speed measurement.
 - **Int8 sites the single gate must also cover**, found during the PR #112
   follow-up: the int8 cooperative-matrix arms (`i8cm_q8_0`, `i8cm_kq`) are gated
   by the coopmat probe, not `i8_dot`; class (b) runs the int8 multi-row GEMV at

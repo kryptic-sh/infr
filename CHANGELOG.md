@@ -383,16 +383,23 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   measured further from the CPU reference than all-int8: on gemma-3-1b Q4_K_M
   (forced onto that tier on an RX 7900 XTX, `INFR_NO_COOPMAT=1`) the worst
   prefill KL of a prompt went from 0.31 to 0.74, past its tolerance of 0.52.
-  Where no int8 arm runs, the tile put gemma-3 outside its tightest float row on
-  the integrated Ryzen GPU (worst KL 2.65e-3 against a bound of 1.8e-3; the
-  per-row GEMV it replaces gives 7.1e-4). The GCN tier itself could not be
-  measured here. `INFR_TUNE=gemm.kq_fma=true` turns it on and `infr tune show`
-  reports it; a device whose shared memory cannot hold the kernel's tile, a
-  shape whose tile grid would pass the device's `maxComputeWorkGroupCount[0]`
-  even without splitting k, or a weight past the 2³² addressing cap keeps the
-  kernels it ran without it. The split-k sum pass, one thread per output, splits
-  its grid in two dimensions past 65,535 workgroups, Vulkan's guaranteed
-  minimum, on every device, whatever limit the device reports.
+  Where no int8 arm runs, the tile now sums each output in 32-element partials
+  that it adds into the running sum with Kahan compensation, and its split-K
+  path sums the k slices with a compensated reduce (`splitk_reduce_kahan`, a
+  build of `splitk_reduce.comp` the cooperative-matrix split-K GEMM does not
+  use); per Linear it is at least as close to an f64 host reference as the
+  per-row GEMV it replaces. A single f32 running sum over the whole `k` range
+  had put gemma-3-1b outside its tightest float row on the integrated Ryzen GPU
+  (worst KL 2.65e-3 against a bound of 1.8e-3); it now measures 3.4e-4 there and
+  1.5e-4 on the RX 7900 XTX, where the GEMV gives 7.1e-4 on both. The GCN tier
+  itself could not be measured here. `INFR_TUNE=gemm.kq_fma=true` turns it on
+  and `infr tune show` reports it; a device whose shared memory cannot hold the
+  kernel's tile, a shape whose tile grid would pass the device's
+  `maxComputeWorkGroupCount[0]` even without splitting k, or a weight past the
+  2³² addressing cap keeps the kernels it ran without it. The split-k sum pass,
+  one thread per output, splits its grid in two dimensions past 65,535
+  workgroups, Vulkan's guaranteed minimum, on every device, whatever limit the
+  device reports.
 
 - **Tuning parameter `attn_split.decode_min_chunk`: the chunk floor of decode
   split-K attention.** Decode attention cuts each head's keys into chunks of

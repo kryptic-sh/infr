@@ -182,65 +182,18 @@ rule in AGENTS.md: output unchanged or no further from the CPU reference.
 - **The core count.** `0xa721` reports `cores:?` (plan 19 S4). Rules scaled by
   core count (split-K windows, grid sizing) take their fallback here.
 
-### B-PARKED-KQ-FMA-KAHAN — the fp32 K-quant GEMM's accuracy fix is parked on a branch (2026-11-27)
+### B-ORDER-2026-11-27 — the order of work agreed with the owner
 
-**Kind:** work in progress, parked at a wrap-up; not reviewed, not on `main`.
+**Kind:** a record of an agreement; the only one.
 
-**Branch:** `wip/kq-fma-compensated-sum` (one commit on top of `2feb0ad6`).
-
-**What it is.** The cause of `native_gemm_kq_fma` sitting further from the
-reference than the per-row GEMV (B-KQ-FMA-GEMM-UNVERIFIED, plan 16 "Found on the
-way") was found: the tile summed each output in one f32 FMA running sum over the
-whole `k` range. Its output equals a host emulation of that sum bit for bit on
-all 52 of gemma-3's Linears, and per op it was about seven times further from an
-f64 reference than the GEMV. Dequantization, FMA contraction and other kernels
-were each ruled out by a measurement. The branch Kahan-adds each 32-element
-partial into the running sum in `native_gemm_kq_fma.comp`, and sums the split-K
-slices with a compensated build of `splitk_reduce.comp` (`-DKAHAN`, kernel
-`splitk_reduce_kahan`); the plain reduce the coopmat split-K path uses is
-byte-identical SPIR-V to `main`'s.
-
-**Figures on the branch** (the coder's, not re-run by the orchestrator;
-`INFR_NO_COOPMAT=1`, worst KL of the float run, gemma-3-1b): integrated GPU
-2.65e-3 to 3.38e-4, RX 7900 XTX 1.74e-3 to 1.51e-4, against 7.1e-4 for the
-per-row GEMV and a bound of 1.8e-3. Per op the fixed tile is at or below the
-GEMV's RMS error on every Linear measured (gemma-3 52 of 52, Qwen3-0.6B 196 of
-196), direct and at 2, 4 and 8 split-K slices. gemma-3's Int8 row with the
-parameter on still fails (the f32/int8 mix), further out than before (about 1.2
-against a bound of 0.52), so `gemm.kq_fma` stays default off on the branch.
-
-**Verified on the branch by the coder:** fmt, workspace clippy and the Apple and
-Windows clippy for infr-vulkan, doc, nextest (1814 passed), the infr-vulkan lib
-tests with ignored ones on both GPUs (365 passed each), `nc_gemm_parity` (6
-passed each), the tolerance gate at defaults on the RX 7900 XTX (14 of 14), the
-forced float gate with the parameter on (every model passes but gemma-3's Int8
-row). New tests seen red against the old kernel.
-
-**Left to do:**
-
-1. The tolerance gate at defaults on the integrated GPU: stopped at 4 of 14, all
-   passing.
-2. A reviewer who has not seen the coder's report, then the orchestrator's own
-   gate on both GPUs, then merge to `main` (rebase onto whatever `main` is by
-   then: the branch edits `CHANGELOG.md`, `docs/backlog.md`,
-   `docs/gpu-tolerance.md` and `docs/plan/16-float-lineup.md`, which will
-   conflict with this entry and anything added since; this entry is deleted in
-   that merge).
-3. No speed figure exists: the tile holds a second accumulator set per thread
-   and does three more adds per 32 FMAs, and the compensated reduce three more
-   adds per plane. A quiet-window A/B before the parameter is recommended to
-   anyone for speed.
-4. The branch's backlog adds B-SPLITK-REDUCE-KAHAN (the coopmat split-K path
-   could take the compensated reduce: needs tolerance rows on both GPUs and a
-   speed A/B).
-
-**Order of work agreed with the owner on 2026-11-27**, after this slice: plan
-18's T0 (measure where a test run's time goes) and T1 to T3 (keep a backend
-alive across test runs); then B-PIPELINE-CACHE-PER-SHADER if T0's figures
-justify it; then the float lineup (plan 16). The serve slices of plan 18 follow
-unless the owner moves them up. Two of plan 18's open decisions gate T1 and are
-unanswered: the gate's loop order (decision 12) and the CI default of the reuse
-switch (decision 15); the plan recommends turning the loop around and `verify`.
+Agreed with the owner on 2026-11-27, to follow the fp32 K-quant GEMM's
+compensated-sum fix (B-KQ-FMA-GEMM-UNVERIFIED): plan 18's T0 (measure where a
+test run's time goes) and T1 to T3 (keep a backend alive across test runs); then
+B-PIPELINE-CACHE-PER-SHADER if T0's figures justify it; then the float lineup
+(plan 16). The serve slices of plan 18 follow unless the owner moves them up.
+Two of plan 18's open decisions gate T1 and are unanswered: the gate's loop
+order (decision 12) and the CI default of the reuse switch (decision 15); the
+plan recommends turning the loop around and `verify`.
 
 ### B-HANDOFF-2026-11-26 — where the session of 2026-11-25/26 stopped
 
@@ -879,16 +832,18 @@ rework is theirs unless they decline.
 (the owner's accuracy rule, B-DECISIONS-2026-11-26: a default-on kernel that
 fails a row its alternative passes goes off).
 
-**Where no int8 arm runs it fails a float row.** In the harness's float runs
-(int8 dot masked) on the integrated Ryzen GPU, the tile puts gemma-3 at worst KL
-2.65e-3 against its FloatNoCoopmat bound of 1.8e-3; the per-row f32 GEMV it
-replaces gives 7.1e-4 and passes. On the RX 7900 XTX the same row passes at
-1.74e-3. The other models' float rows are about as close or closer
-(`docs/gpu-tolerance.md`, "The fp32 K-quant prefill GEMM in the float runs").
-Not established why the tile is further out on gemma-3; the guess, untested, is
-its summation order (one f32 accumulator per output over the whole `k` range).
-Before any default-on, the tile must meet gemma-3's FloatNoCoopmat row on both
-GPUs (a different accumulation, or split-K there).
+**Where no int8 arm runs it now passes the float rows (fixed 2026-11-26).** It
+had put gemma-3 at worst KL 2.65e-3 on the integrated Ryzen GPU against its
+FloatNoCoopmat bound of 1.8e-3. The cause was its summation, one f32 running sum
+per output over the whole `k` range; it now Kahan-adds 32-element partials, and
+its split-K path sums the slices with `splitk_reduce_kahan`. gemma-3's float
+rows measure 3.4e-4 on the integrated GPU and 1.5e-4 on the RX 7900 XTX (the
+GEMV: 7.1e-4); the method, the per-Linear figures and every gated model's before
+and after are in `docs/gpu-tolerance.md`, "The fp32 K-quant prefill GEMM in the
+float runs". `nc_kq_fma_gemm_is_as_accurate_as_the_gemv` and
+`nc_kq_fma_splitk_is_as_accurate_as_the_gemv` (`nc_gemm_parity.rs`) hold both
+paths to the GEMV's error against an f64 host reference. What still keeps the
+default off is the int8 mix below.
 
 **Why it is off.** It moves only the Q4_0/Q4_K/Q6_K prefill Linears with
 `in_f % 256 == 0` to f32; everything else on that tier stays on the int8 `mmq`
@@ -898,9 +853,14 @@ Int8 row's 0.52 (the table and the method are in `docs/gpu-tolerance.md`,
 "Mixing f32 and int8 prefill Linears"; forced on the RX 7900 XTX with
 `INFR_NO_COOPMAT=1`, not on a GCN card). The f32 dequant GEMV given the same
 Linears lands further out (1.12), and the Float rows with the new kernel pass on
-the RX 7900 XTX (not on the integrated GPU: the paragraph above), so the mix,
-not either kernel, explains this figure. Ruled out by runs that did not move the
-figures: the activation memo, split-K, the kernel at gemma-3's shapes.
+both GPUs, so the mix, not either kernel, explains this figure. The summation
+fix above moved the mix further out again, as the GEMV did: gemma-3's Int8 row
+under `INFR_NO_COOPMAT=1` with `gemm.kq_fma` on, worst prefill KL of prompt 1,
+0.74 to 1.19 on the RX 7900 XTX and 0.67 to 1.22 on the integrated GPU. The more
+exact the f32 Linears, the further the mix sits from the reference, which fits
+the cancellation guess under "Also open" and does not prove it. Ruled out by
+runs that did not move the figures: the activation memo, split-K, the kernel at
+gemma-3's shapes.
 
 **The owner's direction is a full float lineup on every GPU without a natively
 accelerated int8 dot** (plan 16: what each class runs today and what is
@@ -942,6 +902,41 @@ Also open:
   shared-memory check and the wide-grid fallback ran only on fixtures,
   `kq_fma_plan` tests and a synthetic `maxComputeWorkGroupCount[0]`
   (`TEST_KERNEL_LIMITS`).
+
+### B-SPLITK-REDUCE-KAHAN — the cooperative-matrix split-K GEMM could take the compensated reduce (2026-11-26)
+
+**Kind:** decision for the owner, with the work it would take; nothing broken.
+
+`splitk_reduce.comp` now has two builds: the plain one (`splitk_reduce`, an
+in-order f32 sum of the k-slice planes) and `-DKAHAN` (`splitk_reduce_kahan`,
+Kahan-compensated). Only the fp32 K-quant tile's split-K path
+(`Recorder::matmul_kq_fma_splitk_at`) takes the compensated build. The
+cooperative-matrix split-K GEMM (`Recorder::matmul_native_splitk`, on by default
+on our GPUs) keeps the plain build bit for bit
+(`recorder::tests::splitk_reduce_builds_match_their_host_sums` holds each build
+to a host emulation of its own sum, bitwise).
+
+**What the compensated reduce did for the K-quant tile.** Per Linear, against an
+f64 host reference, counting the Linears whose RMS error is above the per-row
+GEMV's on the same activations (gemma-3-1b: 52 Linears, Qwen3-0.6B: 196, one
+prompt, the integrated GPU; the slice sums are the fixed tile's either way):
+
+| Slices | Plain reduce              | Compensated reduce          |
+| ------ | ------------------------- | --------------------------- |
+| 4      | gemma-3 2 of 26 (GPU)     | gemma-3 0 of 26 (GPU)       |
+| 4      | Qwen3 5 of 196 (emulated) | Qwen3 0 of 196 (GPU)        |
+| 8      | gemma-3 32 of 52 (emul.)  | gemma-3 2 of 52 (emul.)     |
+| 8      | Qwen3 155 of 196 (emul.)  | Qwen3 0 of 28 (GPU, k=2048) |
+
+"Emulated" rows are a host emulation that matches the GPU bit for bit wherever
+both ran; gemma-3's shapes take 8 slices only in emulation (its `k` values are
+1024 and 6912).
+
+**For the cooperative-matrix path, what it would need:** the tolerance gate on
+both GPUs with that path on the compensated build (the Float and Int8 rows of
+every gated model, against today's figures), and a speed A/B of prefill in a
+quiet window, since the compensated sum costs three more adds per plane. Not
+measured: whether its plain sum costs it anything against the reference today.
 
 ### B-KQ-FMA-BW-IGPU — `kq_fma_mrow_bw` trips the integrated GPU's watchdog (2026-11-26)
 

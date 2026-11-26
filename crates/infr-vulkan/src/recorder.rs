@@ -3792,8 +3792,8 @@ impl<'a> Recorder<'a> {
     }
 
     /// Split-K twin of [`Self::matmul_kq_fma_at`]: `kq_fma_slices_at` over `splits` k
-    /// slices into `partials`, then one `splitk_reduce` pass summing the planes. All slices ride
-    /// one dispatch (the slice index is the top of the workgroup id), so they stay co-resident and
+    /// slices into `partials`, then one `splitk_reduce_kahan` pass summing the planes with
+    /// compensation. All slices ride one dispatch (the slice index is the top of the workgroup id), so they stay co-resident and
     /// overlap; a grid that underfills the device therefore still fills it.
     /// Requires `k % (256*splits)` so every slice stays K-block aligned, and `splits > 1`.
     #[allow(clippy::too_many_arguments)]
@@ -3816,10 +3816,15 @@ impl<'a> Recorder<'a> {
             return;
         }
         let mpad = m.div_ceil(64) * 64;
-        self.label_gemm("splitk_reduce", m, k, n);
-        let rk = self
-            .be
-            .kernel("splitk_reduce", crate::gemm::splitk_reduce_spv(), 2, 12);
+        // The compensated build: a plain f32 sum of the slice planes left this path further from
+        // the reference than the per-row GEMV it replaces.
+        self.label_gemm("splitk_reduce_kahan", m, k, n);
+        let rk = self.be.kernel(
+            "splitk_reduce_kahan",
+            crate::gemm::splitk_reduce_kahan_spv(),
+            2,
+            12,
+        );
         let n_elems = mpad * n;
         let mut rp = [0u8; 12];
         rp[0..4].copy_from_slice(&(n_elems as u32).to_ne_bytes());
@@ -12440,6 +12445,87 @@ mod tests {
             "layout(local_size_x = {SPLITK_REDUCE_WG}, local_size_y = 1, local_size_z = 1)"
         );
         assert!(src.contains(&want), "splitk_reduce.comp lacks `{want}`");
+    }
+
+    /// Both builds of `splitk_reduce.comp` against host emulations of their sums, bit for bit, on
+    /// the same planes: the plain build (the cooperative-matrix split-K GEMM's) is the in-order f32
+    /// sum, and the `-DKAHAN` build (the fp32 K-quant tile's) the Kahan-compensated one. The planes
+    /// mix magnitudes so the two sums differ, which shows each build ran its own arithmetic.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn splitk_reduce_builds_match_their_host_sums() {
+        let (splits, n_elems) = (8usize, 4096usize);
+        let be = VulkanBackend::new().unwrap();
+        let mut seed = 0x9e37_79b9_u32;
+        let parts: Vec<f32> = (0..splits * n_elems)
+            .map(|i| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let v = (seed >> 8) as f32 / (1u32 << 24) as f32 - 0.25;
+                if i / n_elems == 0 {
+                    v * 1e4
+                } else {
+                    v
+                }
+            })
+            .collect();
+        let plain: Vec<f32> = (0..n_elems)
+            .map(|i| (0..splits).fold(0f32, |a, s| a + parts[s * n_elems + i]))
+            .collect();
+        let kahan: Vec<f32> = (0..n_elems)
+            .map(|i| {
+                let (mut acc, mut c) = (0f32, 0f32);
+                for s in 0..splits {
+                    let y = parts[s * n_elems + i] - c;
+                    let t = acc + y;
+                    c = (t - acc) - y;
+                    acc = t;
+                }
+                acc
+            })
+            .collect();
+        assert!(
+            plain.iter().zip(&kahan).any(|(a, b)| a != b),
+            "the planes do not separate the two sums"
+        );
+        let pb = be.alloc(parts.len() * 4, BufferUsage::Activations).unwrap();
+        be.upload(pb.as_ref(), bytemuck::cast_slice(&parts))
+            .unwrap();
+        for (name, spv, want) in [
+            ("splitk_reduce", crate::gemm::splitk_reduce_spv(), &plain),
+            (
+                "splitk_reduce_kahan",
+                crate::gemm::splitk_reduce_kahan_spv(),
+                &kahan,
+            ),
+        ] {
+            let out = be.alloc(n_elems * 4, BufferUsage::Readback).unwrap();
+            let rec = be.recorder().unwrap();
+            let k = be.kernel(name, spv, 2, 12);
+            let mut push = [0u8; 12];
+            push[0..4].copy_from_slice(&(n_elems as u32).to_ne_bytes());
+            push[4..8].copy_from_slice(&(splits as u32).to_ne_bytes());
+            push[8..12].copy_from_slice(&(n_elems as u32).to_ne_bytes());
+            rec.dispatch_wide(
+                k,
+                &[Recorder::vkb(pb.as_ref()), Recorder::vkb(out.as_ref())],
+                1,
+                &push,
+                (n_elems as u32).div_ceil(SPLITK_REDUCE_WG as u32),
+            );
+            rec.finish().unwrap();
+            let mut got = vec![0f32; n_elems];
+            be.download(out.as_ref(), bytemuck::cast_slice_mut(&mut got))
+                .unwrap();
+            let differ = got
+                .iter()
+                .zip(want.iter())
+                .filter(|(g, w)| g.to_bits() != w.to_bits())
+                .count();
+            assert_eq!(
+                differ, 0,
+                "{name}: {differ} of {n_elems} differ from its host sum"
+            );
+        }
     }
 
     #[test]

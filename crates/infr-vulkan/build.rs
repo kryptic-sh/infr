@@ -3546,6 +3546,7 @@ fn main() {
             ],
         ),
         ("splitk_reduce", "splitk_reduce", &[]),
+        ("splitk_reduce", "splitk_reduce_kahan", &["-DKAHAN"]),
         ("bw_scan", "bw_scan", &[]),
         // Known-answer probe for the int8 coopmat accumulator fragment layout the i8cm GEMM reads
         // its `csub[i]` elements with — dispatched at init when that tier is opted into, and the

@@ -198,9 +198,19 @@ void main() {
     uint k0b = slice * (pc.k / pc.splits);
     uint k0e = k0b + pc.k / pc.splits;
 
+    // Summation: one f32 running sum over the whole k range drifts with k (its rounding is
+    // relative to the running sum, not to each term), which put this tile further from the
+    // reference than the per-row GEMV it replaces. So each K tile's BK products go into `part`
+    // with fused multiply-adds, and `part` is Kahan-added into `acc` once per tile; the
+    // compensation is carried as the next tile's starting `part`, so no third register set is
+    // needed. `precise` keeps the compiler from folding `t - acc` away or reassociating it.
     vec4 acc[8][TNV];
+    vec4 part[8][TNV];
     [[unroll]] for (uint i = 0u; i < 8u; i++)
-        [[unroll]] for (uint j = 0u; j < TNV; j++) acc[i][j] = vec4(0.0);
+        [[unroll]] for (uint j = 0u; j < TNV; j++) {
+            acc[i][j] = vec4(0.0);
+            part[i][j] = vec4(0.0);
+        }
 
     loadRaw(k0b);
     storeTile(k0b);
@@ -214,14 +224,22 @@ void main() {
             vec4 b[TNV];
             [[unroll]] for (uint j = 0u; j < TNV; j++) b[j] = Ws[kk][j * 16u + tc];
             [[unroll]] for (uint j = 0u; j < TNV; j++) {
-                acc[0][j] += a0.x * b[j];
-                acc[1][j] += a0.y * b[j];
-                acc[2][j] += a0.z * b[j];
-                acc[3][j] += a0.w * b[j];
-                acc[4][j] += a1.x * b[j];
-                acc[5][j] += a1.y * b[j];
-                acc[6][j] += a1.z * b[j];
-                acc[7][j] += a1.w * b[j];
+                part[0][j] = fma(vec4(a0.x), b[j], part[0][j]);
+                part[1][j] = fma(vec4(a0.y), b[j], part[1][j]);
+                part[2][j] = fma(vec4(a0.z), b[j], part[2][j]);
+                part[3][j] = fma(vec4(a0.w), b[j], part[3][j]);
+                part[4][j] = fma(vec4(a1.x), b[j], part[4][j]);
+                part[5][j] = fma(vec4(a1.y), b[j], part[5][j]);
+                part[6][j] = fma(vec4(a1.z), b[j], part[6][j]);
+                part[7][j] = fma(vec4(a1.w), b[j], part[7][j]);
+            }
+        }
+        [[unroll]] for (uint i = 0u; i < 8u; i++) {
+            [[unroll]] for (uint j = 0u; j < TNV; j++) {
+                precise vec4 t = acc[i][j] + part[i][j];
+                precise vec4 carry = part[i][j] - (t - acc[i][j]);
+                part[i][j] = carry;
+                acc[i][j] = t;
             }
         }
         barrier();
@@ -237,7 +255,9 @@ void main() {
         uint r = wgRow + (i < 4u ? tr * 4u + i : 64u + tr * 4u + i - 4u);
         if (r < mpad) {
             [[unroll]] for (uint j = 0u; j < TNV; j++) {
-                c4[pbase + ((r * pc.n + wgCol + j * 64u + tc * 4u) >> 2u)] = acc[i][j];
+                // The last carry folded in: a k slice's sum is otherwise short by it.
+                precise vec4 o = acc[i][j] + part[i][j];
+                c4[pbase + ((r * pc.n + wgCol + j * 64u + tc * 4u) >> 2u)] = o;
             }
         }
     }

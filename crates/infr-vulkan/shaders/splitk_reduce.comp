@@ -2,8 +2,10 @@
 // Split-K reduce: out[i] = Σ_s part[s·plane + i] over `splits` planes — the deterministic
 // (fixed-order) sum that closes a split-K GEMM. One thread per output element.
 // -DKAHAN (the `splitk_reduce_kahan` build) compensates the sum: a plain f32 sum of the planes
-// rounds against the running total at every step, which is what kept the fp32 K-quant tile's
-// split-K path further from the reference than the direct tile. The plain build is unchanged.
+// rounds against the running total at every step, which left the fp32 K-quant tile's split-K
+// path further from the reference than the per-row GEMV on some Linears. A sum that reaches
+// +-inf comes out NaN from this build (inf - inf in the compensation) where the plain build
+// writes inf. The plain build is unchanged.
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform PC { uint n_elems; uint splits; uint plane; } pc;

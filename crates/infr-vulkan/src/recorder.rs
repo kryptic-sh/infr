@@ -3793,8 +3793,9 @@ impl<'a> Recorder<'a> {
 
     /// Split-K twin of [`Self::matmul_kq_fma_at`]: `kq_fma_slices_at` over `splits` k
     /// slices into `partials`, then one `splitk_reduce_kahan` pass summing the planes with
-    /// compensation. All slices ride one dispatch (the slice index is the top of the workgroup id), so they stay co-resident and
-    /// overlap; a grid that underfills the device therefore still fills it.
+    /// compensation. All slices ride one dispatch (the slice index is the top of the workgroup
+    /// id), so they stay co-resident and overlap; a grid that underfills the device therefore
+    /// still fills it.
     /// Requires `k % (256*splits)` so every slice stays K-block aligned, and `splits > 1`.
     #[allow(clippy::too_many_arguments)]
     pub fn matmul_kq_fma_splitk_at(
@@ -3817,7 +3818,7 @@ impl<'a> Recorder<'a> {
         }
         let mpad = m.div_ceil(64) * 64;
         // The compensated build: a plain f32 sum of the slice planes left this path further from
-        // the reference than the per-row GEMV it replaces.
+        // the reference than the per-row GEMV it replaces on some Linears.
         self.label_gemm("splitk_reduce_kahan", m, k, n);
         let rk = self.be.kernel(
             "splitk_reduce_kahan",

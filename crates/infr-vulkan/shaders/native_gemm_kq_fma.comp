@@ -8,7 +8,7 @@
 // `splits = 1` is the plain tile writing c4 at offset 0. For splits > 1 every workgroup carries its
 // slice in the top of gl_WorkGroupID.x, so one dispatch keeps the whole grid resident: groups are
 // (row tiles x column tiles x splits). Slices write their own plane of a `splits x mpad x n`
-// partial buffer and splitk_reduce sums the planes.
+// partial buffer and splitk_reduce_kahan (splitk_reduce.comp -DKAHAN) sums the planes.
 #extension GL_EXT_control_flow_attributes : require
 
 const uint BM = 128u;
@@ -204,6 +204,8 @@ void main() {
     // with fused multiply-adds, and `part` is Kahan-added into `acc` once per tile; the
     // compensation is carried as the next tile's starting `part`, so no third register set is
     // needed. `precise` keeps the compiler from folding `t - acc` away or reassociating it.
+    // Overflow: once a partial or the sum reaches +-inf the compensation is inf - inf, so the
+    // output is NaN where a plain sum would write inf. Finite sums are not affected.
     vec4 acc[8][TNV];
     vec4 part[8][TNV];
     [[unroll]] for (uint i = 0u; i < 8u; i++)

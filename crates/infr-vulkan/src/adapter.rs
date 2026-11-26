@@ -12811,10 +12811,10 @@ mod tests {
     }
 
     /// The tuning parameter `quant_q8.experts_hi` through the batched MoE lowering, Q4_K experts,
-    /// four token rows carrying a massive activation. Off (the default, and set off explicitly) no
-    /// outlier build is made and the output has the same bits either way; on, both stages'
-    /// quantizers and GEMMs take their outlier builds, and the rows with a massive activation land
-    /// at least four times closer to the f64 reference of the float experts (dequantized weights,
+    /// four token rows carrying a massive activation. On (the default, and set on explicitly) both
+    /// stages' quantizers and GEMMs take their outlier builds and the output has the same bits
+    /// either way; off, no outlier build is made, and the rows with a massive activation land at
+    /// least four times further from the f64 reference of the float experts (dequantized weights,
     /// unquantized activations) than the default does.
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
@@ -12960,29 +12960,33 @@ mod tests {
         let (y_on, k_on) = run(&backend(Some(true)).expect("the GPU found above"));
 
         assert!(
-            k_default.iter().all(|k| !k.ends_with("_hi")),
-            "the default built an outlier kernel: {k_default:?}"
+            k_off.iter().all(|k| !k.ends_with("_hi")),
+            "switch off: built an outlier kernel: {k_off:?}"
         );
         assert_eq!(
-            k_off, k_default,
-            "switch off: other kernels than the default's"
+            k_on, k_default,
+            "switch on: other kernels than the default's"
         );
-        let ndiff = y_off
+        let ndiff = y_on
             .iter()
             .zip(&y_default)
             .filter(|(a, b)| a.to_bits() != b.to_bits())
             .count();
         assert_eq!(
             ndiff, 0,
-            "switch off: {ndiff} outputs differ from the default's"
+            "switch on: {ndiff} outputs differ from the default's"
         );
         for k in ["quant_q8_gather_hi", "quant_q8_hi"] {
-            assert!(k_on.contains(&k), "switch on: {k} not built: {k_on:?}");
+            assert!(
+                k_default.contains(&k),
+                "the default: {k} not built: {k_default:?}"
+            );
         }
         assert!(
-            k_on.iter()
+            k_default
+                .iter()
                 .any(|k| k.starts_with("native_gemm_mmq_q4k_") && k.ends_with("_hi")),
-            "switch on: no outlier expert GEMM built: {k_on:?}"
+            "the default: no outlier expert GEMM built: {k_default:?}"
         );
         let err = |y: &[f32], t: usize| {
             (0..ne)
@@ -12991,12 +12995,16 @@ mod tests {
                 .sqrt()
         };
         for t in 0..rows {
-            let (on, def) = (err(&y_on, t), err(&y_default, t));
-            eprintln!("row {t}: error against the float reference {on:.3e} on, {def:.3e} off");
+            let (def, off) = (err(&y_default, t), err(&y_off, t));
+            eprintln!(
+                "row {t}: error against the float reference {def:.3e} default, {off:.3e} off \
+                 (off / default {:.1})",
+                off / def
+            );
             if massive.contains(&t) {
                 assert!(
-                    on * 4.0 < def,
-                    "row {t} carries a massive activation: {on:.3e} on, {def:.3e} off"
+                    def * 4.0 < off,
+                    "row {t} carries a massive activation: {def:.3e} default, {off:.3e} off"
                 );
             }
         }
@@ -13005,10 +13013,11 @@ mod tests {
     /// The tuning parameter `mmv_mw.moe_float` on two decode graphs (one row, two Q4_K `Linear`s
     /// at int8-GEMV size, one with its residual `Add` fused in): one also running a routed-expert
     /// `MoeFfn`, one without, and the MoE graph cut as the multi-GPU wrappers cut it
-    /// (`crate::multi::segment`) to a segment holding the `Linear`s and not the `MoeFfn`. On, the
-    /// MoE graph and its segment build exactly the kernels of `kernels.vulkan.mmv_mw = false` (no
-    /// int8 GEMV) and get its output bits; the dense graph builds the default's kernels and gets
-    /// its bits. Set off, every graph is the default.
+    /// (`crate::multi::segment`) to a segment holding the `Linear`s and not the `MoeFfn`. On (the
+    /// default, and set on explicitly), the MoE graph and its segment build exactly the kernels of
+    /// `kernels.vulkan.mmv_mw = false` (no int8 GEMV) and get its output bits; the dense graph
+    /// builds the kernels of the switch set off and gets its bits. Set off, every graph takes the
+    /// int8 GEMV at both decode sites.
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn moe_decode_float_switch() {
@@ -13182,25 +13191,29 @@ mod tests {
             let (y_off, k_off) = run(&gpu(Some(false), false), moe, cut);
             let (y_on, k_on) = run(&gpu(Some(true), false), moe, cut);
             let (y_f32, k_f32) = run(&gpu(None, true), moe, cut);
-            // Both lowering sites ran on the int8 GEMV by default: the plain and the fused one.
+            // Both lowering sites ran on the int8 GEMV with the switch off: the plain and the
+            // fused one.
             assert!(
-                k_def.iter().any(|k| int8_gemv(k) && k.ends_with("_res"))
-                    && k_def.iter().any(|k| int8_gemv(k) && !k.ends_with("_res")),
-                "{what}: the default took no int8 GEMV at one of the decode sites: {k_def:?}"
+                k_off.iter().any(|k| int8_gemv(k) && k.ends_with("_res"))
+                    && k_off.iter().any(|k| int8_gemv(k) && !k.ends_with("_res")),
+                "{what}: switch off took no int8 GEMV at one of the decode sites: {k_off:?}"
             );
             assert!(
                 !k_f32.iter().any(|k| int8_gemv(k)),
                 "{what}: mmv_mw = false built an int8 GEMV: {k_f32:?}"
             );
-            assert_eq!(k_off, k_def, "{what}: switch off built other kernels");
-            assert!(y_off == y_def, "{what}: switch off changed the output bits");
+            assert_eq!(k_on, k_def, "{what}: switch on built other kernels");
+            assert!(y_on == y_def, "{what}: switch on changed the output bits");
             let (want_y, want_k) = if moe {
                 (&y_f32, &k_f32)
             } else {
-                (&y_def, &k_def)
+                (&y_off, &k_off)
             };
-            assert_eq!(&k_on, want_k, "{what}: switch on built other kernels");
-            assert!(&y_on == want_y, "{what}: switch on changed the output bits");
+            assert_eq!(&k_def, want_k, "{what}: the default built other kernels");
+            assert!(
+                &y_def == want_y,
+                "{what}: the default changed the output bits"
+            );
         }
     }
 

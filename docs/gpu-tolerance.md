@@ -1958,9 +1958,11 @@ So (a) was built, at one outlier per block and the CPU's ratio of 16.
 
 ### What was built
 
-The Vulkan tuning parameter **`quant_q8.experts_hi`** (experimental, off by
-default): `--set kernels.vulkan.tune.quant_q8.experts_hi=true`,
-`INFR_TUNE=quant_q8.experts_hi=true`, or `"quant_q8.experts_hi" = true` under
+The Vulkan tuning parameter **`quant_q8.experts_hi`**, on by default since the
+owner's decision of 2026-11-26 ("On by default" below). It was built off and
+measured that way; turn it off with
+`--set kernels.vulkan.tune.quant_q8.experts_hi=false`,
+`INFR_TUNE=quant_q8.experts_hi=false`, or `"quant_q8.experts_hi" = false` under
 `[kernels.vulkan.tune]`.
 
 - **`quant_q8.comp -DHI`** (`quant_q8_hi`, and `quant_q8_gather_hi` with
@@ -1994,13 +1996,14 @@ held resident: both files measured here, and any other Q4_K_M MoE file. Dense
 models never reach the batched MoE arm, so they run exactly the shipped kernels
 with the parameter on or off.
 
-**Off is the shipped path.** Every SPIR-V module the tree built before this
-change is byte-identical after it (913 modules compared by SHA-256; ten new
+**Off is the path shipped before it.** Every SPIR-V module the tree built before
+this change is byte-identical after it (913 modules compared by SHA-256; ten new
 ones). `moe_ffn_batched_experts_hi_switch` (adapter tests) runs a batched Q4_K
-`MoeFfn` with the parameter unset and set off and asserts the same built kernel
-list, no `_hi` kernel and the same output bits. The `gpu` and `gpu-ub32` rows
-below reproduce the first measurement's (above) figure for figure on both
-devices and both models, forced and unforced.
+`MoeFfn` with the parameter unset and set on and asserts the same built kernel
+list, the `_hi` kernels and the same output bits, and set off, no `_hi` kernel
+(it asserted the reverse while the parameter was off by default). The `gpu` and
+`gpu-ub32` rows below reproduce the first measurement's (above) figure for
+figure on both devices and both models, forced and unforced.
 
 **Op-level tests** (`kq_gemm_tests.rs`, both GPUs, Khronos validation layer
 clean): `quant_q8_hi_follows_its_rule` drives blocks with one massive value, two
@@ -2027,7 +2030,7 @@ stale value and the adapter test's massive rows come out NaN.
 
 `measure_gpu_tolerance` as in the first measurement (same machine, Mesa RADV
 26.3.1, headless, native lanes, tuning rows on), the configurations
-`DIAGNOSIS_CONFIGS` adds: `gpu-experts-hi` and `gpu-ub32-experts-hi` (the
+`DIAGNOSIS_CONFIGS` then added: `gpu-experts-hi` and `gpu-ub32-experts-hi` (the
 parameter on, at the shipped chunk height and at 32 rows),
 `gpu-dense-decode-float` (`kernels.vulkan.mmv_mw = false`, which empties the
 int8 decode set: a decode row's dense `Linear`s take the dequantizing GEMVs, a
@@ -2160,28 +2163,33 @@ Decode speed with the dense GEMVs float is under Speed below (the same on
 Qwen3-30B-A3B, 3.3% slower on ERNIE on the RX 7900 XTX, 18% slower on ERNIE on
 the integrated GPU). `kernels.vulkan.mmv_mw = false` takes the int8 decode GEMVs
 off for every model; its MoE-only form is the tuning parameter
-**`mmv_mw.moe_float`** (experimental, off by default:
-`--set kernels.vulkan.tune.mmv_mw.moe_float=true`). With it on, a graph that
-runs an `Op::MoeFfn` lowers every one-row `Linear`, and an MTP verify batch's
-(which must score as one row does), exactly as `mmv_mw = false` does
+**`mmv_mw.moe_float`**, on by default on every device since 2026-11-26 ("On by
+default" below; off: `--set kernels.vulkan.tune.mmv_mw.moe_float=false` or
+`INFR_TUNE=mmv_mw.moe_float=false`). With it on, a graph that runs an
+`Op::MoeFfn` lowers every one-row `Linear`, and an MTP verify batch's (which
+must score as one row does), exactly as `mmv_mw = false` does
 (`moe_decode_float` in `adapter.rs`); a graph without routed experts is
 untouched. A part of a forward compiled on its own (a multi-GPU segment, a
 layer-major prefill's layer span) answers for the whole forward
 (`Graph::part_of_routed`), so a part without an `Op::MoeFfn` follows the model.
-Its harness configuration is `gpu-moe-decode-float`, whose rows are in the
+Its harness configuration was `gpu-moe-decode-float`, whose rows are in the
 tables above; on both MoE models and both GPUs they equal
-`gpu-dense-decode-float`'s figure for figure.
+`gpu-dense-decode-float`'s figure for figure. With the parameter on by default
+those configurations are the shipped `gpu` run, and `DIAGNOSIS_CONFIGS` holds
+the off side instead (below).
 
 Tests: `moe_decode_float_switch` (adapter, both GPUs) builds two one-row decode
 graphs with two Q4_K `Linear`s at int8-GEMV size, one fused with its residual
-`Add`, one graph also running a `MoeFfn`: with the parameter on, the MoE graph
-builds exactly the kernels of `mmv_mw = false` and gets its output bits, the
-dense graph the default's; set off, both are the default.
+`Add`, one graph also running a `MoeFfn`: by default and with the parameter set
+on, the MoE graph builds exactly the kernels of `mmv_mw = false` and gets its
+output bits, the dense graph those of the parameter set off; set off, both take
+the int8 GEMV at both decode sites.
 `gpu_seam_tolerance_moe_decode_float_reaches_moe_models_only` does the same on
 the real models (ERNIE-4.5-21B-A3B against Qwen3-0.6B), on whole forced runs'
-logits bits. Red runs (2026-11-25, `Vulkan0`): with the switch never taking
-effect, both fail on the MoE side; with it taking effect on every graph, both
-fail on the dense side.
+logits bits: the shipped run against `gpu-dense-decode-float` and
+`gpu-moe-decode-int8` (the parameter off). Red runs (2026-11-25, `Vulkan0`):
+with the switch never taking effect, both fail on the MoE side; with it taking
+effect on every graph, both fail on the dense side.
 
 ### Speed
 
@@ -2228,6 +2236,10 @@ reporting paged experts (load average 1.2 to 2.5 over the prefill runs, 0.5 to
 | Qwen3-30B-A3B | 4058.2, 4065.5, 4057.3, 4070.0 | 4023.5, 4015.7, 4006.9, 4019.7 | -1.1%  |
 | ERNIE-21B-A3B | 4188.6, 4195.2, 4192.1, 4194.4 | 4131.4, 4140.3, 4123.6, 4133.3 | -1.4%  |
 
+These pp512 figures were measured at `54448f08`, before PR #111 rewrote the Q4_K
+`mmq` staging, the `_hi` builds included (`4563cbd7`); they predate that rewrite
+and a re-measurement is owed.
+
 The first build measured -8.7% and -8.0% the same way (commit `8004eefe`).
 
 | tg128, t/s    | shipped (int8 dense GEMVs) | `mmv_mw.moe_float` on      | change |
@@ -2258,14 +2270,170 @@ Structurally, with `quant_q8.experts_hi` on:
   at a 512-token chunk on Qwen3-30B-A3B about 2.1 and 0.8 MB).
 - Decode does not change: its routed experts take the float per-row GEMVs.
 
-The A/B, decode and prefill as separate runs:
+The A/B, decode and prefill as separate runs (with both parameters now on by
+default, the second run of each pair sets its parameter `false`):
 
 ```text
 INFR_DEV=Vulkan0 infr bench -p 512 -n 0 -r 3 <model.gguf>
-INFR_DEV=Vulkan0 infr bench -p 512 -n 0 -r 3 <model.gguf> --set kernels.vulkan.tune.quant_q8.experts_hi=true
+INFR_DEV=Vulkan0 infr bench -p 512 -n 0 -r 3 <model.gguf> --set kernels.vulkan.tune.quant_q8.experts_hi=false
 INFR_DEV=Vulkan0 infr bench -p 0 -n 128 -r 3 <model.gguf>
-INFR_DEV=Vulkan0 infr bench -p 0 -n 128 -r 3 <model.gguf> --set kernels.vulkan.tune.mmv_mw.moe_float=true
+INFR_DEV=Vulkan0 infr bench -p 0 -n 128 -r 3 <model.gguf> --set kernels.vulkan.tune.mmv_mw.moe_float=false
 ```
+
+### On by default
+
+The owner's decision of 2026-11-26 (accuracy first): `quant_q8.experts_hi` and
+`mmv_mw.moe_float` are on by default on every device, integrated GPUs included,
+so the shipped `gpu` and `gpu-ub32` runs of a routed-expert model now take the
+outlier quantizer in their batched expert GEMMs and the dequantizing float GEMVs
+for every one-row `Linear`. A dense model reaches neither: the switch is read
+only by the `Op::MoeFfn` lowering (`quant_q8.experts_hi`) and by
+`moe_decode_float`, which asks `Graph::has_routed_experts` (`mmv_mw.moe_float`).
+Measured 2026-11-26 on Qwen3-0.6B: the shipped run and `gpu-moe-switches-off`
+build the same kernel list on every prompt and score the same per-position KL on
+both GPUs, and `gpu_seam_tolerance_moe_decode_float_reaches_moe_models_only`
+holds the dense model's shipped logits bit for bit to the parameter-off run's.
+
+`DIAGNOSIS_CONFIGS` now holds the off side: `gpu-no-experts-hi` and
+`gpu-ub32-no-experts-hi` (`quant_q8.experts_hi` off), `gpu-moe-decode-int8`
+(`mmv_mw.moe_float` off) and `gpu-moe-switches-off` (both off: what shipped
+before). `gpu-ub32-moe-float` and `gpu-ub32-dense-float` set the parameter they
+would otherwise pick up off, so they split the int8 kernels as they did when the
+routing study was measured. The configurations the tables above were measured
+with map onto today's as follows (each old one had both parameters off unless it
+named one): `gpu-experts-hi` is now `gpu-moe-decode-int8`;
+`gpu-moe-decode-float` is now `gpu-no-experts-hi`;
+`gpu-experts-hi-dense-decode-float` is now `gpu-dense-decode-float`, which on a
+MoE model builds what `gpu` builds; the old `gpu` is now `gpu-moe-switches-off`.
+Three have no configuration of their own now: the old `gpu-ub32` (both off at
+32-row chunks), `gpu-ub32-experts-hi` (the outlier quantizer at 32-row chunks
+with float decode off) and the old `gpu-dense-decode-float` (float decode with
+the outlier quantizer off). Each is reproduced by adding the setting that
+differs as an environment layer, which a configuration that does not set the
+parameter itself leaves in force: `gpu-ub32` under
+`INFR_TUNE=quant_q8.experts_hi=false,mmv_mw.moe_float=false`, `gpu-ub32` under
+`INFR_TUNE=mmv_mw.moe_float=false`, and `gpu-dense-decode-float` under
+`INFR_TUNE=quant_q8.experts_hi=false`. Checked once: `gpu-ub32` under
+`INFR_TUNE=mmv_mw.moe_float=false` on ERNIE on the RX 7900 XTX reproduces the
+`gpu-ub32-experts-hi` row of the table above (203 selections differing, widest
+7.5e-4, prefill worst 6.0e-4).
+
+`measure_gpu_tolerance` on both MoE models and both GPUs (Mesa RADV, native
+lanes, tuning rows on), with
+`INFR_TOL_ONLY=gpu,gpu-ub32,gpu-no-experts-hi,gpu-ub32-no-experts-hi,gpu-moe-decode-int8,gpu-moe-switches-off`,
+forced and (`INFR_TOL_OWN_ROUTING=1`) unforced; no run's log reported paged
+experts. "First rows" is the worst KL of the two first positions; a worst is the
+worst over the three prompts, a mean the largest of the three prompts' means,
+per phase (the tables above give one mean over every phase, so their means are
+not comparable with these); "differ" sums the three prompts' expert selections
+that differ from the reference's. A forced run takes the reference's tokens and
+expert selections, so it measures arithmetic alone. An unforced run
+(`INFR_TOL_OWN_ROUTING`) still takes the reference's tokens but its own routers'
+selections: once a router near a tie picks other experts, that position's output
+and, through the KV cache, every later one carry the difference, so its KL and
+top-1 say where near ties fell more than how close the arithmetic is.
+
+Qwen3-30B-A3B, `Vulkan0` (15312 selections):
+
+| Configuration                   | Forced: differ (widest) | First rows | Prefill KL, worst / mean | Decode KL, worst / mean | Unforced: differ | Unforced top-1 |
+| ------------------------------- | ----------------------- | ---------- | ------------------------ | ----------------------- | ---------------- | -------------- |
+| CPU production                  | 1135 (1.8e-02)          | 7.4e-03    | 5.2e-02 / 3.4e-03        | 1.5e-02 / 4.3e-03       | 1957             | 305/317        |
+| `gpu` (shipped, both on)        | 262 (1.7e-03)           | 2.5e-04    | 1.8e-03 / 1.4e-04        | 1.0e-04 / 1.5e-05       | 1075             | 314/319        |
+| `gpu-ub32` (shipped)            | 252 (1.0e-03)           | 2.5e-04    | 1.6e-03 / 1.4e-04        | 1.0e-04 / 1.5e-05       | 991              | 315/319        |
+| `gpu-no-experts-hi`             | 276 (5.3e-04)           | 3.8e-02    | 1.9e-03 / 2.0e-04        | 6.1e-05 / 1.3e-05       | 960              | 319/319        |
+| `gpu-ub32-no-experts-hi`        | 287 (5.8e-03)           | 3.8e-02    | 2.0e-03 / 2.0e-04        | 1.4e-04 / 2.2e-05       | 1142             | 313/319        |
+| `gpu-moe-decode-int8`           | 318 (1.7e-03)           | 2.5e-04    | 1.8e-03 / 1.4e-04        | 1.3e-03 / 4.0e-04       | 1101             | 313/319        |
+| `gpu-moe-switches-off` (before) | 339 (6.0e-04)           | 3.8e-02    | 1.9e-03 / 2.0e-04        | 2.2e-03 / 4.0e-04       | 974              | 318/319        |
+
+Qwen3-30B-A3B, `Vulkan1` (15312 selections):
+
+| Configuration                   | Forced: differ (widest) | First rows | Prefill KL, worst / mean | Decode KL, worst / mean | Unforced: differ | Unforced top-1 |
+| ------------------------------- | ----------------------- | ---------- | ------------------------ | ----------------------- | ---------------- | -------------- |
+| CPU production                  | 1135 (1.8e-02)          | 7.4e-03    | 5.2e-02 / 3.4e-03        | 1.5e-02 / 4.3e-03       | 1957             | 305/317        |
+| `gpu` (shipped, both on)        | 467 (6.4e-03)           | 1.3e-03    | 2.5e-03 / 4.4e-04        | 4.3e-04 / 8.2e-05       | 1280             | 312/319        |
+| `gpu-ub32` (shipped)            | 448 (1.9e-03)           | 1.3e-03    | 4.1e-03 / 4.4e-04        | 3.5e-04 / 7.5e-05       | 1319             | 312/319        |
+| `gpu-no-experts-hi`             | 518 (5.8e-03)           | 3.8e-02    | 3.3e-03 / 6.4e-04        | 2.9e-04 / 6.7e-05       | 1311             | 315/319        |
+| `gpu-ub32-no-experts-hi`        | 538 (5.8e-03)           | 3.9e-02    | 3.4e-03 / 6.4e-04        | 3.1e-04 / 9.9e-05       | 1430             | 314/319        |
+| `gpu-moe-decode-int8`           | 528 (1.7e-02)           | 1.3e-03    | 2.5e-03 / 4.4e-04        | 2.4e-03 / 5.4e-04       | 1344             | 312/319        |
+| `gpu-moe-switches-off` (before) | 564 (1.7e-02)           | 3.8e-02    | 3.3e-03 / 6.4e-04        | 1.9e-03 / 4.8e-04       | 1341             | 313/319        |
+
+ERNIE-4.5-21B-A3B, `Vulkan0` (8802 selections):
+
+| Configuration                   | Forced: differ (widest) | First rows | Prefill KL, worst / mean | Decode KL, worst / mean | Unforced: differ | Unforced top-1 |
+| ------------------------------- | ----------------------- | ---------- | ------------------------ | ----------------------- | ---------------- | -------------- |
+| CPU production                  | 1003 (1.5e-02)          | 1.1e-02    | 3.3e-02 / 2.9e-03        | 1.3e-02 / 2.6e-03       | 1300             | 313/324        |
+| `gpu` (shipped, both on)        | 126 (8.4e-04)           | 2.4e-04    | 8.8e-04 / 9.0e-05        | 1.1e-04 / 1.7e-05       | 281              | 325/326        |
+| `gpu-ub32` (shipped)            | 146 (6.6e-04)           | 2.4e-04    | 6.0e-04 / 9.7e-05        | 1.1e-04 / 1.6e-05       | 253              | 326/326        |
+| `gpu-no-experts-hi`             | 195 (8.7e-04)           | 1.2e-03    | 3.6e-03 / 2.4e-04        | 5.8e-04 / 8.7e-05       | 385              | 324/326        |
+| `gpu-ub32-no-experts-hi`        | 195 (7.2e-04)           | 1.1e-03    | 3.6e-03 / 2.4e-04        | 5.9e-04 / 8.8e-05       | 391              | 323/326        |
+| `gpu-moe-decode-int8`           | 192 (9.3e-04)           | 2.4e-04    | 8.8e-04 / 9.0e-05        | 4.4e-04 / 1.6e-04       | 353              | 325/326        |
+| `gpu-moe-switches-off` (before) | 242 (1.7e-03)           | 1.2e-03    | 3.6e-03 / 2.4e-04        | 1.0e-03 / 1.9e-04       | 417              | 324/326        |
+
+ERNIE-4.5-21B-A3B, `Vulkan1` (8802 selections):
+
+| Configuration                   | Forced: differ (widest) | First rows | Prefill KL, worst / mean | Decode KL, worst / mean | Unforced: differ | Unforced top-1 |
+| ------------------------------- | ----------------------- | ---------- | ------------------------ | ----------------------- | ---------------- | -------------- |
+| CPU production                  | 1003 (1.5e-02)          | 1.1e-02    | 3.3e-02 / 2.9e-03        | 1.3e-02 / 2.6e-03       | 1300             | 313/324        |
+| `gpu` (shipped, both on)        | 405 (3.2e-02)           | 2.3e-03    | 6.8e-03 / 6.2e-04        | 1.6e-03 / 2.5e-04       | 668              | 323/326        |
+| `gpu-ub32` (shipped)            | 386 (5.2e-02)           | 2.3e-03    | 5.2e-03 / 4.9e-04        | 1.6e-03 / 2.3e-04       | 641              | 321/326        |
+| `gpu-no-experts-hi`             | 397 (3.2e-02)           | 1.7e-03    | 1.3e-02 / 9.5e-04        | 1.3e-03 / 2.7e-04       | 689              | 323/326        |
+| `gpu-ub32-no-experts-hi`        | 412 (1.3e-02)           | 1.7e-03    | 1.3e-02 / 9.2e-04        | 1.2e-03 / 2.7e-04       | 696              | 322/326        |
+| `gpu-moe-decode-int8`           | 422 (3.2e-02)           | 2.3e-03    | 6.8e-03 / 6.2e-04        | 1.6e-03 / 3.2e-04       | 664              | 323/326        |
+| `gpu-moe-switches-off` (before) | 425 (3.2e-02)           | 1.7e-03    | 1.3e-02 / 9.5e-04        | 1.7e-03 / 3.3e-04       | 674              | 322/326        |
+
+What the numbers say:
+
+- **`gpu-moe-switches-off` reproduces the shipped rows of the tables above**
+  (the forced selections differing, 339, 564, 242 and 425, and the first rows),
+  so the before and after here are the same measurement as there.
+- **Where the defaults are closer.** Qwen3-30B-A3B's first rows go from 3.8e-2
+  to 2.5e-4 and 1.3e-3; the forced decode rows' worst KL goes from 2.2e-3 to
+  1.0e-4 (Qwen3-30B-A3B) and 1.0e-3 to 1.1e-4 (ERNIE) on the RX 7900 XTX, and
+  from 1.9e-3 to 4.3e-4 and 1.7e-3 to 1.6e-3 on the integrated GPU; forced
+  selections differing drop by 23% to 48% on the RX 7900 XTX and 5% to 17% on
+  the integrated GPU.
+- **Every figure where the defaults measure worse** (`gpu` against
+  `gpu-moe-switches-off`, worst and mean as defined above):
+  - forced, ERNIE on the integrated GPU: the first two positions, worst 1.7e-3
+    to 2.3e-3 and mean 1.3e-3 to 1.4e-3, as the outlier quantizer's own
+    measurement found (the int8 dense prefill GEMM sets them there);
+  - forced, Qwen3-30B-A3B on the RX 7900 XTX: the widest margin of a differing
+    selection 6.0e-4 to 1.7e-3, and top-1 agreement 319 to 318;
+  - forced, ERNIE on the RX 7900 XTX: top-1 agreement 323 to 321;
+  - unforced, Qwen3-30B-A3B on the RX 7900 XTX: selections differing 974 to
+    1075, top-1 318 to 314, decode KL worst 4.75e-3 to 1.06e-2 and mean 1.36e-3
+    to 1.41e-3, prefill mean 1.0e-3 to 1.2e-3, widest margin 1.7e-2 to 2.2e-2;
+  - unforced, Qwen3-30B-A3B on the integrated GPU: prefill worst 2.25e-2 to
+    3.83e-2 and mean 2.4e-3 to 2.6e-3, top-1 313 to 312;
+  - unforced, ERNIE on the RX 7900 XTX: prefill mean 9.7e-4 to 1.0e-3, widest
+    margin 6.5e-3 to 9.1e-3;
+  - unforced, ERNIE on the integrated GPU: the first two positions, worst 4.8e-3
+    to 6.4e-3 and mean 3.3e-3 to 3.6e-3, decode mean 1.4e-3 to 1.5e-3, widest
+    margin 5.2e-2 to 1.4e-1.
+
+  Every other figure in the tables is level or closer. The unforced ones move
+  both ways across models and GPUs (unforced top-1 is better with the defaults
+  on ERNIE on both GPUs, 324 to 325 and 322 to 323), as near ties falling
+  differently would.
+
+  How much of that is the metric and how much the change was then measured: the
+  same parameter settings at the shipped prefill chunk height and at 32-row
+  chunks, unforced, differ by up to 182 selections, 6 top-1 matches and half a
+  decade of decode worst KL (Qwen3-30B-A3B, RX 7900 XTX), although one
+  configuration run twice gives byte-identical lines. Against that spread the
+  unforced losses on Qwen3-30B-A3B on the RX 7900 XTX and on ERNIE on the
+  integrated GPU are inside it, and reverse at the other chunk height. Outside
+  it are Qwen3-30B-A3B's prefill on the integrated GPU and ERNIE's prefill mean
+  on the RX 7900 XTX (both from `quant_q8.experts_hi`) and ERNIE's widest margin
+  on the RX 7900 XTX (from `mmv_mw.moe_float`); some of those spreads are zero
+  only because a prompt shorter than 32 tokens is one chunk at either height.
+  The all-float runs, which differ at 49 to 377 selections, show an unforced
+  prefill worst KL of 5.0e-2 on Qwen3-30B-A3B on the integrated GPU, above both
+  int8 configurations: that figure follows where a near tie fell, not how close
+  the arithmetic is.
+
+These are model measurements, not table rows: the real MoE models still have no
+row (see "Not measured"), so no bound moved.
 
 ### Not covered
 

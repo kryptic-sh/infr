@@ -436,11 +436,12 @@ pub(crate) static PARAMS: &[Param] = &[
         kind: Kind::Variant,
         ty: Ty::Bool,
         axis: Axis::None,
-        doc: "experimental: on a graph with routed experts, every one-row Linear takes the \
-              dequantizing GEMVs instead of the int8 ones, exactly as kernels.vulkan.mmv_mw = \
-              false does on every graph",
-        rule: "false",
-        default: |_, _| Value::Bool(false),
+        doc: "on a graph with routed experts, every one-row Linear takes the dequantizing \
+              GEMVs instead of the int8 ones, exactly as kernels.vulkan.mmv_mw = false does on \
+              every graph",
+        rule: "true on every device: float activations keep a MoE model's routers closer to \
+               the CPU reference, at some decode speed on some devices (accuracy first)",
+        default: |_, _| Value::Bool(true),
         get: |t, _| Value::Bool(t.mmv_mw_moe_float),
         set: |t, _, v| t.mmv_mw_moe_float = v.flag(),
     },
@@ -944,11 +945,13 @@ pub(crate) static PARAMS: &[Param] = &[
         kind: Kind::Variant,
         ty: Ty::Bool,
         axis: Axis::None,
-        doc: "experimental: the routed experts' batched Q4_K/Q6_K GEMMs on the outlier \
-              quantizer, which carries a block's largest activation exactly when it stands far \
-              above the rest (quant_q8.comp's -DHI build)",
-        rule: "false",
-        default: |_, _| Value::Bool(false),
+        doc: "the routed experts' batched Q4_K/Q6_K GEMMs on the outlier quantizer, which \
+              carries a block's largest activation exactly when it stands far above the rest \
+              (quant_q8.comp's -DHI build)",
+        rule: "true on every device: plain int8 rounds a block's other activations to zero \
+               beside a massive one, which puts a MoE model's first rows far from the CPU \
+               reference (accuracy first)",
+        default: |_, _| Value::Bool(true),
         get: |t, _| Value::Bool(t.quant_q8_experts_hi),
         set: |t, _, v| t.quant_q8_experts_hi = v.flag(),
     },

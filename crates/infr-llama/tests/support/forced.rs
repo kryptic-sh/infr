@@ -395,20 +395,23 @@ pub const DIAGNOSIS_CONFIGS: &[GpuConfig] = &[
     // float in every configuration (no router dispatch of the Vulkan adapter reaches an int8
     // tier, whatever the router's dtype), so these split the int8 kernels upstream of it, at `SMALL_UBATCH` so every prefill chunk fits the small-batch MoE path. With
     // `moe.small_m` at the chunk height the routed experts take the per-row float GEMVs at every
-    // row (decode already does) and every dense `Linear` keeps its int8 kernels.
+    // row (decode already does) and every dense `Linear` keeps its int8 kernels, the decode rows'
+    // too (`mmv_mw.moe_float` off).
     GpuConfig {
         name: "gpu-ub32-moe-float",
         edit: |c| {
             c.device.ubatch = Some(SMALL_UBATCH);
             c.kernels.vulkan.moe_small_m = SMALL_UBATCH;
+            tune_off(c, "mmv_mw.moe_float");
         },
         reference_kv: None,
     },
     // The other half: the dense `Linear`s (attention, shared expert, dense FFN) off the int8
     // kernels their own switches name, the routed experts' batched prefill GEMM on int8 (it is
-    // gated on `i8_dot` alone). A device without cooperative matrices keeps its dense prefill
-    // GEMM on int8 here too: `nc_gemm_choice` picks the int8 `mmq` tile on `i8_dot` and ignores
-    // `kernels.vulkan.mmq`; only `mmq_fallback` off takes that GEMM away (the last entry).
+    // gated on `i8_dot` alone) with the plain quantizer (`quant_q8.experts_hi` off). A device
+    // without cooperative matrices keeps its dense prefill GEMM on int8 here too:
+    // `nc_gemm_choice` picks the int8 `mmq` tile on `i8_dot` and ignores `kernels.vulkan.mmq`;
+    // only `mmq_fallback` off takes that GEMM away (the last entry).
     GpuConfig {
         name: "gpu-ub32-dense-float",
         edit: dense_float_ub32,
@@ -432,18 +435,18 @@ pub const DIAGNOSIS_CONFIGS: &[GpuConfig] = &[
         },
         reference_kv: None,
     },
-    // The routed experts' batched GEMMs on the outlier quantizer (the tuning parameter
-    // `quant_q8.experts_hi`, `docs/gpu-tolerance.md`), everything else as shipped: at the shipped
-    // chunk height and at `SMALL_UBATCH`, beside `gpu` and `gpu-ub32`.
+    // The routed experts' batched GEMMs back on the plain int8 quantizer (the tuning parameter
+    // `quant_q8.experts_hi` off, `docs/gpu-tolerance.md`), everything else as shipped: at the
+    // shipped chunk height and at `SMALL_UBATCH`, beside `gpu` and `gpu-ub32`.
     GpuConfig {
-        name: "gpu-experts-hi",
-        edit: experts_hi,
+        name: "gpu-no-experts-hi",
+        edit: no_experts_hi,
         reference_kv: None,
     },
     GpuConfig {
-        name: "gpu-ub32-experts-hi",
+        name: "gpu-ub32-no-experts-hi",
         edit: |c| {
-            experts_hi(c);
+            no_experts_hi(c);
             c.device.ubatch = Some(SMALL_UBATCH);
         },
         reference_kv: None,
@@ -451,50 +454,47 @@ pub const DIAGNOSIS_CONFIGS: &[GpuConfig] = &[
     // The dense decode GEMVs on float activations, everything else as shipped:
     // `kernels.vulkan.mmv_mw = false` empties the int8 decode set (`mmv_int8_decode_dtypes`), so
     // a decode row's dense `Linear`s take the dequantizing GEMVs; a prefill chunk keeps its int8
-    // multi-row GEMVs and GEMMs, and the routed experts their int8 batched GEMM.
+    // multi-row GEMVs and GEMMs, and the routed experts their int8 batched GEMM. A model with
+    // routed experts already runs this way as shipped (`mmv_mw.moe_float`).
     GpuConfig {
         name: "gpu-dense-decode-float",
         edit: |c| c.kernels.vulkan.mmv_mw = Some(false),
         reference_kv: None,
     },
+    // A routed-expert model's one-row `Linear`s back on the int8 decode GEMVs (the tuning
+    // parameter `mmv_mw.moe_float` off), everything else as shipped; a dense model runs exactly
+    // what `gpu` runs (`gpu_seam_tolerance_moe_decode_float_reaches_moe_models_only`).
     GpuConfig {
-        name: "gpu-experts-hi-dense-decode-float",
-        edit: |c| {
-            experts_hi(c);
-            c.kernels.vulkan.mmv_mw = Some(false);
-        },
+        name: "gpu-moe-decode-int8",
+        edit: |c| tune_off(c, "mmv_mw.moe_float"),
         reference_kv: None,
     },
-    // `gpu-dense-decode-float` for a model with routed experts only (the tuning parameter
-    // `mmv_mw.moe_float`): such a model runs what that configuration runs, a dense one what `gpu`
-    // runs (`gpu_seam_tolerance_moe_decode_float_reaches_moe_models_only`).
+    // Both MoE switches off: the routed-expert configuration shipped before they went on.
     GpuConfig {
-        name: "gpu-moe-decode-float",
-        edit: moe_decode_float,
+        name: "gpu-moe-switches-off",
+        edit: |c| {
+            no_experts_hi(c);
+            tune_off(c, "mmv_mw.moe_float");
+        },
         reference_kv: None,
     },
 ];
 
-/// `gpu-experts-hi`'s edit: the tuning parameter `quant_q8.experts_hi` on.
-fn experts_hi(c: &mut EngineConfig) {
-    tune_on(c, "quant_q8.experts_hi");
+/// `gpu-no-experts-hi`'s edit: the tuning parameter `quant_q8.experts_hi` off.
+fn no_experts_hi(c: &mut EngineConfig) {
+    tune_off(c, "quant_q8.experts_hi");
 }
 
-/// `gpu-moe-decode-float`'s edit: the tuning parameter `mmv_mw.moe_float` on.
-fn moe_decode_float(c: &mut EngineConfig) {
-    tune_on(c, "mmv_mw.moe_float");
-}
-
-/// The boolean tuning parameter `key` on, at the command line's level, so no other layer of the
+/// The boolean tuning parameter `key` off, at the command line's level, so no other layer of the
 /// test environment overrides it.
-fn tune_on(c: &mut EngineConfig, key: &str) {
+fn tune_off(c: &mut EngineConfig, key: &str) {
     c.kernels
         .vulkan
         .tune
         .entries
         .push(infr_core::config::TuneEntry {
             key: key.into(),
-            value: "true".into(),
+            value: "false".into(),
             level: infr_core::config::TuneLevel::Cli,
         });
 }
@@ -505,11 +505,13 @@ fn both_float_ub32(c: &mut EngineConfig) {
     c.kernels.vulkan.moe_small_m = SMALL_UBATCH;
 }
 
-/// `gpu-ub32-dense-float`'s edit: [`vulkan_float`] with `i8_dot` left on, at [`SMALL_UBATCH`].
+/// `gpu-ub32-dense-float`'s edit: [`vulkan_float`] with `i8_dot` left on, at [`SMALL_UBATCH`], the
+/// routed experts' batched GEMM on the plain quantizer.
 fn dense_float_ub32(c: &mut EngineConfig) {
     vulkan_float(c);
     c.kernels.vulkan.i8_dot = true;
     c.device.ubatch = Some(SMALL_UBATCH);
+    no_experts_hi(c);
 }
 
 /// The three-way measurement on one model: CPU production against the CPU reference, then each

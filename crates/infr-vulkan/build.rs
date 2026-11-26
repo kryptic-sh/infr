@@ -2947,8 +2947,8 @@ fn main() {
         ),
         ("quant_q8", "quant_q8_gather", &["-DGATHER"]),
         // The routed experts' outlier quantizer and the expert GEMMs that read it (tuning
-        // parameter `quant_q8.experts_hi`, off by default): quant_q8.comp's `-DHI` doc. Q4_K and
-        // Q6_K, every resident expert tile.
+        // parameter `quant_q8.experts_hi`): quant_q8.comp's `-DHI` doc. Q4_K and Q6_K, every
+        // resident expert tile.
         ("quant_q8", "quant_q8_hi", &["-DHI"]),
         ("quant_q8", "quant_q8_gather_hi", &["-DGATHER", "-DHI"]),
         (

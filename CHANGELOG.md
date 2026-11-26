@@ -175,31 +175,31 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   the `ChatGenerator` methods `supports_logprobs` and `complete_with_logprobs`
   (both with defaults), `RequestCtx::{push_logprob, take_logprobs}` and
   `OaiRenderer::{token_text, token_is_hidden}`.
-- **Experimental: the Vulkan tuning parameter `quant_q8.experts_hi`** (off by
-  default; `--set kernels.vulkan.tune.quant_q8.experts_hi=true`). With it on, a
-  MoE model's batched prefill quantizes the routed experts' activations with an
-  outlier-aware int8 quantizer: a 32-element block whose largest value stands
-  over 16 times above the rest is quantized on the scale of the rest, and that
-  value's remainder is carried in f32 and added back in the expert GEMM. Q4_K
-  and Q6_K expert weights only, resident (not paged) experts only; another
-  format keeps the shipped quantizer for its stage. On Qwen3-30B-A3B it takes
-  the first two positions' KL against the CPU reference from 3.8e-2 to 2.5e-4 on
-  the RX 7900 XTX and to 1.3e-3 on the integrated GPU (`docs/gpu-tolerance.md`,
-  "The routed experts' outlier quantizer"). Decode is unchanged; pp512 is 1.1%
-  (Qwen3-30B-A3B) and 1.4% (ERNIE-4.5-21B-A3B) slower with it on (RX 7900 XTX):
-  a block that splits is marked by the sign bit of its f16 scale, so the expert
-  GEMMs read a remainder only for those blocks. `Recorder::quant_q8_with`,
-  `quant_q8_gather_with` and `matmul_mmq_experts_with` take the carried
-  remainders as an `Option`.
-- **Experimental: the Vulkan tuning parameter `mmv_mw.moe_float`** (off by
-  default; `--set kernels.vulkan.tune.mmv_mw.moe_float=true`). With it on, a
-  model with routed experts runs every one-row `Linear` (attention, shared
-  expert, LM head) on the dequantizing float GEMVs instead of the int8 ones,
-  exactly as `kernels.vulkan.mmv_mw = false` does for every model; a dense model
-  is unchanged. It brings a MoE model's decode closer to the CPU reference
-  (`docs/gpu-tolerance.md`, "(d) The dense decode GEMVs on float"); tg128 on the
-  RX 7900 XTX is unchanged on Qwen3-30B-A3B and 3.3% slower on
-  ERNIE-4.5-21B-A3B, and 18% slower on ERNIE-4.5-21B-A3B on the integrated GPU.
+- **The Vulkan tuning parameter `quant_q8.experts_hi`** (on by default, see
+  Changed). With it on, a MoE model's batched prefill quantizes the routed
+  experts' activations with an outlier-aware int8 quantizer: a 32-element block
+  whose largest value stands over 16 times above the rest is quantized on the
+  scale of the rest, and that value's remainder is carried in f32 and added back
+  in the expert GEMM. Q4_K and Q6_K expert weights only, resident (not paged)
+  experts only; another format keeps the shipped quantizer for its stage. On
+  Qwen3-30B-A3B it takes the first two positions' KL against the CPU reference
+  from 3.8e-2 to 2.5e-4 on the RX 7900 XTX and to 1.3e-3 on the integrated GPU
+  (`docs/gpu-tolerance.md`, "The routed experts' outlier quantizer"). Decode is
+  unchanged; pp512 is 1.1% (Qwen3-30B-A3B) and 1.4% (ERNIE-4.5-21B-A3B) slower
+  with it on (RX 7900 XTX; measured before the Q4_K `mmq` staging rewrite of PR
+  111, re-measurement owed): a block that splits is marked by the sign bit of
+  its f16 scale, so the expert GEMMs read a remainder only for those blocks.
+  `Recorder::quant_q8_with`, `quant_q8_gather_with` and
+  `matmul_mmq_experts_with` take the carried remainders as an `Option`.
+- **The Vulkan tuning parameter `mmv_mw.moe_float`** (on by default, see
+  Changed). With it on, a model with routed experts runs every one-row `Linear`
+  (attention, shared expert, LM head) on the dequantizing float GEMVs instead of
+  the int8 ones, exactly as `kernels.vulkan.mmv_mw = false` does for every
+  model; a dense model is unchanged. It brings a MoE model's decode closer to
+  the CPU reference (`docs/gpu-tolerance.md`, "(d) The dense decode GEMVs on
+  float"); tg128 on the RX 7900 XTX is unchanged on Qwen3-30B-A3B and 3.3%
+  slower on ERNIE-4.5-21B-A3B, and 18% slower on ERNIE-4.5-21B-A3B on the
+  integrated GPU.
 - **`Op::AttnTemp`** on the CPU, Vulkan and Metal backends: llama.cpp's
   position-dependent attention temperature (`llm_graph_input_attn_temp`), which
   scales each row by `ln(floor((pos + offset) / floor_scale) + 1) * scale + 1`.
@@ -707,6 +707,46 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **A MoE model on Vulkan runs closer to the CPU reference by default: the
+  tuning parameters `quant_q8.experts_hi` and `mmv_mw.moe_float` are now on** on
+  every device, integrated GPUs included (both were added off in this release
+  cycle; see Added). Both reach only a model with routed experts; a dense model
+  builds the same kernels and gets the same logits as before. With both on, the
+  tolerance harness's forced runs (the reference's tokens and expert selections,
+  three prompts) measure against the CPU reference, before and after:
+  Qwen3-30B-A3B's first two positions from KL 3.8e-2 to 2.5e-4 on the RX 7900
+  XTX and to 1.3e-3 on the integrated GPU; its decode rows from a worst KL of
+  2.2e-3 to 1.0e-4 (RX 7900 XTX) and 1.9e-3 to 4.3e-4 (integrated GPU);
+  ERNIE-4.5-21B-A3B's decode rows from 1.0e-3 to 1.1e-4 and its prefill rows
+  from 3.6e-3 to 8.8e-4 (RX 7900 XTX). Expert selections that differ from the
+  reference's fall from 339 to 262 of 15312 (Qwen3-30B-A3B) and 242 to 126 of
+  8802 (ERNIE) on the RX 7900 XTX, 564 to 467 and 425 to 405 on the integrated
+  GPU. Where the defaults measure worse (all figures in `docs/gpu-tolerance.md`,
+  "On by default"): forced, ERNIE's first two positions on the integrated GPU
+  (worst 1.7e-3 to 2.3e-3, mean 1.3e-3 to 1.4e-3; its int8 dense prefill GEMM
+  sets them), Qwen3-30B-A3B's widest margin of a differing selection on the RX
+  7900 XTX (6.0e-4 to 1.7e-3) and top-1 agreement on the RX 7900 XTX (319 to 318
+  on Qwen3-30B-A3B, 323 to 321 on ERNIE); unforced, where a run takes the
+  reference's tokens but its own routers' selections, so a router near a tie
+  carries a different expert into every later position, Qwen3-30B-A3B on the RX
+  7900 XTX (selections differing 974 to 1075, top-1 318 to 314, decode worst KL
+  4.75e-3 to 1.06e-2) and smaller moves on both models and GPUs listed in that
+  section. The known cost, from the earlier measurement in
+  `docs/gpu-tolerance.md` ("Speed"): 1.1% (Qwen3-30B-A3B) and 1.4% (ERNIE) of
+  pp512 on the RX 7900 XTX for `quant_q8.experts_hi`, measured before the Q4_K
+  `mmq` staging rewrite of PR 111 (below), re-measurement owed (not timed on the
+  integrated GPU), and for `mmv_mw.moe_float` 3.3% of ERNIE-4.5-21B-A3B's tg128
+  on the RX 7900 XTX and 18.4% on the integrated GPU (Qwen3-30B-A3B's tg128
+  unchanged on the RX 7900 XTX, not timed on the integrated GPU). Turn either
+  off with `--set kernels.vulkan.tune.quant_q8.experts_hi=false` /
+  `INFR_TUNE=quant_q8.experts_hi=false`, or
+  `--set kernels.vulkan.tune.mmv_mw.moe_float=false` /
+  `INFR_TUNE=mmv_mw.moe_float=false`. Not run on Windows, NVIDIA or Intel, where
+  both switch on as well. The tolerance harness's diagnosis configurations now
+  hold the off side (`gpu-no-experts-hi`, `gpu-ub32-no-experts-hi`,
+  `gpu-moe-decode-int8`, `gpu-moe-switches-off`) in place of `gpu-experts-hi`,
+  `gpu-ub32-experts-hi`, `gpu-experts-hi-dense-decode-float` and
+  `gpu-moe-decode-float`.
 - **Faster Q4_K prefill on the int8 `mmq` kernels** (`native_gemm_mmq_q4k`, the
   dense tier without matrix units and every batched MoE expert GEMM). A block's
   activations, scales and weight nibbles are staged with 16-byte loads instead

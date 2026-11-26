@@ -34,9 +34,7 @@ Provenance tags point at the finding that opened the item:
    is refused at load when the weights stream and the host tier sizes itself
    (read from code only).
 2. **Plan 14 slices L and W** (placement label; bounded wait at start-up).
-3. **The default flips decided in B-DECISIONS-2026-11-26**
-   (`quant_q8.experts_hi`, `mmv_mw.moe_float`) are not built.
-4. Then B-DECISIONS-2026-11-25 from item 3 on.
+3. Then B-DECISIONS-2026-11-25 from item 3 on.
 
 PR #110 (Gemma 4 image input) waits on its contributor's rework: B-IMAGE-INPUT.
 
@@ -48,33 +46,75 @@ scalar); the NextN block's entry is held to the attention blocks' count, which
 no real file has confirmed; Metal's coupled-f16 clamp moved into the resolver
 unrun on Metal; the rope grid change was not measured for prefill.
 
-Not verified in the slice pushed as `54448f08`: the pipeline, tensor-parallel
-and expert-parallel paths with `mmv_mw.moe_float` on (only the shared cut,
-`multi::segment`, is tested); the layer-span mark in the seam's graph builder;
-the MTP draft head keeps int8 GEMVs with the switch on (a choice, not checked
-for effect on acceptance); nothing ran on Windows or Metal.
+Not verified for `mmv_mw.moe_float`, now on by default (slice `54448f08` and the
+default flip after it): the pipeline and tensor-parallel paths refuse a MoE
+model (`dense_multi_gpu_guard`), so the switch cannot reach them; the
+expert-parallel path was exercised only (Qwen3-30B-A3B, two ranks on the RX 7900
+XTX and the integrated GPU: the same 40 greedy tokens as a single-device run,
+with the switch on and off), not checked for which kernels its segments build;
+`expert_parallel_matches_single_device` skipped for host memory, and
+ERNIE-4.5-21B-A3B is refused by expert parallelism (shared expert). The
+layer-span mark in the seam's graph builder is read by code only: a layer span
+is a prefill, which the switch does not touch unless it is an MTP verify batch.
+The MTP draft head keeps int8 GEMVs with the switch on (a choice, not checked
+for effect on acceptance). Nothing ran on Windows or Metal.
 
 ### B-DECISIONS-2026-11-26 — owner's decisions on the MoE switches and accuracy (2026-11-26)
 
-**Kind:** decisions taken, with the work each one queues. Nothing here is built
-yet.
+**Kind:** decisions taken, with the work each one queues. The two default flips
+are built (both parameters on by default, `docs/gpu-tolerance.md`, "On by
+default"); what is below is not.
 
 - **Rule: accuracy first.** A performance change is accepted only with no
   accuracy drawback; fast and wrong is not an option (now in `AGENTS.md`, "What
   to work on"). The decisions below follow from it.
-- **`quant_q8.experts_hi` goes on by default for MoE models.** It takes the
-  first rows of Qwen3-30B-A3B from KL 3.8e-2 to 2.5e-4 against the CPU reference
-  for about 1% of MoE prefill (measured on the RX 7900 XTX; the integrated GPU's
-  accuracy rows are in `docs/gpu-tolerance.md`). To do: flip the default in
-  `tuning/families.rs`, regenerate the snapshots, move the tolerance table's MoE
-  rows to the new default, changelog. Not measured on Windows, NVIDIA or Intel,
-  where it also switches on: ask the Windows session for the parity tests and a
-  prefill A/B once it lands.
-- **`mmv_mw.moe_float` goes on by default everywhere**, integrated GPUs
-  included, although ERNIE-21B lost 18.4% of tg128 there (3.3% on the RX 7900
-  XTX; Qwen3-30B-A3B lost nothing). Accuracy over speed. To do: flip the
-  default, snapshots, tolerance rows, changelog; then look for the speed (a
-  faster float GEMV for the integrated GPU's decode) without going back to int8.
+- **Not run where the two defaults also switch on: Windows, NVIDIA, Intel.** Ask
+  the Windows session for the parity tests (`moe_ffn_batched_experts_hi_switch`,
+  `moe_decode_float_switch`,
+  `gpu_seam_tolerance_moe_decode_float_reaches_moe_models_only`) and the MoE
+  models' `measure_gpu_tolerance` on both its GPUs; NVIDIA and Intel have no box
+  here. The decode and prefill cost was not re-timed with the flip: the figures
+  are the earlier A/B's (ERNIE-21B tg128 -18.4% on the integrated GPU, -3.3% on
+  the RX 7900 XTX; pp512 -1.1% and -1.4%, measured before the PR #111 staging
+  rewrite, item 9 of B-PR-AUDIT-2026-11-26); a quiet-window A/B of the shipped
+  build against both parameters off is owed.
+- **Win back the integrated GPU's decode speed with `mmv_mw.moe_float` on** (a
+  faster float GEMV for its decode), without going back to int8.
+- **MoE families that now get both defaults and were never measured with them:**
+  DiffusionGemma (its denoise canvas runs the batched MoE arm on every step, and
+  its denoise loop amplifies numeric noise into different tokens), gemma4moe
+  (gemma-4-26B-A4B), Qwen3.6-MoE (`qwen35moe`) and llama4. None has a GGUF in
+  the local HF cache (checked 2026-11-26: the cached gemma-4 files are the dense
+  12B and E2B, the Qwen3.5 files the dense 0.8B and 4B-MTP). Needed: a Q4_K_M
+  (Q4_K/Q6_K experts, so the outlier build is reached) of each, then
+  `measure_gpu_tolerance` with `INFR_TOL_ONLY=gpu,gpu-ub32,gpu-moe-switches-off`
+  on both GPUs, forced and unforced; for DiffusionGemma also its own
+  bit-identity and denoise checks with both parameters off against on.
+- **MTP verify on a MoE model with `mmv_mw.moe_float` on (read from code, not
+  run):** `quant_linear` (adapter) drops the int8 `mrow` tiers for a verify
+  batch of a routed-expert graph
+  (`!(graph.mtp_verify && moe_decode_float(..))`), and above 8 rows there is no
+  dequantizing `mrow`, so a verify batch of 9 to 16 rows falls to the GEMM tier
+  (the int8 `mmq` tile on a device without cooperative matrices) while one-row
+  decode runs the float GEMVs: the decode/verify mismatch `mrow_int8_dtype_ok`'s
+  doc warns flips greedy tokens. Dormant while MTP is parked; resolve before MTP
+  is un-parked for MoE models (a float GEMM or float multi-row tier for verify
+  on such graphs, or a cap on the verify height).
+- **No gated tolerance row exercises either default.** The real MoE models have
+  no table row, and the synthetic MoE (`synthetic_moe`) has f32 experts and
+  takes no batched prefill, so neither the outlier quantizer (Q4_K/Q6_K resident
+  experts, batched prefill above `moe.small_m`) nor the float decode switch
+  (one-row quantized `Linear`s at int8-GEMV size) is reached by the gate. A row
+  needs either a real MoE model in the gate (Int8 and Float rows for
+  Qwen3-30B-A3B or ERNIE-4.5-21B-A3B, set from both GPUs' shipped figures in
+  `docs/gpu-tolerance.md`, "On by default", and the gate's time: about 70 s
+  forced per model on the RX 7900 XTX, 250 s on the integrated GPU), or a
+  synthetic MoE with Q4_K experts, a batched prefill and quantized dense
+  projections large enough for the int8 decode GEMVs, with a planted bug that
+  shows each row can go red.
+- **ERNIE-21B's first rows on the integrated GPU are worse with the outlier
+  quantizer** (forced worst 1.7e-3 to 2.3e-3; its int8 dense prefill GEMM sets
+  them). Not investigated.
 - **The remaining routing gap is to be investigated and closed, on CPU and
   GPU.** After both switches roughly 260 expert selections on Qwen3-30B-A3B
   still differ from the reference where an all-float run differs at 13 to 20,
@@ -90,6 +130,27 @@ yet.
   range and releases its pages to the OS until needed again. That needs the
   shrinkable arena from plan 15 (slice R3) first, so D follows R3, or drops the
   tier with a log line until R3 exists.
+
+- **How to read the unforced (own-routing) figures, measured 2026-11-26.** A run
+  that picks its own experts is deterministic (two processes gave byte-identical
+  scored lines), but its figures move between configurations of equal accuracy
+  by where a router near a tie falls. Between the shipped prefill chunk height
+  and 32-row chunks, under the same parameter settings, Qwen3-30B-A3B on the RX
+  7900 XTX moved by up to 182 differing selections, 6 top-1 matches and half a
+  decade of decode worst KL; the all-float runs, which differ at 49 to 377
+  selections, still show a prefill worst KL of 5.0e-2 on the integrated GPU,
+  above both int8 defaults. So a one-run unforced comparison of two settings is
+  weak evidence. Old defaults against new, the unforced losses were inside that
+  spread on Qwen3-30B-A3B (RX 7900 XTX) and ERNIE-21B (integrated), and reversed
+  at the other chunk height. Outside it, all small: Qwen3-30B-A3B on the
+  integrated GPU, prefill worst 2.25e-2 to 3.83e-2 and mean 2.38e-3 to 2.62e-3
+  (`quant_q8.experts_hi`); ERNIE-21B on the RX 7900 XTX, prefill mean 9.69e-4 to
+  1.04e-3 (`quant_q8.experts_hi`) and widest differing margin 6.5e-3 to 9.1e-3
+  (`mmv_mw.moe_float`); some of those spreads are zero only because a prompt
+  shorter than 32 tokens is one chunk at either height. First rows went from
+  8.3e-2 to about 5e-3 on Qwen3-30B-A3B on both GPUs. To do: a scoring of
+  unforced runs that is not hostage to one tie (several prompts and chunk
+  heights, reported as a distribution) before the next default is judged on it.
 
 ### B-REFERENCE-CACHE — what slice 1 of the reference cache left (2026-11-26)
 
@@ -477,38 +538,42 @@ Queue order (the owner's): MoE routing first, then the rest in the order below.
 2. **MoE routing: keep int8, fix the GPU activation quantizer (B207).** The
    slice ran 2026-11-25 (`docs/gpu-tolerance.md`, "The routed experts' outlier
    quantizer"): f32 block scales and sums change nothing; carrying each
-   32-block's outlier exactly fixes the first rows, and is built as the
-   experimental Vulkan tuning parameter `quant_q8.experts_hi` (off). It takes
-   Qwen3-30B-A3B's first rows from 3.8e-2 to 2.5e-4 (RX 7900 XTX) and 1.3e-3
-   (integrated GPU) and lowers the forced KL on the RX 7900 XTX, but leaves the
-   routing gap: forced, the selections differing fall by 1% to 21%
-   (Qwen3-30B-A3B on the RX 7900 XTX: 339 to 318), where the Float runs differ
-   at only 13 to 20 selections. The dense decode GEMVs on float
+   32-block's outlier exactly fixes the first rows, and is built as the Vulkan
+   tuning parameter `quant_q8.experts_hi` (built off; on by default since
+   2026-11-26). It takes Qwen3-30B-A3B's first rows from 3.8e-2 to 2.5e-4 (RX
+   7900 XTX) and 1.3e-3 (integrated GPU) and lowers the forced KL on the RX 7900
+   XTX, but leaves the routing gap: forced, the selections differing fall by 1%
+   to 21% (Qwen3-30B-A3B on the RX 7900 XTX: 339 to 318), where the Float runs
+   differ at only 13 to 20 selections. The dense decode GEMVs on float
    (`kernels.vulkan.mmv_mw = false`, measured, not built as a MoE-only switch)
    take 7% to 19% off the selections differing and 5% to 44% off the mean KL.
    Timed on the RX 7900 XTX (the doc's Speed tables): the parameter costs 8.7%
    of pp512 on Qwen3-30B-A3B and 8.0% on ERNIE-21B-A3B; float dense decode GEMVs
    cost nothing on Qwen3-30B-A3B (+0.4%) and 3.4% of tg128 on ERNIE. **Decided
-   2026-11-25:** (i) `quant_q8.experts_hi` stays off; make the remainder load
-   cheaper and re-time; (ii) build a MoE-only float dense decode switch, default
-   off. **Both built 2026-11-25** (the doc's Speed section and "(d)"): (i) a
-   split block is now marked by the sign bit of its f16 scale, so the expert
-   GEMMs read a remainder only for marked blocks; output is bit-identical to the
-   first build's, and pp512 now costs 1.1% on Qwen3-30B-A3B and 1.4% on ERNIE
-   (was 8.7% and 8.0%; RX 7900 XTX), what is left mostly the quantizer's two
-   extra reductions. (ii) is the tuning parameter `mmv_mw.moe_float` (harness
-   configuration `gpu-moe-decode-float`): on a MoE model it runs exactly what
-   `mmv_mw = false` runs, so its accuracy rows are `gpu-dense-decode-float`'s;
-   tg128 +0.2% on Qwen3-30B-A3B and -3.3% on ERNIE on the RX 7900 XTX, -18.4% on
-   ERNIE on the integrated GPU (Qwen3-30B-A3B not timed there). **The owner
-   decides both defaults:** `quant_q8.experts_hi` (first rows 3.8e-2 to 2.5e-4
-   on Qwen3-30B-A3B for about 1% of prefill) and `mmv_mw.moe_float` (7% to 19%
-   fewer forced selections differing, free on Qwen3-30B-A3B's decode, 3% of
-   ERNIE's on the RX 7900 XTX and 18% on the integrated GPU; a device-specific
-   default is possible, it is a tuning parameter). Still open: (iii) whether the
-   routing gap is worth more (the simulation's only lever was finer blocks, 8
-   elements: about 40% fewer selections differing, a change to every int8 kernel
-   family). The real MoE rows of the tolerance table still wait for these.
+   2026-11-25 (superseded 2026-11-26, both on):** (i) `quant_q8.experts_hi`
+   stays off; make the remainder load cheaper and re-time; (ii) build a MoE-only
+   float dense decode switch, default off. **Both built 2026-11-25** (the doc's
+   Speed section and "(d)"): (i) a split block is now marked by the sign bit of
+   its f16 scale, so the expert GEMMs read a remainder only for marked blocks;
+   output is bit-identical to the first build's, and pp512 now costs 1.1% on
+   Qwen3-30B-A3B and 1.4% on ERNIE (was 8.7% and 8.0%; RX 7900 XTX; measured
+   before the PR #111 staging rewrite, re-measurement owed), what is left mostly
+   the quantizer's two extra reductions. (ii) is the tuning parameter
+   `mmv_mw.moe_float` (harness configuration `gpu-moe-decode-float`): on a MoE
+   model it runs exactly what `mmv_mw = false` runs, so its accuracy rows are
+   `gpu-dense-decode-float`'s; tg128 +0.2% on Qwen3-30B-A3B and -3.3% on ERNIE
+   on the RX 7900 XTX, -18.4% on ERNIE on the integrated GPU (Qwen3-30B-A3B not
+   timed there). **The owner decided both defaults on (2026-11-26, built):**
+   `quant_q8.experts_hi` (first rows 3.8e-2 to 2.5e-4 on Qwen3-30B-A3B for about
+   1% of prefill) and `mmv_mw.moe_float` (7% to 19% fewer forced selections
+   differing, free on Qwen3-30B-A3B's decode, 3% of ERNIE's on the RX 7900 XTX
+   and 18% on the integrated GPU; a device-specific default is possible, it is a
+   tuning parameter). Still open: (iii) whether the routing gap is worth more
+   (the simulation's only lever was finer blocks, 8 elements: about 40% fewer
+   selections differing, a change to every int8 kernel family). The real MoE
+   models still have no tolerance table row; with the defaults decided, rows can
+   be set from the shipped configuration's figures (`docs/gpu-tolerance.md`, "On
+   by default"), not done.
 3. **`kv.overflow` without `VK_EXT_memory_budget`.** Stays off there
    (`kv_spill_armed`). Add a one-line load warning that the flag has no effect
    on this driver and why.
@@ -8303,14 +8368,14 @@ values. What it leaves:
     2.5e-4) and lowers the forced KL; (c) 16- and 8-element blocks only shrink
     the first rows (9.4e-3, 3.4e-3) but are the one lever on the routing gap (8
     elements: 314 to 188 selections differing on Qwen3-30B-A3B). (a) is built
-    behind the tuning parameter `quant_q8.experts_hi` (off):
-    `quant_q8.comp -DHI` and the Q4_K/Q6_K resident expert tiles `-DACT_HI`,
-    switched in `Op::MoeFfn`'s resident batched arm. Left: the prefill and
-    decode A/B (commands in the doc); the paged expert path (`_xpg`) and the
-    other expert formats keep the shipped quantizer; the integrated GPU's int8
-    dense prefill GEMM (`nc_gemm_choice`'s `mmq` tile), the larger share of that
-    device's gap, has no outlier handling, nor do the dense decode GEMVs;
-    Windows has run none of it. The ratio (16, the CPU's) is a trade the
+    behind the tuning parameter `quant_q8.experts_hi` (on by default since
+    2026-11-26): `quant_q8.comp -DHI` and the Q4_K/Q6_K resident expert tiles
+    `-DACT_HI`, switched in `Op::MoeFfn`'s resident batched arm. Left: the
+    prefill and decode A/B (commands in the doc); the paged expert path (`_xpg`)
+    and the other expert formats keep the shipped quantizer; the integrated
+    GPU's int8 dense prefill GEMM (`nc_gemm_choice`'s `mmq` tile), the larger
+    share of that device's gap, has no outlier handling, nor do the dense decode
+    GEMVs; Windows has run none of it. The ratio (16, the CPU's) is a trade the
     simulation puts close: 8 takes a little more of the steady KL.
   - **Decode and prefill cost of the float alternatives: timed once, not in a
     quiet window** (`docs/gpu-tolerance.md`, "Cost"). A quiet window is still
@@ -8326,7 +8391,7 @@ values. What it leaves:
     activations make the other 31 elements of their 32-block quantize to 0 in
     the routed experts' activations. Fixed with `quant_q8.experts_hi` on (2.5e-4
     and 1.3e-3, the rest on the integrated GPU being its int8 dense prefill
-    GEMM); shipped still has it until the owner turns it on.
+    GEMM); on by default since 2026-11-26, so the shipped path no longer has it.
   - **The CPU production path is far from the reference on both MoE models**:
     forced along the reference's routing, 1003 (ERNIE) and 1135 (Qwen3-30B-A3B)
     selections differ, at margins up to 1.5e-2 and 1.8e-2, and the worst KL from

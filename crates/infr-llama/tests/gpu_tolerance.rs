@@ -296,15 +296,17 @@ fn gpu_seam_tolerance_float_runs_build_no_int8_kernel() {
     }
 }
 
-/// `gpu-moe-decode-float` (the tuning parameter `mmv_mw.moe_float`) changes a routed-expert
-/// model's one-row `Linear`s and nothing else: on ERNIE-4.5-21B-A3B it builds exactly the kernels
+/// The tuning parameter `mmv_mw.moe_float`, on as shipped, changes a routed-expert model's one-row
+/// `Linear`s and nothing else: on ERNIE-4.5-21B-A3B the shipped run builds exactly the kernels
 /// `gpu-dense-decode-float` (`kernels.vulkan.mmv_mw = false`) builds and gives the same logits
-/// bits; on Qwen3-0.6B (dense) it builds the shipped kernels and gives the shipped bits. Each
-/// model also shows `gpu-dense-decode-float` building other kernels than the shipped run, so
-/// neither comparison passes by the switches doing nothing; where the shipped run builds no int8
-/// dense decode GEMV (`gemv.kq_fma` on), the switches have nothing to turn off and the test asserts
-/// that they change no kernel instead. Without either model, or with either
-/// unable to run on the device, the whole test is skipped, saying so.
+/// bits; on Qwen3-0.6B (dense) it builds the kernels of `gpu-moe-decode-int8` (the parameter off)
+/// and gives its bits. Whether this device runs int8 decode GEMVs at all is read off the dense
+/// model's shipped run, which neither switch reaches: where it builds one, each model's
+/// `gpu-moe-decode-int8` run must build one too and `gpu-dense-decode-float` must build other
+/// kernels, so neither comparison passes by an edit doing nothing; where it builds none
+/// (`gemv.kq_fma` on), the switches have nothing to turn off and the test asserts that they change
+/// no kernel instead. Without either model, or with either unable to run on the device, the whole
+/// test is skipped, saying so.
 #[test]
 #[ignore = "needs Qwen3-0.6B and ERNIE-4.5-21B-A3B Q4_K_M and a Vulkan GPU"]
 fn gpu_seam_tolerance_moe_decode_float_reaches_moe_models_only() {
@@ -320,7 +322,8 @@ fn gpu_seam_tolerance_moe_decode_float_reaches_moe_models_only() {
     // Both models or neither: a run with one of them checks only half of the claim. A missing
     // model fails the test under `INFR_TEST_REQUIRE_MODELS` (`forced::open_or_skip`).
     let mut cases = Vec::new();
-    for (key, moe) in [("ernie-21b-moe", true), ("qwen3-0.6b", false)] {
+    // The dense model first: its shipped run says whether this device has int8 decode GEMVs.
+    for (key, moe) in [("qwen3-0.6b", false), ("ernie-21b-moe", true)] {
         let Some(case) = forced::open_or_skip(key) else {
             eprintln!("SKIPPED, the whole test: {key} is needed for its half of the check");
             return;
@@ -331,6 +334,12 @@ fn gpu_seam_tolerance_moe_decode_float_reaches_moe_models_only() {
         }
         cases.push((key, moe, case));
     }
+    let int8_gemv = |kernels: &[&str]| {
+        kernels
+            .iter()
+            .any(|k| k.starts_with(INT8_DENSE_DECODE_GEMV))
+    };
+    let mut int8_decode = None;
     for (key, moe, case) in &cases {
         let (key, moe) = (*key, *moe);
         // The prompt, then its own first tokens forced: every run feeds the same sequence, and
@@ -358,39 +367,44 @@ fn gpu_seam_tolerance_moe_decode_float_reaches_moe_models_only() {
         };
         let shipped = run(None);
         let dense_float = run(Some("gpu-dense-decode-float"));
-        let moe_float = run(Some("gpu-moe-decode-float"));
+        let moe_int8 = run(Some("gpu-moe-decode-int8"));
         eprintln!(
-            "{key}: shipped {:?}\n  dense decode float {:?}\n  MoE decode float {:?}",
-            shipped.1, dense_float.1, moe_float.1
+            "{key}: shipped {:?}\n  dense decode float {:?}\n  MoE decode int8 {:?}",
+            shipped.1, dense_float.1, moe_int8.1
         );
-        if shipped
-            .1
-            .iter()
-            .any(|k| k.starts_with(INT8_DENSE_DECODE_GEMV))
-        {
+        if !moe {
+            int8_decode = Some(int8_gemv(&shipped.1));
+        }
+        let int8_decode = int8_decode.expect("the dense model runs first");
+        if int8_decode {
+            assert!(
+                int8_gemv(&moe_int8.1),
+                "{key}: the parameter-off run built no int8 decode GEMV where the dense model's \
+                 shipped run does: the off edit did not take effect"
+            );
             assert_ne!(
-                dense_float.1, shipped.1,
+                dense_float.1, moe_int8.1,
                 "{key}: mmv_mw = false changed no kernel, so this check cannot fail"
             );
         } else {
             // The fp32 decode GEMVs (`gemv.kq_fma`) already serve every one-row Linear here.
             eprintln!(
-                "{key}: the shipped run builds no int8 dense decode GEMV: `mmv_mw = false` has \
-                 nothing to turn off here, so it must change no kernel"
+                "{key}: the dense model's shipped run builds no int8 decode GEMV on this device: \
+                 `mmv_mw = false` has nothing to turn off here, so it must change no kernel"
             );
             assert_eq!(
-                dense_float.1, shipped.1,
+                dense_float.1, moe_int8.1,
                 "{key}: mmv_mw = false changed kernels on a run with no int8 dense decode GEMV"
             );
         }
-        let want = if moe { &dense_float } else { &shipped };
+        let want = if moe { &dense_float } else { &moe_int8 };
         assert_eq!(
-            moe_float.1, want.1,
-            "{key}: mmv_mw.moe_float built other kernels"
+            shipped.1, want.1,
+            "{key}: mmv_mw.moe_float (shipped on) built other kernels"
         );
         assert!(
-            moe_float.0 == want.0,
-            "{key}: mmv_mw.moe_float changed the logits bits"
+            shipped.0 == want.0,
+            "{key}: mmv_mw.moe_float (shipped on) changed the logits bits"
         );
     }
 }

@@ -26,6 +26,66 @@ Provenance tags point at the finding that opened the item:
 
 ## Open
 
+### B-PARKED-KQ-FMA-KAHAN — the fp32 K-quant GEMM's accuracy fix is parked on a branch (2026-11-27)
+
+**Kind:** work in progress, parked at a wrap-up; not reviewed, not on `main`.
+
+**Branch:** `wip/kq-fma-compensated-sum` (one commit on top of `2feb0ad6`).
+
+**What it is.** The cause of `native_gemm_kq_fma` sitting further from the
+reference than the per-row GEMV (B-KQ-FMA-GEMM-UNVERIFIED, plan 16 "Found on the
+way") was found: the tile summed each output in one f32 FMA running sum over the
+whole `k` range. Its output equals a host emulation of that sum bit for bit on
+all 52 of gemma-3's Linears, and per op it was about seven times further from an
+f64 reference than the GEMV. Dequantization, FMA contraction and other kernels
+were each ruled out by a measurement. The branch Kahan-adds each 32-element
+partial into the running sum in `native_gemm_kq_fma.comp`, and sums the split-K
+slices with a compensated build of `splitk_reduce.comp` (`-DKAHAN`, kernel
+`splitk_reduce_kahan`); the plain reduce the coopmat split-K path uses is
+byte-identical SPIR-V to `main`'s.
+
+**Figures on the branch** (the coder's, not re-run by the orchestrator;
+`INFR_NO_COOPMAT=1`, worst KL of the float run, gemma-3-1b): integrated GPU
+2.65e-3 to 3.38e-4, RX 7900 XTX 1.74e-3 to 1.51e-4, against 7.1e-4 for the
+per-row GEMV and a bound of 1.8e-3. Per op the fixed tile is at or below the
+GEMV's RMS error on every Linear measured (gemma-3 52 of 52, Qwen3-0.6B 196 of
+196), direct and at 2, 4 and 8 split-K slices. gemma-3's Int8 row with the
+parameter on still fails (the f32/int8 mix), further out than before (about 1.2
+against a bound of 0.52), so `gemm.kq_fma` stays default off on the branch.
+
+**Verified on the branch by the coder:** fmt, workspace clippy and the Apple and
+Windows clippy for infr-vulkan, doc, nextest (1814 passed), the infr-vulkan lib
+tests with ignored ones on both GPUs (365 passed each), `nc_gemm_parity` (6
+passed each), the tolerance gate at defaults on the RX 7900 XTX (14 of 14), the
+forced float gate with the parameter on (every model passes but gemma-3's Int8
+row). New tests seen red against the old kernel.
+
+**Left to do:**
+
+1. The tolerance gate at defaults on the integrated GPU: stopped at 4 of 14, all
+   passing.
+2. A reviewer who has not seen the coder's report, then the orchestrator's own
+   gate on both GPUs, then merge to `main` (rebase onto whatever `main` is by
+   then: the branch edits `CHANGELOG.md`, `docs/backlog.md`,
+   `docs/gpu-tolerance.md` and `docs/plan/16-float-lineup.md`, which will
+   conflict with this entry and anything added since; this entry is deleted in
+   that merge).
+3. No speed figure exists: the tile holds a second accumulator set per thread
+   and does three more adds per 32 FMAs, and the compensated reduce three more
+   adds per plane. A quiet-window A/B before the parameter is recommended to
+   anyone for speed.
+4. The branch's backlog adds B-SPLITK-REDUCE-KAHAN (the coopmat split-K path
+   could take the compensated reduce: needs tolerance rows on both GPUs and a
+   speed A/B).
+
+**Order of work agreed with the owner on 2026-11-27**, after this slice: plan
+18's T0 (measure where a test run's time goes) and T1 to T3 (keep a backend
+alive across test runs); then B-PIPELINE-CACHE-PER-SHADER if T0's figures
+justify it; then the float lineup (plan 16). The serve slices of plan 18 follow
+unless the owner moves them up. Two of plan 18's open decisions gate T1 and are
+unanswered: the gate's loop order (decision 12) and the CI default of the reuse
+switch (decision 15); the plan recommends turning the loop around and `verify`.
+
 ### B-HANDOFF-2026-11-26 — where the session of 2026-11-25/26 stopped
 
 **Kind:** work raised and not finished, in the order it should be picked up.
@@ -236,6 +296,62 @@ default"); what is below is not.
   8.3e-2 to about 5e-3 on Qwen3-30B-A3B on both GPUs. To do: a scoring of
   unforced runs that is not hostage to one tie (several prompts and chunk
   heights, reported as a distribution) before the next default is judged on it.
+
+### B-PIPELINE-CACHE-PER-SHADER — plan a pipeline cache that survives a shader edit (2026-11-27)
+
+**Kind:** a plan to write, raised by the owner; nothing designed in detail or
+built. Decide whether to build from plan 18's T0 measurement.
+
+The on-disk `vkPipelineCache` (`crates/infr-vulkan/src/pcache.rs`, one file per
+device under the cache directory) is keyed on `SHADER_SET_FINGERPRINT`, a hash
+over every compiled SPIR-V blob, so changing one shader discards the whole file
+and every pipeline is compiled again. That is deliberate (entries of retired
+variants would otherwise accumulate), but every kernel slice then starts cold.
+What it costs is not measured for the tests: the module's doc records about 5 s
+of pipeline creation for one cold DiffusionGemma forward, and Mesa's own shader
+cache softens a cold start.
+
+To write as `docs/plan/NN-…`, if T0 (plan 18: backend creation, weight upload,
+pipeline creation warm and cold, and the run, per forced run) shows pipeline
+creation is worth it:
+
+- **One entry per pipeline** (or per shader family: to settle in the plan),
+  keyed by that kernel's SPIR-V content and everything else that decides the
+  binary (specialization constants, pipeline flags, driver version, the driver's
+  cache UUID, the device), merged into the in-memory cache at start-up. A
+  changed shader then misses alone.
+- **Cleanup in place of wholesale discard:** last-used age and a size cap,
+  deleting only files the cache can prove its own (the rules of plan 17's
+  reference cache).
+- **What it must hold to:** a stale binary is a hung GPU, not a wrong number
+  (the project has had a poisoned pipeline cache), so the key is stored verbatim
+  and compared on read, with a test that changes one byte of one shader and sees
+  that entry miss while the others hit; the device-loss tripwire kept, per
+  entry, naming the kernels in use; a verify mode showing results bit-identical
+  with the cache off and warm; the tolerance gate on both GPUs in both states;
+  tests that can fail for a tampered entry, each cleanup rule, two processes
+  writing at once, and a planted device loss;
+  `kernels.vulkan.pipeline_cache_disk` stays the off switch; the sealed-file
+  envelope of `infr_core::kernel_cache` reused, no new dependency.
+- **Not verifiable here:** NVIDIA, Intel and the Windows AMD driver (ask the
+  Windows session before it is trusted there). Metal's binary archive is
+  separate and out of scope.
+
+**When:** after plan 18's T0 and T1. T1 keeps a backend alive across test runs,
+which removes most repeated pipeline creation within a process and so changes
+how much this is worth; and before the float lineup's kernel slices (plan 16, S3
+on), which edit shaders in every slice.
+
+### B-SERVER-PANIC-GAUGE-FLAKE — `streaming_panic_is_reported_as_a_failure` failed once (2026-11-27)
+
+**Kind:** flaky test, not diagnosed. In a full
+`INFR_DEV=Vulkan1 cargo nextest run --workspace --locked`, the infr-server test
+`tests::streaming_panic_is_reported_as_a_failure` failed once on its assertion
+that the slot gauge is released by the unwind (gauge 1, expected 0). It passed
+five times alone and in the next full run (1814 of 1814). The guess, untested:
+the assertion reads the gauge before the panicking stream task's unwind has
+dropped its slot, a race with the runtime's worker thread. The change under test
+that day touched only Vulkan kernels.
 
 ### B-REFERENCE-CACHE — what slice 1 of the reference cache left (2026-11-26)
 

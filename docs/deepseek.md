@@ -26,8 +26,8 @@ GGUFs declare `llama`, so they cannot test this arch). There is no CPU-vs-Vulkan
 seam test for it. V2-Lite is the development model for the rest.
 
 The reference implementation is llama.cpp, checked out locally at
-`~/Projects/mxaddict/llama.cpp`. Every claim about DeepSeek's maths in this
-document was read out of that tree at `b10356-2-g030ebb5`
+`ref/llama.cpp`. Every claim about DeepSeek's maths in this document was read
+out of that tree at `b10356-2-g030ebb5`
 (`030ebb558a5820b444a8f836ed5cdd46c9b4bd7a`), and every claim about what `infr`
 already has was read out of this one. Where something was **not** verified it
 says so — those lines are the ones to check first, not to trust.

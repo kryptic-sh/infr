@@ -601,7 +601,7 @@ run everywhere are the non-ignored ones. Run twice, the regenerator reproduced
 every file:
 
 ```text
-INFR_LLAMA_DEBUG=~/Projects/mxaddict/llama.cpp/build/bin/Release/llama-debug.exe \
+INFR_LLAMA_DEBUG=ref/llama.cpp/build/bin/Release/llama-debug.exe \
 INFR_LLAMA_FIXTURE_OUT=crates/infr-llama/tests/fixtures \
   cargo test -p infr-llama --test synthetic_deepseek4_llama_cpp -- --ignored \
   synthetic_dsv4_regenerate_llama_cpp_fixtures

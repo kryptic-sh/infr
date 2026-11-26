@@ -5,8 +5,8 @@
 //! Quantised weight blocks are returned as-is; the backend owns dequantisation.
 //!
 //! References:
-//!   `~/Projects/llama.cpp/ggml/include/gguf.h`  (format spec)
-//!   `~/Projects/llama.cpp/ggml/include/ggml.h`  (ggml_type enum)
+//!   `ref/llama.cpp/ggml/include/gguf.h`  (format spec)
+//!   `ref/llama.cpp/ggml/include/ggml.h`  (ggml_type enum)
 //!   `~/Projects/llama.cpp/conversion/diffusion_gemma.py` (tensor names / keys)
 
 pub mod dequant;

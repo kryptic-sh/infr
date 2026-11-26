@@ -93,7 +93,7 @@ models (step35).
 
 ## Oracle commands (llama.cpp master, Vulkan build at
 
-`~/Projects/mxaddict/llama.cpp/build/bin`)
+`ref/llama.cpp/build/bin`)
 
 ```bash
 llama-cli -m Qwen3.5-4B-MTP-UD-Q4_K_XL.gguf -ngl 99 --spec-type draft-mtp \

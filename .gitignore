@@ -13,6 +13,8 @@ Cargo.lock.bak
 # Editor / OS
 .DS_Store
 *.swp
+
+# Reference checkouts (llama.cpp for porting and baselines): ref/llama.cpp
 /ref/
 target-prof/
 

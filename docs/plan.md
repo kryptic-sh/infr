@@ -195,10 +195,10 @@ tensor-name set.
 
 Dump a GGUF of the closest supported family and diff the two tensor-name lists
 and metadata keys. Then read the reference builder in llama.cpp
-(`~/Projects/mxaddict/llama.cpp`): `src/llama-arch.cpp` for the arch's tensor
-table and metadata keys, `src/models/<arch>.cpp` for its forward pass. **That
-file is the specification** — every claim you make about the maths should come
-out of it, and anything you did not read there should say so.
+(`ref/llama.cpp`): `src/llama-arch.cpp` for the arch's tensor table and metadata
+keys, `src/models/<arch>.cpp` for its forward pass. **That file is the
+specification** — every claim you make about the maths should come out of it,
+and anything you did not read there should say so.
 
 Classify the delta before writing code:
 
@@ -277,8 +277,8 @@ out of the GGUF. When they do:
 In this order:
 
 1. **Logits vs llama.cpp** on a fixed prompt — build the reference
-   (`~/Projects/mxaddict/llama.cpp`) and compare top-k on the CPU backend.
-   Disagreement here is an arch bug; every later check is noise until it passes.
+   (`ref/llama.cpp`) and compare top-k on the CPU backend. Disagreement here is
+   an arch bug; every later check is noise until it passes.
 2. **CPU golden** — add a case to `crates/infr-llama/tests/cpu_backend.rs`. The
    goldens render a plain prompt through the model's own template, generate
    greedily, and lock an FNV-1a of the output. The CPU goldens are **not**
@@ -373,17 +373,20 @@ One lead lives only here because it has never been measurable:
 
 ## Reference implementations
 
-Paths on the author's machine; treat them as the source of truth over any
-summary in these docs.
+Treat these checkouts as the source of truth over any summary in these docs.
 
-- **`~/Projects/mxaddict/llama.cpp`** — mainline. `src/llama-arch.cpp` (arch
-  tables, tensor names, metadata keys) and `src/models/<arch>.cpp` (the per-arch
-  forward pass) are what a port is diffed against. `build/bin/` holds
-  `llama-cli` / `llama-bench`, the oracles `infr compare` shells out to.
-- **`~/Projects/mxaddict/llama.cpp-dg`** — the DiffusionGemma fork, which never
-  merged upstream. Its `llama-diffusion-cli` is the oracle for
-  `arch=diffusion-gemma`, resolved via `INFR_LLAMA_DIFFUSION_CLI` > `PATH` > the
-  fork's build dirs — see `ModelBench::llama_diffusion_cli_path` and
+- **`ref/llama.cpp`** — mainline, cloned into the gitignored `ref/` directory of
+  this repository
+  (`git clone https://github.com/ggml-org/llama.cpp ref/llama.cpp`).
+  `src/llama-arch.cpp` (arch tables, tensor names, metadata keys) and
+  `src/models/<arch>.cpp` (the per-arch forward pass) are what a port is diffed
+  against. `build/bin/` holds `llama-cli` / `llama-bench`, the oracles
+  `infr compare` shells out to.
+- **`~/Projects/mxaddict/llama.cpp-dg`** (a path on the author's machine) — the
+  DiffusionGemma fork, which never merged upstream. Its `llama-diffusion-cli` is
+  the oracle for `arch=diffusion-gemma`, resolved via
+  `INFR_LLAMA_DIFFUSION_CLI` > `PATH` > the fork's build dirs — see
+  `ModelBench::llama_diffusion_cli_path` and
   [`perf/benchmarking.md`](perf/benchmarking.md).
 - **`~/Projects/scratch/dgemma-openai-server.py`** — the original OpenAI shim
   prototype (channel split, `<|tool_call>` parsing). Its logic now lives in

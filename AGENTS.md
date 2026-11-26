@@ -56,7 +56,8 @@
 - New model families and planned features are in scope. Support recent models
   people will actually run; an older or less useful family gets support only
   when it is genuinely little work. The reference for a port is the llama.cpp
-  checkout at `~/Projects/mxaddict/llama.cpp`.
+  checkout at `ref/llama.cpp` (gitignored: clone
+  https://github.com/ggml-org/llama.cpp there).
 - Streaming is a standing goal: disk to DRAM to VRAM, so that any model size
   runs on any hardware. That includes the cache eviction logic in every tier,
   which should be as fast as it can be made.

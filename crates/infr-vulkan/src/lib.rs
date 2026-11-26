@@ -1,6 +1,6 @@
 //! Vulkan backend (`ash` + SPIR-V). The MVP `Backend` impl.
 //!
-//! Reference: `~/Projects/llama.cpp/ggml/src/ggml-vulkan/` and its `vulkan-shaders/*.comp`
+//! Reference: `ref/llama.cpp/ggml/src/ggml-vulkan/` and its `vulkan-shaders/*.comp`
 //! (reuse the tuned quant matmul / dequant / attention shaders). Enable device features
 //! `VK_KHR_cooperative_matrix`, `shaderFloat16`, `VK_KHR_16bit_storage`,
 //! `VK_KHR_shader_subgroup_extended_types`. See docs/plan.md.

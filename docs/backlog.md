@@ -26,6 +26,77 @@ Provenance tags point at the finding that opened the item:
 
 ## Open
 
+### B-INTEL-IGPU — the first run on an Intel iGPU: what failed and why (2026-11-27)
+
+**Kind:** findings from a run, the fixes in progress and queued.
+
+**The device.** A laptop's Intel Raptor Lake-P UHD Graphics (`RPL-U`, PCI id
+`0xa721`, Xe-LP), Mesa 26.3.1 ANV, Linux 7.2.14. `infr devices` lists it as
+`Vulkan0` (integrated, 11.5 GiB device-local), with llvmpipe as `Vulkan1`.
+Properties that differ from the AMD parts everything was tuned on: subgroup
+range 8 to 32 (no 64), `maxComputeSharedMemorySize` 48 KiB, no cooperative
+matrix, 4x8-bit packed integer dot products accelerated, 15 GiB of host memory
+in all. The laptop's NVIDIA MX550 (TU117) was not run: its module did not load
+(driver/library mismatch after a kernel package update, pending a reboot). No
+NVIDIA result exists yet.
+
+**The model-free GPU gate on `INFR_DEV=Vulkan0`.** This was the gate filter in
+`docs/gpu-tolerance.md` "Running it", restricted to the kernel parity binaries,
+`seam_op_parity` and `test(gpu_synthetic)`, release build at `2813f6e4`, run
+serially: 484 run, 475 passed, 9 failed. The failures fall into four groups.
+
+1. **RoPE misses the reference on Intel; the other failures are harness
+   problems.** `ops::tests::rope_matches_host` (5.2901835 against 5.290327,
+   bound 1e-4, at angles of at most 12 rad) and
+   `rope_freq_factors_match_ggml_at_long_positions`: the worst error over
+   tolerance is 0.31 to 0.39 at every position up to 65535, and 2.687 at
+   position 131070. The CPU backend reaches 0.039 there. The CPU reference
+   rounds `sin_cos` and `powf` correctly (`infr_core::math`), while every RoPE
+   shader (`rope.comp`, `qk_norm_rope.comp`, `qk_norm_rope_interleaved.comp`,
+   `mla.comp`) calls GLSL's built-in `sin`, `cos` and `pow`. GLSL only promises
+   2^-11 absolute error for `sin`/`cos`; AMD's results sit far inside that, and
+   Intel's hardware math unit apparently does not. Which of the three built-ins
+   carries the error is not yet measured. Queued as the slice after the test
+   margin (below).
+2. **Three multi-device tests open llvmpipe and fail instead of skipping.**
+   `adapter::tests::ep_matches_single_device_synthetic`,
+   `multi::tests::wrappers_report_an_integrated_rank_behind_a_discrete_rank_0`
+   and `pipeline::tests::kv_past_the_last_layer_is_refused_across_devices`
+   enumerate every Vulkan device and `new_on(i).expect(..)` each. llvmpipe
+   enumerates, but the backend refuses it (subgroup range 8 to 8), so the
+   `expect` panics. A box whose only other device is the CPU rasterizer has one
+   usable GPU, and these tests should skip there.
+3. **Two slow-device tests force wave64, which Intel cannot pin.**
+   `gpu_seam_first_forward_split_on_a_slow_device` and
+   `gpu_seam_work_split_slow_class_forward_under_the_default_budget` set
+   `INFR_FORCE_WAVE64=1` to make the device slow. On a device without 64 in its
+   subgroup range the backend refuses to open, so the tests fail where they
+   should take another way to slow the device down or skip.
+4. **The two pool-guard tests see room the filler should have taken.**
+   `pool::gpu_tests::a_pooled_buffer_in_an_open_block_is_admitted_below_its_size`
+   reports 1160773632 B of room after `fill_to` left half a request, and
+   `a_pooled_buffer_that_opens_a_block_is_refused_by_the_guard` reports
+   989855744 B. `limited` sets the limit from the live `VK_EXT_memory_budget`
+   reading, and after a large allocation `alloc_room` is still about a gigabyte
+   above what the test expects. Suspected, not shown: ANV's budget on a
+   unified-memory device follows host memory (which other processes and swap
+   move) or does not count a buffer before its pages are touched. Not
+   investigated further.
+
+Everything else in that filter passed on the iGPU, including every float and
+K-quant GEMV/GEMM parity binary, decode split-K attention, the logits tail,
+`seam_op_parity` apart from the RoPE test, and the Intel `caps` unit tests.
+
+**The model tolerance gates were all skipped.** On a unified-memory device the
+harness requires free host memory of twice the model plus a fixed 12 GiB
+(`UNIFIED_HOST_MARGIN`), which a 15 GiB laptop can never have. That rule lives
+in two copies (`tests/support/forced.rs` and `tests/cpu_backend.rs`). Slice 1 in
+progress makes the margin the smaller of the fixed cap and a share of total host
+memory, keeps one copy, and adds a total-memory probe to `infr_plat::mem`. The
+small catalogue models (Qwen3 0.6B and 1.7B, Qwen2.5 0.5B, Gemma 3 1B, Qwen3.5
+0.8B, ERNIE 4.5 0.3B Q4 and F16, Llama 3.2 1B, LFM3 1.7B) are cached on the
+laptop for the gate run that follows.
+
 ### B-PARKED-KQ-FMA-KAHAN — the fp32 K-quant GEMM's accuracy fix is parked on a branch (2026-11-27)
 
 **Kind:** work in progress, parked at a wrap-up; not reviewed, not on `main`.
@@ -8047,7 +8118,8 @@ at the arena slot's address. What that slice did not do:
 The integrated-GPU half is done: `cpu_backend`'s `resident_room` /
 `need_resident_room!` skip a test that would hold a multi-GB model on a
 unified-memory device unless `UNIFIED_RESIDENT_FACTOR` times the GGUF size plus
-`UNIFIED_HOST_MARGIN` is available (`docs/windows.md` has the rule).
+the margin `unified_host_margin` gives (`tests/support/hostroom.rs`) is
+available (`docs/windows.md` has the rule).
 
 **The discrete-GPU cause was measured and fixed (2026-11-16).** A resident load
 on `Vulkan0` kept every mapped page the upload read in the process working set
@@ -9050,8 +9122,8 @@ values. What it leaves:
   used and returned it between runs. Another session's WSL VM was also growing
   at the time, so the cause is not settled. The tolerance tests now skip, with a
   printed line, on an integrated GPU whose free host memory is under twice the
-  model plus 12 GB; that prices one resident load, so it would not stop growth
-  that is the harness's own.
+  model plus a margin (`unified_host_margin`); that prices one resident load, so
+  it would not stop growth that is the harness's own.
 - **The q8_0 KV class sits two orders above the float class** (Qwen3-0.6B worst
   KL about 2e-2 against 4e-5): the GPU quantizes the f16 RoPE output into the
   cache, the CPU reference its f32 one. It catches what the int8 class catches.

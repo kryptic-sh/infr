@@ -94,6 +94,18 @@ impl Finish {
 /// today) keeps an internal `Mutex` and is served with `--parallel 1`, which is honest rather than
 /// silently serialising a server the user asked to parallelise.
 pub trait ChatGenerator: Send + Sync {
+    /// Validate backend support, request budgets, and image payloads before HTTP response headers.
+    /// Called on a blocking thread; must not run the vision transformer or acquire a GPU slot (the
+    /// encoder runs when the prompt is built). The default refuses images, which is what every
+    /// backend but the Vulkan one wants; a refusal is answered like [`prepare`](Self::prepare)'s,
+    /// a `400` naming `messages`.
+    fn validate_images(&self, images: &[Arc<[u8]>]) -> anyhow::Result<()> {
+        if !images.is_empty() {
+            anyhow::bail!("image input is not supported by this model/backend");
+        }
+        Ok(())
+    }
+
     /// Run one chat turn.
     ///
     /// * `tools` is the request's `tools` array as a borrowed [`serde_json::Value`] — passed by
@@ -569,6 +581,10 @@ pub struct GenParams {
     /// `None` for free text. Not sampling, but the same "what this request asked for" the rest of
     /// this struct carries to the generator.
     pub response_format: Option<ResponseFormat>,
+    /// The request's images (decoded `image_url` data URIs), in the order their
+    /// [`infr_engine::IMAGE_MARKER`]s appear in the flattened messages. Filled by the handler, not
+    /// by [`GenParams::from_request`] (the messages are flattened separately).
+    pub images: Vec<Arc<[u8]>>,
 }
 
 /// An OpenAI-shaped 400: `{"error":{"message":..,"type":"invalid_request_error","param":..}}`.
@@ -710,6 +726,7 @@ impl GenParams {
             logit_bias,
             stop,
             response_format: ResponseFormat::from_request(req.response_format.as_ref())?,
+            images: Vec::new(),
         })
     }
 
@@ -1952,7 +1969,17 @@ async fn chat_completions_handler(
     };
     // Cap an absurd explicit budget so one request can't pin a slot forever. Unset stays unset.
     params.max_tokens = clamp_max_tokens(params.max_tokens, max_tokens_cap(&state.cfg));
-    let messages: Vec<ChatMessage> = req.messages.iter().map(dto_to_engine).collect();
+    let mut images = Vec::new();
+    let messages: Vec<ChatMessage> = match req
+        .messages
+        .iter()
+        .map(|m| dto_to_engine(m, &mut images))
+        .collect::<Result<_, _>>()
+    {
+        Ok(m) => m,
+        Err(e) => return param_error(Some(e.param), e.message),
+    };
+    params.images = images;
     // Pass the request's `tools` array THROUGH as a Value (moved into the blocking task) — no
     // Value→string→Value round-trip (audit finding 6).
     let tools: Option<serde_json::Value> = req.tools.clone();
@@ -2018,8 +2045,20 @@ async fn chat_completions_handler(
             };
             let joined = tokio::task::spawn_blocking(move || {
                 let _permit = permit;
-                let prepared =
-                    engine.prepare(&messages, tools.as_ref(), tool_choice.as_deref(), &params);
+                // The images first: a backend that cannot serve them refuses here, before any
+                // prompt is rendered or slot taken. The refusal names the field the client got
+                // wrong, so it is a `400` on a streaming request too.
+                let prepared: anyhow::Result<Option<PreparedRequest>> = engine
+                    .validate_images(&params.images)
+                    .map_err(|e| {
+                        anyhow::Error::new(ParamError {
+                            param: "messages",
+                            message: e.to_string(),
+                        })
+                    })
+                    .and_then(|()| {
+                        engine.prepare(&messages, tools.as_ref(), tool_choice.as_deref(), &params)
+                    });
                 (messages, tools, tool_choice, params, prepared)
             })
             .await;
@@ -3016,14 +3055,84 @@ pub fn flatten_content(v: &Option<serde_json::Value>) -> String {
     }
 }
 
-fn dto_to_engine(dto: &ChatMessageDto) -> ChatMessage {
-    ChatMessage {
+/// [`flatten_content`], keeping images: each `image_url` part becomes an
+/// [`infr_engine::IMAGE_MARKER`] in the text and its decoded bytes are appended to `images`, so the
+/// two stay in the same order. Only `data:` URIs are accepted — the server never fetches URLs on a
+/// client's behalf. A marker typed into the text itself is removed, so a user cannot claim an image
+/// slot.
+pub fn flatten_content_media(
+    v: &Option<serde_json::Value>,
+    images: &mut Vec<Arc<[u8]>>,
+) -> Result<String, ParamError> {
+    use base64::Engine as _;
+    let marker = infr_engine::IMAGE_MARKER;
+    let strip = |t: &str| t.replace(marker, "");
+    let Some(serde_json::Value::Array(parts)) = v else {
+        return Ok(strip(&flatten_content(v)));
+    };
+    let mut out = String::new();
+    for p in parts {
+        match p.get("type").and_then(|t| t.as_str()) {
+            Some("text") => {
+                if let Some(t) = p.get("text").and_then(|t| t.as_str()) {
+                    out.push_str(&strip(t));
+                }
+            }
+            Some("image_url") | Some("image") => {
+                let url = p
+                    .get("image_url")
+                    .and_then(|u| u.get("url").or(Some(u)))
+                    .and_then(|u| u.as_str())
+                    .unwrap_or("");
+                let bad = |message: String| ParamError {
+                    param: "messages",
+                    message,
+                };
+                if images.len() >= infr_engine::MAX_REQUEST_IMAGES {
+                    return Err(bad("at most four images are allowed per request".into()));
+                }
+                let Some(rest) = url.strip_prefix("data:") else {
+                    return Err(bad(
+                        "image_url must be a base64 data: URI (remote image URLs are not fetched)"
+                            .into(),
+                    ));
+                };
+                let Some((meta, data)) = rest.split_once(',') else {
+                    return Err(bad("malformed image data: URI".into()));
+                };
+                if !meta.ends_with(";base64") {
+                    return Err(bad("image data: URI must be base64-encoded".into()));
+                }
+                let data = data.trim();
+                if data.len() > infr_engine::MAX_IMAGE_BYTES.div_ceil(3) * 4 {
+                    return Err(bad("image exceeds the 16 MiB encoded size limit".into()));
+                }
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(data)
+                    .map_err(|e| bad(format!("image data: URI is not valid base64: {e}")))?;
+                if bytes.len() > infr_engine::MAX_IMAGE_BYTES {
+                    return Err(bad("image exceeds the 16 MiB encoded size limit".into()));
+                }
+                images.push(Arc::from(bytes));
+                out.push_str(marker);
+            }
+            _ => {}
+        }
+    }
+    Ok(out)
+}
+
+fn dto_to_engine(
+    dto: &ChatMessageDto,
+    images: &mut Vec<Arc<[u8]>>,
+) -> Result<ChatMessage, ParamError> {
+    Ok(ChatMessage {
         role: dto.role.clone(),
-        content: flatten_content(&dto.content),
+        content: flatten_content_media(&dto.content, images)?,
         tool_calls: dto.tool_calls.as_ref().and_then(parse_oai_tool_calls),
         tool_call_id: dto.tool_call_id.clone(),
         name: dto.name.clone(),
-    }
+    })
 }
 
 /// Convert an inbound OpenAI `tool_calls` array (`[{function:{name, arguments}}]`, where `arguments`
@@ -3316,7 +3425,11 @@ mod tests {
             {"id":"a1B2c3D4e","type":"function",
              "function":{"name":"bash","arguments":"{\"cmd\":\"ls\"}"}},
             {"type":"function","function":{"name":"noid","arguments":"{}"}}]}"#;
-        let msg = dto_to_engine(&serde_json::from_str::<ChatMessageDto>(raw).unwrap());
+        let msg = dto_to_engine(
+            &serde_json::from_str::<ChatMessageDto>(raw).unwrap(),
+            &mut Vec::new(),
+        )
+        .unwrap();
         let calls = msg.tool_calls.expect("two calls parse");
         assert_eq!(calls[0].id.as_deref(), Some("a1B2c3D4e"));
         assert_eq!(calls[0].arguments, serde_json::json!({"cmd": "ls"}));
@@ -3339,7 +3452,11 @@ mod tests {
                 r#"{{"role":"assistant","content":null,"tool_calls":[
                 {{"type":"function","function":{{"name":"f","arguments":{arguments}}}}}]}}"#
             );
-            let msg = dto_to_engine(&serde_json::from_str::<ChatMessageDto>(&raw).unwrap());
+            let msg = dto_to_engine(
+                &serde_json::from_str::<ChatMessageDto>(&raw).unwrap(),
+                &mut Vec::new(),
+            )
+            .unwrap();
             let a = &msg.tool_calls.expect("one call")[0].arguments;
             let got = [&a["a"], &a["b"], &a["c"][0]].map(|v| v.as_f64().unwrap());
             let want = floats.map(|f| f.parse::<f64>().unwrap());
@@ -4019,6 +4136,89 @@ mod tests {
             {"type": "text",      "text": " world"}
         ]));
         assert_eq!(flatten_content(&v), "hello world");
+    }
+
+    #[test]
+    fn flatten_content_media_turns_data_uris_into_markers() {
+        let m = infr_engine::IMAGE_MARKER;
+        let uri = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgZGIGAAAOAAfXb+R4AAAAAElFTkSuQmCC";
+        let v = Some(serde_json::json!([
+            {"type": "text", "text": "look "},
+            {"type": "image_url", "image_url": {"url": uri}},
+            {"type": "text", "text": "and"},
+            {"type": "image_url", "image_url": {"url": uri}}
+        ]));
+        let mut images = Vec::new();
+        let text = flatten_content_media(&v, &mut images).unwrap();
+        assert_eq!(text, format!("look {m}and{m}"));
+        assert_eq!(images.len(), 2);
+        assert_eq!(&images[0][..8], b"\x89PNG\r\n\x1a\n");
+        assert_eq!(images[0], images[1]);
+    }
+
+    #[test]
+    fn flatten_content_media_rejects_remote_and_bad_uris() {
+        let mut images = Vec::new();
+        for url in [
+            "http://x/a.png",
+            "data:image/png,raw",
+            "data:image/png;base64,!!!",
+        ] {
+            let v = Some(serde_json::json!([{"type": "image_url", "image_url": {"url": url}}]));
+            assert!(flatten_content_media(&v, &mut images).is_err(), "{url}");
+        }
+        assert!(images.is_empty());
+    }
+
+    #[test]
+    fn flatten_content_media_enforces_count_and_encoded_size() {
+        let mut images = vec![Arc::<[u8]>::from([0u8]); infr_engine::MAX_REQUEST_IMAGES];
+        let v = Some(
+            serde_json::json!([{"type":"image_url", "image_url":{"url":"data:image/png;base64,AQID"}}]),
+        );
+        assert!(flatten_content_media(&v, &mut images)
+            .unwrap_err()
+            .message
+            .contains("four images"));
+        let v = Some(
+            serde_json::json!([{"type":"image_url", "image_url":{"url":format!("data:image/png;base64,{}", "A".repeat(infr_engine::MAX_IMAGE_BYTES.div_ceil(3)*4+1))}}]),
+        );
+        assert!(flatten_content_media(&v, &mut Vec::new())
+            .unwrap_err()
+            .message
+            .contains("16 MiB"));
+    }
+
+    #[tokio::test]
+    async fn unsupported_images_are_json_400_even_when_streaming() {
+        for stream in [false, true] {
+            let resp = multi_router().oneshot(Request::builder()
+                .method("POST").uri("/v1/chat/completions").header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({"model":"alpha", "stream":stream, "messages":[{"role":"user", "content":[{"type":"image_url", "image_url":{"url":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgZGIGAAAOAAfXb+R4AAAAAElFTkSuQmCC"}}]}]}).to_string())).unwrap()).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+            assert!(resp.headers()["content-type"]
+                .to_str()
+                .unwrap()
+                .starts_with("application/json"));
+            let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert!(body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("not supported"));
+        }
+    }
+
+    #[test]
+    fn flatten_content_media_strips_typed_markers() {
+        // A user cannot claim an image slot by typing the marker into plain text.
+        let m = infr_engine::IMAGE_MARKER;
+        let mut images = Vec::new();
+        let s = Some(serde_json::Value::String(format!("a{m}b")));
+        assert_eq!(flatten_content_media(&s, &mut images).unwrap(), "ab");
+        let arr = Some(serde_json::json!([{"type": "text", "text": format!("c{m}d")}]));
+        assert_eq!(flatten_content_media(&arr, &mut images).unwrap(), "cd");
+        assert!(images.is_empty());
     }
 
     #[test]

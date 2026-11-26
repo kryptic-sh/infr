@@ -6022,7 +6022,13 @@ fn e2b_ipl_rows(g: &Gguf, ple: &PerLayerEmbd, tokens: &[u32]) -> AResult<Vec<f32
     out.par_chunks_mut(nl * npl)
         .zip(tokens.par_iter())
         .try_for_each(|(dst, &tok)| -> AResult<()> {
-            let tok = tok as usize;
+            // Image placeholder positions read the PAD row (id 0), as llama.cpp's gemma4 does for
+            // multimodal embeddings ([TAG_GEMMA4_IMG_PADDING]).
+            let tok = if crate::media::is_media_id(tok) {
+                0
+            } else {
+                tok as usize
+            };
             let r0 = tok * ple.tok_embd_row_bytes;
             let pl_tok = dequant_block(
                 ple.tok_embd_dtype,
@@ -6037,10 +6043,29 @@ fn e2b_ipl_rows(g: &Gguf, ple: &PerLayerEmbd, tokens: &[u32]) -> AResult<Vec<f32
     Ok(out)
 }
 
-/// Longest shared prefix of the cached tokens and the new prompt (the KV rows that stay valid).
+/// Longest provably reusable KV prefix. Image ids are compact tags, not collision-proof
+/// identities: stop before any image row, even for equal tags. The vision encoder separately
+/// caches by exact image bytes; text-only prefix reuse is unchanged.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 fn common_prefix_len(a: &[u32], b: &[u32]) -> usize {
-    a.iter().zip(b).take_while(|(x, y)| x == y).count()
+    a.iter()
+        .zip(b)
+        .take_while(|(x, y)| x == y && !crate::media::is_media_id(**x))
+        .count()
+}
+
+#[cfg(test)]
+mod media_prefix_tests {
+    #[test]
+    fn image_tags_never_authorize_kv_reuse() {
+        let tag = crate::media::MEDIA_ID_BASE | 17;
+        assert_eq!(
+            super::common_prefix_len(&[1, 2, tag, 3], &[1, 2, tag, 3]),
+            2
+        );
+        assert_eq!(super::common_prefix_len(&[tag], &[tag]), 0);
+        assert_eq!(super::common_prefix_len(&[1, 2, 3], &[1, 2, 4]), 2);
+    }
 }
 
 #[cfg(test)]

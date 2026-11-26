@@ -894,6 +894,13 @@ cfg_struct! {
         /// is a `413`. Must be positive, else the default — which is axum's own default body
         /// limit, the limit this server applied before the knob existed.
         max_body_bytes: u64 = 2_097_152,
+        /// `INFR_MMPROJ`: the vision projector (`mmproj-*.gguf`) for image input. Unset = the first
+        /// `mmproj*.gguf` beside the model file, if any.
+        mmproj: Option<PathBuf> = None,
+        /// `INFR_IMAGE_MAX_TOKENS`: soft-token ceiling per image (clamped to Gemma 4's 70..=1120).
+        /// More tokens = more detail, but the CPU vision encoder's attention grows with the square
+        /// of the image's patch count. 280 is Gemma 4's default budget.
+        image_max_tokens: usize = 280,
     }
 }
 

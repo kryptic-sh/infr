@@ -88,6 +88,25 @@ fn validate_token_ids(ids: &[u32], vocab: usize) -> AResult<()> {
     Ok(())
 }
 
+/// [`validate_token_ids`] for a prompt that may carry image placeholders: an id above the vocab is
+/// accepted ONLY where the current [`crate::media::EmbedOverride`] supplies that position's row
+/// (the runner never indexes the vocab there). Anything else is the same clean error.
+fn validate_prompt_ids(
+    ids: &[u32],
+    vocab: usize,
+    media: Option<&crate::media::EmbedOverride>,
+) -> AResult<()> {
+    let Some(media) = media else {
+        return validate_token_ids(ids, vocab);
+    };
+    for (pos, &t) in ids.iter().enumerate() {
+        if t as usize >= vocab && !(crate::media::is_media_id(t) && media.row(pos).is_some()) {
+            return Err(anyhow!("token id {t} out of range for vocab size {vocab}"));
+        }
+    }
+    Ok(())
+}
+
 /// Which prompt/generated tokens' KV rows are materialized (resident) after a generation turn —
 /// the token list recorded in `SeamKv::cached` for the next turn's prefix diff.
 ///
@@ -761,6 +780,11 @@ pub(crate) fn generate_dense_backend_bound(
             .iter()
             .find(|t| t.name == "per_layer_token_embd.weight")
             .is_some_and(|t| infr_vulkan::linear::embed_gather_supported(t.dtype));
+    // Image soft tokens for this prompt (`crate::media`): rows that REPLACE the token embedding at
+    // the image's placeholder positions. Prefill chunks that contain any take the host-embed path
+    // (the in-graph gather has nothing to gather them from); every other chunk and the decode keep
+    // whatever embed path was chosen above.
+    let media = crate::media::current_override();
 
     // KV cache dtype, chosen PER-SIDE (K and V independent, like llama's --cache-type-k /
     // --cache-type-v). The graph decl carries the dtype and the config is stable for the process,
@@ -1687,7 +1711,7 @@ pub(crate) fn generate_dense_backend_bound(
         if prompt.is_empty() {
             return Err(anyhow!("empty prompt: nothing to generate from"));
         }
-        validate_token_ids(prompt, c.vocab)?;
+        validate_prompt_ids(prompt, c.vocab, media.as_deref())?;
     }
     // Phase-2 DiffusionGemma denoise: capture the prompt length BEFORE the ordinary prefix-diff
     // logic below runs (a denoise call's `prompt`/`max_new` are empty/0 — see `DenoiseReq`'s
@@ -5655,6 +5679,12 @@ pub(crate) fn generate_dense_backend_bound(
         if c.moe.is_some() || ple.is_some() {
             return Err(anyhow!("speculative verify: dense non-E2B models only"));
         }
+        if prompt[start..]
+            .iter()
+            .any(|&t| crate::media::is_media_id(t))
+        {
+            return Err(anyhow!("speculative verify does not support image input"));
+        }
         let vf_scale = if gemma { (ne as f32).sqrt() } else { 1.0 };
         let m = prompt.len() - start;
         let mut vf_hidden: Vec<f32> = Vec::with_capacity(m * ne);
@@ -6077,6 +6107,9 @@ pub(crate) fn generate_dense_backend_bound(
                     // the baton to whichever sequence has been waiting longest.
                     let _gp = req.and_then(|r| r.gate_pass());
                     let pf_m = cend - cstart;
+                    // Image rows in this chunk force the host-embed path for it (see `media`).
+                    let chunk_media = media.as_deref().filter(|o| o.any_in(cstart..cend));
+                    let chunk_gpu_embed = gpu_embed && chunk_media.is_none();
                     if live[ci].is_none() {
                         // GPU embed gather: upload the chunk's token IDS (4*pf_m bytes) — the graph's
                         // Op::EmbedGather dequantizes the rows on-device. Host-embed fallback keeps
@@ -6096,12 +6129,18 @@ pub(crate) fn generate_dense_backend_bound(
                         } else {
                             None
                         };
-                        let input = if gpu_embed {
+                        let input = if chunk_gpu_embed {
                             upload_ids()?
                         } else {
                             let mut pf_hidden: Vec<f32> = Vec::with_capacity(pf_m * ne);
                             let token_embd = token_embd.get()?; // host embed gather → materialize
-                            for &tok in &prompt[cstart..cend] {
+                            for (i, &tok) in prompt[cstart..cend].iter().enumerate() {
+                                // An image row goes in as-is: the vision projector's output is
+                                // already in the residual stream's scale (no sqrt(n_embd)).
+                                if let Some(row) = chunk_media.and_then(|o| o.row(cstart + i)) {
+                                    pf_hidden.extend_from_slice(row);
+                                    continue;
+                                }
                                 let base = tok as usize * ne;
                                 pf_hidden.extend(
                                     token_embd[base..base + ne].iter().map(|&x| x * embed_scale),
@@ -6122,7 +6161,7 @@ pub(crate) fn generate_dense_backend_bound(
                         // binds — the interpreters' write-back is a length-checked `copy_from_slice`
                         // against the declared numel, and the host-embed path has always bound this
                         // shape, so nothing writes past it.
-                        let resid = if gpu_embed {
+                        let resid = if chunk_gpu_embed {
                             Some(
                                 be.alloc(pf_m * ne * 4, BufferUsage::Activations)
                                     .map_err(|e| anyhow!("{e}"))?,
@@ -6140,7 +6179,7 @@ pub(crate) fn generate_dense_backend_bound(
                         // gemma4 E2B: the chunk's per-layer TOKEN embedding rows (gather+dequant only
                         // — the model_proj GEMV/RMSNorm/combine run as GPU graph ops in the `build`
                         // prologue).
-                        let ipl = if let (Some(ple), false) = (ple, gpu_ple) {
+                        let ipl = if let (Some(ple), false) = (ple, gpu_ple && chunk_gpu_embed) {
                             let rows = e2b_ipl_rows(g, ple, &prompt[cstart..cend])?;
                             let b = be
                                 .alloc(rows.len() * 4, BufferUsage::Staging)
@@ -6208,7 +6247,7 @@ pub(crate) fn generate_dense_backend_bound(
                         false,
                         // The token-id input + in-graph gather belong to the span that STARTS the
                         // stack; a later span reads the residual stream that one left behind.
-                        gpu_embed && span.start == 0,
+                        chunk_gpu_embed && span.start == 0,
                         false, // mtp_verify: ordinary chunked prefill, not MTP verify
                         Some(span.clone()),
                     );
@@ -6336,6 +6375,18 @@ pub(crate) fn generate_dense_backend_bound(
     } else {
         start // fall through to per-token loop for MoE / E2B / short suffixes
     };
+    // The per-token loop below embeds by token id only. Image rows always land in the batched
+    // prefill (they never sit in the final two prompt tokens of a chat turn), but a model or
+    // suffix that skips batching must fail loudly here rather than index the vocab with a
+    // placeholder id.
+    if media
+        .as_deref()
+        .is_some_and(|o| o.any_in(decode_start..prompt.len()))
+    {
+        return Err(anyhow!(
+            "image input needs batched prefill, which this model/prompt did not take"
+        ));
+    }
 
     // Record-once decode: on a backend that replays (the Vulkan and Metal seams), build, compile
     // and bind ONE decode plan here and reuse it across the whole decode loop. The backend records

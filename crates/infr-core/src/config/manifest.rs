@@ -351,6 +351,8 @@ knobs! {
     // `0` turns the keep-alive off, so the env layer keeps it.
     "INFR_SERVE_SSE_KEEPALIVE_SECS" => "serve.sse_keepalive_secs", Int, Ignored, "30", migrated;
     "INFR_SERVE_MAX_BODY_BYTES" => "serve.max_body_bytes", Int, Ignored, "8388608", migrated;
+    "INFR_MMPROJ" => "serve.mmproj", Path, Ignored, "/tmp/mmproj.gguf", migrated;
+    "INFR_IMAGE_MAX_TOKENS" => "serve.image_max_tokens", Int, Ignored, "560", migrated;
 
     // ── hub ──────────────────────────────────────────────────────────────────
     // Same "`0` is a VALUE" grammar as the two `serve` knobs above: `0` means "one connection",

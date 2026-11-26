@@ -113,6 +113,11 @@ missed in a pull request we then had to correct by hand:
   test fails on hardware that is right. Comparing two kernels bit for bit inside
   one test, on the same device and input, is fine, and is how "this change keeps
   the output identical" is shown.
+- The tolerance gate keeps its CPU reference in an on-disk cache
+  (`INFR_TOL_REFCACHE`: `on` by default, `off`, `verify`, `refresh`, `clear`;
+  off when `CI` is set). Say which mode a reported run used; `verify` recomputes
+  every reference and fails on a stored entry that differs. See
+  `docs/gpu-tolerance.md`, "The reference cache".
 - Model math is compared with a reference: llama.cpp's embeddings or logits on
   the same input. Output that reads well is not evidence.
 - A server feature has a test against a real small model, not only the stub

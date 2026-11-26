@@ -86,8 +86,29 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   rewritten in place". New: `infr_plat::fileio::reopen_for_reads`,
   `infr_gguf::watch::WeightWatch::for_model`, which watches a loaded `Gguf`'s
   own files against the stamps it took when mapping them.
+- **`infr_llama::tolerance::gate::Reference` gains a private field** (its
+  oracle, `Reference::oracle`), so it can no longer be built as a struct
+  literal; build it with `Reference::new` or the new `Reference::cached`.
 
 ### Added
+
+- **The GPU tolerance gate caches its CPU reference on disk**
+  (`infr_llama::tolerance::oracle`, `docs/gpu-tolerance.md` "The reference
+  cache"). The `gpu_seam_tolerance_*` cases read it through the new
+  `gate::check_cached`; `INFR_TOL_REFCACHE` (`on` by default, `off`, `verify`,
+  `refresh`, `clear`) picks what a lookup does, and it is off when `CI` is set.
+  A cache that cannot be opened (a read-only or full cache directory) is
+  reported in one line and the gate runs without it. Entries live under
+  `~/.cache/infr/tolerance-reference`, one directory per build-time fingerprint
+  of the CPU reference's crates and build settings, each keyed by a hash of
+  every model shard, the run's inputs and the engine configuration; a served
+  reference is recomputed once per case and compared bit for bit. Each gate
+  case, and `infr tune check`, now logs the seconds the reference spent hashing
+  the weights, computing and reading. The envelope
+  `infr_core::kernel_cache::KernelCache` writes is now also public: `seal`,
+  `unseal` (refusing with the new `Rejected`), `sealed_header`, `sealed_parts`,
+  `write_sealed`, and the constants `FORMAT_VERSION` and `HEADER_LEN`, with
+  `KernelCache`'s file format unchanged.
 
 - **Experimental: the Vulkan tuning parameter `quant_q8.experts_hi`** (off by
   default; `--set kernels.vulkan.tune.quant_q8.experts_hi=true`). With it on, a

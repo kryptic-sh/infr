@@ -134,12 +134,14 @@ fn process_token() -> u64 {
 
 /// Envelope layout version, INSIDE the producer's `magic`. A producer that changes its payload
 /// meaning bumps its own magic (`INFRVPC2` → `INFRVPC3`); this bumps only if the header itself
-/// changes shape, which would invalidate every producer at once.
-const FORMAT_VERSION: u16 = 1;
+/// changes shape, which would invalidate every producer at once. Public for a cleaner telling a
+/// file of an older envelope from one of the current ([`sealed_header`]).
+pub const FORMAT_VERSION: u16 = 1;
 
 /// `magic(8) ++ format_version(2) ++ key_len(2) ++ payload_len(8) ++ payload_hash(8)`, followed by
-/// the key bytes and then the payload.
-const HEADER_LEN: usize = 28;
+/// the key bytes and then the payload. Public for a reader that proves a file its own by its
+/// header alone ([`sealed_header`]).
+pub const HEADER_LEN: usize = 28;
 
 /// Suffix for a tripwire marker: `<path stem>.seeded.<pid>-<token>-<nonce>`. See the module doc.
 const MARKER_EXT: &str = "seeded";
@@ -302,38 +304,7 @@ impl KernelCache {
         let Some(path) = self.path.as_ref() else {
             return Ok(());
         };
-        let key_len: u16 = self.key.len().try_into().map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "kernel-cache key exceeds 65535 bytes",
-            )
-        })?;
-        let mut out = Vec::with_capacity(HEADER_LEN + self.key.len() + payload.len());
-        out.extend_from_slice(&self.magic);
-        out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
-        out.extend_from_slice(&key_len.to_le_bytes());
-        out.extend_from_slice(&(payload.len() as u64).to_le_bytes());
-        out.extend_from_slice(&fnv1a(payload).to_le_bytes());
-        out.extend_from_slice(&self.key);
-        out.extend_from_slice(payload);
-
-        let tmp = tmp_path(path);
-        match write_durable(&tmp, &out).and_then(|()| std::fs::rename(&tmp, path)) {
-            Ok(()) => {
-                // The rename itself is a directory metadata change: sync the directory so the new
-                // entry survives a crash too (the payload it points at is already on disk).
-                if let Some(dir) = path.parent() {
-                    if let Ok(d) = std::fs::File::open(dir) {
-                        let _ = d.sync_all();
-                    }
-                }
-                Ok(())
-            }
-            Err(e) => {
-                let _ = std::fs::remove_file(&tmp);
-                Err(e)
-            }
-        }
+        write_sealed(path, &seal(self.magic, &self.key, payload)?)
     }
 
     /// TRIPWIRE step 2: this run seeded from the blob and came back ALIVE. Removes THIS instance's
@@ -464,38 +435,135 @@ impl KernelCache {
     fn load_validated(&self) -> Option<Vec<u8>> {
         let path = self.path.as_ref()?;
         let data = std::fs::read(path).ok()?;
-        if data.len() < HEADER_LEN || data[..8] != self.magic {
-            return None;
+        match unseal(&data, self.magic, &self.key) {
+            Ok(payload) => Some(payload.to_vec()),
+            Err(Rejected::Checksum) => {
+                // Damaged file: never hand it to the driver (invalid cache data is explicitly
+                // undefined behavior, and on a GPU that reads as a hung ring rather than an error).
+                // Drop it and let this launch rebuild.
+                tracing::warn!(
+                    "[infr] kernel cache {} failed its checksum — discarding and rebuilding",
+                    path.display()
+                );
+                let _ = std::fs::remove_file(path);
+                None
+            }
+            Err(Rejected::Malformed | Rejected::Key) => None,
         }
-        let ver = u16::from_le_bytes(data[8..10].try_into().unwrap());
-        let key_len = u16::from_le_bytes(data[10..12].try_into().unwrap()) as usize;
-        let payload_len = u64::from_le_bytes(data[12..20].try_into().unwrap());
-        let sum = u64::from_le_bytes(data[20..28].try_into().unwrap());
-        // `payload_len` is attacker-free but not trust-free (bit-rot in the HEADER lands here):
-        // compute the expected size with checked arithmetic so a garbage length is a clean miss
-        // rather than a wrapped index.
-        let want = usize::try_from(payload_len)
-            .ok()
-            .and_then(|p| HEADER_LEN.checked_add(key_len)?.checked_add(p))?;
-        if ver != FORMAT_VERSION || data.len() != want {
-            return None;
+    }
+}
+
+/// Why [`unseal`] refused a file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rejected {
+    /// Not this producer's file, not this envelope version, or not the length its header says
+    /// (truncated, or a header damaged in its length fields).
+    Malformed,
+    /// A well-formed file whose key is not the one asked for: stale, never damaged.
+    Key,
+    /// The payload fails its checksum: the file is damaged, and the caller deletes it.
+    Checksum,
+}
+
+/// The envelope around `payload`: `magic ++ format_version ++ key_len ++ payload_len ++
+/// payload_hash ++ key ++ payload` (see the module doc). An error when the key is longer than
+/// the envelope's key length field can say.
+pub fn seal(magic: [u8; 8], key: &[u8], payload: &[u8]) -> std::io::Result<Vec<u8>> {
+    let key_len: u16 = key.len().try_into().map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "kernel-cache key exceeds 65535 bytes",
+        )
+    })?;
+    let mut out = Vec::with_capacity(HEADER_LEN + key.len() + payload.len());
+    out.extend_from_slice(&magic);
+    out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+    out.extend_from_slice(&key_len.to_le_bytes());
+    out.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+    out.extend_from_slice(&fnv1a(payload).to_le_bytes());
+    out.extend_from_slice(key);
+    out.extend_from_slice(payload);
+    Ok(out)
+}
+
+/// The payload of a file [`seal`]ed with `magic` and `key`, or why it is not one. Nothing is
+/// deleted here: on [`Rejected::Checksum`] the caller removes the damaged file.
+pub fn unseal<'a>(data: &'a [u8], magic: [u8; 8], key: &[u8]) -> Result<&'a [u8], Rejected> {
+    if data.len() < HEADER_LEN || data[..8] != magic {
+        return Err(Rejected::Malformed);
+    }
+    let ver = u16::from_le_bytes(data[8..10].try_into().unwrap());
+    let key_len = u16::from_le_bytes(data[10..12].try_into().unwrap()) as usize;
+    let payload_len = u64::from_le_bytes(data[12..20].try_into().unwrap());
+    let sum = u64::from_le_bytes(data[20..28].try_into().unwrap());
+    // `payload_len` is attacker-free but not trust-free (bit-rot in the HEADER lands here):
+    // compute the expected size with checked arithmetic so a garbage length is a clean miss
+    // rather than a wrapped index.
+    let want = usize::try_from(payload_len)
+        .ok()
+        .and_then(|p| HEADER_LEN.checked_add(key_len)?.checked_add(p))
+        .ok_or(Rejected::Malformed)?;
+    if ver != FORMAT_VERSION || data.len() != want {
+        return Err(Rejected::Malformed);
+    }
+    if data[HEADER_LEN..HEADER_LEN + key_len] != key[..] {
+        return Err(Rejected::Key);
+    }
+    let payload = &data[HEADER_LEN + key_len..];
+    if fnv1a(payload) != sum {
+        return Err(Rejected::Checksum);
+    }
+    Ok(payload)
+}
+
+/// The magic, key and payload of a sealed file, split as its header says, without checking the
+/// version or the checksum: for a test that rewrites a payload and seals it again. `None` for a
+/// file whose lengths do not add up.
+pub fn sealed_parts(data: &[u8]) -> Option<([u8; 8], &[u8], &[u8])> {
+    if data.len() < HEADER_LEN {
+        return None;
+    }
+    let key_len = u16::from_le_bytes(data[10..12].try_into().unwrap()) as usize;
+    let payload_len = usize::try_from(u64::from_le_bytes(data[12..20].try_into().unwrap())).ok()?;
+    if HEADER_LEN.checked_add(key_len)?.checked_add(payload_len)? != data.len() {
+        return None;
+    }
+    let (key, payload) = data[HEADER_LEN..].split_at(key_len);
+    Some((data[..8].try_into().unwrap(), key, payload))
+}
+
+/// The producer magic and envelope version a sealed file's header claims, read without checking
+/// anything else: what a cleaner proves a file is its own by. `None` for a file shorter than the
+/// header.
+pub fn sealed_header(data: &[u8]) -> Option<([u8; 8], u16)> {
+    if data.len() < HEADER_LEN {
+        return None;
+    }
+    let magic = data[..8].try_into().unwrap();
+    Some((magic, u16::from_le_bytes(data[8..10].try_into().unwrap())))
+}
+
+/// Write `bytes` to `path` atomically AND durably: a unique temp file beside it (`<path stem>.tmp.
+/// <pid>.<seq>`) → `fsync` → `rename` → `fsync` the directory. See the module doc for why plain
+/// `write` + `rename` is not enough. A failed write leaves the previous file untouched and the
+/// temp file removed, never a half-written target.
+pub fn write_sealed(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = tmp_path(path);
+    match write_durable(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path)) {
+        Ok(()) => {
+            // The rename itself is a directory metadata change: sync the directory so the new
+            // entry survives a crash too (the payload it points at is already on disk).
+            if let Some(dir) = path.parent() {
+                if let Ok(d) = std::fs::File::open(dir) {
+                    let _ = d.sync_all();
+                }
+            }
+            Ok(())
         }
-        if data[HEADER_LEN..HEADER_LEN + key_len] != self.key[..] {
-            return None;
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
         }
-        let payload = &data[HEADER_LEN + key_len..];
-        if fnv1a(payload) != sum {
-            // Damaged file: never hand it to the driver (invalid cache data is explicitly
-            // undefined behavior, and on a GPU that reads as a hung ring rather than an error).
-            // Drop it and let this launch rebuild.
-            tracing::warn!(
-                "[infr] kernel cache {} failed its checksum — discarding and rebuilding",
-                path.display()
-            );
-            let _ = std::fs::remove_file(path);
-            return None;
-        }
-        Some(payload.to_vec())
     }
 }
 
@@ -642,6 +710,22 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A sealed file splits back into the magic, key and payload it was sealed from, and one whose
+    /// lengths do not add up does not split.
+    #[test]
+    fn sealed_parts_split_what_seal_joined() {
+        let sealed = seal(MAGIC, b"the key", b"the payload").unwrap();
+        assert_eq!(
+            sealed_parts(&sealed),
+            Some((MAGIC, &b"the key"[..], &b"the payload"[..]))
+        );
+        assert_eq!(sealed_parts(&sealed[..sealed.len() - 1]), None);
+        assert_eq!(sealed_parts(&sealed[..HEADER_LEN - 1]), None);
+        let mut long = sealed.clone();
+        long.push(0);
+        assert_eq!(sealed_parts(&long), None, "a byte past the payload");
     }
 
     /// THE TRIPWIRE. A blob that hangs the GPU is perfectly well-formed, so no envelope check can

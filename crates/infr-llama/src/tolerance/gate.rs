@@ -9,6 +9,7 @@
 //! not exercised come back in an [`Evaluation`].
 
 use super::greedy::{greedy, GreedyOutcome};
+use super::oracle::{Oracle, Query, RefCache};
 use super::{lookup, Check, Entry, PathClass, RouteScore, RunScore, FIRST_ROWS, MIN_TOP1_SCORED};
 use crate::seam::{ForcedLogits, ForcedOn, PrefillHead, Routing};
 use crate::{EngineConfig, SeamModel};
@@ -120,18 +121,11 @@ pub fn argmax(row: &[f32]) -> u32 {
     (0..row.len()).fold(0, |b, i| if row[i] > row[b] { i } else { b }) as u32
 }
 
-/// The CPU reference's greedy run on `prompt`: `n` tokens, the logits at every position.
+/// The CPU reference's greedy run on `prompt`: `n` tokens, the logits at every position. Never
+/// through the reference cache.
 pub fn forced_reference(model: &SeamModel, prompt: &[u32], n: usize) -> Result<ForcedLogits> {
-    model
-        .forced_logits(
-            ForcedOn::CpuReference,
-            |_| {},
-            prompt,
-            n,
-            PrefillHead::All,
-            None,
-            |_, row| argmax(row),
-        )
+    Query::greedy(prompt, n)
+        .compute(model)
         .context("cpu reference run")
 }
 
@@ -175,6 +169,17 @@ pub fn forced_along(
             reference.seq[p + s]
         })
         .with_context(|| format!("forced run on {on:?}"))?;
+    check_along(on, head, reference, got)
+}
+
+/// `got`, a run on `on` forced along `reference`'s tokens scoring the prefill rows `head` names,
+/// or the error [`forced_along`] gives when it did not score the reference's positions.
+fn check_along(
+    on: ForcedOn,
+    head: PrefillHead,
+    reference: &ForcedLogits,
+    got: ForcedLogits,
+) -> Result<ForcedLogits> {
     // The two runs may be of models loaded apart (another configuration, a planted bug), so
     // these are answers about the caller's pair, not invariants.
     if head != PrefillHead::All {
@@ -560,20 +565,66 @@ pub fn check_file(table: &str, file: &FileIdentity) -> Result<(), String> {
 }
 
 /// A case with its CPU reference's greedy run on each prompt, computed once for every
-/// [`evaluate_with`] that scores against it.
+/// [`evaluate_with`] that scores against it, and every other reference run of the case's model
+/// an evaluation asks for ([`Reference::oracle`]).
 pub struct Reference<'a> {
     pub case: &'a Case,
     pub runs: Vec<ForcedLogits>,
+    oracle: Oracle<'a>,
 }
 
 impl<'a> Reference<'a> {
+    /// The reference of `case`, computed, never through the reference cache.
     pub fn new(case: &'a Case) -> Result<Self> {
-        let runs = case
-            .prompts
-            .iter()
-            .map(|ids| forced_reference(&case.model, ids, N_DECODE))
-            .collect::<Result<_>>()?;
-        Ok(Self { case, runs })
+        Self::with_cache(case, None)
+    }
+
+    /// The reference of `case` through `cache`: the greedy runs, and every reference run an
+    /// evaluation asks of it later, are served from the cache where stored. Under
+    /// [`super::oracle::Mode::On`] the shortest prompt's run among those served is recomputed
+    /// and compared bit for bit, and a difference is the error.
+    pub fn cached(case: &'a Case, cache: &'a RefCache) -> Result<Self> {
+        Self::with_cache(case, Some(cache))
+    }
+
+    fn with_cache(case: &'a Case, cache: Option<&'a RefCache>) -> Result<Self> {
+        let oracle = Oracle::new(&case.model, cache)?;
+        let mut runs = Vec::with_capacity(case.prompts.len());
+        let mut served = Vec::new();
+        for (pi, ids) in case.prompts.iter().enumerate() {
+            let (run, hit) = oracle.lookup(&Query::greedy(ids, N_DECODE))?;
+            if hit {
+                served.push(pi);
+            }
+            runs.push(run);
+        }
+        if let Some(&pi) = served.iter().min_by_key(|&&pi| case.prompts[pi].len()) {
+            oracle.canary(&Query::greedy(&case.prompts[pi], N_DECODE), &runs[pi])?;
+        }
+        Ok(Self { case, runs, oracle })
+    }
+
+    /// Where every other reference run of the case's model goes: through the cache when the
+    /// reference was made with one ([`Reference::cached`]).
+    pub fn oracle(&self) -> &Oracle<'a> {
+        &self.oracle
+    }
+
+    /// `run`'s tokens, and on a routed-expert model its expert selections, forced through the
+    /// reference with the KV format pair `kv`: [`forced`] on the CPU reference, through the
+    /// oracle.
+    pub fn along_kv(&self, run: &ForcedLogits, kv: (&str, &str)) -> Result<ForcedLogits> {
+        let on = ForcedOn::CpuReference;
+        let got = self
+            .oracle
+            .run(&Query::along(
+                run,
+                PrefillHead::All,
+                run.routing.as_ref(),
+                Some(kv),
+            ))
+            .with_context(|| format!("forced run on {on:?}"))?;
+        check_along(on, PrefillHead::All, run, got)
     }
 
     /// Hold the reference's prefill rows to what the case says of its model, adding to
@@ -788,12 +839,7 @@ pub fn evaluate_with(
             let entry = outcomes[ri].entry;
             let reference_run = match reference_kv {
                 None => r.clone(),
-                Some((k, v)) => forced(
-                    &reference.case.model,
-                    ForcedOn::CpuReference,
-                    |c| kv_types(c, k, v),
-                    r,
-                )?,
+                Some(kv) => reference.along_kv(r, kv)?,
             };
             let g = forced_with(&test.model, on, edit, PrefillHead::All, r)?;
             match (entry.route_near_tie, g.routing.is_some()) {
@@ -948,8 +994,24 @@ pub fn check(
     runs: &[(&str, PathClass)],
     log: Log,
 ) -> Result<Verdict> {
+    check_cached(key, table, reference, test, runs, None, log)
+}
+
+/// [`check`] with the CPU reference served through `cache` when one is given
+/// ([`Reference::cached`]), else computed. Either way the seconds the reference spent hashing the
+/// model's weights for the key, computing and reading from the cache are logged as three
+/// [`Event::Time`]s once the greedy check is done.
+pub fn check_cached(
+    key: &str,
+    table: &str,
+    reference: &Case,
+    test: &Case,
+    runs: &[(&str, PathClass)],
+    cache: Option<&RefCache>,
+    log: Log,
+) -> Result<Verdict> {
     let t0 = std::time::Instant::now();
-    let reference = Reference::new(reference)?;
+    let reference = Reference::with_cache(reference, cache)?;
     let cmp = Comparison {
         key,
         table,
@@ -976,6 +1038,14 @@ pub fn check(
         what: "the greedy check",
         seconds: t0.elapsed().as_secs_f64(),
     });
+    let spent = reference.oracle().seconds();
+    for (what, seconds) in [
+        ("the CPU reference's weights hashed", spent.hashed),
+        ("the CPU reference computed", spent.computed),
+        ("the CPU reference read from the cache", spent.read),
+    ] {
+        log(Event::Time { key, what, seconds });
+    }
     Ok(Verdict { forced, greedy })
 }
 

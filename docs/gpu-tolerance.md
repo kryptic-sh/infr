@@ -924,10 +924,12 @@ The evaluation is library code, `infr_llama::tolerance::gate` and `greedy`
 (`GPU_CONFIGS`), which of them a model runs and against which class's row
 (`runs_for`, read off the rows the table has for the model), the scoring, and
 `gate::check`, which runs the forced comparison and then the greedy check. Two
-things call `gate::check`: the tests below, and the command `infr tune check`
-("The command" further down). The test support code (`tests/support/forced.rs`)
-keeps what only tests need: opening a case by key or from a synthetic or planted
-file, the measurement, the watchdog and the skips.
+things call `gate::check`: the tests below (through `gate::check_cached`, which
+reads the CPU reference from a cache, "The reference cache" further down), and
+the command `infr tune check` ("The command" further down). The test support
+code (`tests/support/forced.rs`) keeps what only tests need: opening a case by
+key or from a synthetic or planted file, the measurement, the watchdog and the
+skips.
 
 The gate's tests are `gpu_seam_tolerance_*` in
 `crates/infr-llama/tests/gpu_tolerance.rs`, ignored by default like every GPU
@@ -1193,6 +1195,94 @@ the reference against itself, at a distance of exactly 0. The int8-free check
 reads the kernels a run BUILT, which are built lazily when first recorded: a
 superset of what ran, so its negative check is the conservative one; its marker
 list is typed by hand (B207).
+
+## The reference cache
+
+The CPU reference is the same for every GPU, configuration and tuning mode of
+one commit, so the gate keeps it on disk and computes it once per build rather
+than once per run ([plan 17](plan/17-reference-cache.md)). The cache is
+`infr_llama::tolerance::oracle`; the gate reads it through `gate::check_cached`,
+whose reference is built by `Reference::cached`. Only the `gpu_seam_tolerance_*`
+cases that call `forced::gate` go through it.
+
+`INFR_TOL_REFCACHE` picks what it does, read by the test support only (the
+library takes an opened cache and reads no environment):
+
+| Value     | What a lookup does                                                                                                                                                                                                                            |
+| --------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `on`      | The default. Serve a stored entry, compute and store a missing one. The shortest prompt among a case's served greedy runs is recomputed and compared bit for bit (the canary); a case with none served recomputes the first other run served. |
+| `verify`  | Always compute; fail on a stored entry that differs bit for bit, naming it; store a missing one.                                                                                                                                              |
+| `refresh` | Always compute and store; never read.                                                                                                                                                                                                         |
+| `off`     | No cache: the reference is computed, as before the cache existed.                                                                                                                                                                             |
+| `clear`   | Remove everything the cache owns, then run as `off`.                                                                                                                                                                                          |
+
+It is off whenever `CI` is set. It lives under the user cache directory,
+`$XDG_CACHE_HOME/infr/tolerance-reference`
+(`~/.cache/infr/tolerance-reference`), not under `target/`, so it survives
+`cargo clean` and is shared by worktrees whose hashed sources match. To clear
+it, run one case with `clear`:
+
+```text
+INFR_TOL_REFCACHE=clear INFR_DEV=Vulkan0 cargo test --release -p infr-llama \
+  --test gpu_tolerance -- --ignored gpu_seam_tolerance_synthetic_f32
+```
+
+**What separates entries.** A code fingerprint `crates/infr-llama/build.rs`
+hashes over the sources and manifests of every crate the CPU reference runs
+(`infr-core`, `infr-cpu`, `infr-gguf`, `infr-llama`, `infr-chat`, `infr-plat`,
+`infr-prof`, `infr-prof-rt`; a test fails when infr-llama gains a workspace
+dependency that is in neither this list nor the list of crates the reference
+does not run), the workspace manifest and lockfile, the compiler version, the
+target, profile, opt level, debug info, flags and features, and every
+`CARGO_CFG_*` value (debug assertions, overflow checks, the panic strategy,
+target features). It names the generation directory, whose marker holds it
+whole: an open whose fingerprint differs from the marker's is refused. Within a
+generation, each entry's key is stored in the entry verbatim and compared on
+read: a SHA-256 over every shard of the model file; the prompt ids, the step
+count, the prefill head, the tokens forced along (or greedy), a digest of any
+forced routing; every path of the engine configuration as text; the architecture
+and OS. `infr-vulkan` and `infr-metal` are not hashed, so a shader edit keeps
+the cache warm; an edit to any hashed crate starts a new generation cold. A
+build with no fingerprint (no sibling sources) refuses to open the cache. The
+reference case is the model file loaded again under the shipped defaults
+(`forced::reference_case`), as `infr tune check` loads its own, so the key does
+not split by device or mode.
+
+**When it cannot open.** A cache directory that is read-only or full, or a
+cleanup lock that cannot be made, does not fail the gate: one line,
+`refcache: OFF, the cache at ... could not be opened, so every reference is computed: <error>`,
+and the gate runs as `off`. A build with no fingerprint does the same when
+`INFR_TOL_REFCACHE` is unset, and fails the run when it names `on`, `verify` or
+`refresh`.
+
+**What it logs**, on stderr: one line per lookup, `refcache hit`, `stored` (a
+miss, computed and written), `miss, not stored (<error>):` (computed, the write
+failed) or `verified`, with the entry's file name and the query;
+`refcache canary` when a served entry was recomputed and matched. Each case also
+logs three timing lines with the others,
+`time <key>: the CPU reference's weights hashed <s>` (the SHA-256 of the model
+file for the key, zero without a cache),
+`time <key>: the CPU reference computed <s>` and
+`time <key>: the CPU reference read from the cache <s>`, so a report can say
+which reference it used and what it cost.
+
+**How old values go.** One directory per code fingerprint, with a marker and a
+last-used stamp, each entry one file in `infr_core::kernel_cache`'s envelope
+(magic, version, verbatim key, checksum, atomic durable write); a checksum
+failure deletes the entry. When a process first opens the cache, and only if it
+wins the cleanup lock, it removes another generation unused for three days, an
+entry of the current one unused that long, the least recently used entries past
+6 GB in all, and files of an older layout. It never deletes a file modified in
+the last hour, a symlink, anything outside its directory, or a file it cannot
+prove its own by name and header, and removes a directory only once it is empty.
+
+**Never read from the cache:** every test whose subject is the CPU reference or
+CPU production — `forced_run_reproduces_the_cpu_reference_on_every_path`, the
+self-checks, the red-path tests and the planted demonstrations (whose reference
+is `Reference::new`), the `cpu_act_quant` tests, the CPU goldens, the int8
+prefill accuracy test, `measure_gpu_tolerance` — and every test that calls
+`gate::forced_reference` directly. `infr tune check` stays uncached; it logs the
+same three timing lines.
 
 ## The command: `infr tune check`
 

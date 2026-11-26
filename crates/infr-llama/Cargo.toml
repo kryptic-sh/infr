@@ -21,6 +21,7 @@ infr-chat.workspace = true
 infr-vulkan.workspace = true
 infr-gguf.workspace = true
 infr-cpu.workspace = true
+infr-plat.workspace = true
 serde_json.workspace = true
 llguidance.workspace = true
 toktrie_hf_tokenizers.workspace = true
@@ -30,6 +31,13 @@ anyhow.workspace = true
 rayon.workspace = true
 tracing.workspace = true
 tokenizers = { workspace = true }
+# Content hashes for the tolerance gate's reference cache (`tolerance::oracle`): every model
+# shard's bytes, keyed so a changed weight never serves an old reference.
+sha2.workspace = true
+
+[build-dependencies]
+# The reference cache's code fingerprint (`build.rs`), over the sources the CPU reference runs.
+sha2.workspace = true
 
 [dev-dependencies]
 infr-hub.workspace = true

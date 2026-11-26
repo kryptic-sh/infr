@@ -10,6 +10,7 @@ pub use infr_llama::tolerance::gate::{
     argmax, kv_types, try_score, vulkan_float, vulkan_float_nocoopmat, GpuConfig, Reference,
     Scored, GPU_CONFIGS, N_DECODE, SMALL_UBATCH,
 };
+use infr_llama::tolerance::oracle::{Mode, RefCache};
 use infr_llama::tolerance::{PathClass, RunScore};
 
 /// The routed-expert (MoE) half: the synthetic model, the routing comparison, its self-check.
@@ -790,11 +791,15 @@ pub fn gate(key: &str) {
     let Some(device) = device_for(key, case.bytes) else {
         return;
     };
+    let reference = reference_case(&case);
+    let cache = ref_cache();
     let t_case = std::time::Instant::now();
     let table = table_name(key);
     let runs = gate::runs_for(table).unwrap_or_else(|| panic!("no tolerance row for {table}"));
-    let verdict = gate::check(key, table, &case, &case, &runs, &mut |e| println!("{e}"))
-        .unwrap_or_else(|e| panic!("{e:#}"));
+    let verdict = gate::check_cached(key, table, &reference, &case, &runs, cache, &mut |e| {
+        println!("{e}")
+    })
+    .unwrap_or_else(|e| panic!("{e:#}"));
     for n in verdict.not_exercised() {
         eprintln!("{n}");
     }
@@ -808,6 +813,122 @@ pub fn gate(key: &str) {
         "{key} is outside the GPU tolerance of the CPU reference:\n  {}",
         failures.join("\n  ")
     );
+}
+
+/// The case the gate's CPU reference runs on: `case`'s model file loaded again under the shipped
+/// defaults, with `case`'s prompts. Nothing of the test environment's GPU configuration reaches
+/// it, so one reference serves every device and mode, and its cache key does not split by them;
+/// `infr tune check` loads its reference the same way.
+pub fn reference_case(case: &Case) -> gate::Case {
+    let path = case.model.gguf().shard_handles()[0].path.to_path_buf();
+    let model = SeamModel::load_with(&path, None, std::sync::Arc::new(EngineConfig::default()))
+        .expect("reference model load");
+    gate::Case {
+        model,
+        prompts: case.prompts.clone(),
+        chat_prompt: case.chat_prompt.clone(),
+        batched_prefill: case.batched_prefill,
+        chains: case.chains,
+    }
+}
+
+/// What the gate does with the reference cache, decided from `CI` and `INFR_TOL_REFCACHE` alone
+/// ([`cache_choice`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CacheChoice {
+    /// Run without it, for the reason given.
+    Off(&'static str),
+    /// Remove everything it owns, then run without it.
+    Clear,
+    /// Open it in `mode`; `asked` when `INFR_TOL_REFCACHE` named the mode rather than defaulting.
+    Open { mode: Mode, asked: bool },
+}
+
+/// [`CacheChoice`] for `CI` being set (`ci`) and `INFR_TOL_REFCACHE`'s value (`setting`): off
+/// whenever `CI` is set, `on` when unset, else the named mode; an error naming the value for one
+/// it does not know.
+pub fn cache_choice(ci: bool, setting: Option<&str>) -> Result<CacheChoice, String> {
+    if ci {
+        return Ok(CacheChoice::Off("CI is set"));
+    }
+    let open = |mode| CacheChoice::Open { mode, asked: true };
+    Ok(match setting {
+        None => CacheChoice::Open {
+            mode: Mode::On,
+            asked: false,
+        },
+        Some("on") => open(Mode::On),
+        Some("verify") => open(Mode::Verify),
+        Some("refresh") => open(Mode::Refresh),
+        Some("off") => CacheChoice::Off("INFR_TOL_REFCACHE=off"),
+        Some("clear") => CacheChoice::Clear,
+        Some(other) => {
+            return Err(format!(
+                "INFR_TOL_REFCACHE={other:?}: expected off, on, verify, refresh or clear"
+            ))
+        }
+    })
+}
+
+/// Whether a cache that did not open fails the run (`true`) or lets it run without the cache: it
+/// fails only for a build with no code fingerprint when the mode was asked for by name. Anything
+/// else (a read-only or full cache directory, a lock that cannot be made, no fingerprint under
+/// the default) is the machine's, not the gate's, and runs without the cache.
+pub fn refuse_without_cache(asked: bool, has_fingerprint: bool) -> bool {
+    asked && !has_fingerprint
+}
+
+/// The reference cache the gate reads, as [`cache_choice`] decides from the environment. Opened
+/// once per process, which is when its cleanup runs; its lines go to stderr. A cache that cannot
+/// be opened is reported in one line and the gate runs without it, unless
+/// [`refuse_without_cache`] says otherwise. See `docs/gpu-tolerance.md`, "The reference cache".
+pub fn ref_cache() -> Option<&'static RefCache> {
+    static CACHE: std::sync::OnceLock<Option<RefCache>> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let setting = std::env::var("INFR_TOL_REFCACHE").ok();
+            let choice = cache_choice(std::env::var_os("CI").is_some(), setting.as_deref())
+                .unwrap_or_else(|e| panic!("{e}"));
+            let root = RefCache::default_root();
+            let (mode, asked) = match choice {
+                CacheChoice::Off(why) => {
+                    eprintln!("refcache: off, {why}");
+                    return None;
+                }
+                CacheChoice::Clear => {
+                    if let Some(root) = &root {
+                        let removed = RefCache::clear(root);
+                        eprintln!("refcache: cleared {removed} files under {}", root.display());
+                    }
+                    eprintln!("refcache: off after the clear");
+                    return None;
+                }
+                CacheChoice::Open { mode, asked } => (mode, asked),
+            };
+            let has_fingerprint = infr_llama::tolerance::oracle::fingerprint().is_some();
+            let Some(root) = root else {
+                eprintln!("refcache: OFF, no home directory to keep it under");
+                return None;
+            };
+            match RefCache::open(&root, mode, |l| eprintln!("{l}")) {
+                Ok(cache) => {
+                    eprintln!("refcache: {mode:?} at {}", root.display());
+                    Some(cache)
+                }
+                Err(e) if refuse_without_cache(asked, has_fingerprint) => {
+                    panic!("{e:#} (INFR_TOL_REFCACHE=off runs the gate without the cache)")
+                }
+                Err(e) => {
+                    eprintln!(
+                        "refcache: OFF, the cache at {} could not be opened, so every reference \
+                         is computed: {e:#}",
+                        root.display()
+                    );
+                    None
+                }
+            }
+        })
+        .as_ref()
 }
 
 /// Score each run of `test` (driven on `on`) against the CPU reference's run of `reference` along

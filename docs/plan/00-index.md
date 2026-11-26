@@ -40,7 +40,7 @@ reference to judge tuned values against.
 | Phase | What                                                                                               | Status                                                                                                                                                          |
 | ----- | -------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | 11    | [CPU output bit-identical on every platform, GPUs within tolerance of it](11-cpu-bit-identical.md) | S0-S4 and S6 done (S5 in S2), G1-G3 done; G4 partly done (the Qwen3 golden retired, `infr tune check` done); **the tests of G4 that need a row first are next** |
-| 17    | [Cache the CPU reference](17-reference-cache.md)                                                   | not started                                                                                                                                                     |
+| 17    | [Cache the CPU reference](17-reference-cache.md)                                                   | in progress: slice 1 done (the cache, the gate wiring, the timing line); slices 2 and 3 not started                                                             |
 
 ## Vulkan backend
 

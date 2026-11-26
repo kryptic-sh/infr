@@ -12,10 +12,12 @@
 //!
 //! [`metrics`] has the distances, [`table`] the bounds, and [`gate`] and [`greedy`] the
 //! evaluation that holds a model to them: what the GPU tolerance tests and `infr tune check` run.
+//! [`oracle`] keeps the CPU reference those tests score against in an on-disk cache.
 
 pub mod gate;
 pub mod greedy;
 pub mod metrics;
+pub mod oracle;
 pub mod table;
 
 pub use metrics::{score_row, RouteFlip, RouteScore, RowError, RowScore, RunScore, TokenScore};

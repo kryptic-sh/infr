@@ -17,6 +17,10 @@
 #[path = "support/forced.rs"]
 mod forced;
 
+/// The reference cache's tests on synthetic models (`infr_llama::tolerance::oracle`).
+#[path = "support/oracle.rs"]
+mod oracle;
+
 /// The planted-bug demonstrations, built only with the `mutations` feature.
 #[cfg(feature = "mutations")]
 #[path = "planted/mod.rs"]

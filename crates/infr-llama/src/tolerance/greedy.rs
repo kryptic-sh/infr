@@ -16,7 +16,8 @@
 //! prints nothing itself: measured values go to the caller's [`Log`], and what it could not
 //! compare on the device or model comes back in [`GreedyOutcome::not_exercised`].
 
-use super::gate::{argmax, entry, gpu_config, kv_types, Case, Event, GpuConfig, Log, Reference};
+use super::gate::{argmax, entry, gpu_config, Case, Event, GpuConfig, Log, Reference};
+use super::oracle::{Pick, Query};
 use super::{Check, PathClass, TokenScore, MIN_TOP1_SCORED};
 use crate::seam::{ForcedLogits, ForcedOn, GreedyTail, PrefillHead};
 use crate::EngineConfig;
@@ -349,21 +350,15 @@ pub fn greedy(
                 Some(k) => k,
                 None => {
                     let run = reference
-                        .case
-                        .model
-                        .forced_logits(
-                            ForcedOn::CpuReference,
-                            |c| {
-                                if let Some((k, v)) = kv {
-                                    kv_types(c, k, v);
-                                }
-                            },
-                            ids,
-                            m,
-                            PrefillHead::Off,
-                            None,
-                            |s, _| chosen[s],
-                        )
+                        .oracle()
+                        .run(&Query {
+                            prompt: ids,
+                            steps: m,
+                            head: PrefillHead::Off,
+                            pick: Pick::Along(&chosen[..m]),
+                            route: None,
+                            kv,
+                        })
                         .with_context(|| format!("{at}, the reference along its tokens"))?;
                     along.push((seq, run));
                     along.len() - 1

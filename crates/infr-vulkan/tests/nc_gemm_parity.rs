@@ -582,9 +582,56 @@ fn run_kq_fma(
     }
 }
 
+/// What [`kq_fma_and_gemv_rms_error`] measures on one shape.
+struct KqFmaError {
+    /// The tile's root-mean-square error against the f64 reference.
+    tile: f64,
+    /// The per-row GEMV's, on the same weights and activations.
+    gemv: f64,
+    /// The root mean square of the f64 reference's outputs: the scale both errors are read
+    /// against.
+    scale: f64,
+}
+
+/// The tile's RMS error allowed against the f64 reference, as a fraction of the RMS of the
+/// reference's outputs, in units of `f32::EPSILON`. The comparison with the GEMV alone would pass
+/// a tile that got worse together with the GEMV, and could fail one that did not regress on a
+/// driver whose GEMV rounds a little better; this bound holds the tile to the reference itself.
+const KQ_FMA_REL_BOUND_EPS: f64 = 2.0;
+
+impl KqFmaError {
+    /// Why this shape fails, if it does: the tile further from the reference than the GEMV, past
+    /// [`KQ_FMA_REL_BOUND_EPS`], or both.
+    fn failure(&self) -> Option<String> {
+        let mut why = Vec::new();
+        if self.tile > self.gemv {
+            why.push("above the per-row GEMV's error");
+        }
+        if self.tile > KQ_FMA_REL_BOUND_EPS * f32::EPSILON as f64 * self.scale {
+            why.push("above the bound against the f64 reference");
+        }
+        (!why.is_empty()).then(|| why.join(" and "))
+    }
+}
+
+impl std::fmt::Display for KqFmaError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let eps = f32::EPSILON as f64 * self.scale;
+        write!(
+            f,
+            "tile {:.3e} ({:.3} eps), gemv {:.3e} ({:.3} eps), outputs' RMS {:.3e}",
+            self.tile,
+            self.tile / eps,
+            self.gemv,
+            self.gemv / eps,
+            self.scale
+        )
+    }
+}
+
 /// The fp32 K-quant tile's (`splits` picks split-K) and the per-row f32 dequant GEMV's
 /// (`native_gemv.comp`, the kernel the tile replaces) root-mean-square error against an f64 dot
-/// of the host-dequantized weight, on one shared input: `(tile, gemv)`.
+/// of the host-dequantized weight, on one shared input.
 #[allow(clippy::too_many_arguments)]
 fn kq_fma_and_gemv_rms_error(
     be: &VulkanBackend,
@@ -594,7 +641,7 @@ fn kq_fma_and_gemv_rms_error(
     k: usize,
     n: usize,
     splits: Option<usize>,
-) -> (f64, f64) {
+) -> KqFmaError {
     let bank = synth_bank(dt, n * k, 0xacc ^ dt as u64 ^ (k * n) as u64);
     let w_host = infr_gguf::dequant::dequant_block(dt, &bank).unwrap();
     let padded = pad_to_u32_align(&bank);
@@ -637,31 +684,44 @@ fn kq_fma_and_gemv_rms_error(
         .expect("a resident weight has a device address");
     rec.linear_native_at(dt, addr, 0, xbuf.as_ref(), gemv.as_ref(), m, k, n);
     rec.finish().unwrap();
+    let want: Vec<f64> = (0..m * n)
+        .map(|i| {
+            let (r, o) = (i / n, i % n);
+            w_host[o * k..(o + 1) * k]
+                .iter()
+                .zip(&x[r * k..(r + 1) * k])
+                .map(|(a, b)| *a as f64 * *b as f64)
+                .sum()
+        })
+        .collect();
     let rms = |b: &dyn Buffer, rows: usize| {
         let mut v = vec![0f32; rows * n];
         be.download(b, bytemuck::cast_slice_mut(&mut v)).unwrap();
         let mut se = 0f64;
-        for r in 0..m {
-            for o in 0..n {
-                let want: f64 = w_host[o * k..(o + 1) * k]
-                    .iter()
-                    .zip(&x[r * k..(r + 1) * k])
-                    .map(|(a, b)| *a as f64 * *b as f64)
-                    .sum();
-                let g = v[r * n + o];
-                assert!(g.is_finite(), "{dt:?} non-finite at row {r} col {o}");
-                se += (g as f64 - want).powi(2);
-            }
+        for (i, want) in want.iter().enumerate() {
+            let g = v[i];
+            assert!(
+                g.is_finite(),
+                "{dt:?} non-finite at row {} col {}",
+                i / n,
+                i % n
+            );
+            se += (g as f64 - want).powi(2);
         }
         (se / (m * n) as f64).sqrt()
     };
-    (rms(tile.as_ref(), mpad), rms(gemv.as_ref(), m))
+    KqFmaError {
+        tile: rms(tile.as_ref(), mpad),
+        gemv: rms(gemv.as_ref(), m),
+        scale: (want.iter().map(|w| w * w).sum::<f64>() / (m * n) as f64).sqrt(),
+    }
 }
 
-/// The tile is held to the kernel it replaces: on the same weights and activations its RMS error
-/// against an f64 host reference is no larger than the per-row GEMV's. A tile summing each output
-/// in one f32 running sum over the whole k range fails this at every shape below (gemma-3-1b's
-/// `ffn_down` and `attn_output` among them); its summation is what this guards.
+/// The tile is held to the kernel it replaces and to the reference: on the same weights and
+/// activations its RMS error against an f64 host reference is no larger than the per-row GEMV's,
+/// and within [`KQ_FMA_REL_BOUND_EPS`] of the reference's own scale. A tile summing each output
+/// in one f32 running sum over the whole k range fails this (the shapes include gemma-3-1b's
+/// `ffn_down` and `attn_output`); its summation is what this guards.
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn nc_kq_fma_gemm_is_as_accurate_as_the_gemv() {
@@ -673,23 +733,23 @@ fn nc_kq_fma_gemm_is_as_accurate_as_the_gemv() {
     for dt in [DType::Q4_0, DType::Q4K, DType::Q6K] {
         for bn in [64, 128] {
             for (m, k, n) in [(20, 6912, 1152), (33, 1024, 1152), (64, 4096, 256)] {
-                let (tile, gemv) = kq_fma_and_gemv_rms_error(&be, dt, bn, m, k, n, None);
-                let line = format!("{dt:?} t{bn} m{m} k{k} n{n}: tile {tile:.3e}, gemv {gemv:.3e}");
+                let e = kq_fma_and_gemv_rms_error(&be, dt, bn, m, k, n, None);
+                let line = format!("{dt:?} t{bn} m{m} k{k} n{n}: {e}");
                 println!("{line}");
-                if tile > gemv {
-                    worse.push(line);
+                if let Some(why) = e.failure() {
+                    worse.push(format!("{line}: {why}"));
                 }
             }
         }
     }
     assert!(
         worse.is_empty(),
-        "the tile's RMS error exceeds the per-row GEMV's:\n  {}",
+        "the tile is not as accurate as required:\n  {}",
         worse.join("\n  ")
     );
 }
 
-/// The split-K twin under the same bound as the direct tile, at the slice counts the plan picks
+/// The split-K twin under the same two bounds as the direct tile, at the slice counts the plan picks
 /// for gemma-3-1b's `attn_output` (k = 1024) and for a deeper k.
 #[test]
 #[ignore = "requires a Vulkan GPU"]
@@ -702,20 +762,18 @@ fn nc_kq_fma_splitk_is_as_accurate_as_the_gemv() {
     for dt in [DType::Q4_0, DType::Q4K, DType::Q6K] {
         for bn in [64, 128] {
             for (m, k, n, s) in [(33, 1024, 1152, 4), (33, 1024, 1152, 2), (20, 8192, 256, 8)] {
-                let (tile, gemv) = kq_fma_and_gemv_rms_error(&be, dt, bn, m, k, n, Some(s));
-                let line = format!(
-                    "{dt:?} t{bn} m{m} k{k} n{n} splits{s}: tile {tile:.3e}, gemv {gemv:.3e}"
-                );
+                let e = kq_fma_and_gemv_rms_error(&be, dt, bn, m, k, n, Some(s));
+                let line = format!("{dt:?} t{bn} m{m} k{k} n{n} splits{s}: {e}");
                 println!("{line}");
-                if tile > gemv {
-                    worse.push(line);
+                if let Some(why) = e.failure() {
+                    worse.push(format!("{line}: {why}"));
                 }
             }
         }
     }
     assert!(
         worse.is_empty(),
-        "the split-K tile's RMS error exceeds the per-row GEMV's:\n  {}",
+        "the split-K tile is not as accurate as required:\n  {}",
         worse.join("\n  ")
     );
 }
@@ -746,7 +804,7 @@ fn nc_kq_fma_gemm_parity_and_determinism() {
 }
 
 /// The split-K twin: same host-reference parity and run-to-run determinism as the direct tile,
-/// with the k range cut into `splits` slices plus a `splitk_reduce` pass. Shapes cover a single
+/// with the k range cut into `splits` slices plus a `splitk_reduce_kahan` pass. Shapes cover a single
 /// row tile, a partial row tile and several (m=512: 4 row tiles) across both column tiles.
 #[test]
 #[ignore = "requires a Vulkan GPU"]

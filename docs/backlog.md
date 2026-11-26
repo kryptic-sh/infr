@@ -87,15 +87,84 @@ Everything else in that filter passed on the iGPU, including every float and
 K-quant GEMV/GEMM parity binary, decode split-K attention, the logits tail,
 `seam_op_parity` apart from the RoPE test, and the Intel `caps` unit tests.
 
-**The model tolerance gates were all skipped.** On a unified-memory device the
-harness requires free host memory of twice the model plus a fixed 12 GiB
-(`UNIFIED_HOST_MARGIN`), which a 15 GiB laptop can never have. That rule lives
-in two copies (`tests/support/forced.rs` and `tests/cpu_backend.rs`). Slice 1 in
-progress makes the margin the smaller of the fixed cap and a share of total host
-memory, keeps one copy, and adds a total-memory probe to `infr_plat::mem`. The
-small catalogue models (Qwen3 0.6B and 1.7B, Qwen2.5 0.5B, Gemma 3 1B, Qwen3.5
-0.8B, ERNIE 4.5 0.3B Q4 and F16, Llama 3.2 1B, LFM3 1.7B) are cached on the
-laptop for the gate run that follows.
+**The model gate on the iGPU (2026-11-27).** This was the gate filter's model
+half,
+`test(gpu_seam) | test(gpu_prefill) | test(lfm3) | test(qwen35) | test(gemma) | test(paged) | test(deepseek) | test(dsv4) | test(mtp_head_cpu_vulkan_parity) | test(vram_limit_tests)`
+without the `infr-vulkan` binaries and `seam_op_parity` already run above, on
+`INFR_DEV=Vulkan0`, release, serially, reference cache `on`: 277 run, 273
+passed, 4 failed. The tolerance cases for Qwen3, Qwen3.5, LFM3, ERNIE 0.3B and
+the synthetic f16 model passed in every run.
+
+- **The int8 runs miss on two models; the float runs pass.**
+  `gpu_seam_tolerance_gemma3` fails `gpu` and `gpu-ub32` only: mean KL 0.062
+  over 0.027 on the 33-token prompt; on the 180-token prompt, top-k cosine 0.60
+  at position 114 under 0.71 and KL 0.65 at position 155 over 0.52. The greedy
+  check passes. `gpu_seam_tolerance_synthetic_f32` fails the same two runs:
+  prefill logit deviation 3.96e-3 at position 115 over 3.9e-3. Plan 19 S2b. The
+  same symptom on the AMD iGPU is B207.
+- **The VRAM-limit tests disagree with ANV's budget.**
+  `vram_limit_tests::auto_ctx_before_the_load_is_the_ctx_after_it`: Qwen3-0.6B
+  under a 1400 MiB limit opened with 1576 tokens and ran with 1125 ("27525120
+  bytes promised and not held"), and under 1600 MiB opened with 3652 and ran
+  with 2710. `explicit_ctx_short_of_the_room_after_the_weights_is_refused` was
+  served in Q8_0/Q8_0, not f16. This is probably the same as group 4 above: what
+  ANV's memory budget reports on this unified-memory device. Not investigated.
+
+**The model tolerance gates skipped on this laptop until the margin scaled.** On
+a unified-memory device the harness required free host memory of twice the model
+plus a fixed `UNIFIED_HOST_MARGIN`, which a 15 GiB host never has. The margin is
+now `unified_host_margin` (`tests/support/hostroom.rs`), the smaller of that cap
+and a share of total host memory (`infr_plat::mem::total`), and the rule has one
+copy. The small catalogue models (Qwen3 0.6B and 1.7B, Qwen2.5 0.5B, Gemma 3 1B,
+Qwen3.5 0.8B, ERNIE 4.5 0.3B Q4 and F16, Llama 3.2 1B, LFM3 1.7B) are cached on
+the laptop; their gate run on the iGPU is the next result to record here.
+
+### B-INTEL-IGPU-PERF — optimizing for Intel integrated GPUs (2026-11-27)
+
+**Kind:** performance work raised and not started. **Blocked on:** the
+correctness slices of plan 19 (S2 and S3), since a row or a kernel change is not
+measured on a device that still fails the gate.
+
+Plan 19 S5 covers the tuning rows: existing parameters set to measured values.
+This entry is the work beyond that, the kernels and paths themselves, each a
+candidate until measured. None of it has been measured. Each one is held to the
+rule in AGENTS.md: output unchanged or no further from the CPU reference.
+
+- **A baseline first.** llama.cpp is cloned at `ref/llama.cpp` on the Intel
+  laptop but not built yet, so nothing yet says how far infr is from llama.cpp's
+  Vulkan backend on this device. Build it and run `infr compare` or `infr bench`
+  against `llama-bench` on Qwen3-1.7B, Llama-3.2-1B and Gemma-3-1B Q4_K_M, pp512
+  and tg128, in a quiet window. That baseline decides which items below are
+  worth doing.
+- **Subgroup widths.** Xe-LP's subgroup range is 8 to 32 and `device.sg_pref`
+  resolves to 16 on it. Kernels that pin 32 run SIMD32 on Intel, which can cost
+  occupancy and registers there. See which kernels pin which width on this
+  device, and whether SIMD16 builds of the decode GEMVs and reductions are
+  faster. The wave64 kernels never run here.
+- **48 KiB of shared memory.** The tile and staging sizes were chosen against
+  AMD's 64 KiB. A tile that only fits in 64 KiB falls back or runs with lower
+  occupancy on Intel. List which builds the 48 KiB limit turns off on this
+  device and what they fall back to.
+- **The int8 dot path with no matrix units.** The device reports the packed
+  4x8-bit dot as accelerated (DP4A) and has no cooperative matrix. So prefill
+  takes the non-coopmat GEMM tier and decode the int8 GEMVs (`gemv.kq_fma`
+  resolves to false). Whether the int8 or the fp32 K-quant GEMV is faster here
+  is not measured.
+- **Unified memory with host-pointer import.** The device exposes
+  `VK_EXT_external_memory_host` with a 4 KiB `minImportedHostPointerAlignment`.
+  On a unified-memory part, importing the GGUF mmap pages could replace the
+  upload copy for page-aligned tensors: no second copy of the weights in system
+  RAM, and a faster load. That needs a correctness story for the file changing
+  under the mapping (B30) and measuring against the copy. `docs/igpu.md` covers
+  the AMD iGPU's unified-memory work; the Intel heap layout (one 11.48 GiB heap)
+  differs and was not studied.
+- **The watchdog rule's numbers.** The integrated-GPU default (128-row prefill
+  chunks, a forward split every 128 dispatches) was set on the AMD iGPU's
+  timeout. The i915/xe kernel driver has its own preemption and reset timeouts.
+  Measure what the Intel part tolerates before raising the chunk height, which
+  is where prefill speed on an iGPU comes from.
+- **The core count.** `0xa721` reports `cores:?` (plan 19 S4). Rules scaled by
+  core count (split-K windows, grid sizing) take their fallback here.
 
 ### B-PARKED-KQ-FMA-KAHAN — the fp32 K-quant GEMM's accuracy fix is parked on a branch (2026-11-27)
 

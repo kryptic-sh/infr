@@ -360,6 +360,30 @@ impl OaiRenderer {
         &self.ecfg
     }
 
+    /// `prompt` with the model's BOS token in front when the GGUF asks for one and the prompt does
+    /// not already start with it — for raw text completion, where no chat template supplies it.
+    pub fn with_bos(&self, prompt: &str) -> String {
+        use infr_core::loader::MetaValue;
+        use infr_core::WeightSource;
+        let md = self.gguf.metadata();
+        // A GGUF normally states this; the fallback is llama.cpp's per-vocabulary default for the
+        // two families this crate builds — SentencePiece (`llama`) adds a BOS, byte-level BPE
+        // (`gpt2`: Qwen, Llama-3, SmolLM) does not. An unknown family without the key reads as
+        // "off", which leaves the prompt alone rather than prepending a token it may not know.
+        let add = match md.get("tokenizer.ggml.add_bos_token") {
+            Some(MetaValue::Bool(b)) => *b,
+            _ => md.str("tokenizer.ggml.model") == Some("llama"),
+        };
+        let bos = add
+            .then(|| md.u64("tokenizer.ggml.bos_token_id"))
+            .flatten()
+            .and_then(|id| self.tokenizer.id_to_token(id as u32));
+        match bos {
+            Some(b) if !prompt.starts_with(&b) => format!("{b}{prompt}"),
+            _ => prompt.to_string(),
+        }
+    }
+
     pub fn render(
         &self,
         messages: &[infr_chat::ChatMessage],

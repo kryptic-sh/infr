@@ -2245,6 +2245,20 @@ impl infr_server::ChatGenerator for SeamGenerator {
             None => run_chat(self, messages, tools, tool_choice, params, cancel, on_delta),
         }
     }
+
+    fn complete(
+        &self,
+        prompt: &str,
+        params: &infr_server::GenParams,
+        cancel: &Arc<std::sync::atomic::AtomicBool>,
+        on_text: &mut dyn FnMut(&str),
+    ) -> anyhow::Result<infr_server::ChatOutcome> {
+        run_completion(self, prompt, params, cancel, on_text)
+    }
+
+    fn prepare_completion(&self, prompt: &str) -> anyhow::Result<Option<(u32, Option<u32>)>> {
+        Ok(Some(count_completion_tokens(self, prompt)?))
+    }
 }
 
 impl infr_server::ChatGenerator for ParallelGenerator {
@@ -2304,6 +2318,80 @@ impl infr_server::ChatGenerator for ParallelGenerator {
             None => run_chat(self, messages, tools, tool_choice, params, cancel, on_delta),
         }
     }
+
+    fn complete(
+        &self,
+        prompt: &str,
+        params: &infr_server::GenParams,
+        cancel: &Arc<std::sync::atomic::AtomicBool>,
+        on_text: &mut dyn FnMut(&str),
+    ) -> anyhow::Result<infr_server::ChatOutcome> {
+        run_completion(self, prompt, params, cancel, on_text)
+    }
+
+    fn prepare_completion(&self, prompt: &str) -> anyhow::Result<Option<(u32, Option<u32>)>> {
+        Ok(Some(count_completion_tokens(self, prompt)?))
+    }
+}
+
+/// The raw prompt as generation will see it (BOS included), in tokens, and the model's prompt
+/// budget — what lets the server refuse an over-long completion before it queues for a slot.
+fn count_completion_tokens(
+    be: &dyn GenBackend,
+    prompt: &str,
+) -> anyhow::Result<(u32, Option<u32>)> {
+    let renderer = be.renderer();
+    let n = renderer.count_tokens(&renderer.with_bos(prompt))?;
+    let saturate = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+    Ok((saturate(n), be.max_prompt_tokens().map(saturate)))
+}
+
+/// The `/v1/completions` body shared by every serve backend: the raw prompt (plus BOS when the model
+/// wants one) is continued as plain text, with stop sequences applied to the decoded stream.
+fn run_completion(
+    be: &dyn GenBackend,
+    prompt: &str,
+    params: &infr_server::GenParams,
+    cancel: &Arc<std::sync::atomic::AtomicBool>,
+    on_text: &mut dyn FnMut(&str),
+) -> anyhow::Result<infr_server::ChatOutcome> {
+    be.weights().check()?;
+    let prompt = be.renderer().with_bos(prompt);
+    let max_new = params
+        .max_tokens
+        .map(|v| v as usize)
+        .unwrap_or_else(|| be.max_new_default());
+    let req = be
+        .request_ctx(request_sampling(params))
+        .with_cancel(cancel.clone());
+    let mut stops = infr_server::StopMatcher::new(params.stop.clone());
+    let stats = be
+        .generate(&prompt, max_new, None, &req, &mut |piece: &str| {
+            let safe = stops.push(piece);
+            if !safe.is_empty() {
+                on_text(&safe);
+            }
+            if stops.hit() {
+                req.abort();
+            }
+        })
+        .map_err(|e| {
+            // The request's own fault reaches the server as its typed 400: an over-long prompt,
+            // or a sampling field this backend refuses.
+            context_length_exceeded(&e, params.max_tokens.is_some())
+                .or_else(|| unsupported_sampling(&e))
+                .unwrap_or(e)
+        })?;
+    let tail = stops.flush();
+    if !tail.is_empty() {
+        on_text(&tail);
+    }
+    // `finish_reason`/`chat_outcome`, not a copy: `ctx_full` and `natural_stop` decide `length`
+    // versus `stop`, and `prompt_tokens` is the WHOLE prompt, cached part included.
+    Ok(chat_outcome(
+        finish_reason(stops.hit(), &stats, max_new),
+        &stats,
+    ))
 }
 
 /// Tool-call parsing is enabled only when the request offers at least one tool and has not

@@ -199,6 +199,16 @@ Per-request sampling fields: `temperature`, `top_p`, `top_k`, `min_p`, `seed`,
 and `max_tokens` / `max_completion_tokens`. `n` above 1, `logprobs` and
 `top_logprobs` are not supported and answer `400`.
 
+`POST /v1/completions` serves the same models through the legacy text-completion
+shape: a raw prompt continued as text, with no chat template, which is what FIM
+(`<|fim_prefix|>…`) and autocompletion clients speak. It takes `prompt` as a
+string or a one-element array, plus `stream`, `stop`, `echo`,
+`stream_options.include_usage` and the sampling fields above, `logit_bias`
+included. `suffix`, token-array prompts, `n` above 1, `best_of` above 1, `user`
+and `logprobs` answer `400`. The route is always registered: no configuration
+key turns it off, and it sits behind the same API key, `Host` check and body
+limit as the chat route.
+
 ## Performance
 
 Measured against llama.cpp on an **AMD Radeon RX 7900 XTX** (RDNA3, Vulkan /

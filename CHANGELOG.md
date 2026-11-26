@@ -109,7 +109,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `unseal` (refusing with the new `Rejected`), `sealed_header`, `sealed_parts`,
   `write_sealed`, and the constants `FORMAT_VERSION` and `HEADER_LEN`, with
   `KernelCache`'s file format unchanged.
-
+- **`POST /v1/completions`**, the legacy OpenAI text-completion endpoint: a raw
+  prompt continued without a chat template, which is what FIM
+  (`<|fim_prefix|>…`) and autocompletion clients speak. It takes `prompt` as a
+  string or a one-element array, and supports `stream`, `stop`, `echo`,
+  `stream_options.include_usage`, the usual sampling fields and request-level
+  `logit_bias`. It shares the chat route's validation, typed `400` bodies, queue
+  accounting, deadline and client-hangup cancellation; `usage.prompt_tokens`
+  counts the whole prompt, KV-cache hits included. `suffix`, token-array
+  prompts, `n > 1`, `best_of > 1`, `user` and `logprobs` answer `400`. The route
+  is always registered — it cannot be switched off in the configuration.
 - **Experimental: the Vulkan tuning parameter `quant_q8.experts_hi`** (off by
   default; `--set kernels.vulkan.tune.quant_q8.experts_hi=true`). With it on, a
   MoE model's batched prefill quantizes the routed experts' activations with an

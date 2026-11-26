@@ -967,15 +967,16 @@ const BDA_CHUNK_ROW_ALIGN: usize = 64;
 /// or, as the error, that count when it is past `max_x`. The kernel recovers the flat id from
 /// `gl_WorkGroupID.x` alone (the k slice is the top of it), so this grid records through plain
 /// `Recorder::dispatch`, NOT `dispatch_wide`'s 2-D split: a wider one must be refused rather than
-/// truncated by a driver that enforces the limit. Same shape as [`expert_grid_x`].
-fn kq_fma_grid_x(
+/// truncated by a driver that enforces the limit. The adapter's plan (`kq_fma_plan`) asks this
+/// first and takes another kernel instead. Same shape as [`expert_grid_x`].
+pub(crate) fn kq_fma_grid_x(
     m: usize,
     n: usize,
     bn: usize,
     splits: usize,
     max_x: u32,
 ) -> std::result::Result<u32, usize> {
-    let gx = m.div_ceil(128) * (n / bn).max(1) * splits;
+    let gx = m.div_ceil(crate::gemm::KQ_FMA_BM) * (n / bn).max(1) * splits;
     if gx <= max_x as usize {
         Ok(gx as u32)
     } else {
@@ -3671,11 +3672,13 @@ impl<'a> Recorder<'a> {
         self.dispatch_wide(kern, &bufs, 1, &push, groups);
     }
 
-    /// One dispatch per k slice of the fp32 K-quant tile, each writing the full
-    /// `ceil(m/64)*64 x n` tile into `dst` (the same buffer bound 3×; the shader reads the slice
-    /// bounds from its push constants). `splits == 1` is the direct tile: a single dispatch into
-    /// `dst`, no partials. Returns whether the dispatch was recorded: `false` once the grid is
-    /// past the device's x limit, which fails the recording by name.
+    /// One dispatch of the fp32 K-quant tile over all `splits` k slices: row tiles × column tiles
+    /// × slices workgroups, the slice in the top of the workgroup id. Slice `s` writes its
+    /// `ceil(m/64)*64 x n` plane at offset `s * ceil(m/64)*64 * n` of `dst`; with `splits == 1`
+    /// that is the direct tile, written straight into `dst`. Bindings: `a` at 0, `a` again at 1
+    /// as a filler (the weight is read by its 64-bit address from the push constants), `dst` at 2.
+    /// Returns whether the dispatch was recorded: `false` once the grid is past the device's x
+    /// limit, which fails the recording by name.
     #[allow(clippy::too_many_arguments)]
     fn kq_fma_slices_at(
         &self,

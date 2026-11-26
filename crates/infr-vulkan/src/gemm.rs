@@ -1061,9 +1061,25 @@ pub(crate) fn native_gemv_kq_fma_mrow_spv(
         _ => return None,
     })
 }
+/// Output rows per workgroup of the fp32 K-quant prefill GEMM (`native_gemm_kq_fma.comp`'s `BM`):
+/// the grid's row tiles are counted in it.
+pub(crate) const KQ_FMA_BM: usize = 128;
+/// k elements that GEMM stages per pass (its `BK`).
+const KQ_FMA_BK: usize = 32;
+/// That GEMM's tile widths (its `-DBN` builds), narrowest first.
+pub(crate) const KQ_FMA_BN: [usize; 2] = [64, 128];
+
+/// Shared memory, in bytes, a `native_gemm_kq_fma` build of tile width `bn` declares: a `BK`-deep
+/// f32 tile of activations (`BM` wide) and one of dequantized weights (`bn` wide). A device whose
+/// `maxComputeSharedMemorySize` is below it cannot build that pipeline.
+/// `kq_fma_shared_matches_shader` reads the declarations back out of the shader.
+pub(crate) const fn native_gemm_kq_fma_shared_bytes(bn: usize) -> u32 {
+    (KQ_FMA_BK * (KQ_FMA_BM + bn) * std::mem::size_of::<f32>()) as u32
+}
+
 /// SPIR-V (kernel-cache name + words) for the fp32 K-quant prefill GEMM
-/// (`native_gemm_kq_fma.comp`), tiled `128 x bn`, weights dequantized in-shader; `None` for
-/// dtypes or tile widths without a build.
+/// (`native_gemm_kq_fma.comp`), tiled [`KQ_FMA_BM`]` x bn`, weights dequantized in-shader; `None`
+/// for dtypes or tile widths without a build.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_gemm_kq_fma_spv(
     dtype: infr_core::DType,
@@ -1087,7 +1103,8 @@ pub(crate) fn native_gemm_kq_fma_spv(
         _ => return None,
     })
 }
-/// Whether `native_gemm_kq_fma` has a build for `dtype`.
+/// Whether `native_gemm_kq_fma` has a build for `dtype` at every tile width; linear.rs's
+/// `kernel_name_gate_matches_spv_source` holds it to [`native_gemm_kq_fma_spv`].
 pub(crate) fn native_gemm_kq_fma_supported(dtype: infr_core::DType) -> bool {
     matches!(
         dtype,
@@ -4149,6 +4166,50 @@ mod tests {
                 format!("\"-DTILE_TT={}u\"", t.thread_tokens),
                 format!("\"-DTILE_TW={}u\"", t.thread_rows),
             ] {
+                assert!(entry.contains(&want), "{name}: {entry} lacks {want}");
+            }
+        }
+    }
+
+    /// [`native_gemm_kq_fma_shared_bytes`] is what decides whether a device can take the fp32
+    /// K-quant prefill GEMM at a tile width; the shader declares the arrays. Its tile constants,
+    /// its shared declarations (and no others), and the `-DBN` of each build must be the ones the
+    /// Rust side counts.
+    #[test]
+    fn kq_fma_shared_matches_shader() {
+        let src = include_str!("../shaders/native_gemm_kq_fma.comp");
+        for want in [
+            format!("const uint BM = {KQ_FMA_BM}u;"),
+            format!("const uint BK = {KQ_FMA_BK}u;"),
+            "shared vec4 As[BK][BM / 4u];".to_string(),
+            "shared vec4 Ws[BK][uint(BN) / 4u];".to_string(),
+        ] {
+            assert!(
+                src.contains(&want),
+                "native_gemm_kq_fma.comp lacks `{want}`"
+            );
+        }
+        let shared = src
+            .lines()
+            .filter(|l| l.trim_start().starts_with("shared "))
+            .count();
+        assert_eq!(
+            shared, 2,
+            "native_gemm_kq_fma.comp declares other shared memory"
+        );
+        let build = include_str!("../build.rs");
+        for dtype in [
+            infr_core::DType::Q4_0,
+            infr_core::DType::Q4K,
+            infr_core::DType::Q6K,
+        ] {
+            for bn in KQ_FMA_BN {
+                let (name, _) = native_gemm_kq_fma_spv(dtype, bn).expect("kq_fma build");
+                let at = build
+                    .find(&format!("\"{name}\""))
+                    .unwrap_or_else(|| panic!("{name} not in build.rs"));
+                let entry = &build[at..at + build[at..].find(')').expect("entry end")];
+                let want = format!("\"-DBN={bn}\"");
                 assert!(entry.contains(&want), "{name}: {entry} lacks {want}");
             }
         }

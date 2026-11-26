@@ -251,9 +251,11 @@ fn gpu_seam_tolerance_prefill_head_leaves_decode_unchanged() {
 const INT8_KERNEL_MARKERS: &[&str] = &["mmq", "i8", "dp4a", "quant_q8", "native_mmv"];
 
 /// The Float class is int8-free: a Float run of a quantized model builds no int8-activation
-/// kernel, while the shipped configuration on the same model does (so the check can fail).
-/// Kernels are built lazily, when first recorded, so the built set is a superset of what ran and
-/// the negative check is the conservative one.
+/// kernel, while the shipped configuration on the same model does (so the check can fail). On a
+/// device whose shipped run builds no int8 kernel either (the fp32 K-quant GEMV and GEMM on, no
+/// coopmat), the check above could not fail; there the Float switches must change nothing, so the
+/// two runs build the same kernels. Kernels are built lazily, when first recorded, so the built
+/// set is a superset of what ran and the negative check is the conservative one.
 #[test]
 #[ignore = "needs Qwen3-0.6B Q4_K_M and a Vulkan GPU"]
 fn gpu_seam_tolerance_float_runs_build_no_int8_kernel() {
@@ -276,12 +278,18 @@ fn gpu_seam_tolerance_float_runs_build_no_int8_kernel() {
     let shipped = forced::forced(&case.model, ForcedOn::Vulkan, |_| {}, &r).kernels;
     let float = forced::forced(&case.model, ForcedOn::Vulkan, forced::vulkan_float, &r).kernels;
     eprintln!("shipped: {shipped:?}\nfloat: {float:?}");
-    assert!(
-        shipped.iter().any(|k| int8(k)),
-        "the shipped run built no int8 kernel, so this check cannot fail: {shipped:?}"
-    );
     let bad: Vec<_> = float.iter().filter(|k| int8(k)).collect();
     assert!(bad.is_empty(), "the Float run built int8 kernels: {bad:?}");
+    if !shipped.iter().any(|k| int8(k)) {
+        eprintln!(
+            "this device's shipped run builds no int8 kernel: the two classes run the same \
+             kernels here, and the check above could not have failed"
+        );
+        assert_eq!(
+            shipped, float,
+            "the Float switches changed kernels on a device whose shipped run is int8-free"
+        );
+    }
 }
 
 /// `gpu-moe-decode-float` (the tuning parameter `mmv_mw.moe_float`) changes a routed-expert
@@ -289,7 +297,9 @@ fn gpu_seam_tolerance_float_runs_build_no_int8_kernel() {
 /// `gpu-dense-decode-float` (`kernels.vulkan.mmv_mw = false`) builds and gives the same logits
 /// bits; on Qwen3-0.6B (dense) it builds the shipped kernels and gives the shipped bits. Each
 /// model also shows `gpu-dense-decode-float` building other kernels than the shipped run, so
-/// neither comparison passes by the switches doing nothing. Without either model, or with either
+/// neither comparison passes by the switches doing nothing; where the shipped run builds no int8
+/// dense decode GEMV (`gemv.kq_fma` on), the switches have nothing to turn off and the test asserts
+/// that they change no kernel instead. Without either model, or with either
 /// unable to run on the device, the whole test is skipped, saying so.
 #[test]
 #[ignore = "needs Qwen3-0.6B and ERNIE-4.5-21B-A3B Q4_K_M and a Vulkan GPU"]
@@ -349,10 +359,26 @@ fn gpu_seam_tolerance_moe_decode_float_reaches_moe_models_only() {
             "{key}: shipped {:?}\n  dense decode float {:?}\n  MoE decode float {:?}",
             shipped.1, dense_float.1, moe_float.1
         );
-        assert_ne!(
-            dense_float.1, shipped.1,
-            "{key}: mmv_mw = false changed no kernel, so this check cannot fail"
-        );
+        if shipped
+            .1
+            .iter()
+            .any(|k| k.starts_with(INT8_DENSE_DECODE_GEMV))
+        {
+            assert_ne!(
+                dense_float.1, shipped.1,
+                "{key}: mmv_mw = false changed no kernel, so this check cannot fail"
+            );
+        } else {
+            // The fp32 decode GEMVs (`gemv.kq_fma`) already serve every one-row Linear here.
+            eprintln!(
+                "{key}: the shipped run builds no int8 dense decode GEMV: `mmv_mw = false` has \
+                 nothing to turn off here, so it must change no kernel"
+            );
+            assert_eq!(
+                dense_float.1, shipped.1,
+                "{key}: mmv_mw = false changed kernels on a run with no int8 dense decode GEMV"
+            );
+        }
         let want = if moe { &dense_float } else { &shipped };
         assert_eq!(
             moe_float.1, want.1,
@@ -364,6 +390,13 @@ fn gpu_seam_tolerance_moe_decode_float_reaches_moe_models_only() {
         );
     }
 }
+
+/// The prefix every int8 GEMV build's name starts with (`native_mmv*`): the multi-warp
+/// (`native_mmv_mw_*`) and multi-row (`native_mmv_mrow_*`, which RADV runs at one row) builds that
+/// `kernels.vulkan.mmv_mw = false` moves off, and also the expert (`native_mmv_id_*`) and plain
+/// `native_mmv*` builds, which it does not. A run with none of them has no int8 decode GEMV for the
+/// switch to move. The same text is one of [`INT8_KERNEL_MARKERS`].
+const INT8_DENSE_DECODE_GEMV: &str = "native_mmv";
 
 /// What makes a kernel a cooperative-matrix prefill GEMM, by its name. Typed by hand, like
 /// [`INT8_KERNEL_MARKERS`] and with the same gap: one named otherwise would pass unseen (B207).

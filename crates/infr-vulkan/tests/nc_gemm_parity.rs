@@ -601,6 +601,8 @@ fn nc_kq_fma_gemm_parity_and_determinism() {
                 run_kq_fma(&be, dt, bn, m, k, n, 0, None);
             }
             run_kq_fma(&be, dt, bn, 70, 768, 128, 256, None);
+            // gemma-3-1b's ffn_down: an odd count of superblocks per row, too few to split.
+            run_kq_fma(&be, dt, bn, 20, 6912, 1152, 0, None);
         }
     }
 }

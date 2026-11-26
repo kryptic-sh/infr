@@ -6228,38 +6228,57 @@ fn sync_stream<'a>(
     Ok(())
 }
 
-/// The two arms of the non-coopmat tiled prefill GEMM tier (see the NON-COOPMAT doc in
-/// `lower_op`'s `Op::Linear` arm): dp4a mmq for integer-coded weights, the fma warptile for float.
+/// The arms of the non-coopmat tiled prefill GEMM tier (see the NON-COOPMAT doc in `lower_op`'s
+/// `Op::Linear` arm): dp4a mmq for integer-coded weights, the fma warptile for float, and the fp32
+/// K-quant tile for the K-quants on a device whose int8 dot is emulated.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NcGemm {
     Mmq,
     Fma,
     /// The fp32 K-quant tile (`native_gemm_kq_fma.comp`): Q4_0/Q4_K/Q6_K weights dequantized
-    /// in-shader, for parts without fast int8 dot (GCN) where the dp4a mmq emulation is slow.
-    KqFma,
+    /// in-shader, for parts without fast int8 dot (GCN) where the dp4a mmq emulation is slow. It
+    /// carries the plan [`kq_fma_plan`] checked against the device: tile width and k slices.
+    KqFma {
+        bn: usize,
+        splits: usize,
+    },
 }
 
-/// Which non-coopmat tiled GEMM serves a `dt` Linear whose shape passed `gemm_ok`, or `None` when
-/// the device has f16 coopmat (the coopmat tier owns it), `INFR_NO_MMQ_FALLBACK` disabled the tier,
-/// or no build covers `dt`. Shared by `quant_linear` and `float_linear`.
+/// Which non-coopmat tiled GEMM serves a `dt` Linear of `m` rows whose shape passed `gemm_ok`, or
+/// `None` when the device has f16 coopmat (the coopmat tier owns it), `INFR_NO_MMQ_FALLBACK`
+/// disabled the tier, or no build covers `dt`. Shared by `quant_linear` and `float_linear`.
+#[allow(clippy::too_many_arguments)]
 fn nc_gemm_choice(
     be_: &VulkanBackend,
     dt: infr_core::DType,
     gemm_ok: bool,
+    m: usize,
     in_f: usize,
+    out_f: usize,
     w_off: usize,
 ) -> Option<NcGemm> {
     if !gemm_ok || be_.caps().f16_coopmat() || !be_.cfg().kernels.vulkan.mmq_fallback {
         return None;
     }
-    // A K-quant tile needs whole superblocks along k and an aligned weight base; anything else
-    // falls through to the generic arms below.
-    let kq_fma = be_.tuning().gemm_kq_fma
+    // A K-quant tile needs whole superblocks along k and an aligned weight base, and a plan this
+    // device can build and dispatch; anything else falls through to the arms below.
+    let kq_fma = (be_.tuning().gemm_kq_fma
         && crate::gemm::native_gemm_kq_fma_supported(dt)
         && in_f.is_multiple_of(256)
-        && w_off.is_multiple_of(256);
-    if kq_fma {
-        Some(NcGemm::KqFma)
+        && w_off.is_multiple_of(256))
+    .then(|| {
+        kq_fma_plan(
+            m,
+            in_f,
+            out_f,
+            be_.caps().compute_units.max(1) as usize,
+            be_.caps().max_shared_memory_bytes,
+            be_.kernel_limits().workgroup_count_x,
+        )
+    })
+    .flatten();
+    if let Some((bn, splits)) = kq_fma {
+        Some(NcGemm::KqFma { bn, splits })
     } else if be_.caps().i8_dot && infr_core::tensor::moe_mmq_ok(dt) {
         Some(NcGemm::Mmq)
     } else if crate::gemm::native_gemm_fma_kernel_name(dt).is_some() {
@@ -6490,7 +6509,12 @@ fn quant_linear(
     // scalar GEMVs (the field-measured 10-30x prefill gap; decode was already at parity).
     // This tier remains the Arc DEFAULT; the opt-in `cm8_ok` XMX tier above takes only
     // the Linears it covers, and only under INFR_CM_8X8=1.
-    // Two arms (`nc_gemm_choice`), same padded-dst convention as `is_gemm`:
+    // Three arms (`nc_gemm_choice`), same padded-dst convention as `is_gemm`:
+    //  • `NcGemm::KqFma`: the tuning parameter `gemm.kq_fma` (off unless set; see its rule)
+    //    and a Q4_0/Q4_K/Q6_K weight whose plan fits the device (`kq_fma_plan`) → the fp32
+    //    K-quant tile (`matmul_kq_fma_at`, native_gemm_kq_fma.comp — f32 activations, no int8
+    //    prepass).
+    //    A shape it declines takes the arms below.
     //  • `NcGemm::Mmq` (`nc_mmq`): weight dtype in `infr_core::tensor::MOE_MMQ_DTYPES` +
     //    `caps.i8_dot` → the DENSE dp4a mmq GEMM family (`matmul_mmq_at` — the same shader
     //    code the batched MoE expert path already gates on `i8_dot` alone, base-grid
@@ -6499,11 +6523,11 @@ fn quant_linear(
     //  • `NcGemm::Fma` (`nc_fma`): f16/bf16/f32 weights (no integer codes to dp4a) → the
     //    shared-memory fma warptile (`matmul_fma_at`, native_gemm_fma.comp — no subgroup
     //    ops, no f16 exts; bf16 reads stay native, no f32 upconvert).
-    // Both read the weight by 64-bit address, so a streamed weight takes the same tier.
+    // All read the weight by 64-bit address, so a streamed weight takes the same tier.
     // Exercisable on coopmat hardware via INFR_NO_COOPMAT=1 (lib.rs's force-disable test
     // knob — drops the device feature itself, a faithful simulation). INFR_NO_MMQ_FALLBACK=1
-    // disables the WHOLE tier (both arms) for A/B against the scalar floor.
-    let nc = nc_gemm_choice(be_, dt, gemm_ok, in_f, w_off);
+    // disables the WHOLE tier (every arm) for A/B against the scalar floor.
+    let nc = nc_gemm_choice(be_, dt, gemm_ok, m, in_f, out_f, w_off);
     // A `>= 2^32`-element weight (a big-vocab lm_head/embed) can only take the CHUNKED GEMV
     // (decode m=1, or the per-input-row GEMV) — the tiled coopmat/nc GEMMs below decode a
     // 64-row weight tile that can't be split into single input rows, so a breach on this
@@ -6951,7 +6975,8 @@ fn quant_linear(
     Ok(())
 }
 
-/// Record one tiled dp4a-mmq or fma-warptile prefill GEMM reading the weight at the 64-bit address
+/// Record one tiled non-coopmat prefill GEMM (`kind`: dp4a mmq, fma warptile or fp32 K-quant
+/// tile) reading the weight at the 64-bit address
 /// `w_addr` (a resident weight's BDA, or a streamed slot's arena base) plus element offset `w_off`.
 /// Same padded-dst dance as every tiled tier (`with_padded_dst`): the GEMM writes ceil(m/64)*64
 /// rows. The caller has already checked the grid and `bda_weight_breaches` (refusing the op on the
@@ -7031,15 +7056,7 @@ fn nc_prefill_gemm(
                 }
             }
             NcGemm::Fma => rec.matmul_fma_at(dt, xb, w_addr, w_off, out, m, in_f, out_f),
-            NcGemm::KqFma => {
-                // BN=128 only when it still gives every CU a workgroup.
-                let cu = be_.caps().compute_units.max(1) as usize;
-                let bn = if out_f.is_multiple_of(128) && m.div_ceil(128) * (out_f / 128) >= cu {
-                    128
-                } else {
-                    64
-                };
-                let splits = kq_fma_split_plan(m, in_f, out_f, bn, cu);
+            NcGemm::KqFma { bn, splits } => {
                 if splits > 1 {
                     let mpad = m.div_ceil(64) * 64;
                     let pk = pooled(pool, be_, "kq_splitk_part", splits * mpad * out_f * 4)?;
@@ -7065,11 +7082,48 @@ fn nc_prefill_gemm(
     })
 }
 
+/// Tile width and k-slice count of the fp32 K-quant prefill GEMM (`native_gemm_kq_fma.comp`) for
+/// an `[m, in_f] x [out_f, in_f]ᵀ` product on a device with `cu` compute units, `shared` bytes of
+/// `maxComputeSharedMemorySize` and `max_x` of `maxComputeWorkGroupCount[0]`, or `None` when no
+/// build fits that device: no tile's shared memory fits, or the grid is wider than `max_x` even at
+/// one k slice (the kernel recovers its tile from `gl_WorkGroupID.x` alone, so its grid cannot be
+/// split; k slices past the limit are dropped first). The wide
+/// tile is taken only when its shared memory fits and it still gives every compute unit a
+/// workgroup.
+fn kq_fma_plan(
+    m: usize,
+    in_f: usize,
+    out_f: usize,
+    cu: usize,
+    shared: u32,
+    max_x: u32,
+) -> Option<(usize, usize)> {
+    use crate::gemm::{native_gemm_kq_fma_shared_bytes as shared_bytes, KQ_FMA_BM, KQ_FMA_BN};
+    let [narrow, wide] = KQ_FMA_BN;
+    let bn = if shared_bytes(wide) <= shared
+        && out_f.is_multiple_of(wide)
+        && m.div_ceil(KQ_FMA_BM) * (out_f / wide) >= cu
+    {
+        wide
+    } else if shared_bytes(narrow) <= shared {
+        narrow
+    } else {
+        return None;
+    };
+    // Fewer k slices before none: halving keeps every slice K-block aligned.
+    let mut splits = kq_fma_split_plan(m, in_f, out_f, bn, cu);
+    while splits > 1 && crate::recorder::kq_fma_grid_x(m, out_f, bn, splits, max_x).is_err() {
+        splits /= 2;
+    }
+    crate::recorder::kq_fma_grid_x(m, out_f, bn, splits, max_x).ok()?;
+    Some((bn, splits))
+}
+
 /// Split-K count for the fp32 K-quant prefill GEMM (`native_gemm_kq_fma.comp`): enough k slices to
 /// fill the device's compute units at the chosen tile, subject to `in_f % (256 * splits) == 0` so
 /// every slice stays K-block aligned.
 fn kq_fma_split_plan(m: usize, in_f: usize, out_f: usize, bn: usize, cu: usize) -> usize {
-    let grid = (m.div_ceil(128) * (out_f / bn).max(1)).max(1);
+    let grid = (m.div_ceil(crate::gemm::KQ_FMA_BM) * (out_f / bn).max(1)).max(1);
     let mut splits = (cu * 8).div_ceil(grid).next_power_of_two().clamp(1, 8);
     while splits > 1 && !in_f.is_multiple_of(256 * splits) {
         splits /= 2;
@@ -7169,7 +7223,7 @@ fn float_linear(
     // Only f16 has a coopmat GEMM (`gemm_proj` stages the weight as f16 for the matrix cores);
     // an f32 prefill on a coopmat device keeps the row-tiled f32 GEMV.
     let is_gemm = is_f16 && gemm_ok && be_.caps().f16_coopmat();
-    let nc = nc_gemm_choice(be_, dt, gemm_ok, in_f, w_off);
+    let nc = nc_gemm_choice(be_, dt, gemm_ok, m, in_f, out_f, w_off);
     // The tiled GEMMs decode a 64-row weight tile that cannot be split into single input rows, so a
     // `>= 2^32`-element weight fails loudly there rather than wrap (issue #77).
     if (is_gemm || nc.is_some())
@@ -8796,6 +8850,144 @@ mod tests {
         // The wide tile halves the grid, so it needs more slices to fill the same device.
         assert_eq!(kq_fma_split_plan(2, 4096, 512, 64, 1), 1);
         assert_eq!(kq_fma_split_plan(2, 4096, 512, 128, 1), 2);
+    }
+
+    /// The fp32 K-quant tile is planned against the device, so the tier never picks a build it
+    /// cannot create or a grid it cannot dispatch: the wide tile needs its own shared memory, the
+    /// narrow one its smaller budget, and a grid past `maxComputeWorkGroupCount[0]` declines the
+    /// kernel (the caller then takes the arms it had before), where recording it would fail.
+    #[test]
+    fn kq_fma_plan_fits_the_device() {
+        use crate::gemm::native_gemm_kq_fma_shared_bytes as need;
+        let spec_min = Recorder::MAX_GROUP_COUNT_X;
+        let big = 64 * 1024;
+        // A tall prefill of a wide output: the wide tile fills the device at one slice
+        // (4 row tiles x 32 column tiles, 8 groups per compute unit).
+        assert_eq!(
+            kq_fma_plan(512, 4096, 4096, 16, big, spec_min),
+            Some((128, 1))
+        );
+        // Shared memory for the narrow tile only: the narrow one, still filling the device.
+        assert_eq!(
+            kq_fma_plan(512, 4096, 4096, 16, need(128) - 1, spec_min),
+            Some((64, 1))
+        );
+        assert_eq!(
+            kq_fma_plan(512, 4096, 4096, 16, need(64), spec_min),
+            Some((64, 1))
+        );
+        // Below the narrow tile's budget no build can be created.
+        assert_eq!(
+            kq_fma_plan(512, 4096, 4096, 16, need(64) - 1, spec_min),
+            None
+        );
+        // A 262k-vocab head at a 4096-row chunk: 32 row tiles x 2048 column tiles is past the
+        // guaranteed minimum, and fits a device that reports a wider limit.
+        assert_eq!(kq_fma_plan(4096, 4096, 262_144, 16, big, spec_min), None);
+        assert_eq!(
+            kq_fma_plan(4096, 4096, 262_144, 16, big, 65_536),
+            Some((128, 1))
+        );
+        // Without the wide tile's memory the same head needs twice the groups.
+        assert_eq!(kq_fma_plan(4096, 4096, 262_144, 16, need(64), 65_536), None);
+        // The k slices count against the limit too, and are halved before the kernel is declined.
+        // (One row tile x four column tiles x eight slices.)
+        assert_eq!(kq_fma_plan(2, 4096, 256, 16, big, 32), Some((64, 8)));
+        assert_eq!(kq_fma_plan(2, 4096, 256, 16, big, 31), Some((64, 4)));
+        assert_eq!(kq_fma_plan(2, 4096, 256, 16, big, 4), Some((64, 1)));
+        assert_eq!(kq_fma_plan(2, 4096, 256, 16, big, 3), None);
+    }
+
+    /// End to end on a device without coopmat, with `gemm.kq_fma` on: a prefill `Linear` whose
+    /// fp32 K-quant grid is wider than the device's `maxComputeWorkGroupCount[0]` (played smaller
+    /// through `TEST_KERNEL_LIMITS`) still runs and matches the host, on the kernels the tier
+    /// chose before that GEMM existed; at the grid's own width it takes the fp32 K-quant GEMM.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn kq_fma_grid_past_the_limit_takes_the_other_arms() {
+        let (m, in_f, out_f) = (130usize, 256usize, 512usize);
+        let backend = || {
+            let mut cfg = crate::test_config();
+            cfg.kernels.vulkan.coopmat = false;
+            cfg.kernels
+                .vulkan
+                .tune
+                .entries
+                .push(infr_core::config::TuneEntry {
+                    key: "gemm.kq_fma".into(),
+                    value: "true".into(),
+                    level: infr_core::config::TuneLevel::Cli,
+                });
+            infr_testkit::gpu_or_skip_noted(VulkanBackend::new_with(std::sync::Arc::new(cfg)))
+        };
+        let Some(probe) = backend() else {
+            return; // no GPU — self-skip
+        };
+        let cu = probe.caps().compute_units.max(1) as usize;
+        let shared = probe.caps().max_shared_memory_bytes;
+        let real_x = probe.kernel_limits().workgroup_count_x;
+        drop(probe);
+        let Some((bn, splits)) = kq_fma_plan(m, in_f, out_f, cu, shared, real_x) else {
+            eprintln!("skip: this device cannot take the fp32 K-quant GEMM at all");
+            return;
+        };
+        let gx = crate::recorder::kq_fma_grid_x(m, out_f, bn, splits, u32::MAX).unwrap();
+        let x: Vec<f32> = (0..m * in_f)
+            .map(|i| ((i % 89) as f32 - 44.0) * 0.013)
+            .collect();
+        let w: Vec<f32> = (0..out_f * in_f)
+            .map(|i| (i as f32 * 0.031).sin() * 0.4)
+            .collect();
+        let wq = q4k(&w);
+        let want = infr_testkit::ref_linear(&x, &deq_q4k(&wq), m, in_f, out_f);
+        for (limit, kq) in [(gx, true), (gx - 1, false)] {
+            let Some(be_) = backend() else { return };
+            crate::TEST_KERNEL_LIMITS.with(|l| {
+                l.set(Some(crate::caps::KernelLimits {
+                    workgroup_count_x: limit,
+                    ..be_.shared.kernel_limits
+                }))
+            });
+            let mut g = Graph::new();
+            let xi = g.input(TensorDesc::new(vec![m, in_f], DType::F32));
+            let wi = g.weight(TensorDesc::new(vec![out_f, in_f], DType::Q4K));
+            let yi = g.output(TensorDesc::new(vec![m, out_f], DType::F32));
+            g.push(Op::Linear {
+                x: xi,
+                weight: wi,
+                dst: yi,
+                m: m as u32,
+                in_f: in_f as u32,
+                out_f: out_f as u32,
+                w_off: 0,
+            });
+            let got = infr_testkit::run_graph(
+                &be_,
+                &g,
+                &[(xi, infr_testkit::f32_bytes(&x)), (wi, wq.clone())],
+                yi,
+                m * out_f,
+            );
+            crate::TEST_KERNEL_LIMITS.with(|l| l.set(None));
+            let built = be_.built_kernel_names();
+            assert_eq!(
+                built.iter().any(|k| k.starts_with("native_gemm_kq_fma")),
+                kq,
+                "limit {limit} against a grid of {gx}: built {built:?}"
+            );
+            let rms =
+                (want.iter().map(|v| (*v as f64).powi(2)).sum::<f64>() / want.len() as f64).sqrt();
+            let worst = got.iter().zip(&want).fold(0f64, |a, (g, w)| {
+                infr_testkit::nan_max64(a, (*g as f64 - *w as f64).abs())
+            });
+            // The f32 tile is held tighter than the int8 arm it replaces.
+            let bound = if kq { 1e-4 } else { 2e-2 };
+            assert!(
+                worst / rms < bound,
+                "limit {limit}: {:.2e} of the output RMS off the host",
+                worst / rms
+            );
+        }
     }
 
     /// The mrow m-ladder moved to the shared `infr_core::tier` policy (candidate F): the two

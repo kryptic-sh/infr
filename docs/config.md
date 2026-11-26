@@ -352,16 +352,28 @@ needs a model that has rows in the tolerance table, exits 0 within tolerance and
 3 outside it, and takes `--dev` and `--json` like `show`
 ([`gpu-tolerance.md`](gpu-tolerance.md), "The command").
 
-Three parameters carry kernels and choices contributed from an RX 580 under RADV
-(PRs 105 to 107). The first two default to what was measured there on that class
-of device only, so every other device runs what it ran before them; the third is
-on wherever it applies:
+Four parameters carry kernels and choices contributed from an RX 580 under RADV
+(PRs 105 to 107 and 112). `gemv.kq_fma` and `attn_split.decode_min_chunk`
+default to what was measured there on that class of device only, so every other
+device runs what it ran before them; `gemm.kq_fma` is off everywhere unless set;
+`queue.family` is on wherever it applies:
 
 - `gemv.kq_fma` turns on the fp32 decode GEMVs (`native_gemv_kq_fma` for
   Q4_K/Q6_K with its MTP verify twin, `linear_f32_mo`, one-row bf16). Default:
   on where the driver does not report an accelerated packed int8 dot
   (`dot_accelerated` in `infr tune show --json`). `kernels.vulkan.kq_fma_gemv`
   (`INFR_KQ_FMA_GEMV=0|1`) is its alias.
+- `gemm.kq_fma` turns on the fp32 K-quant prefill GEMM (`native_gemm_kq_fma`:
+  Q4_0/Q4_K/Q6_K weights dequantized in-shader, f32 activations) on a device
+  without cooperative matrices, in place of the int8 GEMMs where the int8 dot is
+  live and of the per-row f32 GEMV where it is not. Default: off on every
+  device. Where int8 arms run, only those Linears move to f32, and gemma-3
+  measured further from the CPU reference with that mix than all-int8; where
+  none run, the tile put gemma-3 outside a float row that the per-row GEMV meets
+  ([`gpu-tolerance.md`](gpu-tolerance.md), "Mixing f32 and int8 prefill Linears"
+  and "The fp32 K-quant prefill GEMM in the float runs"). Set, it still leaves a
+  shape to the kernels it ran without it when the device's shared memory cannot
+  hold the tile or the grid would pass `maxComputeWorkGroupCount[0]`.
 - `attn_split.decode_min_chunk` is the fewest keys per chunk of decode split-K
   attention. Default: 16 on a discrete device in the slow class (wave64-only, or
   neither matrix units nor an accelerated int8 dot), 64 elsewhere. It changes

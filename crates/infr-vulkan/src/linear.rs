@@ -509,6 +509,15 @@ mod tests {
                 gemm::native_gemm_mmq_dense_spv(d).is_some(),
                 "nc_mmq gate vs native_gemm_mmq_dense_spv availability disagree for {d:?}"
             );
+            // The non-coopmat tier gates the fp32 K-quant GEMM on the dtype alone, then loads a
+            // build at whichever tile width it planned.
+            for bn in gemm::KQ_FMA_BN {
+                assert_eq!(
+                    gemm::native_gemm_kq_fma_supported(d),
+                    gemm::native_gemm_kq_fma_spv(d, bn).is_some(),
+                    "native_gemm_kq_fma gate vs spv availability disagree for {d:?} bn={bn}"
+                );
+            }
             for &warps in &[1u32, 2, 4, 8, 16] {
                 for res in [false, true] {
                     for sg16 in [false, true] {

@@ -193,7 +193,8 @@ What it says:
   `mmv_mw = Some(false)` name the rest), f16 KV cache. That the class is
   int8-free is a test (`gpu_seam_tolerance_float_runs_build_no_int8_kernel`: the
   Float run builds no int8-activation kernel, the shipped run on the same model
-  does).
+  does; on a device whose shipped run is int8-free as well, the two build the
+  same kernels).
 - **FloatNoCoopmat**: the Float configuration with the whole cooperative-matrix
   tier off as well (`vulkan_float_nocoopmat`: `kernels.vulkan.coopmat`, what
   `INFR_NO_COOPMAT` sets), so the batched prefill's GEMMs take f32 operands on
@@ -201,16 +202,28 @@ What it says:
   dominated by the f16 operands of the cooperative-matrix prefill GEMMs
   (`native_gemm_warp_*`); this class is its fine check of what still runs. With
   the tier off the kernels that serve those GEMMs are not built either
-  (`splitk_reduce` and `store_f16`, on the RX 7900 XTX under RADV), so on a
-  device with the tier they, like the GEMMs, are scored only under the Float
-  row. That the class runs none of them is a test
+  (`splitk_reduce` and `store_f16`, on the RX 7900 XTX under RADV, with
+  `gemm.kq_fma` at its default; set, its split-K tile builds `splitk_reduce`),
+  so on a device with the tier they, like the GEMMs, are scored only under the
+  Float row. That the class runs none of them is a test
   (`gpu_seam_tolerance_nocoopmat_runs_build_no_coopmat_gemm`: such a run builds
   no `gemm_warp` kernel, and the Float run on the same model does wherever the
   device has the tier). On a device without the tier, and with wave64 forced,
   the Float configurations build the same kernels as these, and are held to the
   Float row all the same.
 - **Int8**: quantized weights through the int8-activation kernels, the shipped
-  default. Dominated by the activation quantization.
+  default. Dominated by the activation quantization. Where `gemv.kq_fma` is on
+  (the default where the driver does not report the packed int8 dot as
+  accelerated; its choice does not look at cooperative matrices), the Q4_K/Q6_K
+  decode Linears take f32 activations instead (the fp32 K-quant GEMVs); where
+  `gemm.kq_fma` is set as well on a device without cooperative matrices, so do
+  the Q4_0/Q4_K/Q6_K prefill Linears (the fp32 K-quant prefill GEMM). The rest
+  stay int8: see "Mixing f32 and int8 prefill Linears" below. A device with no
+  packed int8 dot (or with `INFR_NO_I8DOT`) takes no int8 arm outside the
+  cooperative-matrix tier. Its shipped run is still not the Float run kernel for
+  kernel: the Float configuration also sets `mrow = false`, which turns off the
+  f32 dequant multi-row GEMV (`native_mrow_*`, 2 to 8 rows) along with the int8
+  one, so a chunk in that row band runs other f32 kernels there.
 - **KvQ8**: the Float configuration with a `q8_0` K and V cache, scored against
   the CPU reference running the same cache. The GPU quantizes the f16 RoPE
   output and the CPU its f32 value, so the two caches round to different codes:
@@ -221,6 +234,59 @@ tiers, so its prefill runs other kernels and its own distances; the tuning rows
 change the RX 7900 XTX's native prefill and change nothing measured under wave64
 (the wave64 rows-off combination was therefore not re-measured after the
 first-row split).
+
+## Mixing f32 and int8 prefill Linears
+
+Measured 2026-11-26 on the RX 7900 XTX under RADV with the cooperative-matrix
+tier masked (`INFR_NO_COOPMAT=1`), a forced stand-in for a device without
+cooperative matrices, not a GCN card: `gpu_seam_tolerance_gemma3`, the Int8
+(`gpu`) row, prompt 1, prefill. gemma-3-1b Q4_K_M's prefill Linears whose `in_f`
+is a multiple of 256 are `attn_output` (Q4_K) and `ffn_down` (Q4_K, Q6_K); its
+q/k/v, gate/up and head (Q5_0, Q8_0) stay on the int8 `mmq` tile throughout.
+
+| Those Q4_K/Q6_K Linears on                           | Worst KL (position 13) | Mean KL |
+| ---------------------------------------------------- | ---------------------- | ------- |
+| the int8 `mmq` tile (`gemm.kq_fma` off, its default) | 0.31                   | 1.7e-2  |
+| `native_gemm_kq_fma` (`INFR_TUNE=gemm.kq_fma=true`)  | 0.74                   | 8.0e-2  |
+| the f32 dequant GEMV (a throwaway hook)              | 1.12                   | 1.1e-1  |
+| `native_gemm_kq_fma` on `attn_output` only           | 1.42                   | 1.3e-1  |
+
+The row's bounds are 0.52 and 2.7e-2. An f32 kernel that was already in the
+tree, given the same Linears, lands further out than the new one, and on this
+device the float runs with the new kernel on the same Linears pass their rows
+(next section): the distance comes from mixing f32 and int8 Linears in one
+prefill, not from either kernel. Why the mix is further from the reference than
+all-int8 is not established. That is why `gemm.kq_fma` is off by default
+wherever int8 arms can run.
+
+## The fp32 K-quant prefill GEMM in the float runs
+
+Where no int8 arm runs at all, the tile would replace only the per-row f32
+dequant GEMV, so it was measured there too, in the harness's float runs (whose
+configuration masks the int8 dot): the whole `gpu_seam_tolerance` gate with
+`gemm.kq_fma` off against on, both GPUs, 2026-11-26. Float and FloatNoCoopmat
+rows, worst KL and mean KL over each model's prompts and phases, GEMV against
+the tile:
+
+| Device, model, class                    | per-row GEMV    | `native_gemm_kq_fma` |
+| --------------------------------------- | --------------- | -------------------- |
+| RX 7900 XTX, gemma-3-1b, FloatNoCoopmat | 7.1e-4 / 3.5e-5 | 1.7e-3 / 7.9e-5      |
+| Ryzen iGPU, gemma-3-1b, Float           | 7.1e-4 / 3.5e-5 | 2.7e-3 / 1.2e-4      |
+| Ryzen iGPU, gemma-3-1b, FloatNoCoopmat  | 7.1e-4 / 3.5e-5 | **2.7e-3** / 1.2e-4  |
+| Ryzen iGPU, Qwen3-0.6B, Float           | 1.8e-5 / 1.4e-6 | 1.1e-5 / 1.4e-6      |
+| Ryzen iGPU, Qwen3.5-0.8B, Float         | 3.8e-7 / 3.9e-8 | 3.6e-7 / 3.6e-8      |
+| Ryzen iGPU, ERNIE-0.3B Q4, Float        | 2.2e-5 / 2.0e-6 | 2.3e-5 / 2.1e-6      |
+| Ryzen iGPU, LFM3 Q4, Float              | 2.4e-6 / 1.3e-6 | 2.0e-6 / 3.2e-7      |
+
+On the RX 7900 XTX only gemma-3's FloatNoCoopmat runs change (its other float
+runs keep the cooperative-matrix tier); the f16 and synthetic models take no
+Q4_0/Q4_K/Q6_K Linear and do not change. gemma-3's FloatNoCoopmat row has a
+worst-KL bound of 1.8e-3: the tile passes it on the RX 7900 XTX and fails it on
+the integrated GPU, where the GEMV passes, so `gemm.kq_fma` is off there as
+well. On the other models it is about as close as the GEMV or closer. Why it is
+further out on gemma-3 is not established (a guess, untested: one f32
+accumulator per output summing the whole `k` range in order, where the GEMV
+reduces across threads).
 
 ## The greedy check
 
@@ -362,10 +428,11 @@ those were added): with
 `INFR_TUNE=gemv.kq_fma=true,attn_split.decode_min_chunk=16`, the two values
 `gpu_seam_golden_qwen3` failed for, every model's case passed, forced rows and
 greedy check alike (the shipped runs then build the `native_gemv_kq_fma_*`
-kernels). One test of the set fails under it,
+kernels). One test of the set failed under it,
 `gpu_seam_tolerance_float_runs_build_no_int8_kernel`, at its own guard: with the
 fp32 decode GEMVs forced, the shipped configuration builds no int8 kernel under
-RADV, so the check reports that it cannot fail (B207).
+RADV, so the check reported that it could not fail (B207). It now asserts there
+that the shipped and Float runs build the same kernels instead.
 
 **Shown to fail** (`--features mutations`, `tests/planted/greedy.rs`;
 2026-11-23, Linux 7.3.5-arch1-1, Mesa RADV 26.3.1, headless, both GPUs;
@@ -941,16 +1008,14 @@ own. `infr-vulkan`'s bench and probe binaries stay out on purpose: some of them
 have lost the device on the integrated GPU.
 
 `INFR_FORCE_WAVE64=1` runs the wave64 path, `INFR_TUNE_NO_ROWS=1` the generic
-tuning defaults, and `INFR_TUNE=family.param=value` one tuning parameter forced
-(all three reach these tests through `infr_testkit::honour_env`). The last is
+tuning defaults, `INFR_TUNE=family.param=value` one tuning parameter forced, and
+the capability masks `INFR_NO_COOPMAT` and `INFR_NO_I8DOT` the tiers of a device
+without matrix units or without the int8 dot (all of them reach these tests
+through `infr_testkit::honour_env`; the masks only clear, never set). That is
 how a device here stands in for one it is not:
-`INFR_TUNE=gemv.kq_fma=true,attn_split.decode_min_chunk=16` scores every model
-on the decode kernels and the attention chunking an RX 580 gets by default. The
-capability masks (`INFR_NO_I8DOT`, `INFR_NO_COOPMAT`) do NOT reach the tests of
-`infr-llama`, which build their config from the shipped defaults: the tolerance
-tests run their own int8-free configurations (`GPU_CONFIGS`), and, gemma-3's
-`gpu-float-nocoopmat*` runs apart, no whole-model test runs with the matrix
-units masked off. `measure_gpu_tolerance` (also ignored) prints the full
+`INFR_NO_COOPMAT=1 INFR_TUNE=gemv.kq_fma=true,attn_split.decode_min_chunk=16`
+scores every model on the prefill tier, decode kernels and attention chunking an
+RX 580 gets by default. `measure_gpu_tolerance` (also ignored) prints the full
 comparison for the models named in `INFR_TOL_MODELS` (keys of `MODELS` in
 `tests/support/forced.rs`), with `INFR_TOL_ONLY` to pick configurations and
 `INFR_TOL_PROMPTS`, `INFR_TOL_SUBMIT`, `INFR_TOL_HEAD`, `INFR_TOL_UBATCH` and

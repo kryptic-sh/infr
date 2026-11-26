@@ -1,7 +1,9 @@
 #version 460
-// fp32 K-quant prefill GEMM (C = A·Wᵀ, 128xBN tile) for GPUs without fast int8 dot or coopmat.
-// Validated on Polaris10 (GCN4, RX 580): Qwen pp512 206 -> 499 t/s vs emulated-dp4a MMQ.
-// -DFMT_Q4K|-DFMT_Q6K|-DFMT_Q4_0, -DBN=64|128; requires n%BN, k%256, w_base%256; no subgroup ops.
+// fp32 K-quant prefill GEMM (C = A·Wᵀ, BMxBN tile) for GPUs without fast int8 dot or coopmat,
+// where the dp4a mmq tile would emulate the int8 dot in ALU.
+// -DFMT_Q4K|-DFMT_Q6K|-DFMT_Q4_0, -DBN (build.rs); requires n%BN, k%256, w_base%256; no subgroup
+// ops. The shared arrays below are what the host's shared-memory gate counts
+// (gemm.rs native_gemm_kq_fma_shared_bytes).
 // The same build serves the direct tile and split-K: the k range is cut into pc.splits slices, and
 // `splits = 1` is the plain tile writing c4 at offset 0. For splits > 1 every workgroup carries its
 // slice in the top of gl_WorkGroupID.x, so one dispatch keeps the whole grid resident: groups are
@@ -15,9 +17,8 @@ const uint BM = 128u;
 #endif
 const uint BK = 32u;
 const uint THREADS = 256u;
-const uint TNV = uint(BN) / 64u;               // vec4 column groups per thread (1 or 2)
-const uint CPT = THREADS / uint(BN);           // staging threads per weight column (4 or 2)
-const uint EPT = uint(BN) * BK / THREADS;      // weight elements staged per thread (8 or 16)
+const uint TNV = uint(BN) / 64u;               // vec4 column groups per thread
+const uint EPT = uint(BN) * BK / THREADS;      // weight elements staged per thread
 
 layout(local_size_x = THREADS, local_size_y = 1, local_size_z = 1) in;
 layout(push_constant) uniform PC {

@@ -5,13 +5,13 @@ kernels buy no speed, and they cost accuracy. Two f32-activation kernels exist
 for that hardware (`native_gemv_kq_fma` for decode, `native_gemm_kq_fma` for
 prefill), but each covers only some weight formats, and a model that runs some
 Linears on f32 and the rest on int8 measured **further** from the CPU reference
-than all-int8 does (gemma-3, worst KL 0.741 against 0.310, bound 0.52; all-float
-runs sit around 3e-6: `docs/gpu-tolerance.md`). The owner decided 2026-11-26 to
-build the full lineup: on that hardware every Linear of a model runs on f32
-activations, prefill, decode and MoE experts, so the run belongs to the Float
-tolerance class at the best speed the device has. The contributor of the two
-kernels has no further float kernels in their fork (checked 2026-11-26, told on
-PR #112), so this is ours to build; they own an RX 580 and can measure it.
+than all-int8 does (gemma-3, worst KL 0.741 against 0.310, bound 0.52:
+`docs/gpu-tolerance.md`). The owner decided 2026-11-26 to build the full lineup:
+on that hardware every Linear of a model runs on f32 activations, prefill,
+decode and MoE experts, so the run belongs to the Float tolerance class at the
+best speed the device has. The contributor of the two kernels has no further
+float kernels in their fork (checked 2026-11-26, told on PR #112), so this is
+ours to build; they own an RX 580 and can measure it.
 
 Nothing here is built. Statements marked **guess** are guesses. The format
 table's "what people run" column comes from reading the tensor types of the
@@ -131,6 +131,21 @@ Each ships alone through coder then reviewer.
 | S7  | GPUs with a native int8 dot: per kernel family on both GPUs here, float against int8 for accuracy (tolerance rows) and speed (alternated, quiet window); float becomes the default where it is not slower                                                                                                      | better accuracy at no cost on the hardware most users have; the rest reported for a decision |
 
 ## Found on the way, to fix whatever this plan does
+
+- **The f32 K-quant tile is not yet a sound base for the lineup.** With no int8
+  arm running, `native_gemm_kq_fma` puts gemma-3 outside its FloatNoCoopmat row
+  on the integrated GPU (worst KL 2.65e-3 against a bound of 1.8e-3) and passes
+  it thinly on the RX 7900 XTX (1.74e-3); the per-row f32 GEMV it replaces gives
+  7.1e-4 (`docs/gpu-tolerance.md`, "The fp32 K-quant prefill GEMM in the float
+  runs"). Why is not established (**guess:** one f32 accumulator per output over
+  the whole `k` range). It is diagnosed and fixed before S1 makes the tile
+  unconditional under Float; `gemm.kq_fma` stays default off until then.
+- **Int8 sites the single gate must also cover**, found during the PR #112
+  follow-up: the int8 cooperative-matrix arms (`i8cm_q8_0`, `i8cm_kq`) are gated
+  by the coopmat probe, not `i8_dot`; class (b) runs the int8 multi-row GEMV at
+  small row counts (`mrow_int8_prefill_dtypes`); the paged expert path has its
+  own format list (`MOE_MMQ_PAGED_DTYPES`). The K-quant tile also needs `w_off`,
+  not only `in_f`, to be a multiple of 256.
 
 - **A no-int8-dot device sends full MoE prefill chunks through the small-m
   path.** The seam caps the chunk only when the expert widths fail

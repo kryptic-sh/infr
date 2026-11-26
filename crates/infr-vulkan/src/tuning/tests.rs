@@ -1777,41 +1777,22 @@ fn kq_fma_follows_the_dot_fact() {
     assert!(!r.tuning.gemv_kq_fma);
 }
 
-/// `gemm.kq_fma` follows the same dot fact as the decode GEMVs: the fp32 K-quant prefill GEMM
-/// exists because a device without an accelerated packed int8 dot emulates the dp4a dot in ALU
-/// (measured on an RX 580 under RADV), so a device that reports an accelerated dot keeps the mmq
-/// tile. `INFR_TUNE` sets it either way.
+/// `gemm.kq_fma` is off by default on every device. Where int8 arms run, a prefill with only its
+/// Q4_0/Q4_K/Q6_K Linears on f32 measured further from the CPU reference than all-int8 (gemma-3);
+/// where none run, the tile put gemma-3 outside its FloatNoCoopmat row on the integrated GPU.
+/// `INFR_TUNE` turns it on, on any device; whether the device can then take the kernel (shared
+/// memory, grid width) is `kq_fma_plan`'s check.
 #[test]
-fn the_kq_fma_gemm_follows_the_dot_fact() {
-    let on = |id: &str| fixture_tuning(id).gemm_kq_fma;
-    assert!(on("rx580-gcn-radv"));
-    assert!(!on("rx7900xtx-amdwin"));
-    assert!(!on("rx7900xtx-radv"));
-    assert!(!on("raphael-igpu-amdwin"));
-    // The dot fact alone decides: matrix units do not turn it on or off.
-    let mut f = fixture("rx7900xtx-amdwin");
-    f.matrix_units = false;
+fn the_kq_fma_gemm_is_off_unless_set() {
+    let all = fixtures();
     assert!(
-        !resolve_with(&f, &Config::default(), &[], None)
-            .unwrap()
-            .tuning
-            .gemm_kq_fma
+        all.iter().any(|(_, f)| !f.dot_accelerated),
+        "no fixture without an accelerated dot"
     );
-    f.dot_accelerated = false;
-    assert!(
-        resolve_with(&f, &Config::default(), &[], None)
-            .unwrap()
-            .tuning
-            .gemm_kq_fma
-    );
-    let r = resolve_fixture(
-        "rx580-gcn-radv",
-        &env_cfg(&[("INFR_TUNE", "gemm.kq_fma=false")]),
-    );
-    assert!(!r.tuning.gemm_kq_fma);
-    let r = resolve_fixture(
-        "rx7900xtx-amdwin",
-        &env_cfg(&[("INFR_TUNE", "gemm.kq_fma=true")]),
-    );
-    assert!(r.tuning.gemm_kq_fma);
+    for (id, f) in &all {
+        let r = resolve_with(f, &Config::default(), &[], None).unwrap();
+        assert!(!r.tuning.gemm_kq_fma, "{id}: on by default");
+        let r = resolve_with(f, &env_cfg(&[("INFR_TUNE", "gemm.kq_fma=true")]), &[], None).unwrap();
+        assert!(r.tuning.gemm_kq_fma, "{id}: INFR_TUNE did not set it");
+    }
 }

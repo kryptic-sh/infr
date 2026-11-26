@@ -1,6 +1,6 @@
 device:  Unknown GPU (Other, driver unreported)
 match:   vendor=other arch=Other driver=unreported integrated=false device_id=0x0001 cu=0 subgroup=32-32 driver_version=0x0
-hash:    1fafb790
+hash:    59892a24
 rows: none
 
 device.sg_pref               32     default
@@ -57,7 +57,7 @@ submit.prior_gflops          16     default
 split_k.fixed_grid           128    default
 split_k.fill_per_cu          4      default
 split_k.scale_by_cu          false  default
-gemm.kq_fma                  true   default
+gemm.kq_fma                  false  default
 gemm_i8cm_kq.enabled         false  default
 gemm_i8cm_kq.l_fill_per_cu   2      default
 rmsnorm.wide                 true   default

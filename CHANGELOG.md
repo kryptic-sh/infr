@@ -275,6 +275,28 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `linear_f32_mo`'s grid splits past 65535 workgroups, which a 262144-wide f32
   output reaches.
 
+- **Tuning parameter `gemm.kq_fma`: an opt-in fp32 K-quant prefill GEMM for GPUs
+  without cooperative matrices.** `native_gemm_kq_fma` dequantizes Q4_0, Q4_K
+  and Q6_K weights into shared memory and multiplies them against the f32
+  activations, in place of the activation quantize plus the dp4a GEMM, which a
+  device with an emulated int8 dot runs in ALU, or of the per-row f32 GEMV on a
+  device with no int8 dot; a grid too small to fill the device is cut along k
+  within the one dispatch. On an RX 580 it took pp512 of Qwen2.5-Coder-3B Q4_K_M
+  from 123.6 to 628.5 t/s and pp2048 from 122.8 to 560.3 t/s, tg128 unchanged
+  (the contributor's figures; contributed in PR 112). It is off by default on
+  every device, for accuracy. Where int8 arms run, only the Q4_0/Q4_K/Q6_K
+  Linears move to f32 while the rest of the prefill stays int8, and that mix
+  measured further from the CPU reference than all-int8: on gemma-3-1b Q4_K_M
+  (forced onto that tier on an RX 7900 XTX, `INFR_NO_COOPMAT=1`) the worst
+  prefill KL of a prompt went from 0.31 to 0.74, past its tolerance of 0.52.
+  Where no int8 arm runs, the tile put gemma-3 outside its tightest float row on
+  the integrated Ryzen GPU (worst KL 2.65e-3 against a bound of 1.8e-3; the
+  per-row GEMV it replaces gives 7.1e-4). The GCN tier itself could not be
+  measured here. `INFR_TUNE=gemm.kq_fma=true` turns it on and `infr tune show`
+  reports it; a device whose shared memory cannot hold the kernel's tile, or a
+  shape whose grid would pass the device's `maxComputeWorkGroupCount[0]` even
+  without splitting k, keeps the kernels it ran without it.
+
 - **Tuning parameter `attn_split.decode_min_chunk`: the chunk floor of decode
   split-K attention.** Decode attention cuts each head's keys into chunks of
   `max(keys / 32, floor)`, one workgroup per chunk. The floor is 16 on a

@@ -30,15 +30,7 @@ Provenance tags point at the finding that opened the item:
 
 **Kind:** work raised and not finished, in the order it should be picked up.
 
-1. **PR #111 (Q4_K mmq staging with 16-byte loads, one shader) is reviewed but
-   not measured.** The reviewer found no defect and a clean merge with `main`.
-   Not done: build the PR's shader in a separate worktree; check a MoE model's
-   logits are bit-identical to `main`; run the GPU parity tests on both GPUs
-   (`nc_mmq_dense_gemm_parity_and_determinism`, the `*_expert_gemm_*` tests,
-   `expert_gemm_hi_matches_its_decomposition`); alternated `-p 512 -n 0 -r 3` on
-   Qwen3-30B-A3B and ERNIE-21B-A3B with two seconds between runs. The author
-   measured one dense model on an RX 6600 XT in a fork whose routing differs;
-   our MoE prefill path is unmeasured. The owner gives the verdict.
+1. (PR #111 was measured, merged and pushed on 2026-11-26; see the changelog.)
 2. **PR #110 (Gemma 4 image input) is reviewed; the owner gives the verdict.**
    Confirmed against llama.cpp: image spans need non-causal attention
    (`mtmd_decode_use_non_causal` returns true for GEMMA4V) and the PR feeds them
@@ -69,9 +61,236 @@ and expert-parallel paths with `mmv_mw.moe_float` on (only the shared cut,
 the MTP draft head keeps int8 GEMVs with the switch on (a choice, not checked
 for effect on acceptance); nothing ran on Windows or Metal.
 
+### B-DECISIONS-2026-11-26 — owner's decisions on the MoE switches and accuracy (2026-11-26)
+
+**Kind:** decisions taken, with the work each one queues. Nothing here is built
+yet.
+
+- **Rule: accuracy first.** A performance change is accepted only with no
+  accuracy drawback; fast and wrong is not an option (now in `AGENTS.md`, "What
+  to work on"). The decisions below follow from it.
+- **`quant_q8.experts_hi` goes on by default for MoE models.** It takes the
+  first rows of Qwen3-30B-A3B from KL 3.8e-2 to 2.5e-4 against the CPU reference
+  for about 1% of MoE prefill (measured on the RX 7900 XTX; the integrated GPU's
+  accuracy rows are in `docs/gpu-tolerance.md`). To do: flip the default in
+  `tuning/families.rs`, regenerate the snapshots, move the tolerance table's MoE
+  rows to the new default, changelog. Not measured on Windows, NVIDIA or Intel,
+  where it also switches on: ask the Windows session for the parity tests and a
+  prefill A/B once it lands.
+- **`mmv_mw.moe_float` goes on by default everywhere**, integrated GPUs
+  included, although ERNIE-21B lost 18.4% of tg128 there (3.3% on the RX 7900
+  XTX; Qwen3-30B-A3B lost nothing). Accuracy over speed. To do: flip the
+  default, snapshots, tolerance rows, changelog; then look for the speed (a
+  faster float GEMV for the integrated GPU's decode) without going back to int8.
+- **The remaining routing gap is to be investigated and closed, on CPU and
+  GPU.** After both switches roughly 260 expert selections on Qwen3-30B-A3B
+  still differ from the reference where an all-float run differs at 13 to 20,
+  from int8 rounding of activations; and the CPU production path differs from
+  the reference in more selections than the GPU does (1003 to 1135), probably
+  from its 256-element activation blocks. The owner wants both made accurate and
+  fast, not accepted. Leads so far, none measured for speed: finer activation
+  blocks (8 elements simulated at about 40% fewer differing selections on the
+  GPU; 32-element blocks cut the CPU's dense-Linear part 3 to 7 times), and
+  float activations with a faster kernel. B207 holds the study's detail.
+- **Plan 14, slice D:** when every expert is back in VRAM and the pager is
+  dropped, an explicitly sized RAM tier (`INFR_DRAM_CACHE`) keeps its address
+  range and releases its pages to the OS until needed again. That needs the
+  shrinkable arena from plan 15 (slice R3) first, so D follows R3, or drops the
+  tier with a log line until R3 exists.
+
+### B-REFERENCE-CACHE — cache the CPU reference so tolerance runs are fast (2026-11-26)
+
+**Kind:** planned, next slice after the PR #112 follow-up; the owner raised its
+priority on 2026-11-26 because it speeds our own work and every contributor's.
+
+Every test that scores a GPU or CPU-production run against the CPU reference
+recomputes the reference: there is no cache. In one release run on ERNIE-21B-A3B
+the reference took 4.6 to 10.5 s a prompt against 1.1 to 6.4 s for each GPU
+configuration; the whole `gpu_seam_tolerance` gate took 408 s on the RX 7900 XTX
+and 1166 s on the integrated GPU, and one follow-up slice ran it four times plus
+isolation runs. Not measured: the split between the reference, model loading,
+device set-up and the GPU runs across the whole gate.
+
+To build: an on-disk cache of what a comparison takes from the reference run,
+keyed by weight content, prompt tokens, token count, KV formats, every setting
+that can change reference output, and a fingerprint of the CPU reference's own
+code; a bypass switch; a verify mode that recomputes and compares bit for bit;
+hit and miss logged; never read by a test whose subject is the CPU reference.
+The danger it must rule out is a stale entry serving as the oracle. Then measure
+the gate cold against warm on both GPUs, and document for contributors how to
+run the tolerance tests with it (and add a pointer in `AGENTS.md`, "Before
+opening a pull request"). A design pass is in progress.
+
+### B-SAFETENSORS-EXL3 — safetensors first, then EXL3; both need a plan and a dependency policy (2026-11-26)
+
+**Kind:** owner's decision of 2026-11-26; nothing started.
+
+- **EXL3 (ExLlamaV3's quantization format) is intended, not soon.** The owner
+  first tabled it, then decided it is a good feature to support; issue #104 was
+  told so on 2026-11-26 (safetensors first, EXL3 after, a plan and a dependency
+  decision before either, and no pull requests for either until the plans
+  exist). The contributor's fork has work on it (`exl3_dot.comp`,
+  `exl3_hadamard.comp`, a branch `exl3-phase0-perplexity`), none of it reviewed
+  here. Its reference has to be ExLlamaV3 itself, since llama.cpp does not read
+  the format, and under the accuracy rule that comparison is designed first.
+- **Loading models from safetensors is wanted** ("a given"), but not as an
+  ad-hoc addition: it needs a plan under `docs/plan/` first. What the plan has
+  to settle: which sources (a Hugging Face model directory with `config.json`
+  and tokenizer files; which architectures map onto the seam's existing
+  configs), full-precision only or with quantization at load, how weights stream
+  from disk (the same disk to RAM to VRAM tiers as GGUF), where the CPU
+  reference comes from (transformers, or llama.cpp on a converted file), and
+  what it shares with the GGUF loader.
+- **A dependency policy is owed with it.** Decide which new dependencies are
+  acceptable and on what terms before either feature is planned in detail: the
+  rules so far are case by case (a new dependency is the owner's call and lands
+  as an optional feature; `gemm`/`image` were refused for PR #110 in favour of
+  the seam and our own `crcbl-image`; `redb`/`redis` were refused for the KV
+  store). The policy should say what earns a dependency (untrusted-format
+  parsing someone else has hardened, versus arithmetic we already have), whether
+  it must be optional, limits on its transitive tree, `unsafe` and licences
+  (`deny.toml` exists), and whether a small format such as the safetensors
+  header (a JSON header and raw tensors) is written here instead.
+
+### B-ACCURACY-AUDIT — default-on kernels that fail accuracy go default off (2026-11-26)
+
+**Kind:** audit owed, started with two parameters; the owner's instruction of
+2026-11-26: "If there are other kernels that are default on now, that fail due
+to accuracy we should also switch them to default off."
+
+The tolerance gate passes 14 of 14 on the two GPUs here at their defaults, so
+nothing default-on fails on the tiers we can run natively. The tiers we cannot
+run natively take other kernels by default, and those have only been measured
+when a pull request forced them:
+
+- **The emulated-dot tier** (drivers that do not report the packed int8 dot as
+  accelerated: Polaris, Vega, older Intel): `gemm.kq_fma` (PR #112) failed
+  gemma-3's row when forced and is now default off on every device (with no int8
+  arm running it also fails gemma-3's FloatNoCoopmat row on the integrated GPU);
+  `gemv.kq_fma` (PR #107, default on there) passes the whole gate forced but is
+  further from the reference on gemma-3, inside its bound, so it stays on (the
+  owner's rule: a kernel that passes its rows stays on). The figures are in
+  B-KQ-FMA-GEMM-UNVERIFIED.
+- **To do:** for every default that depends on a device fact (the tuning
+  parameters in `tuning/families.rs` whose default is a rule, and every kernel
+  tier chosen from capabilities: no f16 matrix units, no int8 dot at all,
+  wave64-only, the integrated-GPU overrides), force that tier on the RX 7900 XTX
+  and the integrated GPU where the hardware allows it and run the whole
+  `gpu_seam_tolerance` gate. A parameter whose default-on value fails a row that
+  its other value passes goes default off, with its figures in the changelog and
+  here. One that stays inside its bound but sits further from the reference than
+  its alternative is reported to the owner, not switched.
+- **What forcing cannot show:** a driver's own code generation. A tier forced on
+  RADV says what the kernels compute, not what a GCN card's driver does with
+  them. Those rows need the hardware (the contributor has an RX 580).
+- Which forcing knobs exist: `INFR_NO_COOPMAT=1` (honoured by the test helpers
+  since the PR #112 follow-up), `INFR_TUNE=<param>=<value>`, and the
+  `kernels.vulkan.*` switches. A tier with no forcing knob is a gap to list.
+
+### B-PR-AUDIT-2026-11-26 — second pass over the pull requests merged this session (owner's request)
+
+**Kind:** review owed, not started; the owner asked for it on 2026-11-26, to run
+once the queued merges are in.
+
+PRs #111, #112, #113, #114, #115, #116, and #117 and #118 once merged, each had
+one fresh review plus a check of that review. Several findings since then came
+from a second look, not the first: an explicit KV format priced without the
+runner's alignment fallback, a rope dispatch site the fix missed, a test that
+passed without the change it was added for, and a later pull request (#119) that
+reverted a follow-up fix. So the merged changes get one more pass, by reviewers
+that did not see the first reviews, looking for the same kinds of thing:
+
+- a site with the same defect that the fix did not reach;
+- a test that cannot fail, or does not exercise the line that changed;
+- an estimate or gate that disagrees with what the code it guards really does;
+- a claim in a comment, doc or changelog entry that the code does not bear out;
+- an input the new code neither handles nor refuses;
+- interactions between the merged changes themselves, and with our follow-ups.
+
+Scope is the merge commits and our follow-up commits from `1b292bb5` on.
+Findings go through the normal coder then reviewer flow.
+
+**First part done 2026-11-26: #113, #114, #116 and our follow-up (`f492c19a`,
+`fc8511e4`).** No case was found where an estimate prices a KV format pair other
+than the one the runner allocates. To fix, none done yet:
+
+1. **A KV head count that does not divide the head count is never refused**
+   (confirmed by reading: `Config` has no such check; the CPU attention computes
+   `group = nh / nkv` then `kvh = h / group`). A file with `head_count_kv` above
+   `head_count` divides by zero; `head_count` 32 with `head_count_kv` 24 indexes
+   K heads past the cache; the Vulkan shaders use the same formula. Older than
+   the pull requests, reachable from an untrusted GGUF on the scalar and the new
+   array path. Refuse it in `Config` by name, with a test per path.
+2. **gemma4 and diffusion-gemma read only two entries of a per-layer
+   `head_count_kv` array** (entry 0 and the first sliding-window layer's), never
+   check its length or the other entries, and a non-integer scalar still falls
+   back to `n_head` silently; the changelog's "every other architecture reads a
+   per-block array" overstates it. Check the whole array or correct the entry.
+3. **Doc errors:** the doc on `qwen35_kv_heads_read_the_attention_blocks` says
+   the reference reads a block's count only where it runs attention; llama.cpp
+   reads block 0's entry for every layer (`llama-graph.cpp`, `n_head_kv()` at
+   layer 0), so a per-block qwen35 array is something only infr accepts, and the
+   changelog entry should say so. B153 still lists `tower-http` and `infr-metal`
+   as open.
+4. **Tests that prove less than they look:**
+   `kv_fit_fmts_match_the_runner_resolution` compares a function with itself and
+   does not check that the runner passes its backend name and `kv_auto_q8()`; no
+   test calls `kv_ladder_fmts` for Metal's mixed-pair clamp or for the CPU with
+   an auto-q8 pin set; the qwen35 NextN entries have no fixture;
+   `moe_budget_prices_the_kv_pair_the_runner_allocates` reads the ambient
+   `kv_auto_q8()` outside a `PlacementScope`.
+5. **Older, lower:** the Vulkan prefill's `kvdeq_k`/`kvdeq_v` scratch for a
+   non-f16 KV side (two buffers of two bytes an element, up to the full context)
+   is priced by nothing (about 128 MiB for Qwen3-14B at 32768 tokens; not
+   checked whether `ACT_RESERVE_PAD` absorbs it); the multi-GPU backends' names
+   fail `kv_ladder_fmts`'s backend check, so a named KV format or `kv.force_q8`
+   silently allocates f16 there; `infr bench` prints `kv f16` for an explicit
+   q8_0, f32 or turbo cache (`BenchPlacement.kv_q8` is only the auto-q8 pin).
+
+**Second part done 2026-11-26: #111, #115, our rope follow-up and our MoE
+outlier-quantizer commits.** No wrong-result defect found. The pair nobody had
+reviewed together is clean: PR #111's prefetch writes only per-thread registers,
+and the outlier term reads the current block's staged data and its own `hres`
+entry. To fix, none done yet:
+
+6. **Two more kernels sized in threads where the shader is 64 wide** (the defect
+   PR #115 fixed for rope; wasted work, not wrong output): `attention.comp` from
+   `Recorder::attention` and `ops.rs::attention` (tests and the eager path
+   only), and `moe_ep_band_remap` from the recorder's plain `dispatch`
+   (production under expert parallelism; 8192 workgroups where 128 do at a
+   1024-row chunk with top-8, and past a 65535 workgroup limit at an 8192-row
+   chunk, the second part inferred). The comment above
+   `elementwise_ops_split_wide_grids` still lists attention as one workgroup per
+   unit.
+7. **`elementwise_ops_split_wide_grids` cannot catch a rope grid that is too
+   small:** both of its runs use the same grid and start from the same data, so
+   rows left unwritten match. `rope_matches_host` catches it on the eager path
+   only; `rope_wg_matches_shader` checks the shader's layout line, not a
+   dispatch site. Give the recorder's rope sites a host oracle.
+8. **Builds no op-level test dispatches:** `native_gemm_mmq_q4k_xpg` (the paged
+   64-row tile); the dense resident and `_streamed` builds are held to the host
+   only at a loose bound and to each other bit for bit, on shared staging code;
+   `moe_ffn_batched_experts_hi_switch` reaches one `_hi` tile at one superblock;
+   nothing tests the layer-span `part_of_routed` mark in the seam's graph
+   builder.
+9. **To re-measure:** the cost of `quant_q8.experts_hi` (changelog and
+   `docs/gpu-tolerance.md`, "Speed") was measured before PR #111, which adds
+   prefetch registers to the `_hi` builds. The changelog entry for PR #111 says
+   "instead of byte by byte", which is true of the scales only; activations and
+   nibbles were word loads already.
+
+The standing fact behind several of these: CI runs no Vulkan GPU test (it passes
+`--include-ignored` for the Metal crate only), so every claim about a kernel
+rests on local runs.
+
+Still to audit: #112 once pushed, and the server endpoints (#117, #118) once
+merged.
+
 ### B-IMAGE-INPUT — image input for vision models: how it is to be built (2026-11-26)
 
-**Kind:** planned feature, not started; the owner's direction, given on PR #110.
+**Kind:** planned feature, not started and not to be started yet. The owner's
+decision of 2026-11-26: wait for the contributor of PR #110 to do the rework
+described there; only if they decline do we write a plan and build it ourselves.
 
 PR #110 (Gemma 4 image input, an outside contribution) was not taken: its vision
 encoder was a separate CPU forward pass on new dependencies (`gemm`, `image`),
@@ -100,6 +319,102 @@ unverified against a reference. The direction, posted on the PR:
   token embedding need replacing, never a host copy of the whole table; KV reuse
   should not stop at the first image; and limits should not count images the
   client resends from earlier turns.
+
+- **Gemma 4 preprocessing, as the crcbl session read it from llama.cpp at
+  `57291f2`** (their reading and their runs, not checked here; the first three
+  are infr's steps, not the crate's):
+  - Target size: `mtmd_image_preprocessor_dyn_size` with
+    `calc_size_preserved_ratio`, aligned to patch size times merge factor (48),
+    between 40 and 280 tokens' worth of pixels, in f32 arithmetic with `round`,
+    `floor`, `ceil` and a square root. Reproduce it in f32, not f64.
+  - A source already at the target size is used as it is. Otherwise fit and pad:
+    scale by the smaller ratio, round the new size up, bicubic resize, paste
+    centred on a black canvas of the target size. The black bars are usual
+    (1024x768 becomes 896x672 inside 912x672).
+  - Mean and std are 0 and 1 for Gemma 4; the `2x - 1` scale is inside the
+    vision graph (`ggml_scale_bias` in `models/gemma4v.cpp`). Do not normalise
+    twice. Not checked against a real mmproj file.
+  - The crate's float output is interleaved RGB; llama.cpp's input tensor is
+    planar, so transpose for the encoder.
+  - JPEG will not be bit-identical to llama.cpp: it decodes with stb_image, and
+    `crcbl-image` matches libjpeg-turbo (up to 3 levels apart on llama.cpp's own
+    test image, far more on some subsampled files). PNG and BMP match exactly.
+    So the reference comparison uses PNG input, unless the crate adds an
+    stb-compatible JPEG mode (raised with the owner there).
+  - llama.cpp's arm64 builds use fast float flags, so normalisation can differ
+    by an ulp against those; default x86 builds are exact.
+
+### B-KQ-FMA-GEMM-UNVERIFIED — `gemm.kq_fma` stays off until it passes the float rows and the prefill is f32 throughout (2026-11-26)
+
+**Kind:** open work; plan 12's S4. PR 112's fp32 K-quant prefill GEMM
+(`native_gemm_kq_fma`, chosen in `nc_gemm_choice` through `kq_fma_plan`) is on
+`main` as the tuning parameter `gemm.kq_fma`, off by default on every device
+(the owner's accuracy rule, B-DECISIONS-2026-11-26: a default-on kernel that
+fails a row its alternative passes goes off).
+
+**Where no int8 arm runs it fails a float row.** In the harness's float runs
+(int8 dot masked) on the integrated Ryzen GPU, the tile puts gemma-3 at worst KL
+2.65e-3 against its FloatNoCoopmat bound of 1.8e-3; the per-row f32 GEMV it
+replaces gives 7.1e-4 and passes. On the RX 7900 XTX the same row passes at
+1.74e-3. The other models' float rows are about as close or closer
+(`docs/gpu-tolerance.md`, "The fp32 K-quant prefill GEMM in the float runs").
+Not established why the tile is further out on gemma-3; the guess, untested, is
+its summation order (one f32 accumulator per output over the whole `k` range).
+Before any default-on, the tile must meet gemma-3's FloatNoCoopmat row on both
+GPUs (a different accumulation, or split-K there).
+
+**Why it is off.** It moves only the Q4_0/Q4_K/Q6_K prefill Linears with
+`in_f % 256 == 0` to f32; everything else on that tier stays on the int8 `mmq`
+tile. On gemma-3-1b Q4_K_M that mix measured further from the CPU reference than
+all-int8: worst prefill KL 0.31 to 0.74 at position 13 of prompt 1, past the
+Int8 row's 0.52 (the table and the method are in `docs/gpu-tolerance.md`,
+"Mixing f32 and int8 prefill Linears"; forced on the RX 7900 XTX with
+`INFR_NO_COOPMAT=1`, not on a GCN card). The f32 dequant GEMV given the same
+Linears lands further out (1.12), and the Float rows with the new kernel pass on
+the RX 7900 XTX (not on the integrated GPU: the paragraph above), so the mix,
+not either kernel, explains this figure. Ruled out by runs that did not move the
+figures: the activation memo, split-K, the kernel at gemma-3's shapes.
+
+**The owner's direction is a full float lineup on every GPU without a natively
+accelerated int8 dot** (plan 16: what each class runs today and what is
+missing). **To turn it on by default, the tier's prefill has to be f32
+throughout:** an f32 tile for what `nc_gemm_choice` still sends to `mmq` there.
+On gemma-3 (the choice log of the forced run) that is Q5_0 (q/k/v, gate/up) and
+Q8_0 (v, the head), plus any Q4_0/Q4_K/Q6_K Linear whose `in_f` is not a
+multiple of 256 (gemma-3's are all `in_f = 1152`). In general it is every format
+of `infr_core::tensor::MOE_MMQ_DTYPES` the f32 tile does not cover. Then the run
+is in the Float class, and once the tile meets the float rows the default can be
+on there.
+
+Also open:
+
+- **Not established why the mix is worse than all-int8.** The guess, untested:
+  error cancellation between the int8 Linears that a partial switch to f32
+  breaks.
+- **All-int8 gemma-3 is already at worst KL 0.31 at position 13** on this tier,
+  an accuracy gap of its own; it belongs to the int8 investigation in
+  B-DECISIONS-2026-11-26 ("the remaining routing gap"), not repeated here.
+- **`gemv.kq_fma` (decode, PR 107, on by default on that tier) has the same
+  shape**: f32 decode GEMVs for Q4_K/Q6_K among int8 ones. The whole
+  `gpu_seam_tolerance` gate on the RX 7900 XTX under `INFR_NO_COOPMAT=1`, with
+  `gemm.kq_fma` off, passes 14 of 14 both with `INFR_TUNE=gemv.kq_fma=false` and
+  `=true`, so the default was left on. Int8 `gpu` row, decode rows, worst KL off
+  against on: gemma-3-1b is further out with it on at every prompt (prompt 0
+  1.52e-2 to 1.61e-2, prompt 1 6.04e-2 to 9.06e-2, prompt 2 0.173 to 0.189; mean
+  KL 3.80e-3 to 4.29e-3, 1.24e-2 to 1.30e-2, 6.77e-3 to 7.15e-3), all inside its
+  bounds; Qwen3-0.6B (worst 0.20 to 0.61 times off's), Qwen3.5-0.8B (0.08 to
+  0.31 times), ERNIE-0.3B Q4 (0.35 to 1.03 times) and LFM3 Q4 (0.55 to 1.08
+  times) mostly come closer. Whether gemma-3's smaller margin is acceptable is
+  the owner's call; S8's full float lineup would make the question moot.
+- `gpu_seam_tolerance_moe_decode_float_reaches_moe_models_only` skipped as a
+  whole on the integrated GPU under `INFR_TUNE=gemv.kq_fma=true` ("ernie-21b-moe
+  cannot run on this device") where the default run went through; not looked
+  into.
+- Not verified: pp512 against llama.cpp and a profile on the GCN tier itself
+  (needs the card; the contributor's speed figures are in `CHANGELOG.md`); the
+  shared-memory check and the wide-grid fallback ran only on fixtures,
+  `kq_fma_plan` tests and a synthetic `maxComputeWorkGroupCount[0]`
+  (`TEST_KERNEL_LIMITS`).
 
 ### B-KQ-FMA-BW-IGPU — `kq_fma_mrow_bw` trips the integrated GPU's watchdog (2026-11-26)
 
@@ -192,11 +507,7 @@ Queue order (the owner's): MoE routing first, then the rest in the order below.
     `repeat_last_n` accepted as a request field. `presence_penalty` and
     `frequency_penalty` keep the OpenAI definition. Fix
     `RequestSampling::default`'s doc.
-11. **`gpu_seam_tolerance_float_runs_build_no_int8_kernel` on a device with no
-    int8 kernel.** Approved: when the shipped run builds no int8 kernel the test
-    says so and asserts the Int8 and Float kernel lists are equal, as
-    `gpu_seam_tolerance_nocoopmat_runs_build_no_coopmat_gemm` does for its tier.
-12. **`/status` and `infr tune show` under `INFR_VRAM_LIMIT`.** Additive: keep
+11. **`/status` and `infr tune show` under `INFR_VRAM_LIMIT`.** Additive: keep
     total and free as the budget in force, add the configured limit and the
     device's real total; `infr tune show` gains a memory line with the same
     figures.

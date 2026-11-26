@@ -866,9 +866,11 @@ pub(crate) static PARAMS: &[Param] = &[
         doc: "the fp32 K-quant prefill GEMM for devices without an accelerated int8 dot: \
               Q4_0/Q4_K/Q6_K weights dequantized in-shader (native_gemm_kq_fma), where the \
               dp4a mmq tile emulates the int8 dot in ALU",
-        rule: "true where the driver does not report the packed int8 dot as accelerated, where \
-               it was measured; else false",
-        default: |f, _| Value::Bool(!f.dot_accelerated),
+        rule: "false: where int8 arms run, a prefill with only its Q4_0/Q4_K/Q6_K Linears on \
+               f32 measured further from the CPU reference than all-int8 (gemma-3); where none \
+               run, the tile put gemma-3 outside its FloatNoCoopmat row on the integrated GPU, \
+               which the per-row f32 GEMV it replaces meets",
+        default: |_, _| Value::Bool(false),
         get: |t, _| Value::Bool(t.gemm_kq_fma),
         set: |t, _, v| t.gemm_kq_fma = v.flag(),
     },

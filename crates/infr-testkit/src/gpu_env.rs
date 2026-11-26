@@ -29,8 +29,12 @@ pub fn force_wave64() -> bool {
 /// a run with `INFR_TUNE=gemv.kq_fma=true` tests the kernels a device without an accelerated int8
 /// dot gets; and every older knob that is an alias of a tuning parameter ([`TUNE_ALIASES`]:
 /// `INFR_KQ_FMA_GEMV`, `INFR_GFX_QUEUE` and the rest), so the alias spelling selects the same
-/// kernels here as it does in a backend opened from the environment. A test that pins a parameter
-/// itself adds its setting after this, at a higher level (see [`env_config_with_tune`]).
+/// kernels here as it does in a backend opened from the environment; and `INFR_NO_COOPMAT`
+/// (`kernels.vulkan.coopmat`) and `INFR_NO_I8DOT` (`kernels.vulkan.i8_dot`), which mask the
+/// cooperative-matrix tiers and the packed int8 dot, so a run with them set tests the kernels a
+/// device without them gets. They only mask: unset, they leave a helper's own `false` alone. A
+/// test that pins a parameter itself adds its setting after this, at a higher level (see
+/// [`env_config_with_tune`]).
 pub fn honour_env(cfg: &mut Config) {
     carry_gpu_knobs(&ConfigLayer::env().expect("test environment config"), cfg);
 }
@@ -40,6 +44,8 @@ fn carry_gpu_knobs(layer: &PartialConfig, cfg: &mut Config) {
     let env = Config::load_from_layers(std::slice::from_ref(layer));
     cfg.kernels.vulkan.force_wave64 = env.kernels.vulkan.force_wave64;
     cfg.kernels.vulkan.tuning.rows = env.kernels.vulkan.tuning.rows;
+    cfg.kernels.vulkan.coopmat &= env.kernels.vulkan.coopmat;
+    cfg.kernels.vulkan.i8_dot &= env.kernels.vulkan.i8_dot;
     // The alias knobs the environment set, each by its config path, as typed values.
     let mut aliases = PartialConfig::default();
     for &path in TUNE_ALIASES {
@@ -298,5 +304,27 @@ mod tests {
         assert!(!cfg.kernels.vulkan.tuning.rows);
         assert!(cfg.kernels.vulkan.force_wave64);
         assert_eq!(cfg.device.dev, None);
+    }
+
+    /// `INFR_NO_COOPMAT` and `INFR_NO_I8DOT` mask their capability in a helper-built config, and
+    /// their absence does not undo a helper that masked it itself.
+    #[test]
+    fn honour_env_carries_the_capability_masks() {
+        type Field = fn(&mut Config) -> &mut bool;
+        let cases: [(&str, Field); 2] = [
+            ("INFR_NO_COOPMAT", |c| &mut c.kernels.vulkan.coopmat),
+            ("INFR_NO_I8DOT", |c| &mut c.kernels.vulkan.i8_dot),
+        ];
+        for (env, field) in cases {
+            let mut cfg = Config::default();
+            assert!(*field(&mut cfg), "{env}");
+            carry_gpu_knobs(&env_layer(&[(env, "1")]), &mut cfg);
+            assert!(!*field(&mut cfg), "{env}");
+            carry_gpu_knobs(&env_layer(&[]), &mut cfg);
+            assert!(!*field(&mut cfg), "{env}");
+            let mut cfg = Config::default();
+            carry_gpu_knobs(&env_layer(&[]), &mut cfg);
+            assert!(*field(&mut cfg), "{env}");
+        }
     }
 }

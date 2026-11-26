@@ -440,6 +440,21 @@ unverified against a reference. The direction, posted on the PR:
   - llama.cpp's arm64 builds use fast float flags, so normalisation can differ
     by an ulp against those; default x86 builds are exact.
 
+**2026-11-26: `crcbl-image` 0.21.0 is released** (crates.io; version confirmed
+with `cargo search`, the features below are from the crcbl session's release
+note and have not been exercised from infr). It has what the image path needs:
+`format::sniff` and header-only `dimensions`; `jpeg::decode_as_stb_image`
+(bit-exact with stb_image v2.30, which llama.cpp decodes with) and
+`png/webp::decode_stored` (stb ignores EXIF; the plain `decode` applies it);
+`tensor::opaque` (call before resizing); `resize::resize_pillow` with
+`PillowFilter::Bicubic` (a port of llama.cpp's, tested against its fixture);
+`tensor::normalised_rgb` (interleaved RGB, Gemma 4 uses mean 0 and std 1);
+`ImageError::TooMuchWork` bounds JPEG decoding work. The size calculation and
+padding stay on infr's side, and llama.cpp's input tensor is planar. On arm64 a
+llama.cpp built with `-ffp-model=fast` can differ by about one ulp in the float
+stage. The contributor of PR #110 was told on the pull request the same day; the
+rework is theirs unless they decline.
+
 ### B-KQ-FMA-GEMM-UNVERIFIED — `gemm.kq_fma` stays off until it passes the float rows and the prefill is f32 throughout (2026-11-26)
 
 **Kind:** open work; plan 12's S4. PR 112's fp32 K-quant prefill GEMM

@@ -52,11 +52,6 @@ session whose whole cache goes to system RAM. Left and not verified:
   VRAM guard ("205.5 MiB requested + 2.79 GiB already in use > 2.75 GiB budget")
   instead of spilling the cache. The R0 change does not touch that path; whether
   it failed the same before was not run.
-- **Seen and not investigated:** the same model, greedy, gave the same first
-  reply resident and streamed with the whole cache spilled, and a second turn
-  that differs by one token between the two placements (every `paging.dram`
-  setting of the streamed run gave identical text). Not compared against the CPU
-  reference.
 - **The dense call site's wiring is covered only by the ignored test.**
   `seam::price_host_tier` is what both placement and the non-ignored order test
   call, so the order inside it fails a CI test when broken; the call site in
@@ -88,6 +83,66 @@ layer-span mark in the seam's graph builder is read by code only: a layer span
 is a prefill, which the switch does not touch unless it is an MTP verify batch.
 The MTP draft head keeps int8 GEMVs with the switch on (a choice, not checked
 for effect on acceptance). Nothing ran on Windows or Metal.
+
+### B-PLACEMENT-TOKEN-FLIP — a streamed, spilled session decodes other tokens than a resident one: the prefill chunk, not a defect (2026-11-26)
+
+**Kind:** behaviour that surprised us and is not a bug.
+
+**What was seen.** SmolLM3-3B Q4_K_M on the RX 7900 XTX (`INFR_DEV=Vulkan0`),
+`infr run --temp 0` with two chat turns piped on stdin, resident against
+`INFR_VRAM_LIMIT=4g INFR_KV_OVERFLOW=1 --ctx 32768` (weights streamed, 70 to 72
+of the 72 KV buffers in system RAM): the replies differ in places. The earlier
+note said the first turn was identical and the second differed; that was the one
+prompt. Four other conversations all diverged within the FIRST reply (at reply
+tokens 33 to 95), so nothing is specific to the second turn, the prefix reuse or
+the re-prefill at an offset.
+
+**The one factor.** Each variable alone, with every decode row's logits dumped
+and compared bit for bit against the resident default (both turns):
+
+| run                                                      | logits vs resident        |
+| -------------------------------------------------------- | ------------------------- |
+| `--ctx 32768`, resident                                  | bit-identical             |
+| KV spilled (`INFR_KV_OVERFLOW_VRAM_MB=64`), weights res. | bit-identical             |
+| weights streamed (`INFR_CACHE=1g`), KV resident, 1024    | bit-identical             |
+| `INFR_UBATCH=128`, everything resident                   | differs from turn one on  |
+| streamed + spilled (the reported placement)              | = `INFR_UBATCH=128`, bits |
+
+The streamed placement settles on a 128-row prefill chunk (`vulkan_moe_binder`'s
+sweep down `seam::ubatch_candidates` / `DENSE_UBATCH_LADDER`; the log says
+`chunk=128`), where resident keeps 1024. With 1024 a 256-token chat prompt is
+one chunk; with 128 it is three, and the later chunks attend to cached rows
+through the split-KV attention (`attn_partial_bda` + `attn_combine`,
+`attn_flash_warp` + `attn_flash_combine`) instead of `attention_kv_bda`, and run
+their GEMMs at another `m`. Reduction order differs, so the KV rows the prompt
+writes differ in the last bits, and every later row (turn two included) reads
+them. Streaming and the spill themselves change nothing: same chunk, same bits,
+which is what `spilled_kv_gives_the_logits_of_a_resident_one` claims, here
+confirmed on a 3B model across two chat turns.
+
+**Against the CPU reference** (`SeamModel::forced_logits` with
+`ForcedOn::CpuReference`, prefill head on every row, along the conversation's
+own tokens up to the flip): both placements are equally close. Per-row KL from
+the reference, means over the reply up to the flip, resident / chunk 128:
+2.44e-4 / 2.45e-4, 1.49e-4 / 2.10e-4, 3.06e-4 / 2.79e-4; max abs logit
+difference about 0.4 on both. Resident and chunk 128 differ from each other by
+max abs 0.3 to 0.5 and KL 3e-4 to 1.5e-3 at the flip. Every flip is a near tie
+in the reference: top-2 margins 0.065, 0.059 and 0.0023 logits. Which placement
+picked the reference's token there varies (chunk 128 on two, resident on one).
+
+**Why it is not a defect.** GPU kernels are not chunk-height invariant by design
+(only the CPU backend is, plan 11), and the chunked prefill is already held to
+the reference by the tolerance gate's `SMALL_UBATCH` runs. Neither placement is
+further from the reference than the other. If greedy output that does not depend
+on the chunk height is ever wanted, that is a feature (chunk-invariant GPU
+prefill), not a fix to the streaming or spill paths.
+
+**Not verified:** other models and devices; prompts longer than a few hundred
+tokens (more chunks); the `INFR_VRAM_LIMIT=3g INFR_CACHE=1g` refusal from the
+handoff entry, which is a separate question. Streamed weights with a resident KV
+at chunk 128 was not run on its own: every `INFR_VRAM_LIMIT` small enough to
+stream refused a resident cache on this desktop, so it was forced with
+`INFR_CACHE=1g` at the default chunk instead.
 
 ### B-DECISIONS-2026-11-26 — owner's decisions on the MoE switches and accuracy (2026-11-26)
 

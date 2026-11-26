@@ -356,87 +356,107 @@ const CPU_ACTIVATION_RESERVE: u64 = 1 << 30;
 /// merely double-counted, it is strictly worse than making that arena bigger. So auto-sizing
 /// declines on unified memory and says why; an explicit `paging.dram` is still honoured, because a
 /// user asking for it by name may be working around something this does not model.
+///
+/// # The live KV spill comes first
+/// The tier is priced before it is built ([`price_host_tier`]): a KV cache spilled to system RAM
+/// (`kv.overflow`) is mandatory and the arena elastic, so an automatic budget is what the spill
+/// leaves, and the spill is refused beside the arena when the two do not fit together.
 fn vulkan_host_tier(
-    ec: &EngineConfig,
     g: &Gguf,
     what: &str,
     classes: &[(usize, usize)],
-    unified: bool,
+    priced: &HostTierPlan,
 ) -> AResult<Vec<Option<std::sync::Arc<infr_core::hostpager::HostPager>>>> {
     let unpaged = || vec![None; classes.len()];
-    // `0` is the explicit OFF switch, not "unset" — so it must reach `Requested` unfiltered.
-    let explicit = infr_core::hostmem::Requested::from_config(
-        ec.paging.dram.map(|s| s.resolve(0)),
-        ec.paging.dram_bypass,
-    );
-    let available = infr_core::hostmem::available_bytes();
-    let pageable: u64 = classes.iter().map(|&(s, n)| (s * n) as u64).sum();
-    let budget =
-        match infr_core::hostmem::streaming_arena_plan(explicit, available, unified, pageable) {
-            // Unified memory: the arena above is already GPU-accessible RAM, so there is nothing
-            // to cache down here — but its misses still come from BLOCK reads instead of the
-            // mapping, which is what lets a big model run on these machines at all.
-            infr_core::hostmem::ArenaPlan::StreamOnly => {
-                let io = std::sync::Arc::new(
-                    infr_core::blockio::FileBlockIo::from_handles(&g.shard_handles())
-                        .map_err(|e| anyhow!("{e}"))?,
-                );
-                tracing::info!(
-                    "{what} host tier: streaming DISK -> GPU-accessible RAM with no host cache — \
+    let available = priced.available;
+    let budget = match priced.plan {
+        // Unified memory: the arena above is already GPU-accessible RAM, so there is nothing
+        // to cache down here — but its misses still come from BLOCK reads instead of the
+        // mapping, which is what lets a big model run on these machines at all.
+        infr_core::hostmem::ArenaPlan::StreamOnly => {
+            let io = std::sync::Arc::new(
+                infr_core::blockio::FileBlockIo::from_handles(&g.shard_handles())
+                    .map_err(|e| anyhow!("{e}"))?,
+            );
+            tracing::info!(
+                "{what} host tier: streaming DISK -> GPU-accessible RAM with no host cache — \
                      this device's memory IS host memory, so the {} pool(s) above are already the \
                      only useful cache and a second one would hold bytes the GPU cannot read in \
                      place. Raise INFR_CACHE to cache more; INFR_DRAM_CACHE forces a host arena",
-                    classes.len(),
-                );
-                let mut out = Vec::with_capacity(classes.len());
-                for &(slot_bytes, _) in classes {
-                    let p = infr_core::hostpager::HostPager::stream_only(slot_bytes, io.clone())
-                        .map_err(|e| anyhow!("{e}"))?;
-                    out.push(Some(std::sync::Arc::new(p)));
-                }
-                return Ok(out);
+                classes.len(),
+            );
+            let mut out = Vec::with_capacity(classes.len());
+            for &(slot_bytes, _) in classes {
+                let p = infr_core::hostpager::HostPager::stream_only(slot_bytes, io.clone())
+                    .map_err(|e| anyhow!("{e}"))?;
+                out.push(Some(std::sync::Arc::new(p)));
             }
-            infr_core::hostmem::ArenaPlan::Take(n) => {
-                if explicit == infr_core::hostmem::Requested::Auto {
-                    tracing::info!(
+            return Ok(out);
+        }
+        infr_core::hostmem::ArenaPlan::Take(n) => {
+            if priced.explicit == infr_core::hostmem::Requested::Auto {
+                let after_spill = if priced.kv_spill_host > 0 {
+                    format!(
+                        ", after the {:.2} GB of KV cache spilled to it",
+                        priced.kv_spill_host as f64 / 1e9
+                    )
+                } else {
+                    String::new()
+                };
+                tracing::info!(
                     "{what} host tier: sized automatically to {:.2} GB of {:.2} GB available host \
-                     memory (set INFR_DRAM_CACHE to override)",
+                     memory{after_spill} (set INFR_DRAM_CACHE to override)",
                     n as f64 / 1e9,
                     available.unwrap_or(0) as f64 / 1e9,
                 );
-                }
-                n as usize
             }
-            infr_core::hostmem::ArenaPlan::Skip(why) => {
-                use infr_core::hostmem::Skip;
-                match why {
-                    Skip::NoProbe => tracing::warn!(
+            n
+        }
+        infr_core::hostmem::ArenaPlan::Skip(why) => {
+            use infr_core::hostmem::Skip;
+            match why {
+                Skip::NoProbe => tracing::warn!(
                     "{what} host tier: this model must stream, but there is no host-memory probe \
                      on this platform, so the arena cannot be sized automatically — set \
                      INFR_DRAM_CACHE to page weights through DRAM instead of leaving them to the \
                      OS page cache"
                 ),
-                    Skip::TooLittle => tracing::warn!(
+                // The spill comes first, so a spill that leaves too little is not helped by a
+                // named tier: one would only be refused beside it.
+                Skip::TooLittle if priced.kv_spill_host > 0 => {
+                    let free = available.unwrap_or(0);
+                    tracing::warn!(
+                        "{what} host tier: this model must stream, and of the {:.2} GB of host \
+                         memory available the {:.2} GB of KV cache spilled to it leaves {:.2} GB \
+                         for this run — too little to seat a useful arena, so the weights stream \
+                         from the OS page cache. For a host tier, ask for a smaller window \
+                         (--ctx N / INFR_CTX=N) or quantize the cache (INFR_KV_TYPE_K=q8_0 \
+                         INFR_KV_TYPE_V=q8_0)",
+                        free as f64 / 1e9,
+                        priced.kv_spill_host as f64 / 1e9,
+                        infr_core::hostmem::spare_bytes(free, priced.kv_spill_host) as f64 / 1e9,
+                    )
+                }
+                Skip::TooLittle => tracing::warn!(
                     "{what} host tier: this model must stream, but only {:.2} GB of host memory \
                      is available — too little to seat a useful arena, so the weights stay on the \
                      OS page cache. Free memory, or set INFR_DRAM_CACHE explicitly",
                     available.unwrap_or(0) as f64 / 1e9,
                 ),
-                    // Off by name: say so once, because a user who set it and then wonders why
-                    // streaming is slow should find the reason in the log.
-                    Skip::Disabled => tracing::info!(
-                        "{what} host tier: disabled by paging.dram=0 — weights stream from the OS \
+                // Off by name: say so once, because a user who set it and then wonders why
+                // streaming is slow should find the reason in the log.
+                Skip::Disabled => tracing::info!(
+                    "{what} host tier: disabled by paging.dram=0 — weights stream from the OS \
                      page cache instead of an arena"
-                    ),
-                    // Unreachable here by construction: `streaming_arena_plan` is for callers already
-                    // past the fit decision, so it never answers `Fits`.
-                    Skip::Fits => tracing::warn!("{what} host tier: not built (weights fit)"),
-                }
-                return Ok(unpaged());
+                ),
+                // Unreachable here by construction: `streaming_arena_plan` is for callers already
+                // past the fit decision, so it never answers `Fits`.
+                Skip::Fits => tracing::warn!("{what} host tier: not built (weights fit)"),
             }
-        };
-    let slots = infr_core::hostpager::plan_slots(budget, classes);
-    if slots.iter().all(|&n| n == 0) {
+            return Ok(unpaged());
+        }
+    };
+    if priced.arena == 0 {
         tracing::warn!(
             "{what} host tier: a {:.2} GB budget seats no block class of this model — keeping \
              the mmap path (raise INFR_DRAM_CACHE past one block's size to page)",
@@ -448,26 +468,110 @@ fn vulkan_host_tier(
         infr_core::blockio::FileBlockIo::from_handles(&g.shard_handles())
             .map_err(|e| anyhow!("{e}"))?,
     );
-    let mut arena = 0usize;
+    let mut arena = 0u64;
     let mut out = Vec::with_capacity(classes.len());
-    for (&n_slots, &(slot_bytes, _)) in slots.iter().zip(classes) {
+    for (&n_slots, &(slot_bytes, _)) in priced.slots.iter().zip(classes) {
         if n_slots == 0 {
             out.push(None);
             continue;
         }
         let p = infr_core::hostpager::HostPager::new(n_slots, slot_bytes, io.clone())
             .map_err(|e| anyhow!("{e}"))?;
-        arena += p.arena_bytes();
+        arena += p.arena_bytes() as u64;
         out.push(Some(std::sync::Arc::new(p)));
+    }
+    if arena != priced.arena {
+        return Err(anyhow!(
+            "{what} host tier: built a {arena}-byte arena where {} bytes were priced",
+            priced.arena
+        ));
     }
     tracing::info!(
         "{what} host tier: {} of {} pool(s) paged, {:.2} GB arena of a {:.2} GB budget",
-        slots.iter().filter(|&&n| n > 0).count(),
+        priced.slots.iter().filter(|&&n| n > 0).count(),
         classes.len(),
         arena as f64 / 1e9,
         budget as f64 / 1e9,
     );
     Ok(out)
+}
+
+/// A KV cache placement put wholly or partly in system RAM beside streamed weights: the window,
+/// how it divides ([`kv_spill_split`]) and its formats.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StreamedSpill {
+    ctx: usize,
+    split: KvSplit,
+    k_fmt: DType,
+    v_fmt: DType,
+}
+
+/// The weights' host tier as priced before it is built ([`price_host_tier`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HostTierPlan {
+    /// What the user asked (`paging.dram`, `paging.dram_bypass`).
+    explicit: infr_core::hostmem::Requested,
+    /// The arena that gives ([`infr_core::hostmem::streaming_arena_plan`]).
+    plan: infr_core::hostmem::ArenaPlan,
+    /// Slots per block class ([`infr_core::hostpager::plan_slots`] of a `Take` budget; all zero
+    /// otherwise).
+    slots: Vec<usize>,
+    /// What those slots take of host memory: the bytes the arena is built with.
+    arena: u64,
+    /// The reading of host memory the tier and the spill were priced against.
+    available: Option<u64>,
+    /// The spill's system-RAM part, priced first.
+    kv_spill_host: u64,
+}
+
+/// Price a streamed session's host memory in order, against one reading of it (`available`): the
+/// spilled KV cache first (`spill`, mandatory), then the weights' host tier over `classes`
+/// (`(slot stride, block count)` per pool) from what it leaves, then the spill checked beside the
+/// arena that tier will be built with ([`refuse_unhostable_kv`]). An explicit `paging.dram` keeps
+/// its size, and a spill that does not fit beside it is refused naming both.
+fn price_host_tier(
+    ec: &EngineConfig,
+    available: Option<u64>,
+    unified: bool,
+    classes: &[(usize, usize)],
+    spill: Option<StreamedSpill>,
+) -> AResult<HostTierPlan> {
+    // `0` is the explicit OFF switch, not "unset" — so it must reach `Requested` unfiltered.
+    let explicit = infr_core::hostmem::Requested::from_config(
+        ec.paging.dram.map(|s| s.resolve(0)),
+        ec.paging.dram_bypass,
+    );
+    let kv_spill_host = spill.map_or(0, |s| s.split.host);
+    let pageable: u64 = classes.iter().map(|&(s, n)| (s * n) as u64).sum();
+    let plan = infr_core::hostmem::streaming_arena_plan(
+        explicit,
+        available,
+        unified,
+        kv_spill_host,
+        pageable,
+    );
+    let slots = match plan {
+        infr_core::hostmem::ArenaPlan::Take(n) => {
+            infr_core::hostpager::plan_slots(usize::try_from(n).unwrap_or(usize::MAX), classes)
+        }
+        _ => vec![0; classes.len()],
+    };
+    let arena = slots
+        .iter()
+        .zip(classes)
+        .map(|(&n, &(stride, _))| (n * stride) as u64)
+        .sum();
+    if let Some(s) = spill {
+        refuse_unhostable_kv(s.ctx, s.split, available, arena, s.k_fmt, s.v_fmt)?;
+    }
+    Ok(HostTierPlan {
+        explicit,
+        plan,
+        slots,
+        arena,
+        available,
+        kv_spill_host,
+    })
 }
 
 fn cpu_upload_bind(be: &CpuBackend) -> Box<BindWeight<'_>> {
@@ -1404,6 +1508,12 @@ pub(crate) struct PlacementPins {
     /// arenas, which the probe sees and this still counts, so it over-counts the tier there — the
     /// conservative side (traced in code 2026-11-25, not run).
     host_tier_bytes: std::sync::atomic::AtomicU64,
+    /// The system-RAM part of the KV cache placement checked beside that tier against its own
+    /// reading of host memory (`0` when placement priced no spill), set with it. The re-clamp
+    /// does not check that part again on its later reading ([`refuse_unpriced_kv`]): the tier was
+    /// sized to leave exactly it, so a reading lower by a few MB would refuse a load placement
+    /// already admitted, after the weights were uploaded.
+    kv_spill_priced: std::sync::atomic::AtomicU64,
 }
 
 impl PlacementPins {
@@ -1417,6 +1527,7 @@ impl PlacementPins {
             kv_q8: Default::default(),
             act_over_reserve_reported: Default::default(),
             host_tier_bytes: Default::default(),
+            kv_spill_priced: Default::default(),
         }
     }
 
@@ -1591,13 +1702,22 @@ pub(crate) fn claim_act_over_reserve_report() -> bool {
     })
 }
 
-/// Record the host memory the current session's weight-streaming host tier takes (see
-/// [`PlacementPins`]'s `host_tier_bytes`).
-fn pin_host_tier_bytes(bytes: u64) {
+/// Record the host memory the current session's weight-streaming host tier takes and the spilled
+/// KV cache placement priced beside it (see [`PlacementPins`]'s `host_tier_bytes` and
+/// `kv_spill_priced`).
+fn pin_host_tier(tier_bytes: u64, kv_spill_priced: u64) {
     with_placement_pins(|p| {
         p.host_tier_bytes
-            .store(bytes, std::sync::atomic::Ordering::Relaxed)
+            .store(tier_bytes, std::sync::atomic::Ordering::Relaxed);
+        p.kv_spill_priced
+            .store(kv_spill_priced, std::sync::atomic::Ordering::Relaxed);
     });
+}
+
+/// The system-RAM part of the KV cache placement priced beside the host tier for the current
+/// session (`0` before any placement, or with no priced spill).
+pub(crate) fn kv_spill_priced() -> u64 {
+    with_placement_pins(|p| p.kv_spill_priced.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// The host memory the current session's weight-streaming host tier takes, as placement recorded
@@ -2768,27 +2888,71 @@ pub(crate) fn refuse_unhostable_kv(
     k_fmt: DType,
     v_fmt: DType,
 ) -> AResult<()> {
+    refuse_unpriced_kv(ctx, split, host_free, committed, 0, k_fmt, v_fmt)
+}
+
+/// [`refuse_unhostable_kv`] for a cache of which `priced` bytes of the system-RAM part were already
+/// checked beside the host tier against an earlier reading of host memory (placement's,
+/// [`kv_spill_priced`]): those bytes are not checked again on `host_free`, a later reading that
+/// may have moved, only counted as held; what the cache spills beyond them is checked against it.
+/// The priced bytes are not allocated yet when this runs, so the later reading still holds them.
+pub(crate) fn refuse_unpriced_kv(
+    ctx: usize,
+    split: KvSplit,
+    host_free: Option<u64>,
+    committed: u64,
+    priced: u64,
+    k_fmt: DType,
+    v_fmt: DType,
+) -> AResult<()> {
     let Some(free) = host_free else {
         return Ok(());
     };
-    let spare = infr_core::hostmem::spare_bytes(free, committed);
-    if split.host <= spare {
+    let credited = split.host.min(priced);
+    let unpriced = split.host - credited;
+    let held = committed.saturating_add(credited);
+    let spare = infr_core::hostmem::spare_bytes(free, held);
+    if unpriced <= spare {
         return Ok(());
     }
     let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+    let beyond = if credited > 0 {
+        format!(
+            " ({:.2} GiB of it was priced beside the host tier before the load; this is the \
+             {:.2} GiB beyond that)",
+            gib(credited),
+            gib(unpriced)
+        )
+    } else {
+        String::new()
+    };
+    let priced_held = if credited > 0 {
+        format!(
+            ", the {:.2} GiB of it priced before the load",
+            gib(credited)
+        )
+    } else {
+        String::new()
+    };
     Err(anyhow!(
         "context {ctx} cannot be served even with its KV cache spilled to system RAM \
          (INFR_KV_OVERFLOW): {:.2} GiB of its {k_fmt:?}/{v_fmt:?} cache does not fit the device \
-         ({:.2} GiB does), and of the {:.2} GiB the host reports it could commit, {:.2} GiB is \
-         left for it after the {:.2} GiB the weights' host tier takes and the {:.2} GiB kept for \
-         the rest of the machine. Ask for a smaller window (--ctx N / INFR_CTX=N), quantize the \
-         cache (INFR_KV_TYPE_K=q8_0 INFR_KV_TYPE_V=q8_0), or free host memory.",
+         ({:.2} GiB does){beyond}, and of the {:.2} GiB the host reports it could commit, {:.2} \
+         GiB is left for it after the {:.2} GiB the weights' host tier takes{priced_held} and the \
+         {:.2} GiB kept for the rest of the machine. Ask for a smaller window (--ctx N / \
+         INFR_CTX=N), quantize the cache (INFR_KV_TYPE_K=q8_0 INFR_KV_TYPE_V=q8_0), {}or free \
+         host memory.",
         gib(split.host),
         gib(split.vram),
         gib(free),
         gib(spare),
         gib(committed),
-        gib(free.saturating_sub(committed).saturating_sub(spare)),
+        gib(free.saturating_sub(held).saturating_sub(spare)),
+        if committed > 0 {
+            "lower the weights' host tier (INFR_DRAM_CACHE / paging.dram), "
+        } else {
+            ""
+        },
     ))
 }
 
@@ -3064,7 +3228,15 @@ fn reclamp_ctx_with_host(
                     gib(reserve - room),
                 ));
             }
-            refuse_unhostable_kv(ctx, split, host_free, host_tier_bytes(), k_fmt, v_fmt)?;
+            refuse_unpriced_kv(
+                ctx,
+                split,
+                host_free,
+                host_tier_bytes(),
+                kv_spill_priced(),
+                k_fmt,
+                v_fmt,
+            )?;
             tracing::warn!(
                 requested_ctx = want_ctx,
                 fits_ctx = fit,
@@ -3685,8 +3857,16 @@ pub(crate) fn vulkan_moe_binder<'a>(
             // `Host` bank can name it. Pool order is preserved, so pool `i`'s tier is `moe_host[i]`.
             let classes: Vec<(usize, usize)> =
                 pool_blocks.iter().map(|&(_, sb, nb)| (sb, nb)).collect();
-            let host_tier =
-                vulkan_host_tier(ec, g, "MoE", &classes, vk.capabilities().unified_memory)?;
+            // No spill is priced here: the MoE placement above keeps the whole cache in device
+            // memory.
+            let priced = price_host_tier(
+                ec,
+                infr_core::hostmem::available_bytes(),
+                vk.capabilities().unified_memory,
+                &classes,
+                None,
+            )?;
+            let host_tier = vulkan_host_tier(g, "MoE", &classes, &priced)?;
             moe_host = pool_blocks
                 .iter()
                 .zip(&host_tier)
@@ -3771,6 +3951,8 @@ pub(crate) fn vulkan_moe_binder<'a>(
         std::collections::HashMap::new();
     // The tier BELOW VRAM, one entry per dense pool (empty = none: every miss reads the mmap).
     let mut dense_host: Vec<Option<std::sync::Arc<infr_core::hostpager::HostPager>>> = Vec::new();
+    // The KV cache's system-RAM part priced beside the dense host tier (`0` with none).
+    let mut kv_spill_host = 0u64;
     if first_load && cfg.moe.is_none() {
         let fuse_gu = runner::fuse_gu_decision(vk.capabilities().combined_gu, g, cfg);
         let fuse_qkv = runner::fuse_qkv_decision(vk.capabilities().combined_gu, g, cfg, ec);
@@ -4119,36 +4301,42 @@ pub(crate) fn vulkan_moe_binder<'a>(
             // The tier below VRAM, sized before the pools so a `Host` source can name it. Pool
             // order is preserved, so pool `i`'s host tier is `dense_host[i]`.
             let classes: Vec<(usize, usize)> = pools.iter().map(|&(_, s, nb)| (s, nb)).collect();
-            dense_host =
-                vulkan_host_tier(ec, g, "dense", &classes, vk.capabilities().unified_memory)?;
-            if stream_spills {
-                // The whole cache goes to system RAM beside the host tier just sized from the
-                // same memory: refused here, before a weight is uploaded, when it does not fit.
-                let (k, v) = kv_fit_fmts(cfg, ec, kv_auto_q8());
-                let ub = ubatch_rows(ec);
-                let ring = placement_ring(cfg, ec, k, v);
+            // The whole cache goes to system RAM when the streaming budget is the one a wholly
+            // spilled cache leaves. It is priced before the host tier, which sizes itself from
+            // what the spill leaves of the same reading of host memory, and refused here, before
+            // a weight is uploaded, when the two do not fit together.
+            let spill = stream_spills.then(|| {
+                let (k_fmt, v_fmt) = kv_fit_fmts(cfg, ec, kv_auto_q8());
+                let ring = placement_ring(cfg, ec, k_fmt, v_fmt);
                 let split = kv_spill_split(
                     cfg,
                     want_ctx,
                     ring,
-                    ub,
+                    ubatch_rows(ec),
                     align,
-                    k,
-                    v,
+                    k_fmt,
+                    v_fmt,
                     1,
                     0,
                     0,
                     kv_spill_cap(ec),
                 );
-                refuse_unhostable_kv(
-                    want_ctx,
+                StreamedSpill {
+                    ctx: want_ctx,
                     split,
-                    infr_core::hostmem::available_bytes(),
-                    host_arena_bytes(&dense_host),
-                    k,
-                    v,
-                )?;
-            }
+                    k_fmt,
+                    v_fmt,
+                }
+            });
+            let priced = price_host_tier(
+                ec,
+                infr_core::hostmem::available_bytes(),
+                vk.capabilities().unified_memory,
+                &classes,
+                spill,
+            )?;
+            kv_spill_host = priced.kv_spill_host;
+            dense_host = vulkan_host_tier(g, "dense", &classes, &priced)?;
             let specs: Vec<infr_vulkan::pager::DensePoolSpec> = pools
                 .iter()
                 .enumerate()
@@ -4257,11 +4445,13 @@ pub(crate) fn vulkan_moe_binder<'a>(
         }
     }
 
-    // What the session's host tiers take of host memory, for the post-load re-clamp's spill check
-    // (their arenas fill on first touch, so the live host probe does not see them yet).
+    // What the session's host tiers take of host memory, and the spill priced beside them, for
+    // the post-load re-clamp's spill check (their arenas fill on first touch, so the live host
+    // probe does not see them yet).
     if first_load {
-        pin_host_tier_bytes(
+        pin_host_tier(
             host_arena_bytes(&dense_host) + host_arena_bytes(moe_host.iter().map(|(_, _, h)| h)),
+            kv_spill_host,
         );
     }
 
@@ -8636,6 +8826,115 @@ mod seam_helper_tests {
             }
         }
         assert!(checked > 150, "only {checked} cases checked");
+    }
+
+    /// Plan 15 R0, the order system RAM is priced in for a streamed session whose cache spills
+    /// whole, through the function the dense placement prices it with ([`super::price_host_tier`]):
+    /// the spill first, then the weights' host tier from what it leaves, then the spill checked
+    /// beside the arena that tier is built with, all against one reading. 8 GiB available leaves 4
+    /// to spare; 6 GiB of weights page in 64 MiB blocks. An automatic tier beside a 3 GiB spill
+    /// takes the 1 GiB left and both load, where a tier sized first would take all 4. A spill past
+    /// the spare is refused, naming its size and the tier's. An explicit tier keeps exactly its
+    /// size, and a spill that does not fit beside it is refused naming both.
+    #[test]
+    fn a_spilled_cache_is_priced_before_the_weights_host_tier() {
+        use infr_core::hostmem::ArenaPlan;
+        const GIB: u64 = 1 << 30;
+        const MIB: u64 = 1 << 20;
+        let available = Some(8 * GIB);
+        let classes = [(64 * MIB as usize, 96usize)];
+        let auto = EngineConfig::default();
+        let fixed = |b: u64| {
+            let mut ec = EngineConfig::default();
+            ec.paging.dram = Some(infr_core::SizeSpec::Bytes(b));
+            ec
+        };
+        let price = |ec: &EngineConfig, host: u64| {
+            let spill = super::StreamedSpill {
+                ctx: 4096,
+                split: super::KvSplit { vram: 0, host },
+                k_fmt: DType::F16,
+                v_fmt: DType::F16,
+            };
+            super::price_host_tier(ec, available, false, &classes, Some(spill))
+        };
+        let priced = price(&auto, 3 * GIB).expect("a 3 GiB spill beside an automatic tier");
+        assert_eq!(
+            (priced.plan, priced.arena, priced.kv_spill_host),
+            (ArenaPlan::Take(GIB), GIB, 3 * GIB)
+        );
+        assert_eq!(priced.slots, vec![16]);
+        // The spill uses all of the spare: the tier steps aside, and the spill still loads.
+        let priced = price(&auto, 4 * GIB).expect("a spill of the whole spare");
+        assert_eq!(priced.arena, 0, "{:?}", priced.plan);
+        let msg = price(&auto, 4 * GIB + 1)
+            .expect_err("a spill past the spare")
+            .to_string();
+        assert!(
+            msg.contains("4.00 GiB of its") && msg.contains("0.00 GiB the weights' host tier"),
+            "{msg}"
+        );
+        // An explicit tier keeps its size beside a spill that fits with it, and one that does not.
+        let priced = price(&fixed(GIB), 3 * GIB).expect("a 3 GiB spill beside a 1 GiB tier");
+        assert_eq!((priced.plan, priced.arena), (ArenaPlan::Take(GIB), GIB));
+        let msg = price(&fixed(2 * GIB), 3 * GIB)
+            .expect_err("a spill beside a 2 GiB tier")
+            .to_string();
+        assert!(
+            msg.contains("3.00 GiB of its")
+                && msg.contains("2.00 GiB the weights' host tier")
+                && msg.contains("INFR_DRAM_CACHE"),
+            "{msg}"
+        );
+        // No spill: the tier takes the half rule's whole spare.
+        let priced = super::price_host_tier(&auto, available, false, &classes, None)
+            .expect("no spill to refuse");
+        assert_eq!(
+            (priced.plan, priced.arena),
+            (ArenaPlan::Take(4 * GIB), 4 * GIB)
+        );
+    }
+
+    /// The post-load check credits the spill placement priced against its own reading
+    /// ([`super::refuse_unpriced_kv`]): placement read 8 GiB and sized an automatic tier of 1 GiB
+    /// beside a 3 GiB spill, leaving exactly the spill. A later reading 64 MiB lower refuses that
+    /// spill when it is checked whole, and loads it when the priced part is credited, as it does a
+    /// smaller one; growth past the priced part is checked on the later reading, with the tier and
+    /// the priced part held: none fits beside that lower reading, and on a reading of 10 GiB, which
+    /// leaves 1 GiB, a spill 1 GiB past the priced one loads and a byte more is refused, naming the
+    /// part beyond the priced one.
+    #[test]
+    fn the_post_load_check_credits_the_spill_placement_priced() {
+        const GIB: u64 = 1 << 30;
+        const MIB: u64 = 1 << 20;
+        let (k, v) = (DType::F16, DType::F16);
+        let (tier, priced) = (GIB, 3 * GIB);
+        let lower = Some(8 * GIB - 64 * MIB);
+        let split = |host| super::KvSplit { vram: 0, host };
+        let check = |host, free, credit| {
+            super::refuse_unpriced_kv(4096, split(host), free, tier, credit, k, v)
+        };
+        assert!(
+            super::refuse_unhostable_kv(4096, split(priced), lower, tier, k, v).is_err(),
+            "the later reading alone must refuse, or this tests nothing"
+        );
+        assert!(check(priced, lower, priced).is_ok());
+        assert!(check(priced - GIB, lower, priced).is_ok());
+        assert!(check(priced + 1, lower, priced).is_err());
+        assert!(check(priced, lower, 0).is_err());
+        let higher = Some(10 * GIB);
+        assert!(check(priced + GIB, higher, priced).is_ok());
+        let msg = check(priced + GIB + 1, higher, priced)
+            .expect_err("a spill past what the later reading leaves")
+            .to_string();
+        assert!(
+            msg.contains("4.00 GiB of its")
+                && msg.contains("3.00 GiB of it was priced")
+                && msg.contains("1.00 GiB beyond that"),
+            "{msg}"
+        );
+        // No probe refuses nothing.
+        assert!(check(priced + GIB, None, 0).is_ok());
     }
 
     /// The post-load rule, case by case: a window is never cut below the minimum —

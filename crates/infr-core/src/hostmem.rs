@@ -54,8 +54,9 @@ const MIN_USEFUL: u64 = 256 << 20;
 /// - `available` — from [`available_bytes`].
 /// - `committed` — host bytes this run will already hold that `available` does not know about. On a
 ///   UNIFIED-memory device (iGPU, APU, Metal) the "VRAM" budget is carved out of this same physical
-///   RAM, so passing it here is what stops the two tiers from spending the same bytes twice. Zero
-///   on a discrete GPU, whose VRAM is a separate pool.
+///   RAM, so passing it here is what stops the two tiers from spending the same bytes twice. On a
+///   discrete GPU, whose VRAM is a separate pool, it is the part of the KV cache spilled to
+///   system RAM ([`streaming_arena_plan`]), zero when nothing spills.
 /// - `pageable` — total bytes of the weights that could be paged. Budgeting past this buys nothing:
 ///   every block would already be resident.
 ///
@@ -147,9 +148,12 @@ impl Requested {
 /// `explicit` (the user's `paging.dram`) always wins, including on unified memory: forcing this
 /// path on hardware that would not choose it is how it gets tested at all.
 ///
-/// The automatic size is the same half-of-available rule as the CPU's, with nothing committed
-/// (the KV cache lives in VRAM). Deliberately the same: what the rule protects against is the
-/// arena itself, anonymous memory the OS cannot reclaim, and a GPU run's arena is that just as
+/// The automatic size is the same half-of-available rule as the CPU's, after `committed`: the host
+/// memory the run will hold besides the arena that `available` does not see yet, which on a GPU is
+/// the part of a KV cache spilled to system RAM (`kv.overflow`). The spill is priced first because
+/// without it the context is refused, where a smaller arena only costs reads. An explicit budget
+/// is not reduced by `committed`. The rule is deliberately the CPU's: what it protects against is
+/// the arena itself, anonymous memory the OS cannot reclaim, and a GPU run's arena is that just as
 /// much as a CPU run's. What it costs was measured on 2026-11-16 on Qwen3-30B-A3B Q4_K_M, RX
 /// 7900 XTX (`paging.cache` 2 GiB, 41 decoded tokens): the arenas the old eighth rule and this one
 /// would size on a machine with 9 GB available, forced by `INFR_DRAM_CACHE`, decoded at 7.96 and
@@ -158,6 +162,7 @@ pub fn streaming_arena_plan(
     explicit: Requested,
     available: Option<u64>,
     unified: bool,
+    committed: u64,
     pageable: u64,
 ) -> ArenaPlan {
     match explicit {
@@ -175,7 +180,7 @@ pub fn streaming_arena_plan(
     let Some(available) = available else {
         return ArenaPlan::Skip(Skip::NoProbe);
     };
-    match auto_arena_bytes(available, 0, pageable) {
+    match auto_arena_bytes(available, committed, pageable) {
         0 => ArenaPlan::Skip(Skip::TooLittle),
         n => ArenaPlan::Take(n),
     }
@@ -348,12 +353,32 @@ mod tests {
         );
         // Streaming tiers: honoured on unified memory, which auto-sizing declines.
         assert_eq!(
-            streaming_arena_plan(forced, Some(64 * GIB), true, 40 * GIB),
+            streaming_arena_plan(forced, Some(64 * GIB), true, 0, 40 * GIB),
             ArenaPlan::Take(3 * GIB)
         );
         assert_eq!(
-            streaming_arena_plan(forced, None, false, 40 * GIB),
+            streaming_arena_plan(forced, None, false, 0, 40 * GIB),
             ArenaPlan::Take(3 * GIB)
+        );
+    }
+
+    /// A streaming tier sizes itself after what the run commits beside it (a spilled KV cache), and
+    /// an explicit budget keeps exactly its size. 10 GiB available, 3 GiB committed: the half rule
+    /// leaves 10 - 3 - 5 = 2 GiB, where nothing committed leaves 5.
+    #[test]
+    fn a_streaming_tier_sizes_itself_after_committed_memory() {
+        let plan = |explicit, committed| {
+            streaming_arena_plan(explicit, Some(10 * GIB), false, committed, 40 * GIB)
+        };
+        assert_eq!(plan(Requested::Auto, 0), ArenaPlan::Take(5 * GIB));
+        assert_eq!(plan(Requested::Auto, 3 * GIB), ArenaPlan::Take(2 * GIB));
+        assert_eq!(
+            plan(Requested::Auto, 5 * GIB),
+            ArenaPlan::Skip(Skip::TooLittle)
+        );
+        assert_eq!(
+            plan(Requested::Fixed(4 * GIB), 3 * GIB),
+            ArenaPlan::Take(4 * GIB)
         );
     }
 
@@ -368,12 +393,12 @@ mod tests {
             ArenaPlan::Skip(Skip::Disabled)
         );
         assert_eq!(
-            streaming_arena_plan(Requested::Off, Some(64 * GIB), false, 200 * GIB),
+            streaming_arena_plan(Requested::Off, Some(64 * GIB), false, 0, 200 * GIB),
             ArenaPlan::Skip(Skip::Disabled)
         );
         // ...and it is distinct from unset, which on that same host DOES build one.
         assert!(matches!(
-            streaming_arena_plan(Requested::Auto, Some(64 * GIB), false, 200 * GIB),
+            streaming_arena_plan(Requested::Auto, Some(64 * GIB), false, 0, 200 * GIB),
             ArenaPlan::Take(_)
         ));
     }
@@ -438,24 +463,24 @@ mod tests {
     #[test]
     fn unified_memory_streams_without_caching() {
         assert_eq!(
-            streaming_arena_plan(Requested::Auto, Some(64 * GIB), true, 40 * GIB),
+            streaming_arena_plan(Requested::Auto, Some(64 * GIB), true, 0, 40 * GIB),
             ArenaPlan::StreamOnly
         );
         // It must NOT collapse to "keep the mmap path" — that is the thing it replaces.
         assert_ne!(
-            streaming_arena_plan(Requested::Auto, Some(64 * GIB), true, 40 * GIB),
+            streaming_arena_plan(Requested::Auto, Some(64 * GIB), true, 0, 40 * GIB),
             ArenaPlan::Skip(Skip::Fits)
         );
         // A host with no memory to spare still streams on unified memory, because the decision
         // does not depend on having any to give.
         assert_eq!(
-            streaming_arena_plan(Requested::Auto, Some(GIB), true, 40 * GIB),
+            streaming_arena_plan(Requested::Auto, Some(GIB), true, 0, 40 * GIB),
             ArenaPlan::StreamOnly
         );
         // The same host WITHOUT unified memory caches instead — otherwise this test would pass
         // for a version that simply never auto-sizes.
         assert!(matches!(
-            streaming_arena_plan(Requested::Auto, Some(64 * GIB), false, 40 * GIB),
+            streaming_arena_plan(Requested::Auto, Some(64 * GIB), false, 0, 40 * GIB),
             ArenaPlan::Take(_)
         ));
     }
@@ -468,7 +493,7 @@ mod tests {
             ArenaPlan::Skip(Skip::NoProbe)
         );
         assert_eq!(
-            streaming_arena_plan(Requested::Auto, None, false, 200 * GIB),
+            streaming_arena_plan(Requested::Auto, None, false, 0, 200 * GIB),
             ArenaPlan::Skip(Skip::NoProbe)
         );
     }

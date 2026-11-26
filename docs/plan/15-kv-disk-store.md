@@ -106,13 +106,17 @@ request, so the order between classes is fixed, not measured at run time.
 - **Unified memory:** the weight tier stays stream-only and the spill stays
   unarmed there, as today; a restore reads straight into the mapped KV buffer.
 
-**Probable bug found on the way, not confirmed by a run.** The seam sizes the
-weights' host tier before pricing the KV spill, and the arena is untouched
-memory the live probe does not see yet, so with an automatic arena the spill's
-room comes out as nothing and a spilled KV cache is refused at load whenever the
-weights stream. That ranks weights above the live window, the reverse of the
-order above. Slice R0 confirms it with a run (a model forced to stream with
-`kv.overflow` on) and fixes the order.
+**Where the order holds today (R0).** A session whose weights stream with the
+whole cache spilled prices the spill first: placement passes its host part to
+`vulkan_host_tier`, whose automatic budget (`streaming_arena_plan`'s
+`committed`) is what the spill leaves, and `refuse_unhostable_kv` checks the
+spill beside the arena built, against the same reading of host memory; the
+re-clamp credits that priced part (`kv_spill_priced`, `refuse_unpriced_kv`) and
+checks only growth past it on its own reading. A spill decided only after the
+load (the re-clamp's `CtxRung::Spill`, when the room measured then is short of
+what placement priced for a cache in device memory, streamed dense or paged MoE)
+and the forks of `infr serve --parallel` are still checked beside a tier already
+sized without them; the ledger (R1) is where they get priced first.
 
 ## What is stored
 
@@ -304,16 +308,14 @@ Each ships alone through coder then reviewer.
 These touch the weight tier as much as the KV cache and run alongside the table
 above.
 
-| #   | Slice                                                                                       | Gate                                                          |
-| --- | ------------------------------------------------------------------------------------------- | ------------------------------------------------------------- |
-| R0  | Price the live KV spill before the weights' host tier; confirm the refusal with a run first | an automatic arena plus a spill that fits loads               |
-| R1  | `HostLedger`: mandatory and elastic classes, replacing the separate calculations            | unit tests on the arithmetic                                  |
-| R2  | Direct reads for the weight host tier (with S1)                                             | t/s and rereads against buffered at three `paging.dram` sizes |
-| R3  | Pressure probe and a shrinkable weight arena                                                | time to give memory back under a memory hog; t/s after        |
-| R4  | Split between the elastic pair from eviction counters, only if both are seen competing      | measure first                                                 |
+| #   | Slice                                                                                  | Gate                                                          |
+| --- | -------------------------------------------------------------------------------------- | ------------------------------------------------------------- |
+| R1  | `HostLedger`: mandatory and elastic classes, replacing the separate calculations       | unit tests on the arithmetic                                  |
+| R2  | Direct reads for the weight host tier (with S1)                                        | t/s and rereads against buffered at three `paging.dram` sizes |
+| R3  | Pressure probe and a shrinkable weight arena                                           | time to give memory back under a memory hog; t/s after        |
+| R4  | Split between the elastic pair from eviction counters, only if both are seen competing | measure first                                                 |
 
-Order: R0, R1, S0 to S3, R2, S4 to S7, R3, S10, then the rest, with S13 after
-S10.
+Order: R1, S0 to S3, R2, S4 to S7, R3, S10, then the rest, with S13 after S10.
 
 ## Corrections from the #109 fork
 

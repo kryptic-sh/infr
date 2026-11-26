@@ -176,12 +176,15 @@ cfg_struct! {
         ///
         /// - `None` (the default) is automatic. The CPU backend keeps the zero-copy mmap path when
         ///   the weights fit host memory. Otherwise an arena is sized from what the host can spare,
-        ///   or the mmap path stays when nothing can be measured or too little is free. On a
+        ///   or the mmap path stays when nothing can be measured or too little is free. On a GPU,
+        ///   a KV cache spilled to system RAM (`kv.overflow`) is priced first and the arena takes
+        ///   what it leaves. On a
         ///   unified-memory GPU the automatic answer is no arena at all: blocks are read from the
         ///   file straight into the GPU-visible arena above, as with `dram_bypass`.
         /// - `Some(0)` keeps the mmap path.
         /// - Any other size is the arena's budget, on unified memory too (a budget too small to
-        ///   seat one block keeps the mmap path).
+        ///   seat one block keeps the mmap path). A spilled KV cache that does not fit beside it is
+        ///   refused at load.
         ///
         /// `dram_bypass` outranks every value here: the GPU tiers then read through with no
         /// arena, and the CPU backend keeps the mmap path.

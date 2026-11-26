@@ -109,6 +109,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`infr_llama::tolerance::gate::Reference` gains a private field** (its
   oracle, `Reference::oracle`), so it can no longer be built as a struct
   literal; build it with `Reference::new` or the new `Reference::cached`.
+- **`infr_core::hostmem::streaming_arena_plan` takes the run's `committed` host
+  bytes**, between `unified` and `pageable`, which an automatic arena is sized
+  after (a Vulkan session's KV cache spilled to system RAM).
 
 ### Added
 
@@ -796,7 +799,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   it failed at weight placement or at the first allocation after the cache:
   placement keeps the weights resident when they fit without the cache, and
   streams them with the whole cache in system RAM when they do not and the cache
-  would leave the streaming arenas less than their floor; the cache takes only
+  would leave the streaming arenas less than their floor, pricing that cache in
+  system RAM before the weights' host tier: an automatic tier (`paging.dram`
+  unset) takes what the cache leaves of the host memory a run may take, an
+  explicit `paging.dram` / `INFR_DRAM_CACHE` keeps its size and a cache that
+  does not fit beside it is refused naming both, and the check after the upload
+  does not refuse again the part placement already priced; the cache takes only
   the device memory the rest of the run is priced to need after it leaves free
   (the activation reserve, the driver's own later allocations and
   `kv.overflow_reserve_mb`), and runs at the shortest prefill chunk unless

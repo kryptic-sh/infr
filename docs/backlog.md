@@ -30,11 +30,41 @@ Provenance tags point at the finding that opened the item:
 
 **Kind:** work raised and not finished, in the order it should be picked up.
 
-1. **Plan 15 slice R0:** confirm with a run, then fix, that a spilled KV cache
-   is refused at load when the weights stream and the host tier sizes itself
-   (read from code only).
-2. **Plan 14 slices L and W** (placement label; bounded wait at start-up).
-3. Then B-DECISIONS-2026-11-25 from item 3 on.
+1. **Plan 14 slices L and W** (placement label; bounded wait at start-up).
+2. Then B-DECISIONS-2026-11-25 from item 3 on.
+
+Plan 15 R0 (the live KV spill priced before the weights' automatic host tier)
+covers only the spill placement decides before the load, a streamed dense
+session whose whole cache goes to system RAM. Left and not verified:
+
+- **A spill decided after the load is still checked beside a tier sized without
+  it.** The re-clamp's `CtxRung::Spill` (`seam::reclamp_ctx_with_host`) runs
+  when the room measured after the load is short of what placement priced for a
+  cache in device memory; by then `vulkan_host_tier` has built its arena (dense
+  or MoE) from the whole spare, and `refuse_unhostable_kv` charges it
+  (`host_tier_bytes`). Read from code, not reproduced. Plan 15 R1 (the ledger)
+  is where it gets priced first.
+- **`infr serve --parallel N` forks are not priced before the tier.** Placement
+  prices one slot; `refuse_unhostable_forks` checks the other N-1 spilled caches
+  after the arena was sized. Not run.
+- **Seen and not investigated:** SmolLM3-3B Q4_K_M on the RX 7900 XTX with
+  `INFR_VRAM_LIMIT=3g INFR_CACHE=1g INFR_KV_OVERFLOW=1 --ctx 32768` fails on the
+  VRAM guard ("205.5 MiB requested + 2.79 GiB already in use > 2.75 GiB budget")
+  instead of spilling the cache. The R0 change does not touch that path; whether
+  it failed the same before was not run.
+- **Seen and not investigated:** the same model, greedy, gave the same first
+  reply resident and streamed with the whole cache spilled, and a second turn
+  that differs by one token between the two placements (every `paging.dram`
+  setting of the streamed run gave identical text). Not compared against the CPU
+  reference.
+- **The dense call site's wiring is covered only by the ignored test.**
+  `seam::price_host_tier` is what both placement and the non-ignored order test
+  call, so the order inside it fails a CI test when broken; the call site in
+  `vulkan_moe_binder` passing `None` for the spill (or no reading) would pass CI
+  and fail only `a_streamed_spill_is_priced_before_an_automatic_host_tier`.
+- Not run: Metal, Windows, a MoE model with a spill. The R0 real-model test
+  (`a_streamed_spill_is_priced_before_an_automatic_host_tier`) needs
+  `systemd-run --user` to limit host memory and skips without it.
 
 PR #110 (Gemma 4 image input) waits on its contributor's rework: B-IMAGE-INPUT.
 

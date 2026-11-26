@@ -56,7 +56,7 @@ reference to judge tuned values against.
 | ----- | ------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
 | 13    | [Replace the caps, refusals and open decisions with implementations](13-caps-refusals-and-decisions.md) | S1 to S5 and S9 done, S11 block-IO items (B35, B30) done; S6 to S8, S10 and the rest of S11 not started |
 | 14    | [Expert placement that recovers](14-expert-placement-recovery.md)                                       | not started                                                                                             |
-| 15    | [KV cache tiers: our own disk store](15-kv-disk-store.md)                                               | not started                                                                                             |
+| 15    | [KV cache tiers: our own disk store](15-kv-disk-store.md)                                               | R0 done; the rest not started                                                                           |
 
 ## Notes on the model phases
 

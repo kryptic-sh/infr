@@ -1782,6 +1782,205 @@ mod tests {
         retry_if_moved("the streamed spill", run).unwrap_or_else(|e| panic!("{e}"));
     }
 
+    /// Set in the child process [`a_streamed_spill_is_priced_before_an_automatic_host_tier`] runs
+    /// itself in, under a host memory limit.
+    const SPILL_BESIDE_TIER_CHILD: &str = "INFR_TEST_SPILL_BESIDE_TIER_CHILD";
+
+    /// The line the child prints when it ran the whole check, which the parent requires.
+    const SPILL_BESIDE_TIER_RAN: &str = "spill beside tier: the child ran the check";
+
+    /// The prefix of the line the child prints, with the reason, when it skipped.
+    const SPILL_BESIDE_TIER_SKIP: &str = "spill beside tier: the child skipped: ";
+
+    /// The memory limit of the child's cgroup: what makes the host's spare memory small enough for
+    /// a spilled Qwen3-1.7B window to need most of it, on a machine with far more free.
+    const SPILL_BESIDE_TIER_HOST: u64 = 8 << 30;
+
+    /// How much of what the host can spare the child leaves to the weights' host tier beside the
+    /// spill: the automatic arena it should build, above `infr_core::hostmem`'s worth-building
+    /// floor, and the drift in host memory between the child's reading and placement's it absorbs
+    /// (half of a drop in available memory comes off the spare).
+    const SPILL_BESIDE_TIER_ARENA: u64 = 512 * MIB;
+
+    /// Plan 15 R0: a session whose weights stream with the whole cache in system RAM
+    /// (`kv.overflow`) prices the spill before the weights' automatic host tier, so a spill that
+    /// fits what the host can spare loads beside an arena sized from what it leaves. Qwen3-1.7B,
+    /// as [`overflow_streams_weights_beside_a_wholly_spilled_cache`] runs it, at the window whose
+    /// spill leaves [`SPILL_BESIDE_TIER_ARENA`] of the spare, where sizing the arena first takes the
+    /// spill's room and refuses the load. The host's memory is made small by running the test
+    /// again in a child process under a cgroup limit (`systemd-run --user --scope`,
+    /// [`SPILL_BESIDE_TIER_HOST`]); skips, saying so, where that cannot start or the limit does
+    /// not reach the host-memory probe. Not on a unified-memory device, where nothing spills. The
+    /// parent passes only when the child says it ran the check ([`SPILL_BESIDE_TIER_RAN`]), and
+    /// reports a child's skip as a skip.
+    #[test]
+    #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+    fn a_streamed_spill_is_priced_before_an_automatic_host_tier() {
+        const NAME: &str = "seam::model::vram_limit_tests::tests::\
+                            a_streamed_spill_is_priced_before_an_automatic_host_tier";
+        let Some(path) =
+            crate::util::test_hub_gguf("unsloth/Qwen3-1.7B-GGUF", "Qwen3-1.7B-Q4_K_M.gguf")
+        else {
+            eprintln!("skip: Qwen3-1.7B is not in the HF cache");
+            return;
+        };
+        if std::env::var_os(SPILL_BESIDE_TIER_CHILD).is_none() {
+            let exe = std::env::current_exe().expect("the test binary");
+            let limit = format!("MemoryMax={SPILL_BESIDE_TIER_HOST}");
+            let out = std::process::Command::new("systemd-run")
+                .args(["--user", "--scope", "--quiet", "-p", &limit, "--"])
+                .arg(exe)
+                .args([NAME, "--exact", "--include-ignored", "--nocapture"])
+                .args(["--test-threads", "1"])
+                .env(SPILL_BESIDE_TIER_CHILD, "1")
+                .stdin(std::process::Stdio::null())
+                .output();
+            let out = match out {
+                Ok(out) => out,
+                Err(e) => {
+                    eprintln!("skip: systemd-run did not start ({e}), so no host limit");
+                    return;
+                }
+            };
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            eprintln!("child stdout:\n{stdout}\nchild stderr:\n{stderr}");
+            assert!(
+                !stdout.contains("running 0 tests"),
+                "the child's filter {NAME} matched no test"
+            );
+            if let Some(reason) = stderr
+                .lines()
+                .find_map(|l| l.strip_prefix(SPILL_BESIDE_TIER_SKIP))
+            {
+                eprintln!("skip: the child under {limit} skipped: {reason}");
+                return;
+            }
+            if stdout.contains("running 1 test") {
+                assert!(
+                    stdout.contains("test result: ok. 1 passed")
+                        && stderr.lines().any(|l| l == SPILL_BESIDE_TIER_RAN),
+                    "the child under {limit} failed, or passed without running the check: {}",
+                    out.status
+                );
+                return;
+            }
+            eprintln!(
+                "skip: systemd-run did not start the child under {limit}: {}",
+                out.status
+            );
+            return;
+        }
+        let skip = |reason: &str| eprintln!("{SPILL_BESIDE_TIER_SKIP}{reason}");
+        let Some(reader) = reader() else {
+            skip("no Vulkan backend opened on the test environment's device");
+            return;
+        };
+        if reader.capabilities().unified_memory {
+            skip("nothing spills on a unified-memory device");
+            return;
+        }
+        // `MemoryMax` is ignored where the user's systemd does not delegate the memory
+        // controller; the probe then reads the whole host, and nothing here would mean anything.
+        match infr_plat::mem::available() {
+            Some(a)
+                if a.source == infr_plat::mem::Source::LinuxCgroupClamped
+                    && a.bytes <= SPILL_BESIDE_TIER_HOST => {}
+            other => {
+                skip(&format!(
+                    "the cgroup limit did not reach the host-memory probe ({other:?}); is the \
+                     memory controller delegated to the user's systemd?"
+                ));
+                return;
+            }
+        }
+        let probe = SeamModel::load_with(&path, None, overflow_cfg(u64::MAX, None, None))
+            .expect("model load");
+        let trained = probe.cfg.n_ctx_train;
+        let align = KvAlign::of(reader);
+        let (k, v) = (DType::F16, DType::F16);
+        let ring = crate::seam::placement_ring(&probe.cfg, &probe.ecfg, k, v);
+        // The whole cache in system RAM, as placement prices a streamed spill.
+        let host_part = |ctx: usize| {
+            kv_spill_split(
+                &probe.cfg,
+                ctx,
+                ring,
+                SPILL_UBATCH,
+                align,
+                k,
+                v,
+                1,
+                0,
+                0,
+                None,
+            )
+            .host
+        };
+        // The streamed weights, near enough to say whether an arena sized before the spill takes
+        // its room: every layer tensor.
+        let streamable: u64 = infr_core::WeightSource::tensors(&probe.gguf)
+            .iter()
+            .filter(|t| t.name.starts_with("blk."))
+            .map(|t| t.nbytes as u64)
+            .sum();
+        let available = infr_core::hostmem::available_bytes().expect("a host-memory probe");
+        let spare = infr_core::hostmem::spare_bytes(available, 0);
+        let target = spare.saturating_sub(SPILL_BESIDE_TIER_ARENA);
+        // The longest window whose spill is at most the target.
+        let want = {
+            let (mut lo, mut hi) = (MIN_SESSION_CTX, trained);
+            assert!(
+                host_part(lo) <= target && host_part(hi) > target,
+                "{available} bytes available: no window between {lo} and {hi} spills {target}"
+            );
+            while hi - lo > 1 {
+                let mid = (lo + hi) / 2;
+                if host_part(mid) <= target {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+            lo
+        };
+        let spill = host_part(want);
+        let old_arena = spare.min(streamable);
+        eprintln!(
+            "{available} bytes available, {spare} spare; ctx {want} spills {spill}; an arena sized \
+             first would take {old_arena} and leave {}",
+            infr_core::hostmem::spare_bytes(available, old_arena)
+        );
+        assert!(
+            infr_core::hostmem::spare_bytes(available, old_arena) < spill,
+            "this window would load with the arena sized first: it tests nothing"
+        );
+        drop(probe);
+        let resident = spill_resident_room(&path, reader, want);
+        let room = resident * MIB - STREAM_SPILL_BELOW_RESIDENT;
+        let run = || -> Result<(), String> {
+            let limit = settled_use(reader) + room;
+            let model = SeamModel::load_with(&path, None, overflow_cfg(limit, Some(want), None))
+                .expect("model load");
+            let ran = spilled_run(&model, |m| m.vulkan_session(want))?;
+            ensure(ran.ctx == want, || {
+                format!("asked {want}, served {}", ran.ctx)
+            })?;
+            ensure(ran.streamed, || "the weights did not stream".to_string())?;
+            ensure(
+                ran.counts.vram_bytes == 0 && ran.counts.host_bytes == spill,
+                || {
+                    format!(
+                        "placement priced {spill} bytes in system RAM: {:?}",
+                        ran.counts
+                    )
+                },
+            )
+        };
+        retry_if_moved("the spill beside the host tier", run).unwrap_or_else(|e| panic!("{e}"));
+        eprintln!("{SPILL_BESIDE_TIER_RAN}");
+    }
+
     /// gemma-4-12b-it Q4_K_M, the largest dense model the GPU tests use, or `None` (saying so)
     /// when it is not in the HF cache. Not required by `INFR_TEST_REQUIRE_MODELS`: the gate runs
     /// without it on a box that lacks it.

@@ -15,6 +15,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`infr_llama::Config` gains `attn_temp_scale` and `attn_temp_floor_scale`**
   (Mistral-Large-3's attention temperature), so a struct literal of it must set
   them or use `..Default::default()`.
+- **`infr_server::ContextLengthExceeded::prompt_too_long` takes the request
+  field's name first** (`"messages"` or `"prompt"`), which the message names; a
+  chat request's wording is unchanged. Its new sibling `reply_too_long` words an
+  overflow caused by the reply budget the same way.
 - **`infr_core::budget::reserve_bytes` takes only the override.** It returns
   `kv.overflow_reserve_mb` in bytes, `0` when unset, where it took the device's
   total memory and defaulted to max(12% of it, 2 GiB).
@@ -114,11 +118,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (`<|fim_prefix|>…`) and autocompletion clients speak. It takes `prompt` as a
   string or a one-element array, and supports `stream`, `stop`, `echo`,
   `stream_options.include_usage`, the usual sampling fields and request-level
-  `logit_bias`. It shares the chat route's validation, typed `400` bodies, queue
-  accounting, deadline and client-hangup cancellation; `usage.prompt_tokens`
-  counts the whole prompt, KV-cache hits included. `suffix`, token-array
-  prompts, `n > 1`, `best_of > 1`, `user` and `logprobs` answer `400`. The route
-  is always registered — it cannot be switched off in the configuration.
+  `logit_bias`; `-1` for `max_tokens` or `seed` means unset, as on the chat
+  route, and `user` is accepted and ignored. It shares the chat route's
+  validation, typed `400` bodies, preparation bound, queue accounting, deadline
+  and client-hangup cancellation; `usage.prompt_tokens` counts the whole prompt,
+  KV-cache hits included. A prompt that is no tokens at all, and one longer than
+  the model's context, answer `400` naming `prompt`, before the request queues
+  when the backend can count the prompt (the second with
+  `context_length_exceeded`, the limit and the prompt's token count). A
+  generator signals an empty prompt with the new
+  `infr_server::ParamError::empty_prompt`, the same `400`. `suffix`, token-array
+  prompts, `n > 1`, `best_of > 1` and `logprobs` answer `400`. The route is
+  always registered — it cannot be switched off in the configuration.
 - **Experimental: the Vulkan tuning parameter `quant_q8.experts_hi`** (off by
   default; `--set kernels.vulkan.tune.quant_q8.experts_hi=true`). With it on, a
   MoE model's batched prefill quantizes the routed experts' activations with an

@@ -204,10 +204,13 @@ shape: a raw prompt continued as text, with no chat template, which is what FIM
 (`<|fim_prefix|>…`) and autocompletion clients speak. It takes `prompt` as a
 string or a one-element array, plus `stream`, `stop`, `echo`,
 `stream_options.include_usage` and the sampling fields above, `logit_bias`
-included. `suffix`, token-array prompts, `n` above 1, `best_of` above 1, `user`
-and `logprobs` answer `400`. The route is always registered: no configuration
-key turns it off, and it sits behind the same API key, `Host` check and body
-limit as the chat route.
+included; `-1` for `max_tokens` or `seed` means unset, as on the chat route, and
+`user` is accepted and ignored. A prompt that comes to no tokens at all (empty
+text on a model that adds no BOS), or one longer than the model's context,
+answers `400` naming `prompt`. `suffix`, token-array prompts, `n` above 1,
+`best_of` above 1 and `logprobs` answer `400`. The route is always registered:
+no configuration key turns it off, and it sits behind the same API key, `Host`
+check and body limit as the chat route.
 
 ## Performance
 

@@ -366,10 +366,13 @@ impl OaiRenderer {
         use infr_core::loader::MetaValue;
         use infr_core::WeightSource;
         let md = self.gguf.metadata();
-        // A GGUF normally states this; the fallback is llama.cpp's per-vocabulary default for the
-        // two families this crate builds — SentencePiece (`llama`) adds a BOS, byte-level BPE
-        // (`gpt2`: Qwen, Llama-3, SmolLM) does not. An unknown family without the key reads as
-        // "off", which leaves the prompt alone rather than prepending a token it may not know.
+        // A GGUF normally states this; without the key the fallback is "on" for SentencePiece
+        // (`llama`) and "off" for everything else, which leaves the prompt alone rather than
+        // prepending a token it may not know. That matches llama.cpp's `llama_vocab::load`
+        // defaults for `llama`, plain `gpt2` BPE (Qwen, SmolLM), `t5` and `rwkv`, but not for:
+        // `gpt2` with the `llama-bpe` pre-tokenizer group (Llama-3, Falcon3, LFM2, ...),
+        // `tekken` or `chameleon`, and `bert`, where llama.cpp adds a BOS and this does not; and
+        // the `gemma4` pre-tokenizer, where llama.cpp adds one even when the key says false.
         let add = match md.get("tokenizer.ggml.add_bos_token") {
             Some(MetaValue::Bool(b)) => *b,
             _ => md.str("tokenizer.ggml.model") == Some("llama"),

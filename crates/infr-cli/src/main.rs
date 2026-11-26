@@ -2357,6 +2357,10 @@ fn run_completion(
 ) -> anyhow::Result<infr_server::ChatOutcome> {
     be.weights().check()?;
     let prompt = be.renderer().with_bos(prompt);
+    // No text and no BOS is no tokens: the request's fault, not the engine failure it would be.
+    if prompt.is_empty() {
+        return Err(infr_server::ParamError::empty_prompt().into());
+    }
     let max_new = params
         .max_tokens
         .map(|v| v as usize)
@@ -2378,7 +2382,7 @@ fn run_completion(
         .map_err(|e| {
             // The request's own fault reaches the server as its typed 400: an over-long prompt,
             // or a sampling field this backend refuses.
-            context_length_exceeded(&e, params.max_tokens.is_some())
+            context_length_exceeded(&e, "prompt", params.max_tokens.is_some())
                 .or_else(|| unsupported_sampling(&e))
                 .unwrap_or(e)
         })?;
@@ -2605,7 +2609,7 @@ fn run_prepared(
     // the field whose constraint a backend without grammar support could not apply, `None` for an
     // unconstrained reply.
     let refusal = |e: &anyhow::Error, param: Option<&'static str>| {
-        context_length_exceeded(e, params.max_tokens.is_some())
+        context_length_exceeded(e, "messages", params.max_tokens.is_some())
             .or_else(|| unsupported_sampling(e))
             .or_else(|| unsupported_constraint(e, param?))
     };
@@ -2858,34 +2862,33 @@ fn unsupported_sampling(e: &anyhow::Error) -> Option<anyhow::Error> {
 /// [`infr_server::ContextLengthExceeded`], which it answers `400 context_length_exceeded` instead
 /// of `500`; `None` for any other error.
 ///
-/// The message opens with OpenAI's own wording, because client-side error mappers match on it.
-/// Lowering `max_tokens` is suggested only when the client set it and it is part of the overflow:
-/// a reply budget the client never chose, or one of zero, is nothing it can lower. The length
-/// quoted is the usable one: the engine keeps a row of the context in reserve, so a request the
-/// size of the whole context is refused too, and quoting the full size would read as "fits".
+/// The wording is the server's (`ContextLengthExceeded`'s constructors), naming `input`, the
+/// request field the prompt came from: `messages` for a chat turn, `prompt` for a raw completion.
+/// Lowering `max_tokens` is suggested only when the client set it and it is part of the overflow.
+/// The length quoted is the usable one: the engine keeps a row of the context in reserve, so a
+/// request the size of the whole context is refused too, and quoting the full size would read as
+/// "fits".
 fn context_length_exceeded(
     e: &anyhow::Error,
+    input: &str,
     client_set_max_tokens: bool,
 ) -> Option<anyhow::Error> {
     let o = e.downcast_ref::<infr_llama::ContextOverflow>()?;
     let usable = o.max_ctx.saturating_sub(1);
-    if o.gen == 0 {
-        return Some(infr_server::ContextLengthExceeded::prompt_too_long(usable, o.prompt).into());
-    }
-    let advice = if client_set_max_tokens {
-        "Please reduce the length of the messages or completion."
-    } else {
-        "Please reduce the length of the messages."
-    };
-    let message = format!(
-        "This model's maximum context length is {} tokens. However, you requested {} tokens ({} \
-         in the messages, {} in the completion). {advice}",
-        usable,
-        o.prompt + o.gen,
-        o.prompt,
-        o.gen
-    );
-    Some(infr_server::ContextLengthExceeded { message }.into())
+    Some(
+        if o.gen == 0 {
+            infr_server::ContextLengthExceeded::prompt_too_long(input, usable, o.prompt)
+        } else {
+            infr_server::ContextLengthExceeded::reply_too_long(
+                input,
+                usable,
+                o.prompt,
+                o.gen,
+                client_set_max_tokens,
+            )
+        }
+        .into(),
+    )
 }
 
 /// Benchmark prefill (pp) or decode (tg) tok/s with the same -p/-n/-d/-r interface as
@@ -6106,14 +6109,14 @@ mod tests {
     /// `400 context_length_exceeded`), also through added context; any other error is left alone.
     #[test]
     fn a_context_overflow_becomes_the_servers_typed_error() {
-        let message = |prompt, gen, client_set_max_tokens| {
+        let message = |input: &str, prompt, gen, client_set_max_tokens| {
             let overflow = anyhow::Error::new(infr_llama::ContextOverflow {
                 prompt,
                 gen,
                 max_ctx: 4096,
             })
             .context("generating");
-            context_length_exceeded(&overflow, client_set_max_tokens)
+            context_length_exceeded(&overflow, input, client_set_max_tokens)
                 .expect("an overflow must map")
                 .downcast_ref::<infr_server::ContextLengthExceeded>()
                 .expect("the server's type")
@@ -6121,22 +6124,35 @@ mod tests {
                 .clone()
         };
         assert_eq!(
-            message(5000, 0, true),
+            message("messages", 5000, 0, true),
             "This model's maximum context length is 4095 tokens. However, your messages resulted \
              in 5000 tokens. Please reduce the length of the messages."
         );
         assert_eq!(
-            message(3000, 2000, true),
+            message("messages", 3000, 2000, true),
             "This model's maximum context length is 4095 tokens. However, you requested 5000 \
              tokens (3000 in the messages, 2000 in the completion). Please reduce the length of \
              the messages or completion."
         );
         // A reply budget the client did not choose is not advice it can follow.
-        assert!(message(3000, 2048, false).ends_with("Please reduce the length of the messages."));
+        assert!(message("messages", 3000, 2048, false)
+            .ends_with("Please reduce the length of the messages."));
         // A request the size of the whole context is refused, and must not read as fitting.
-        assert!(message(4096, 0, true)
+        assert!(message("messages", 4096, 0, true)
             .contains("is 4095 tokens. However, your messages resulted in 4096"));
-        assert!(context_length_exceeded(&anyhow::anyhow!("boom"), true).is_none());
+        // A raw completion's overflow names its prompt, in the same sentences.
+        assert_eq!(
+            message("prompt", 5000, 0, true),
+            "This model's maximum context length is 4095 tokens. However, your prompt resulted \
+             in 5000 tokens. Please reduce the length of the prompt."
+        );
+        assert_eq!(
+            message("prompt", 3000, 2000, false),
+            "This model's maximum context length is 4095 tokens. However, you requested 5000 \
+             tokens (3000 in the prompt, 2000 in the completion). Please reduce the length of \
+             the prompt."
+        );
+        assert!(context_length_exceeded(&anyhow::anyhow!("boom"), "messages", true).is_none());
     }
 
     /// Panics on its first generation, then generates normally; counts its KV resets.
@@ -6681,5 +6697,147 @@ mod tests {
         limit.store(10, std::sync::atomic::Ordering::Relaxed);
         assert_eq!(GenBackend::max_prompt_tokens(&generator), Some(4095));
         drop(held);
+    }
+
+    /// A raw prompt that comes to no tokens (empty text, and a vocabulary that adds no BOS) is
+    /// the request's typed fault naming `prompt`, refused before the engine sees it.
+    #[test]
+    fn an_empty_raw_prompt_is_a_param_error_naming_prompt() {
+        let be = ScriptBackend::new(false, &["x"]);
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let err = run_completion(&be, "", &params_with(None), &cancel, &mut |_| {})
+            .expect_err("an empty prompt must be refused");
+        assert_eq!(
+            err.downcast_ref::<infr_server::ParamError>(),
+            Some(&infr_server::ParamError::empty_prompt())
+        );
+        assert!(be.prompts.lock().unwrap().is_empty(), "never generated");
+        // Any text at all is generated from.
+        run_completion(&be, "a", &params_with(None), &cancel, &mut |_| {}).expect("generates");
+    }
+
+    // --- /v1/completions on a real model ----------------------------------------------------
+
+    /// The served model these tests load when it is in the HF cache. With
+    /// `INFR_TEST_REQUIRE_MODELS` set a missing file fails the test instead of skipping it: a
+    /// skip passes, so a wrong cache path would otherwise report green without running anything.
+    fn cached_qwen3_0_6b() -> Option<PathBuf> {
+        let (repo, file) = ("unsloth/Qwen3-0.6B-GGUF", "Qwen3-0.6B-Q4_K_M.gguf");
+        let found = infr_hub::Store::discover()
+            .ok()
+            .and_then(|s| s.snapshot_file(repo, file));
+        assert!(
+            found.is_some() || std::env::var_os("INFR_TEST_REQUIRE_MODELS").is_none(),
+            "{repo}/{file} is not in the HF cache, and INFR_TEST_REQUIRE_MODELS requires it"
+        );
+        if found.is_none() {
+            eprintln!("skip: {repo}/{file} not in the HF cache");
+        }
+        found
+    }
+
+    /// One HTTP/1.1 request to `port`, read to the end; the status and the body.
+    async fn http_post(port: u16, path: &str, body: &str) -> (u16, String) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut conn = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect");
+        let req = format!(
+            "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        conn.write_all(req.as_bytes()).await.expect("write");
+        let mut raw = String::new();
+        conn.read_to_string(&mut raw).await.expect("read");
+        let (head, body) = raw.split_once("\r\n\r\n").expect("an HTTP response");
+        let status = head
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .expect("a status line");
+        (status, body.to_string())
+    }
+
+    /// `/v1/completions` served by the real serve adapter on the CPU reference backend continues a
+    /// prompt exactly as the engine does when given the same prompt directly (greedy, so the two
+    /// must agree token for token), counts the whole prompt and the reply in `usage`, and reports
+    /// a reply cut by `max_tokens` as `length`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn completions_route_matches_the_engine_on_a_real_model() {
+        let Some(gguf) = cached_qwen3_0_6b() else {
+            return;
+        };
+        const MAX_TOKENS: usize = 8;
+        let prompt = "The capital of France is";
+        let cfg = Arc::new(resolve_cfg(
+            &[("INFR_DEV", "cpu"), ("INFR_CTX", "512")],
+            PartialConfig::default(),
+            &[],
+        ));
+        let renderer = infr_llama::chat::OaiRenderer::open_with_tokenizer(&gguf, None, cfg.clone())
+            .expect("renderer");
+        let seen = renderer.with_bos(prompt);
+
+        // The engine directly, on its own instance so no KV state is shared with the server's.
+        let mut direct = build_chat_model(&gguf, None, false, &cfg).expect("load");
+        let req = infr_llama::sampling::RequestCtx::new(infr_llama::sampling::RequestSampling {
+            temp: Some(0.0),
+            ..Default::default()
+        });
+        let mut expected = String::new();
+        let stats = direct
+            .generate(&seen, MAX_TOKENS, Some(&req), &mut |p| expected.push_str(p))
+            .expect("direct generation");
+        drop(direct);
+        assert!(
+            stats.n_gen == MAX_TOKENS && !stats.natural_stop,
+            "the prompt must run to the budget for the `length` check: {stats:?}"
+        );
+
+        let served = build_chat_model(&gguf, None, false, &cfg).expect("load");
+        let generator: Arc<dyn infr_server::ChatGenerator> = Arc::new(
+            SeamGenerator::new(&gguf, None, served, "cpu", cfg.clone()).expect("generator"),
+        );
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|l| l.local_addr())
+            .expect("a free port")
+            .port();
+        let addr: std::net::SocketAddr = ([127, 0, 0, 1], port).into();
+        let server = tokio::spawn(infr_server::serve(
+            generator,
+            "qwen3".into(),
+            addr,
+            1,
+            cfg.clone(),
+        ));
+        let mut ready = false;
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(ready, "the server never accepted a connection");
+
+        let body = serde_json::json!({
+            "prompt": prompt,
+            "max_tokens": MAX_TOKENS,
+            "temperature": 0,
+        })
+        .to_string();
+        let (status, out) = http_post(port, "/v1/completions", &body).await;
+        server.abort();
+        assert_eq!(status, 200, "{out}");
+        let v: serde_json::Value = serde_json::from_str(&out).expect("a JSON body");
+        assert_eq!(v["object"], "text_completion");
+        assert_eq!(v["choices"][0]["text"], expected.as_str());
+        assert_eq!(v["choices"][0]["finish_reason"], "length");
+        let prompt_tokens = renderer.count_tokens(&seen).expect("count");
+        assert_eq!(prompt_tokens, stats.n_prompt + stats.n_cached);
+        assert_eq!(v["usage"]["prompt_tokens"], prompt_tokens);
+        assert_eq!(v["usage"]["completion_tokens"], MAX_TOKENS);
+        assert_eq!(v["usage"]["total_tokens"], prompt_tokens + MAX_TOKENS);
     }
 }

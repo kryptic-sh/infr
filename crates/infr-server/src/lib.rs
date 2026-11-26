@@ -125,7 +125,9 @@ pub trait ChatGenerator: Send + Sync {
 
     /// Continue `prompt` as raw text — no chat template, no reasoning/tool splitting — streaming the
     /// decoded pieces to `on_text`. Backs `/v1/completions`; `cancel` and the return value behave as
-    /// in [`chat`](Self::chat).
+    /// in [`chat`](Self::chat). A prompt that comes to no tokens should fail with
+    /// [`ParamError::empty_prompt`], which the server answers as a `400` naming `prompt`, and an
+    /// over-long one with a [`ContextLengthExceeded`] naming `prompt`.
     ///
     /// Default: the model cannot serve raw completions, which the server answers as a `400`
     /// naming `model` rather than a `500` that reads as a server fault.
@@ -296,13 +298,40 @@ pub struct ContextLengthExceeded {
 
 impl ContextLengthExceeded {
     /// A prompt of `prompt_tokens` that is longer than `context_length`, in OpenAI's own wording
-    /// (client-side error mappers match on it).
-    pub fn prompt_too_long(context_length: usize, prompt_tokens: usize) -> Self {
+    /// (client-side error mappers match on it). `input` names the request field the prompt came
+    /// from: `messages` on the chat route, `prompt` on `/v1/completions`.
+    pub fn prompt_too_long(input: &str, context_length: usize, prompt_tokens: usize) -> Self {
         Self {
             message: format!(
                 "This model's maximum context length is {context_length} tokens. However, your \
-                 messages resulted in {prompt_tokens} tokens. Please reduce the length of the \
-                 messages."
+                 {input} resulted in {prompt_tokens} tokens. Please reduce the length of the \
+                 {input}."
+            ),
+        }
+    }
+
+    /// A prompt of `prompt_tokens` that fits, but not with the `reply_tokens` the reply was given
+    /// room for, in the same wording. Lowering the reply budget is suggested only when
+    /// `can_lower_reply`: a budget the client never chose, or one of zero, is nothing it can
+    /// lower. `input` is as for [`Self::prompt_too_long`].
+    pub fn reply_too_long(
+        input: &str,
+        context_length: usize,
+        prompt_tokens: usize,
+        reply_tokens: usize,
+        can_lower_reply: bool,
+    ) -> Self {
+        let advice = if can_lower_reply {
+            format!("Please reduce the length of the {input} or completion.")
+        } else {
+            format!("Please reduce the length of the {input}.")
+        };
+        Self {
+            message: format!(
+                "This model's maximum context length is {context_length} tokens. However, you \
+                 requested {} tokens ({prompt_tokens} in the {input}, {reply_tokens} in the \
+                 completion). {advice}",
+                prompt_tokens + reply_tokens
             ),
         }
     }
@@ -619,6 +648,17 @@ impl std::fmt::Display for ParamError {
 }
 
 impl std::error::Error for ParamError {}
+
+impl ParamError {
+    /// A `/v1/completions` prompt that comes to no tokens at all — empty text on a model that adds
+    /// no BOS — which leaves the model nothing to continue from.
+    pub fn empty_prompt() -> Self {
+        Self {
+            param: "prompt",
+            message: "prompt is empty; send at least one token of text".into(),
+        }
+    }
+}
 
 impl GenParams {
     /// Validate + normalise the request's sampling fields. Out-of-range values are a 400, NEVER a
@@ -2054,17 +2094,7 @@ async fn chat_completions_handler(
     let (messages, tools, tool_choice, params, prepared) = match entry.engine.clone() {
         None => (messages, tools, tool_choice, params, Ok(None)),
         Some(engine) => {
-            // A client that hangs up while waiting here drops this future, and its place in the
-            // queue with it; the permit is held for exactly the preparation.
-            let Ok(permit) = entry.prepares.clone().acquire_owned().await else {
-                ctx.stats.fold_failure();
-                return json_error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "server shutting down".into(),
-                );
-            };
-            let joined = tokio::task::spawn_blocking(move || {
-                let _permit = permit;
+            let joined = prepare_bounded(&entry, &ctx, move || {
                 let prepared =
                     engine.prepare(&messages, tools.as_ref(), tool_choice.as_deref(), &params);
                 (messages, tools, tool_choice, params, prepared)
@@ -2072,11 +2102,7 @@ async fn chat_completions_handler(
             .await;
             match joined {
                 Ok(parts) => parts,
-                Err(e) => {
-                    ctx.stats.fold_failure();
-                    tracing::warn!(req = ctx.id, error = %e, "request preparation failed");
-                    return json_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
-                }
+                Err(resp) => return *resp,
             }
         }
     };
@@ -2093,7 +2119,12 @@ async fn chat_completions_handler(
         })) if prompt_tokens > max => (
             None,
             Some(
-                ContextLengthExceeded::prompt_too_long(max as usize, prompt_tokens as usize).into(),
+                ContextLengthExceeded::prompt_too_long(
+                    CHAT_INPUT,
+                    max as usize,
+                    prompt_tokens as usize,
+                )
+                .into(),
             ),
         ),
         Ok(p) => (p, None),
@@ -2113,7 +2144,7 @@ async fn chat_completions_handler(
     if let Some(e) = refused {
         ctx.stats.fold_failure();
         tracing::warn!(req = ctx.id, error = %e, "request refused before generation");
-        return error_response(&e);
+        return error_response(&e, CHAT_INPUT);
     }
 
     if ctx.stream {
@@ -2129,6 +2160,7 @@ async fn chat_completions_handler(
 /// It exists because [`streaming`] and [`non_streaming`] took nine positional arguments and the
 /// instrumentation wanted three more — at which point the next `String` inserted in the wrong slot
 /// is a bug the compiler cannot see.
+#[derive(Clone)]
 struct ReqCtx {
     /// Log-only, monotonic. See [`next_req_id`].
     id: u64,
@@ -2147,6 +2179,283 @@ struct ReqCtx {
 }
 
 // ---------------------------------------------------------------------------
+// Admission and the generation runners both routes share
+// ---------------------------------------------------------------------------
+
+/// The request field a chat request's prompt comes from, which an over-long prompt's `400` names.
+const CHAT_INPUT: &str = "messages";
+
+/// Run `f` — a request's preparation: template render, tokenization, prompt count — on a blocking
+/// thread, admitted by the model's preparation bound ([`ModelEntry::prepares`]). Every route that
+/// readies a request before it queues goes through here, so they share one bound. A failure is
+/// already the response, counted and logged.
+async fn prepare_bounded<T: Send + 'static>(
+    entry: &ModelEntry,
+    ctx: &ReqCtx,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, Box<Response>> {
+    // A client that hangs up while waiting here drops this future, and its place in the queue
+    // with it; the permit is held for exactly the preparation.
+    let Ok(permit) = entry.prepares.clone().acquire_owned().await else {
+        ctx.stats.fold_failure();
+        return Err(Box::new(json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server shutting down".into(),
+        )));
+    };
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        f()
+    })
+    .await
+    .map_err(|e| {
+        ctx.stats.fold_failure();
+        tracing::warn!(req = ctx.id, error = %e, "request preparation failed");
+        Box::new(json_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+    })
+}
+
+/// A generation slot held on one model: its permit and the `active` gauge, released together.
+///
+/// MOVED into the blocking task and dropped when it ends: a slot is held for exactly the
+/// generation, the next queued request is admitted the moment it frees, and the gauge — released
+/// on the same events, an unwinding panic included — can never disagree with it.
+struct Slot {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    _active: ActiveGuard,
+}
+
+/// Wait for a free slot ON THIS MODEL. With `--parallel N`, the (N+1)'th concurrent request to
+/// this model queues HERE — in the async runtime, holding no thread — and is admitted FIFO as soon
+/// as one of that model's generations finishes. A different model's slots are independent. The
+/// guard is what the periodic line's `queued` counts; it drops however the wait ends.
+async fn acquire_slot(entry: &ModelEntry, ctx: &ReqCtx) -> Result<Slot, Box<Response>> {
+    let stats = &ctx.stats;
+    let queued = QueuedGuard::new(stats.clone());
+    let Ok(permit) = entry.slots.clone().acquire_owned().await else {
+        stats.fold_failure();
+        tracing::warn!(req = ctx.id, "rejected — server shutting down");
+        return Err(Box::new(json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server shutting down".into(),
+        )));
+    };
+    drop(queued);
+    Ok(Slot {
+        _permit: permit,
+        _active: ActiveGuard::new(stats.clone()),
+    })
+}
+
+/// The non-streaming generation both routes share: wait for a slot, run `job` on a blocking thread
+/// holding it with the routed engine and the request's abort latch, and wait for it under the
+/// deadline. Returns what `job` produced and whether the deadline cut it short. A failure is
+/// already the response, counted and logged; `input` is the request field an over-long prompt's
+/// error names.
+async fn run_unary<T: Send + 'static>(
+    entry: &ModelEntry,
+    ctx: &ReqCtx,
+    input: &'static str,
+    job: impl FnOnce(&dyn ChatGenerator, &Arc<AtomicBool>) -> anyhow::Result<T> + Send + 'static,
+) -> Result<(T, bool), Box<Response>> {
+    let req_id = ctx.id;
+    let slot = acquire_slot(entry, ctx).await?;
+    let engine_arc = entry.engine.clone();
+
+    // Per-request abort latch. It lives OUT here, not inside the closure, so the deadline below can
+    // reach it: the generator polls it in its decode loop, and that poll is the only way to stop a
+    // `spawn_blocking` task early.
+    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel_blk = cancel.clone();
+    // A client that hangs up is noticed by hyper, which DROPS the handler future — and with it
+    // this guard, which latches the abort so the generation stops and frees its slot instead of
+    // running to `max_tokens` for nobody. On a normal return it latches a generation that has
+    // already ended, which nothing reads.
+    let _hangup = CancelOnDrop(cancel.clone());
+
+    let mut handle = tokio::task::spawn_blocking(move || -> anyhow::Result<T> {
+        let _slot = slot;
+        let Some(engine) = engine_arc else {
+            anyhow::bail!("no engine loaded");
+        };
+        job(&*engine, &cancel_blk)
+    });
+
+    // The deadline, and the ONE thing about it that is easy to get wrong.
+    //
+    // `tokio::time::timeout(d, handle).await` returning `Err` and being propagated to the client is
+    // NOT a fix: the blocking task is not cancellable, so it would keep decoding, keep holding its
+    // `OwnedSemaphorePermit`, and the `--parallel` slot — the entire reason for having a deadline —
+    // would stay occupied while we reported failure. So the timeout is used only to WAKE US: on
+    // expiry we latch the abort flag the generator polls and then go back to awaiting the SAME
+    // join. The task ends at its next token boundary, the permit drops, and we still have every
+    // delta it produced before then, which is what the client gets.
+    //
+    // No watchdog TASK on this path (unlike [`run_streamed`]): the handler is already awaiting the
+    // join, so the timer can live inside its own future. Nothing to spawn means nothing to tear
+    // down — the `Timeout` future is dropped by the `.await` that resolves it, whichever way it
+    // went, and a request that finishes in 5 ms under an hour-long deadline leaves nothing behind.
+    let mut deadline_hit = false;
+    let joined = match ctx.deadline {
+        None => handle.await,
+        Some(d) => match tokio::time::timeout(d, &mut handle).await {
+            Ok(joined) => joined,
+            Err(_elapsed) => {
+                deadline_hit = true;
+                cancel.store(true, Ordering::Relaxed);
+                tracing::warn!(
+                    req = req_id,
+                    timeout_s = d.as_secs(),
+                    "request deadline hit — returning the partial completion"
+                );
+                handle.await
+            }
+        },
+    };
+    match joined.map_err(anyhow::Error::from).and_then(|r| r) {
+        Ok(out) => Ok((out, deadline_hit)),
+        Err(e) => {
+            ctx.stats.fold_failure();
+            tracing::warn!(req = req_id, error = %e, "request failed");
+            Err(Box::new(error_response(&e, input)))
+        }
+    }
+}
+
+/// One streamed generation's end of the SSE channel, handed by [`run_streamed`] to the route's job
+/// on its blocking thread.
+struct StreamJob {
+    tx: tokio::sync::mpsc::UnboundedSender<Result<Event, Infallible>>,
+    /// The request's abort latch, which the generator polls.
+    cancel: Arc<AtomicBool>,
+    /// Set by the deadline watchdog. Separate from `cancel` because `cancel` is ALSO latched by a
+    /// client disconnect, and the finish chunk must not report a timeout as a hangup or vice versa.
+    deadline_hit: Arc<AtomicBool>,
+    /// Closes the stream exactly once, however the job ends — see [`DoneGuard`].
+    done: DoneGuard,
+    /// The routed model's generator; `None` on a headless state.
+    engine: Option<Arc<dyn ChatGenerator>>,
+}
+
+impl StreamJob {
+    /// Send one frame. A failed send means the receiver (the client's stream) is gone: latch the
+    /// abort so the decode loop stops at its next poll and returns the slot.
+    fn send(&self, ev: Event) {
+        if self.tx.send(Ok(ev)).is_err() {
+            self.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// The finish reason to report for a generation that ended with `finish`. The generator saw
+    /// only an abort when the deadline fired and reports `Stop`, so the deadline relabels it
+    /// "length" — the budget ran out, the model did not finish.
+    fn finish(&self, finish: Finish) -> Finish {
+        if self.deadline_hit.load(Ordering::Relaxed) {
+            Finish::Length
+        } else {
+            finish
+        }
+    }
+
+    /// Report a failed generation as the stream's terminal frame. A mid-stream failure is NOT a
+    /// clean `stop` — the error frame lets the client tell this apart from success (matching the
+    /// non-streaming 500). `[DONE]` still follows, via `DoneGuard` (audit finding 1). A request's
+    /// own fault carries the same typed error the non-streaming path answers with a 400, so a
+    /// client can tell it from a crash; `input` is the field an over-long prompt's error names.
+    fn fail(&mut self, e: &anyhow::Error, input: &'static str) {
+        match request_error_body(e, input) {
+            Some(body) => self.done.fail_with(body, &e.to_string()),
+            None => self.done.fail(&e.to_string()),
+        }
+    }
+}
+
+/// The streaming generation both routes share: wait for a slot, then hand `job` a [`StreamJob`]
+/// on a blocking thread holding it, and answer with the SSE stream the job writes into.
+async fn run_streamed(
+    entry: &ModelEntry,
+    ctx: &ReqCtx,
+    job: impl FnOnce(StreamJob) + Send + 'static,
+) -> Response {
+    // UNBOUNDED on purpose. The generator's `on_delta` callback is invoked from inside the decode
+    // loop — which, under `--parallel N`, is holding the GPU baton. A bounded channel would make a
+    // slow (or stalled) SSE client apply backpressure straight into that callback, so ONE
+    // non-draining client would block the GPU step it is inside of and stall every OTHER sequence
+    // behind it: precisely the head-of-line blocking this whole change exists to remove. Decoupling
+    // the socket from the decode loop costs a queue whose depth is bounded anyway by `max_tokens`
+    // (a few thousand short strings, worst case), which is the right trade.
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<Event, Infallible>>();
+
+    // Same per-model admission gate as the non-streaming path. Taken BEFORE the SSE response is
+    // returned, so a queued client simply waits for its first byte rather than being handed an
+    // open-but-silent stream.
+    let slot = match acquire_slot(entry, ctx).await {
+        Ok(slot) => slot,
+        Err(resp) => return *resp,
+    };
+
+    // Per-request abort latch: set when the client disconnects and polled by the generator's
+    // decode loop so it stops promptly and frees the GPU slot instead of running to `max_tokens`
+    // into a dead socket (audit finding 2). A failed send ([`StreamJob::send`]) notices the
+    // hang-up only at the next delta; [`cancel_on_hangup`] notices it as it happens — during a
+    // long prefill, or while the stop matcher holds output back, no delta is being sent at all.
+    let cancel = Arc::new(AtomicBool::new(false));
+    let hangup_done = cancel_on_hangup(&tx, cancel.clone());
+
+    // Wall-clock deadline. Unlike the non-streaming path, nothing here awaits the generation's join
+    // — the SSE response is returned as soon as the stream exists — so the timer needs its own
+    // task, and that task needs an off switch. [`arm_deadline`] hands back a sender whose DROP is
+    // that switch; it is moved into the blocking closure below, so the watchdog dies with the
+    // generation (normally or by panic) instead of accumulating one sleeper per request.
+    let deadline_hit = Arc::new(AtomicBool::new(false));
+    let done_tx = ctx
+        .deadline
+        .map(|d| arm_deadline(d, cancel.clone(), deadline_hit.clone()));
+
+    let engine = entry.engine.clone();
+    let (req_id, stats) = (ctx.id, ctx.stats.clone());
+    tokio::task::spawn_blocking(move || {
+        // Held for exactly this generation; freed for the next queued request on return. The
+        // `active` gauge is released by the same return (or unwind).
+        let _slot = slot;
+        // Disarms the deadline watchdog when this task ends — see [`arm_deadline`]. `None` when no
+        // deadline was configured, in which case there is no watchdog to disarm.
+        let _done_tx = done_tx;
+        // Likewise ends the hang-up watcher, whose sender clone would otherwise hold the stream
+        // open.
+        let _hangup_done = hangup_done;
+        // The job owns the `DoneGuard`, which closes the stream exactly once however the job ends.
+        // It emits `[DONE]` always, and — unless `settled()` says a terminal frame already went
+        // out — reports the generation as a failure. Both matter on an unwinding panic, which
+        // skips the job's own error handling (B23).
+        let done = DoneGuard {
+            tx: tx.clone(),
+            req_id,
+            stats,
+            settled: false,
+        };
+        job(StreamJob {
+            tx,
+            cancel,
+            deadline_hit,
+            done,
+            engine,
+        });
+    });
+
+    // Bridge the mpsc receiver to an async Stream for axum's Sse.
+    let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    });
+
+    let sse = Sse::new(stream);
+    match ctx.keep_alive {
+        Some(d) => sse.keep_alive(KeepAlive::new().interval(d)).into_response(),
+        None => sse.into_response(),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Non-streaming path
 // ---------------------------------------------------------------------------
 
@@ -2159,57 +2468,10 @@ async fn non_streaming(
     params: GenParams,
     ctx: ReqCtx,
 ) -> Response {
-    let ReqCtx {
-        id: req_id,
-        cid,
-        model_id,
-        created,
-        deadline,
-        keep_alive: _,
-        stream,
-        include_usage: _,
-        stats,
-    } = ctx;
-    // Wait for a free slot ON THIS MODEL. With `--parallel N`, the (N+1)'th concurrent request to
-    // this model queues HERE — in the async runtime, holding no thread — and is admitted FIFO as
-    // soon as one of that model's generations finishes. A different model's slots are independent.
-    // The guard is what the periodic line's `queued` counts; it drops however the wait ends.
-    let queued = QueuedGuard::new(stats.clone());
-    let Ok(permit) = entry.slots.clone().acquire_owned().await else {
-        stats.fold_failure();
-        tracing::warn!(req = req_id, "rejected — server shutting down");
-        return json_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "server shutting down".into(),
-        );
-    };
-    drop(queued);
-    let active = ActiveGuard::new(stats.clone());
-    let engine_arc = entry.engine.clone();
-    let cid_blk = cid.clone();
-    let stats_blk = stats.clone();
+    let cid_blk = ctx.cid.clone();
+    let stats_blk = ctx.stats.clone();
 
-    // Per-request abort latch. It lives OUT here, not inside the closure, so the deadline below can
-    // reach it: the generator polls it in its decode loop, and that poll is the only way to stop a
-    // `spawn_blocking` task early.
-    let cancel = Arc::new(AtomicBool::new(false));
-    let cancel_blk = cancel.clone();
-    // A client that hangs up is noticed by hyper, which DROPS this handler future — and with it
-    // this guard, which latches the abort so the generation stops and frees its slot instead of
-    // running to `max_tokens` for nobody. On a normal return it latches a generation that has
-    // already ended, which nothing reads.
-    let _hangup = CancelOnDrop(cancel.clone());
-
-    let mut handle = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-        // The permit is MOVED into the blocking task and dropped when it ends: a slot is held for
-        // exactly the generation, and the next queued request is admitted the moment it frees. The
-        // `active` gauge rides along with it, so the two can never disagree.
-        let _permit = permit;
-        let _active = active;
-        let Some(engine) = engine_arc else {
-            anyhow::bail!("no engine loaded");
-        };
-
+    let ran = run_unary(&entry, &ctx, CHAT_INPUT, move |engine, cancel| {
         let mut reasoning = String::new();
         let mut content = String::new();
         let mut tool_calls: Vec<OAIToolCall> = Vec::new();
@@ -2217,13 +2479,13 @@ async fn non_streaming(
         let mut tally = ReqTally::new();
 
         let outcome = generate(
-            &*engine,
+            engine,
             prepared,
             &messages,
             tools.as_ref(),
             tool_choice.as_deref(),
             &params,
-            &cancel_blk,
+            cancel,
             &mut |delta| match delta {
                 Delta::Reasoning(t) => {
                     tally.on_text_delta(&stats_blk);
@@ -2246,102 +2508,74 @@ async fn non_streaming(
         )?;
 
         Ok((reasoning, content, tool_calls, outcome, tally))
-    });
-
-    // The deadline, and the ONE thing about it that is easy to get wrong.
-    //
-    // `tokio::time::timeout(d, handle).await` returning `Err` and being propagated to the client is
-    // NOT a fix: the blocking task is not cancellable, so it would keep decoding, keep holding its
-    // `OwnedSemaphorePermit`, and the `--parallel` slot — the entire reason for having a deadline —
-    // would stay occupied while we reported failure. So the timeout is used only to WAKE US: on
-    // expiry we latch the abort flag the generator polls and then go back to awaiting the SAME
-    // join. The task ends at its next token boundary, the permit drops, and we still have every
-    // delta it produced before then, which is what the client gets.
-    //
-    // No watchdog TASK on this path (unlike [`streaming`]): the handler is already awaiting the
-    // join, so the timer can live inside its own future. Nothing to spawn means nothing to tear
-    // down — the `Timeout` future is dropped by the `.await` that resolves it, whichever way it
-    // went, and a request that finishes in 5 ms under an hour-long deadline leaves nothing behind.
-    let mut deadline_hit = false;
-    let joined = match deadline {
-        None => handle.await,
-        Some(d) => match tokio::time::timeout(d, &mut handle).await {
-            Ok(joined) => joined,
-            Err(_elapsed) => {
-                deadline_hit = true;
-                cancel.store(true, Ordering::Relaxed);
-                tracing::warn!(
-                    req = req_id,
-                    timeout_s = d.as_secs(),
-                    "request deadline hit — returning the partial completion"
-                );
-                handle.await
-            }
-        },
+    })
+    .await;
+    let ((reasoning, content, tool_calls, outcome, tally), deadline_hit) = match ran {
+        Ok(ran) => ran,
+        Err(resp) => return *resp,
     };
-    let result = joined.map_err(anyhow::Error::from).and_then(|r| r);
+    let ReqCtx {
+        id: req_id,
+        cid,
+        model_id,
+        created,
+        stream,
+        stats,
+        ..
+    } = ctx;
 
-    match result {
-        Err(e) => {
-            stats.fold_failure();
-            tracing::warn!(req = req_id, error = %e, "request failed");
-            error_response(&e)
-        }
-        Ok((reasoning, content, tool_calls, outcome, tally)) => {
-            // A deadline hit is a TRUNCATION, not a failure: the client keeps the partial reply
-            // (a 500 would throw away work it can use) and `finish_reason` says "length", which is
-            // OpenAI's reason for a completion that ran out of budget.
-            //
-            // It has to be decided here because the generator cannot know. From inside the decode
-            // loop, the latch we set is indistinguishable from any other abort, so it reports a
-            // clean `Finish::Stop` — and "stop" tells the client the model finished its thought,
-            // which would be a lie. Only the handler that armed the deadline knows it fired.
-            //
-            // A tool call still wins, as it does for every other reason: the call was emitted
-            // whole, and a client that gets `tool_calls` can act on it.
-            let finish = if !tool_calls.is_empty() {
-                Finish::ToolCalls
-            } else if deadline_hit {
-                Finish::Length
-            } else {
-                outcome.finish
-            };
-            // Fold the request's tallies in ONCE, here, and log its completion line.
-            let rec = tally.finish(outcome, finish);
-            stats.fold_completion(&rec);
-            log_request_done(req_id, &model_id, stream, &rec);
-            Json(ChatCompletionResponse {
-                id: cid,
-                object: "chat.completion",
-                created,
-                model: model_id,
-                choices: vec![CompletionChoice {
-                    index: 0,
-                    message: AssistantMessage {
-                        role: "assistant",
-                        content: if content.is_empty() {
-                            None
-                        } else {
-                            Some(content.clone())
-                        },
-                        reasoning_content: if reasoning.is_empty() {
-                            None
-                        } else {
-                            Some(reasoning)
-                        },
-                        tool_calls: if tool_calls.is_empty() {
-                            None
-                        } else {
-                            Some(tool_calls)
-                        },
-                    },
-                    finish_reason: finish.as_str().into(),
-                }],
-                usage: UsageInfo::from_outcome(&outcome),
-            })
-            .into_response()
-        }
-    }
+    // A deadline hit is a TRUNCATION, not a failure: the client keeps the partial reply (a 500
+    // would throw away work it can use) and `finish_reason` says "length", which is OpenAI's
+    // reason for a completion that ran out of budget.
+    //
+    // It has to be decided here because the generator cannot know. From inside the decode loop,
+    // the latch we set is indistinguishable from any other abort, so it reports a clean
+    // `Finish::Stop` — and "stop" tells the client the model finished its thought, which would be
+    // a lie. Only the handler that armed the deadline knows it fired.
+    //
+    // A tool call still wins, as it does for every other reason: the call was emitted whole, and a
+    // client that gets `tool_calls` can act on it.
+    let finish = if !tool_calls.is_empty() {
+        Finish::ToolCalls
+    } else if deadline_hit {
+        Finish::Length
+    } else {
+        outcome.finish
+    };
+    // Fold the request's tallies in ONCE, here, and log its completion line.
+    let rec = tally.finish(outcome, finish);
+    stats.fold_completion(&rec);
+    log_request_done(req_id, &model_id, stream, &rec);
+    Json(ChatCompletionResponse {
+        id: cid,
+        object: "chat.completion",
+        created,
+        model: model_id,
+        choices: vec![CompletionChoice {
+            index: 0,
+            message: AssistantMessage {
+                role: "assistant",
+                content: if content.is_empty() {
+                    None
+                } else {
+                    Some(content.clone())
+                },
+                reasoning_content: if reasoning.is_empty() {
+                    None
+                } else {
+                    Some(reasoning)
+                },
+                tool_calls: if tool_calls.is_empty() {
+                    None
+                } else {
+                    Some(tool_calls)
+                },
+            },
+            finish_reason: finish.as_str().into(),
+        }],
+        usage: UsageInfo::from_outcome(&outcome),
+    })
+    .into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -2357,91 +2591,21 @@ async fn streaming(
     params: GenParams,
     ctx: ReqCtx,
 ) -> Response {
+    // The job's own copy: it runs on the blocking thread, past this borrow of `ctx`.
     let ReqCtx {
         id: req_id,
         cid,
         model_id,
         created,
-        deadline,
-        keep_alive,
         stream,
         include_usage,
         stats,
-    } = ctx;
-    // UNBOUNDED on purpose. The generator's `on_delta` callback is invoked from inside the decode
-    // loop — which, under `--parallel N`, is holding the GPU baton. A bounded channel would make a
-    // slow (or stalled) SSE client apply backpressure straight into that callback, so ONE
-    // non-draining client would block the GPU step it is inside of and stall every OTHER sequence
-    // behind it: precisely the head-of-line blocking this whole change exists to remove. Decoupling
-    // the socket from the decode loop costs a queue whose depth is bounded anyway by `max_tokens`
-    // (a few thousand short strings, worst case), which is the right trade.
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<Event, Infallible>>();
+        ..
+    } = ctx.clone();
 
-    // Same per-model admission gate as the non-streaming path — the (N+1)'th concurrent stream to
-    // this model queues here. Taken BEFORE the SSE response is returned, so a queued client simply
-    // waits for its first byte rather than being handed an open-but-silent stream.
-    let queued = QueuedGuard::new(stats.clone());
-    let Ok(permit) = entry.slots.clone().acquire_owned().await else {
-        stats.fold_failure();
-        tracing::warn!(req = req_id, "rejected — server shutting down");
-        return json_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "server shutting down".into(),
-        );
-    };
-    drop(queued);
-    let active = ActiveGuard::new(stats.clone());
-    let engine_arc = entry.engine.clone();
-    // Clone sender + strings for use inside the on_delta callback closure.
-    let tx_cb = tx.clone();
-    let cid_cb = cid.clone();
-    let model_cb = model_id.clone();
-    let stats_cb = stats.clone();
-
-    // Per-request abort latch: set when the client disconnects and polled by the generator's
-    // decode loop so it stops promptly and frees the GPU slot instead of running to `max_tokens`
-    // into a dead socket (audit finding 2). A failed `send` below notices the hang-up only at the
-    // next delta; [`cancel_on_hangup`] notices it as it happens — during a long prefill, or while
-    // the stop matcher holds output back, no delta is being sent at all.
-    let cancel = Arc::new(AtomicBool::new(false));
-    let cancel_cb = cancel.clone();
-    let hangup_done = cancel_on_hangup(&tx, cancel.clone());
-
-    // Wall-clock deadline. Unlike the non-streaming path, nothing here awaits the generation's join
-    // — the SSE response is returned as soon as the stream exists — so the timer needs its own
-    // task, and that task needs an off switch. [`arm_deadline`] hands back a sender whose DROP is
-    // that switch; it is moved into the blocking closure below, so the watchdog dies with the
-    // generation (normally or by panic) instead of accumulating one sleeper per request.
-    //
-    // `deadline_hit` is separate from `cancel` because `cancel` is ALSO latched by a client
-    // disconnect, and the finish chunk must not report a timeout as a hangup or vice versa.
-    let deadline_hit = Arc::new(AtomicBool::new(false));
-    let deadline_hit_cb = deadline_hit.clone();
-    let done_tx = deadline.map(|d| arm_deadline(d, cancel.clone(), deadline_hit.clone()));
-
-    tokio::task::spawn_blocking(move || {
-        // Held for exactly this generation; freed for the next queued request on return. The
-        // `active` gauge is released by the same return (or unwind).
-        let _permit = permit;
-        let _active = active;
-        // Disarms the deadline watchdog when this task ends — see [`arm_deadline`]. `None` when no
-        // deadline was configured, in which case there is no watchdog to disarm.
-        let _done_tx = done_tx;
-        // Likewise ends the hang-up watcher, whose sender clone would otherwise hold the stream
-        // open.
-        let _hangup_done = hangup_done;
-        // Closes the stream exactly once, however this closure ends. It emits `[DONE]` always, and
-        // — unless `settled()` says a terminal frame already went out — reports the generation as a
-        // failure. Both matter on an unwinding panic, which skips every arm below (B23).
-        let mut done = DoneGuard {
-            tx: tx.clone(),
-            req_id,
-            stats: stats.clone(),
-            settled: false,
-        };
-
+    run_streamed(&entry, &ctx, move |mut job| {
         // First chunk: role delta (mirrors the Python shim's opening chunk).
-        let _ = tx.send(Ok(sse_chunk(
+        job.send(sse_chunk(
             &cid,
             &model_id,
             created,
@@ -2450,12 +2614,12 @@ async fn streaming(
                 ..Default::default()
             },
             None,
-        )));
+        ));
 
-        let Some(engine) = engine_arc else {
-            // `fail` sends the error frame, folds the statistic and logs; `DoneGuard` then closes
-            // the stream with `[DONE]`.
-            done.fail("no engine loaded");
+        let Some(engine) = job.engine.clone() else {
+            // `fail` sends the error frame, folds the statistic and logs; `DoneGuard` then
+            // closes the stream with `[DONE]`.
+            job.done.fail("no engine loaded");
             return;
         };
 
@@ -2471,18 +2635,18 @@ async fn streaming(
             tools.as_ref(),
             tool_choice.as_deref(),
             &params,
-            &cancel_cb,
+            &job.cancel,
             &mut |delta| {
                 let payload = match delta {
                     Delta::Reasoning(t) => {
-                        tally.on_text_delta(&stats_cb);
+                        tally.on_text_delta(&stats);
                         DeltaPayload {
                             reasoning_content: Some(t),
                             ..Default::default()
                         }
                     }
                     Delta::Content(t) => {
-                        tally.on_text_delta(&stats_cb);
+                        tally.on_text_delta(&stats);
                         DeltaPayload {
                             content: Some(t),
                             ..Default::default()
@@ -2491,7 +2655,7 @@ async fn streaming(
                     Delta::ToolCall { name, arguments } => {
                         let tc = OAIToolCall {
                             index: tc_index,
-                            id: tool_call_id(&cid_cb, tc_index),
+                            id: tool_call_id(&cid, tc_index),
                             kind: "function",
                             function: OAIFunction { name, arguments },
                         };
@@ -2503,73 +2667,44 @@ async fn streaming(
                         }
                     }
                 };
-                // A failed send means the receiver (the client's stream) is gone. Latch the abort so
-                // the decode loop stops at its next poll and returns the slot.
-                if tx_cb
-                    .send(Ok(sse_chunk(&cid_cb, &model_cb, created, payload, None)))
-                    .is_err()
-                {
-                    cancel_cb.store(true, Ordering::Relaxed);
-                }
+                job.send(sse_chunk(&cid, &model_id, created, payload, None));
             },
         );
 
         match res {
             Ok(outcome) => {
-                // Same honesty rule as the non-streaming path: the generator saw only an abort and
-                // reports `Stop`, so the deadline has to relabel it "length" — the budget ran out,
-                // the model did not finish. A tool call still wins.
+                // Same honesty rule as the non-streaming path: a deadline is "length", and a
+                // tool call still wins.
                 let finish = if saw_tool_call {
                     Finish::ToolCalls
-                } else if deadline_hit_cb.load(Ordering::Relaxed) {
-                    Finish::Length
                 } else {
-                    outcome.finish
+                    job.finish(outcome.finish)
                 };
                 // Finish chunk: empty delta + finish_reason.
-                let _ = tx.send(Ok(sse_chunk(
+                job.send(sse_chunk(
                     &cid,
                     &model_id,
                     created,
                     DeltaPayload::default(),
                     Some(finish.as_str().into()),
-                )));
+                ));
                 if include_usage {
-                    let _ = tx.send(Ok(sse_usage_chunk(&cid, &model_id, created, &outcome)));
+                    job.send(sse_usage_chunk(&cid, &model_id, created, &outcome));
                 }
-                // Fold the request's tallies in ONCE, here, and log its completion line. The finish
-                // chunk above IS this stream's terminal frame, so the guard must not also report a
-                // failure when it drops.
+                // Fold the request's tallies in ONCE, here, and log its completion line. The
+                // finish chunk above IS this stream's terminal frame, so the guard must not
+                // also report a failure when it drops.
                 let rec = tally.finish(outcome, finish);
                 stats.fold_completion(&rec);
                 log_request_done(req_id, &model_id, stream, &rec);
-                done.settled();
+                job.done.settled();
             }
-            Err(e) => {
-                // A mid-stream failure is NOT a clean `stop` — the error frame lets the client tell
-                // this apart from success (matching the non-streaming 500). `[DONE]` still follows,
-                // via `DoneGuard` (audit finding 1). An over-long prompt carries the same typed error
-                // the non-streaming path answers with a 400, so a client can tell it from a crash.
-                match request_error_body(&e) {
-                    Some(body) => done.fail_with(body, &e.to_string()),
-                    None => done.fail(&e.to_string()),
-                }
-            }
+            Err(e) => job.fail(&e, CHAT_INPUT),
         }
-        // `DoneGuard` drops here (or on an unwinding panic). It sends `[DONE]`, and if nothing
-        // above settled the stream it first reports the request as failed (B23).
-    });
-
-    // Bridge the mpsc receiver to an async Stream for axum's Sse.
-    let stream = futures_util::stream::unfold(rx, |mut rx| async move {
-        rx.recv().await.map(|item| (item, rx))
-    });
-
-    let sse = Sse::new(stream);
-    match keep_alive {
-        Some(d) => sse.keep_alive(KeepAlive::new().interval(d)).into_response(),
-        None => sse.into_response(),
-    }
+        // `DoneGuard` drops with the job (or on an unwinding panic). It sends `[DONE]`, and if
+        // nothing above settled the stream it first reports the request as failed (B23).
+    })
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -2736,27 +2871,25 @@ fn invalid_request_body(param: Option<&str>, code: Option<&str>, msg: &str) -> s
 }
 
 /// The over-long-prompt error, identical on both paths: a `400` body, or a streamed error frame.
-fn context_length_body(c: &ContextLengthExceeded) -> serde_json::Value {
-    invalid_request_body(
-        Some("messages"),
-        Some("context_length_exceeded"),
-        &c.message,
-    )
+/// `input` is the request field the prompt came from — `messages`, or a raw completion's `prompt`.
+fn context_length_body(c: &ContextLengthExceeded, input: &str) -> serde_json::Value {
+    invalid_request_body(Some(input), Some("context_length_exceeded"), &c.message)
 }
 
 /// The `400` body for a generator error that is the request's fault — an over-long prompt, or a
 /// [`ParamError`] the generator could not honour — or `None` for a failure of the server's own.
-fn request_error_body(e: &anyhow::Error) -> Option<serde_json::Value> {
+/// `input` is as for [`context_length_body`].
+fn request_error_body(e: &anyhow::Error, input: &str) -> Option<serde_json::Value> {
     if let Some(c) = e.downcast_ref::<ContextLengthExceeded>() {
-        return Some(context_length_body(c));
+        return Some(context_length_body(c, input));
     }
     e.downcast_ref::<ParamError>()
         .map(|p| invalid_request_body(Some(p.param), None, &p.message))
 }
 
 /// A generator error as an HTTP response: its typed body with a `400`, else a `500`.
-fn error_response(e: &anyhow::Error) -> Response {
-    match request_error_body(e) {
+fn error_response(e: &anyhow::Error, input: &str) -> Response {
+    match request_error_body(e, input) {
         Some(body) => (StatusCode::BAD_REQUEST, Json(body)).into_response(),
         None => json_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
@@ -6250,6 +6383,15 @@ mod tests {
         most: AtomicU64,
         prepares: AtomicU64,
     }
+    impl SlowPrepare {
+        fn slow_prepare(&self) {
+            self.prepares.fetch_add(1, Ordering::Relaxed);
+            let now = self.running.fetch_add(1, Ordering::SeqCst) + 1;
+            self.most.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(150));
+            self.running.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
     impl ChatGenerator for SlowPrepare {
         fn status(&self) -> GeneratorStatus {
             cpu_status()
@@ -6266,12 +6408,29 @@ mod tests {
             _tool_choice: Option<&str>,
             _params: &GenParams,
         ) -> anyhow::Result<Option<PreparedRequest>> {
-            self.prepares.fetch_add(1, Ordering::Relaxed);
-            let now = self.running.fetch_add(1, Ordering::SeqCst) + 1;
-            self.most.fetch_max(now, Ordering::SeqCst);
-            std::thread::sleep(Duration::from_millis(150));
-            self.running.fetch_sub(1, Ordering::SeqCst);
+            self.slow_prepare();
             Ok(None)
+        }
+
+        fn prepare_completion(&self, prompt: &str) -> anyhow::Result<Option<(u32, Option<u32>)>> {
+            self.slow_prepare();
+            Ok(Some((prompt.len() as u32, None)))
+        }
+
+        fn complete(
+            &self,
+            _prompt: &str,
+            _params: &GenParams,
+            _cancel: &Arc<AtomicBool>,
+            on_text: &mut dyn FnMut(&str),
+        ) -> anyhow::Result<ChatOutcome> {
+            on_text("ok");
+            Ok(ChatOutcome {
+                finish: Finish::Stop,
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                cached_tokens: 0,
+            })
         }
 
         fn chat(
@@ -6310,6 +6469,48 @@ mod tests {
             assert_eq!(resp.status(), StatusCode::OK);
         }
         assert_eq!(g.prepares.load(Ordering::Relaxed), 5);
+        assert_eq!(g.most.load(Ordering::SeqCst), 2, "the bound, and no less");
+    }
+
+    /// A raw completion's prompt count runs under the same per-model bound as a chat request's
+    /// preparation, sharing its permits: a mixed burst never prepares more at once than the model
+    /// has slots.
+    #[tokio::test]
+    async fn completion_preparations_share_the_chat_bound() {
+        let g = Arc::new(SlowPrepare::default());
+        let router = build_router(AppState::new(
+            g.clone(),
+            "m",
+            2,
+            Arc::new(Config::default()),
+        ));
+        let chat = r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#;
+        let raw = r#"{"model":"m","prompt":"hi"}"#;
+        let all = (0..6).map(|i| {
+            let router = router.clone();
+            async move {
+                let (uri, body) = if i % 2 == 0 {
+                    ("/v1/chat/completions", chat)
+                } else {
+                    ("/v1/completions", raw)
+                };
+                router
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri(uri)
+                            .header("content-type", "application/json")
+                            .body(Body::from(body))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+            }
+        });
+        for resp in futures_util::future::join_all(all).await {
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+        assert_eq!(g.prepares.load(Ordering::Relaxed), 6);
         assert_eq!(g.most.load(Ordering::SeqCst), 2, "the bound, and no less");
     }
 

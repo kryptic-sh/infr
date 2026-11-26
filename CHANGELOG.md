@@ -387,13 +387,22 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   that it adds into the running sum with Kahan compensation, and its split-K
   path sums the k slices with a compensated reduce (`splitk_reduce_kahan`, a
   build of `splitk_reduce.comp` the cooperative-matrix split-K GEMM does not
-  use); per Linear it is at least as close to an f64 host reference as the
-  per-row GEMV it replaces. A single f32 running sum over the whole `k` range
-  had put gemma-3-1b outside its tightest float row on the integrated Ryzen GPU
-  (worst KL 2.65e-3 against a bound of 1.8e-3); it now measures 3.4e-4 there and
-  1.5e-4 on the RX 7900 XTX, where the GEMV gives 7.1e-4 on both. The GCN tier
-  itself could not be measured here. `INFR_TUNE=gemm.kq_fma=true` turns it on
-  and `infr tune show` reports it; a device whose shared memory cannot hold the
+  use). On every Linear of gemma-3-1b and Qwen3-0.6B Q4_K_M that takes it (one
+  prompt each, the integrated GPU under RADV), directly and at each k-slice
+  count its plan can pick for them, it is at least as close to an f64 host
+  reference as the per-row GEMV it replaces; that is a measurement on those two
+  models, not a bound. A sum that overflows f32 now comes out NaN where it was
+  inf. A single f32 running sum over the whole `k` range had put gemma-3-1b
+  outside its tightest float row on the integrated Ryzen GPU (worst KL 2.65e-3
+  under RADV, against a bound of 1.8e-3). Under RADV the fixed tile measures
+  3.4e-4 on the integrated GPU and 1.5e-4 on the RX 7900 XTX, where the GEMV
+  gives 7.1e-4 on both. Under the AMD Windows driver the integrated GPU gives
+  2.6e-3 for the tile as contributed, 7.8e-4 for the fixed tile and 1.6e-3 for
+  the GEMV, and the RX 7900 XTX 1.7e-3 for the tile as contributed and 4.8e-4
+  for the fixed tile against 3.0e-4 for the GEMV: there the fixed tile is the
+  further of the two from the reference, inside the bound. The GCN tier itself
+  could not be measured here. `INFR_TUNE=gemm.kq_fma=true` turns it on and
+  `infr tune show` reports it; a device whose shared memory cannot hold the
   kernel's tile, a shape whose tile grid would pass the device's
   `maxComputeWorkGroupCount[0]` even without splitting k, or a weight past the
   2³² addressing cap keeps the kernels it ran without it. The split-k sum pass,

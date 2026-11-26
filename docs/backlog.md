@@ -184,7 +184,8 @@ rule in AGENTS.md: output unchanged or no further from the CPU reference.
 
 ### B-ORDER-2026-11-27 — the order of work agreed with the owner
 
-**Kind:** a record of an agreement; the only one.
+**Kind:** a record of an agreement on the order of work (the owner's other
+decisions are in B-DECISIONS-2026-11-25 and B-DECISIONS-2026-11-26).
 
 Agreed with the owner on 2026-11-27, to follow the fp32 K-quant GEMM's
 compensated-sum fix (B-KQ-FMA-GEMM-UNVERIFIED): plan 18's T0 (measure where a
@@ -832,16 +833,17 @@ rework is theirs unless they decline.
 (the owner's accuracy rule, B-DECISIONS-2026-11-26: a default-on kernel that
 fails a row its alternative passes goes off).
 
-**Where no int8 arm runs it now passes the float rows (fixed 2026-11-26).** It
-had put gemma-3 at worst KL 2.65e-3 on the integrated Ryzen GPU against its
-FloatNoCoopmat bound of 1.8e-3. The cause was its summation, one f32 running sum
-per output over the whole `k` range; it now Kahan-adds 32-element partials, and
-its split-K path sums the slices with `splitk_reduce_kahan`. Under RADV on
-Linux, gemma-3's float rows measure 3.4e-4 on the integrated GPU and 1.5e-4 on
-the RX 7900 XTX (the GEMV: 7.1e-4 on both); the AMD Windows driver's figures are
-in the next paragraph. The method, the per-Linear figures and every gated
-model's before and after are in `docs/gpu-tolerance.md`, "The fp32 K-quant
-prefill GEMM in the float runs". `nc_kq_fma_gemm_is_as_accurate_as_the_gemv` and
+**Where no int8 arm runs it now passes the float rows (fixed 2026-11-27, first
+measured under RADV on 2026-11-26).** It had put gemma-3 at worst KL 2.65e-3 on
+the integrated Ryzen GPU against its FloatNoCoopmat bound of 1.8e-3. The cause
+was its summation, one f32 running sum per output over the whole `k` range; it
+now Kahan-adds 32-element partials, and its split-K path sums the slices with
+`splitk_reduce_kahan`. Under RADV on Linux, gemma-3's float rows measure 3.4e-4
+on the integrated GPU and 1.5e-4 on the RX 7900 XTX (the GEMV: 7.1e-4 on both);
+the AMD Windows driver's figures are in the next paragraph. The method, the
+per-Linear figures and every gated model's before and after are in
+`docs/gpu-tolerance.md`, "The fp32 K-quant prefill GEMM in the float runs".
+`nc_kq_fma_gemm_is_as_accurate_as_the_gemv` and
 `nc_kq_fma_splitk_is_as_accurate_as_the_gemv` (`nc_gemm_parity.rs`) hold both
 paths to the GEMV's error against an f64 host reference, and to a bound against
 that reference itself (`KQ_FMA_REL_BOUND_EPS`). What still keeps the default off
@@ -857,7 +859,8 @@ the integrated GPU not under `INFR_NO_COOPMAT=1` alone); with the parameter on,
 nothing fails that does not fail without it except gemma-3's Int8 rows and, on
 the integrated GPU, the greedy check of gemma-3's Int8 run. **The gemma-3 float
 figures are not RADV's.** Integrated GPU: GEMV 1.6e-3, contributed tile 2.6e-3,
-fixed tile 7.8e-4, RADV's order at about twice its values. RX 7900 XTX: GEMV
+fixed tile 7.8e-4: RADV's order, with the GEMV and the fixed tile at about twice
+RADV's values and the contributed tile at RADV's (2.65e-3). RX 7900 XTX: GEMV
 3.0e-4, contributed tile 1.7e-3, fixed tile 4.8e-4, so there the fixed tile is
 further from the reference than the GEMV, inside the row's 1.8e-3, while per op
 it is closer on every case of the accuracy tests on that card. Not looked into;
@@ -900,10 +903,12 @@ Also open:
 
 - **No speed figure exists for the compensated tile.** It holds a second
   accumulator set per thread and does three more adds per 32 FMAs, and the
-  compensated reduce three more adds per plane. A quiet-window A/B of prefill
-  (the two builds alternated, on each GPU) is owed before the parameter is
-  recommended to anyone for speed; the contributor's figures in `CHANGELOG.md`
-  are of the tile before the fix.
+  compensated reduce three more adds per plane; only those carry `NoContraction`
+  (`kahanStep`; the fix's first form, inline `precise`, had marked the whole
+  kernel, dequantization included, see `docs/gpu-tolerance.md`, "The fix"). A
+  quiet-window A/B of prefill (the two builds alternated, on each GPU) is owed
+  before the parameter is recommended to anyone for speed; the contributor's
+  figures in `CHANGELOG.md` are of the tile before the fix.
 - **An overflowed sum is now NaN where it was inf.** Once a 32-element partial
   or the running sum reaches ±inf, the Kahan compensation is inf − inf, so the
   tile (and `splitk_reduce_kahan`, the same way across planes) writes NaN where
@@ -997,15 +1002,17 @@ measured: whether its plain sum costs it anything against the reference today.
 
 `INFR_DEV=Vulkan1 cargo nextest run --release --run-ignored all --test-threads 1 -E 'test(gpu_seam_tolerance_gemma3)'`
 fails on the Ryzen integrated GPU ("AMD Radeon(TM) Graphics") under the AMD
-Windows driver, Windows 11, reference cache on: "gpu-float chat prompt greedy:
-the greedy token differs from the reference's at positions [13 to 23, 25 to 28,
-30 to 45], each with a reference margin over 0.25 nats". The float run's greedy
-summary is 95 of 126 tokens the reference's, widest miss at an 8.311-nat margin.
-On that chat prompt the Int8 run's generation ends on an end token after 9
-tokens (and its greedy check passes, 67 of 67); the float run's goes the full 33
-without one. Every teacher-forced row of the same test passes: the float runs'
-worst KL is 1.617e-3 (prompt 1, prefill, position 13) against a bound of 1.8e-3,
-which under RADV measures 7.1e-4.
+Windows driver (AMD proprietary 2.0.353, `driverInfo` "25.10.42 (AMD proprietary
+shader compiler)", read with `vulkaninfo --summary`), Windows 11, reference
+cache on: "gpu-float chat prompt greedy: the greedy token differs from the
+reference's at positions [13 to 23, 25 to 28, 30 to 45], each with a reference
+margin over 0.25 nats". The float run's greedy summary is 95 of 126 tokens the
+reference's, widest miss at an 8.311-nat margin. On that chat prompt the Int8
+run's generation ends on an end token after 9 tokens (and its greedy check
+passes, 67 of 67); the float run's goes the full 33 without one. Every
+teacher-forced row of the same test passes: the float runs' worst KL is 1.617e-3
+(prompt 1, prefill, position 13) against a bound of 1.8e-3, which under RADV
+measures 7.1e-4.
 
 Seen twice with the same failure text and figures: on `main` at `2813f6e4`, and
 on the compensated-sum change on top of it with `gemm.kq_fma` at its default
@@ -1027,7 +1034,8 @@ reference's.
 **Kind:** failing gate test at the shipped defaults, on `main`; not diagnosed.
 
 `INFR_DEV=Vulkan0 cargo nextest run --release --run-ignored all --test-threads 1 -E 'test(gpu_seam_tolerance_moe_decode_float_reaches_moe_models_only)'`
-fails on the RX 7900 XTX under the AMD Windows driver, Windows 11:
+fails on the RX 7900 XTX under the AMD Windows driver (AMD proprietary 2.0.353,
+`driverInfo` "25.10.36 (LLPC)", read with `vulkaninfo --summary`), Windows 11:
 "ernie-21b-moe: mmv_mw.moe_float (shipped on) changed the logits bits". That
 assertion comes after the one on the kernels, so the shipped run of
 ERNIE-4.5-21B-A3B built the kernels of `gpu-dense-decode-float` and gave other

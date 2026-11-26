@@ -264,9 +264,10 @@ wherever int8 arms can run.
 Where no int8 arm runs at all, the tile would replace only the per-row f32
 dequant GEMV, so it was measured there too, in the harness's float runs (whose
 configuration masks the int8 dot): the whole `gpu_seam_tolerance` gate with
-`gemm.kq_fma` off against on, both GPUs under RADV on Linux, 2026-11-26 (the AMD
-Windows driver's figures are further down). Float and FloatNoCoopmat rows, worst
-KL and mean KL over each model's prompts and phases, GEMV against the tile:
+`gemm.kq_fma` off against on, both GPUs under RADV on Linux (Mesa version not
+recorded), 2026-11-26 (the AMD Windows driver's figures are further down). Float
+and FloatNoCoopmat rows, worst KL and mean KL over each model's prompts and
+phases, GEMV against the tile:
 
 | Device, model, class                    | per-row GEMV    | `native_gemm_kq_fma` |
 | --------------------------------------- | --------------- | -------------------- |
@@ -346,7 +347,9 @@ wrong):
 - **Dequantization: not the cause.** Read through one-hot activation rows
   (identity blocks, so every output is one weight times 1.0, exactly), the
   weights the tile and the GEMV decode equal `dequant_block`'s, which the CPU
-  reference uses, bit for bit, on every element of all 52 gemma-3 weights.
+  reference uses, bit for bit, on every element of all 52 gemma-3 weights. That
+  is RADV's evidence, on the tile as contributed (no `precise` anywhere in it);
+  no such probe ran under the AMD Windows driver on an unmarked build.
 - **Split-K: not the cause, and it narrowed the gap.** As contributed, 2 and 4
   slices measured 6.47e-7 and 4.02e-7 against the direct tile's 1.06e-6 on the
   same 26 Linears (shorter running sums). With the fixed slices, the plain
@@ -369,11 +372,44 @@ into a partial with explicit FMAs, and the partial is Kahan-added into the
 running sum once per tile, its compensation carried as the next tile's starting
 partial, so the tile holds two accumulator sets rather than three; `precise`
 keeps the compiler from folding the compensation away; the last carry is added
-on the write. Its split-K pass is `splitk_reduce_kahan`. Both match their host
-emulations bit for bit on the integrated GPU under RADV, and under the AMD
-Windows driver (below). Structurally that is a second set of accumulator
-registers per thread and three adds per 32 FMAs, plus three adds per plane in
-the reduce; its speed was not measured, on any device.
+on the write. Its split-K pass is `splitk_reduce_kahan`.
+
+`precise` reaches further than the variable it is written on: glslang marks
+every float operation that feeds a precise value, within the function, as
+`NoContraction`. The fix's first form declared the compensation `precise` inline
+in `main`, and that marked the whole kernel, the dequantization in `storeTile`
+(`dl * q - mm` and the like) included, so the driver could no longer fuse those
+multiply-adds either. Counted with `glslc -O` (the build's flags) and
+`spirv-dis`, Vulkan SDK 1.4.357.0, `NoContraction` decorations in the six builds
+of `native_gemm_kq_fma.comp`:
+
+| Build        | `main` (contributed) | first form | `kahanStep` |
+| ------------ | -------------------- | ---------- | ----------- |
+| Q4_0, BN=64  | 0                    | 84         | 24          |
+| Q4_0, BN=128 | 0                    | 141        | 48          |
+| Q4_K, BN=64  | 0                    | 89         | 24          |
+| Q4_K, BN=128 | 0                    | 146        | 48          |
+| Q6_K, BN=64  | 0                    | 123        | 24          |
+| Q6_K, BN=128 | 0                    | 180        | 48          |
+
+The shipped form moves the compensation into its own function, `kahanStep`,
+whose parameter stops the propagation: what is left is exactly one `OpFAdd` and
+two `OpFSub` per accumulator (8 accumulators of `vec4` per column group, one
+group at BN=64 and two at BN=128), so the products and the dequantization are as
+free to contract as in the contributed tile. The compensated reduce has 4: per
+plane, the carry subtracted from the plane's value, the add into the total, and
+the two subtractions that recover the new carry. Under the AMD Windows driver
+the two forms give the same `nc_gemm_parity` figures to every printed digit on
+both GPUs (36 cases each), and gemma-3's tolerance test with
+`INFR_TUNE=gemm.kq_fma=true INFR_NO_COOPMAT=1` the same KL, top-k cosine and
+logit-deviation lines (216 of 216 on each GPU), so the Windows figures for the
+fixed tile below stand for the shipped form on gemma-3; the other models were
+not re-run on it, and nothing was re-run under RADV. The bit-for-bit probes
+described in this section ran on the first form. Structurally the shipped form
+costs a second set of accumulator registers per thread and three adds per 32
+FMAs, plus three adds per plane in the reduce; the first form also gave up any
+contraction of the dequantization. Its speed was not measured, in either form,
+on any device.
 
 One behaviour changed outside the finite range: once a 32-element partial or the
 running sum reaches ±inf, the compensation is inf − inf, so the tile, and the
@@ -390,59 +426,82 @@ weights and activations, for Q4_0, Q4_K and Q6_K, both tile widths, at
 gemma-3-shaped and deeper `k` and at 2, 4 and 8 slices. The tile as contributed
 fails both (`k` = 6912, Q4_0: 8.67e-6 against the GEMV's 3.48e-7 under RADV).
 Since 2026-11-27 each case is also held to the reference itself: the tile's RMS
-error may not exceed `KQ_FMA_REL_BOUND_EPS` (2) times `f32::EPSILON` times the
-RMS of the f64 outputs, so the tests cannot pass because the GEMV got worse, and
-a failure says which of the two bounds was crossed.
+error may not exceed `KQ_FMA_REL_BOUND_EPS` times `f32::EPSILON` times the RMS
+of the f64 outputs, so the tests cannot pass because the GEMV got worse, and a
+failure says which of the two bounds was crossed.
 `recorder::tests::splitk_reduce_builds_match_their_host_sums` holds the plain
 and compensated reduce builds each to a host emulation of its own sum, bit for
 bit. None of these ran in the GPU gate before 2026-11-27: its filter did not
 select `binary(nc_gemm_parity)` (it does now: "Running it" below).
 
 **On the Ryzen integrated GPU under the AMD Windows driver, 2026-11-27**
-(`INFR_DEV=Vulkan1`, "AMD Radeon(TM) Graphics", Windows 11; the figures above
-are RADV's; the RX 7900 XTX under the same driver gives these figures too, see
-the end of this section). Both tests pass, every case, with the two tile widths
-giving the same figures. Errors in units of `f32::EPSILON` times the RMS of the
-f64 outputs; "tile / GEMV" is the ratio of the two RMS errors, under 1 where the
-tile is closer:
+(`INFR_DEV=Vulkan1`, "AMD Radeon(TM) Graphics", Windows 11, AMD proprietary
+driver: `driverVersion` 2.0.353, `driverInfo` "25.10.42 (AMD proprietary shader
+compiler)" on this GPU and "25.10.36 (LLPC)" on the RX 7900 XTX, read with
+`vulkaninfo --summary` the same day; the figures above are RADV's, whose Mesa
+version was not recorded for them; the RX 7900 XTX under the same driver gives
+these figures too, see the end of this section). Both tests pass, every case,
+with the two tile widths giving the same figures. Errors in units of
+`f32::EPSILON` times the RMS of the f64 outputs; "tile / GEMV" is the ratio of
+the two RMS errors, under 1 where the tile is closer:
 
-| Cases                 | Tile, fixed  | GEMV         | Tile / GEMV  | Thinnest case                     |
-| --------------------- | ------------ | ------------ | ------------ | --------------------------------- |
-| direct, 18            | 0.20 to 0.89 | 0.34 to 1.65 | 0.52 to 0.89 | Q6_K, `k` = 1024: 0.879 to 0.988  |
-| split-K (2, 4, 8), 18 | 0.21 to 0.93 | 0.34 to 1.81 | 0.52 to 0.93 | Q6_K, `k` = 1024, 4 slices: 0.923 |
+| Cases                 | Tile, fixed  | GEMV         | Tile / GEMV  | Thinnest case, tile / GEMV                        |
+| --------------------- | ------------ | ------------ | ------------ | ------------------------------------------------- |
+| direct, 18            | 0.20 to 0.89 | 0.34 to 1.65 | 0.52 to 0.89 | Q6_K, `k` = 1024: 0.879 / 0.988 = 0.890           |
+| split-K (2, 4, 8), 18 | 0.21 to 0.93 | 0.34 to 1.81 | 0.52 to 0.93 | Q6_K, `k` = 1024, 4 slices: 0.923 / 0.988 = 0.934 |
 
-So the comparison with the GEMV has a margin of 7 % at its thinnest on this
-driver, and the bound of 2 has a factor of 2.1 over the worst case. The GEMV is
-not the same on the two drivers (Q4_0, `k` = 6912: 4.32e-7 here, 3.48e-7 under
-RADV), which is the reason for the second bound. Each test was seen to fail on
-this device, with the kernel changed and then restored:
+So the tile sits 11 % under the GEMV at its thinnest direct case and 6.6 % under
+it at its thinnest split-K case on this driver. The worst case against the
+reference itself is 0.930 (Q6_K, `k` = 8192, 8 slices), under
+`KQ_FMA_REL_BOUND_EPS`. That second bound is an extra requirement, not a
+relaxation of the first: a case fails when it crosses either, and the bound
+stops the tile from passing because the GEMV got worse with it (the GEMV is not
+the same on the two drivers: Q4_0, `k` = 6912, 4.32e-7 here and 3.48e-7 under
+RADV). The comparison with the GEMV stays strict, so a change that makes
+`native_gemv` more accurate can turn these tests red with no regression in the
+tile; then check the tile against the bound and these figures, and improve the
+tile or take the question to the owner, rather than loosen the comparison.
 
-| Kernel change                                         | Direct test                                              | Split-K test                                        | Reduce's host-sum test             |
-| ----------------------------------------------------- | -------------------------------------------------------- | --------------------------------------------------- | ---------------------------------- |
-| the tile as contributed (one running sum)             | fails: 18 of 18 cases above the GEMV, 18 above the bound | fails: 18 of 18 above the GEMV, 10 above the bound  | not run                            |
-| partials of 32, compensation dropped (carry set to 0) | fails: 18 of 18 above the GEMV, 2 above the bound        | fails: 8 of 18 above the GEMV, none above the bound | not run                            |
-| `splitk_reduce_kahan` with its compensation set to 0  | passes (the direct tile has no reduce)                   | fails: 4 of 18 above the GEMV, none above the bound | fails: 1523 of 4096 outputs differ |
+`KQ_FMA_REL_BOUND_EPS` was 2 when the bound was added and is 1.2 since, with the
+fixed tile's worst case (0.930, the same on both GPUs) 1.29 times under it. At 2
+the carry-dropped tile below crossed the bound on only 2 of its 18 direct cases;
+at 1.2 it crosses on 14, so the bound on its own now catches most of a lost
+compensation. Each test was seen to fail on this device, with the kernel changed
+and then restored. The first and third rows ran at the bound of 2 (with the
+first form of the fix), and the bound columns there are its counts; the second
+row ran at 1.2 on the shipped form:
+
+| Kernel change                                         | Direct test                                              | Split-K test                                                             | Reduce's host-sum test             |
+| ----------------------------------------------------- | -------------------------------------------------------- | ------------------------------------------------------------------------ | ---------------------------------- |
+| the tile as contributed (one running sum)             | fails: 18 of 18 cases above the GEMV, 18 above the bound | fails: 18 of 18 above the GEMV, 10 above the bound                       | not run                            |
+| partials of 32, compensation dropped (carry set to 0) | fails: 18 of 18 above the GEMV, 14 above the bound       | fails: 10 of 18: 8 above the GEMV, 2 others above the bound only         | not run                            |
+| `splitk_reduce_kahan` with its compensation set to 0  | passes (the direct tile has no reduce)                   | fails: 4 of 18 above the GEMV, none above the bound (its worst is 1.013) | fails: 1523 of 4096 outputs differ |
 
 The tile as contributed measures 3.9 to 12.3 in the same units on the direct
 cases (Q4_0, `k` = 6912: 8.67e-6, RADV's figure to the digit) and 1.07 to 4.83
-on the split-K ones, so the bound of 2 alone fails it on every direct case and
-on 10 of the 18 split-K cases; the other 8 it fails through the GEMV comparison.
+on the split-K ones, so the bound alone fails it on every direct case, and on 10
+of the 18 split-K cases at 2 or 16 of them at 1.2 (counted from those printed
+figures, not run at 1.2); the rest it fails through the GEMV comparison.
 
-A throwaway probe (deleted, like the RADV one) compared the fixed tile's output
-on this driver with a host emulation of its sum (`f32::mul_add` partials of 32
-over `dequant_block`'s weights, Kahan-added, and the compensated plane sum for
-split-K), on the tests' synthetic weights: bit-identical on all 30 cases (three
-formats, both widths; `k` = 6912 and 1024 direct, 1024 at 2 and 4 slices, 8192
-at 8), every output of each. With each of the three changes above applied the
-same probe reported differing outputs (under the reduce change only on the
-split-K cases at 4 and 8 slices), so it could have failed. So this driver fuses
-the tile's `fma()` and decodes these weights as the host does. That is two AMD
-drivers on one GPU family; no other vendor's driver was run.
+A throwaway probe (deleted, like the RADV one) compared the fixed tile's output,
+in its first form (`precise` over the whole kernel), on this driver with a host
+emulation of its sum (`f32::mul_add` partials of 32 over `dequant_block`'s
+weights, Kahan-added, and the compensated plane sum for split-K), on the tests'
+synthetic weights: bit-identical on all 30 cases (three formats, both widths;
+`k` = 6912 and 1024 direct, 1024 at 2 and 4 slices, 8192 at 8), every output of
+each. With each of the three changes above applied the same probe reported
+differing outputs (under the reduce change only on the split-K cases at 4 and 8
+slices), so it could have failed. So this driver fuses the tile's `fma()` and,
+with contraction forbidden, decodes these weights as the host does. The probe
+did not run on the shipped form, nor on the RX 7900 XTX (whose `nc_gemm_parity`
+figures match to every printed digit). That is two AMD drivers on one GPU
+family; no other vendor's driver was run.
 
 **Model figures, before and after.** The gate with `INFR_NO_COOPMAT=1`, worst KL
 / largest per-phase mean KL of the `gpu-float` run over each model's prompts and
 phases (FloatNoCoopmat matches it on gemma-3; the `-ub32` and `-static` runs are
-left out), both GPUs under RADV on Linux, 2026-11-26:
+left out), both GPUs under RADV on Linux (Mesa version not recorded),
+2026-11-26:
 
 | Device      | Model         | per-row GEMV    | tile as contributed | tile, fixed     |
 | ----------- | ------------- | --------------- | ------------------- | --------------- |
@@ -470,7 +529,8 @@ XTX, 0.67 to 1.22 on the integrated GPU), so the parameter stays off by default.
 
 **The same figures under the AMD Windows driver, 2026-11-27** (Windows 11,
 reference cache on; `Vulkan0` the RX 7900 XTX, `Vulkan1` the Ryzen integrated
-GPU, "AMD Radeon(TM) Graphics"; the table above is RADV's, on Linux). Every
+GPU, "AMD Radeon(TM) Graphics"; AMD proprietary driver 2.0.353, the `driverInfo`
+of each GPU as given above; the table above is RADV's, on Linux). Every
 `gpu_seam_tolerance_*` test, on each device. The GEMV column is the gate with
 `gemm.kq_fma` at its default (on the RX 7900 XTX with `INFR_NO_COOPMAT=1`, so
 that the float runs take the GEMV rather than the cooperative-matrix GEMM), the
@@ -498,40 +558,41 @@ tile's shader put back to the contributed one, and on the RX 7900 XTX from
 | Ryzen iGPU  | ERNIE-0.3B Q4 | 1.9e-5 / 2.2e-6 | not run             | 1.9e-5 / 2.0e-6 |
 
 These do not repeat RADV's picture. On the integrated GPU the order is RADV's at
-about twice its values: the tile as contributed is where RADV put it (2.58e-3
-here, 2.65e-3 there) and fails the FloatNoCoopmat row, the fixed tile passes at
-7.8e-4 (RADV: 3.4e-4), closer than the GEMV, and the GEMV itself is at 1.6e-3
-(RADV: 7.1e-4), 0.2e-3 inside the row's 1.8e-3. On the RX 7900 XTX the tile as
-contributed is where RADV put it too (1.67e-3 here, 1.74e-3 there), just inside
-the row, and the fix takes it to 4.8e-4; but the GEMV measures 3.0e-4, so there
-the fixed tile is further from the reference than the GEMV on gemma-3, where
-RADV has it at 1.5e-4 against 7.1e-4. Both are well inside the row. All of
-gemma-3's figures are at prompt 1, prefill, position 13. (The contributed run on
-the RX 7900 XTX failed only its Int8 rows, worst prefill KL 1.13 at position 13
-of prompt 1, the parameter's known failure; its greedy checks passed.) Per op,
-on the same card and driver, the fixed tile is closer than the GEMV on every
-case of the `nc_gemm_parity` accuracy tests (next paragraph), so the gate's
-distance and the per-op error disagree about the order on that device; which
-other kernel accounts for it was not looked into, and "closer than the GEMV" is
-a statement about RADV and about this integrated GPU, not about the tile
-everywhere.
+about twice its values for the GEMV and the fixed tile, while the tile as
+contributed is where RADV put it (2.58e-3 here, 2.65e-3 there) and fails the
+FloatNoCoopmat row, the fixed tile passes at 7.8e-4 (RADV: 3.4e-4), closer than
+the GEMV, and the GEMV itself is at 1.6e-3 (RADV: 7.1e-4), 0.2e-3 inside the
+row's 1.8e-3. On the RX 7900 XTX the tile as contributed is where RADV put it
+too (1.67e-3 here, 1.74e-3 there), just inside the row, and the fix takes it to
+4.8e-4; but the GEMV measures 3.0e-4, so there the fixed tile is further from
+the reference than the GEMV on gemma-3, where RADV has it at 1.5e-4 against
+7.1e-4. Both are well inside the row. All of gemma-3's figures are at prompt 1,
+prefill, position 13. (The contributed run on the RX 7900 XTX failed only its
+Int8 rows, worst prefill KL 1.13 at position 13 of prompt 1, the parameter's
+known failure; its greedy checks passed.) Per op, on the same card and driver,
+the fixed tile is closer than the GEMV on every case of the `nc_gemm_parity`
+accuracy tests (next paragraph), so the gate's distance and the per-op error
+disagree about the order on that device; which other kernel accounts for it was
+not looked into, and "closer than the GEMV" is a statement about RADV and about
+this integrated GPU, not about the tile everywhere.
 
 The `nc_gemm_parity` accuracy tests on the RX 7900 XTX under this driver give
 the integrated GPU's figures above: the tile's errors are the same to every
 printed digit in all 36 cases, and the GEMV's differ in the third digit (Q4_0,
-`k` = 6912: 4.31e-7 against 4.32e-7), so the ranges and the thinnest margin (7
-%) are the same on both. The split-K, reduce and `kq_fma` tests of the
-`infr-vulkan` lib pass on both.
+`k` = 6912: 4.31e-7 against 4.32e-7), so the ranges are the same on both and the
+thinnest margins nearly so (direct 11 % on each; split-K 6.6 % on the integrated
+GPU and 6.7 % on the RX 7900 XTX, whose GEMV gives 0.989 there against 0.988).
+The split-K, reduce and `kq_fma` tests of the `infr-vulkan` lib pass on both.
 
 What passed and what did not, under this driver, of the 14 `gpu_seam_tolerance`
 tests:
 
-| Run                                            | RX 7900 XTX                          | Ryzen iGPU                                    |
-| ---------------------------------------------- | ------------------------------------ | --------------------------------------------- |
-| defaults                                       | 13 pass; the routed-expert one fails | 13 pass; gemma-3 fails its float greedy check |
-| `INFR_NO_COOPMAT=1`                            | 13 of 13 (routed-expert one not run) | not run (no tier to mask)                     |
-| `INFR_TUNE=gemm.kq_fma=true`                   | 13 pass; the routed-expert one fails | 13 pass; gemma-3 fails                        |
-| `INFR_TUNE=gemm.kq_fma=true INFR_NO_COOPMAT=1` | 12 of 13: gemma-3's Int8 rows        | 12 of 13: gemma-3                             |
+| Run                                            | RX 7900 XTX                                               | Ryzen iGPU                                    |
+| ---------------------------------------------- | --------------------------------------------------------- | --------------------------------------------- |
+| defaults                                       | 13 pass; the routed-expert one fails                      | 13 pass; gemma-3 fails its float greedy check |
+| `INFR_NO_COOPMAT=1`                            | 13 of 13 (routed-expert one not run)                      | not run (no tier to mask)                     |
+| `INFR_TUNE=gemm.kq_fma=true`                   | 13 pass; the routed-expert one fails                      | 13 pass; gemma-3 fails                        |
+| `INFR_TUNE=gemm.kq_fma=true INFR_NO_COOPMAT=1` | 12 of 13 (routed-expert one not run): gemma-3's Int8 rows | 12 of 13 (routed-expert one not run): gemma-3 |
 
 With the parameter on and no cooperative-matrix tier, gemma-3's Int8 rows fail
 on both devices as on RADV (worst prefill KL 1.30 at position 13 of prompt 1 on

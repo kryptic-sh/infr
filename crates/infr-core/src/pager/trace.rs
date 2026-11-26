@@ -524,11 +524,11 @@ pub fn parse(mut input: impl BufRead) -> Result<Parsed, ParseError> {
         if let Some(rest) = line.strip_prefix("pool ") {
             let mut f = rest.splitn(5, ' ');
             let mut next = |what: &str| f.next().ok_or_else(|| err(format!("header: no {what}")));
-            let pool = num(next("pool")?).map_err(&err)?;
+            let pool = num(next("pool")?).map_err(err)?;
             let tier = next("tier")?;
             let tier = Tier::parse(tier).ok_or_else(|| err(format!("unknown tier `{tier}`")))?;
-            let n_slots = num(next("n_slots")?).map_err(&err)?;
-            let n_blocks = num(next("n_blocks")?).map_err(&err)?;
+            let n_slots = num(next("n_slots")?).map_err(err)?;
+            let n_blocks = num(next("n_blocks")?).map_err(err)?;
             let label = next("label").unwrap_or_default().to_string();
             if pools.iter().any(|(p, _)| p.pool == pool) {
                 return Err(err(format!("pool {pool} declared twice")));
@@ -545,7 +545,7 @@ pub fn parse(mut input: impl BufRead) -> Result<Parsed, ParseError> {
             pools.push((trace, Recorded::Unknown));
             continue;
         }
-        let (pool, call, outcome) = parse_event(line).map_err(&err)?;
+        let (pool, call, outcome) = parse_event(line).map_err(err)?;
         let (p, recorded) = pools
             .iter_mut()
             .find(|(p, _)| p.pool == pool)

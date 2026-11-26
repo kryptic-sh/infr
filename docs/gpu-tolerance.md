@@ -944,7 +944,10 @@ Every test ends as a pass, a fail or a printed `skip:` line, never a hang:
 
 - it skips without its model (and fails instead under
   `INFR_TEST_REQUIRE_MODELS`) or without a Vulkan device, and on an integrated
-  GPU when free host memory is under twice the model plus a 12 GB margin;
+  GPU when free host memory is under `UNIFIED_RESIDENT_FACTOR` times the model
+  plus a margin, the smaller of `UNIFIED_HOST_MARGIN` and the host's total
+  memory over `UNIFIED_HOST_FRACTION`
+  (`crates/infr-llama/tests/support/hostroom.rs`);
 - a watchdog (`GATE_TIMEOUT`, 20 minutes: about 4.5 times the slowest test
   measured, LFM3's 266 s on the integrated GPU) fails a case that runs too long,
   saying it is a hang. The bound is per `gate()` call, and some tests call it

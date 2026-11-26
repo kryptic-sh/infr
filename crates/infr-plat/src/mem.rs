@@ -99,6 +99,33 @@ pub fn available() -> Option<Available> {
     }
 }
 
+/// The host's physical memory in total, or `None` where this platform has no probe.
+///
+/// Unlike [`available`], this is the size of the machine, not what this process may take of it:
+/// no platform clamps it by a cgroup or Job Object limit. It is for a caller sizing what it owes
+/// the REST of the machine, which grows with the machine and not with this process's share of it.
+///
+/// **Linux** reads `MemTotal` from `/proc/meminfo`, **Windows** `ullTotalPhys` from
+/// `GlobalMemoryStatusEx`, and **macOS** the `hw.memsize` sysctl. The BSDs answer `None`.
+pub fn total() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        parse_mem_total(&std::fs::read_to_string("/proc/meminfo").ok()?)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos_memsize()
+    }
+    #[cfg(windows)]
+    {
+        Some(windows_memory_status()?.ullTotalPhys)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
+        None
+    }
+}
+
 /// Pick between a host figure and a container's headroom, and say which was taken.
 ///
 /// Shared by the Linux cgroup clamp and the Windows Job Object clamp: both are the same policy —
@@ -205,6 +232,25 @@ fn macos_vm_statistics64() -> Option<libc::vm_statistics64> {
     }
     // SAFETY: `kr == KERN_SUCCESS` means the kernel filled in every field of `stats`.
     Some(unsafe { stats.assume_init() })
+}
+
+/// The `hw.memsize` sysctl: the host's physical memory in bytes, or `None` if the call fails.
+#[cfg(target_os = "macos")]
+fn macos_memsize() -> Option<u64> {
+    let mut bytes: u64 = 0;
+    let mut len = std::mem::size_of::<u64>();
+    // SAFETY: the name is a NUL-terminated literal, and `hw.memsize` is a 64-bit integer, so the
+    // kernel writes at most `len` bytes into `bytes`; no new value is passed (null, 0).
+    let rc = unsafe {
+        libc::sysctlbyname(
+            c"hw.memsize".as_ptr(),
+            (&mut bytes as *mut u64).cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (rc == 0 && len == std::mem::size_of::<u64>()).then_some(bytes)
 }
 
 /// The host's page size in bytes.
@@ -349,10 +395,22 @@ fn read_u64(path: &std::path::Path) -> Option<u64> {
 /// cannot produce a file with the field missing, which is the case worth checking.
 #[cfg(any(target_os = "linux", test))]
 fn parse_mem_available(text: &str) -> Option<u64> {
-    let line = text.lines().find(|l| l.starts_with("MemAvailable:"))?;
+    parse_meminfo_bytes(text, "MemAvailable:")
+}
+
+/// Pull `MemTotal` out of `/proc/meminfo`'s text, as [`parse_mem_available`] does `MemAvailable`.
+#[cfg(any(target_os = "linux", test))]
+fn parse_mem_total(text: &str) -> Option<u64> {
+    parse_meminfo_bytes(text, "MemTotal:")
+}
+
+/// One `/proc/meminfo` field, named with its colon, converted from the kB it is reported in.
+#[cfg(any(target_os = "linux", test))]
+fn parse_meminfo_bytes(text: &str, field: &str) -> Option<u64> {
+    let line = text.lines().find(|l| l.starts_with(field))?;
     // `MemAvailable:   12345678 kB`
     let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
-    Some(kb * 1024)
+    kb.checked_mul(1024)
 }
 
 #[cfg(test)]
@@ -364,6 +422,18 @@ mod tests {
         let text = "MemTotal:       65780000 kB\nMemFree:         2000000 kB\n\
                     MemAvailable:   43000000 kB\nBuffers:          100000 kB\n";
         assert_eq!(parse_mem_available(text), Some(43_000_000 * 1024));
+    }
+
+    /// `MemTotal` comes from its own line, not the first `kB` figure in the file, and its absence
+    /// is unknown rather than zero.
+    #[test]
+    fn parses_mem_total_in_kb() {
+        let text = "MemFree:         1000000 kB\nMemTotal:       16000000 kB\n\
+                    MemAvailable:   43000000 kB\n";
+        assert_eq!(parse_mem_total(text), Some(16_000_000 * 1024));
+        assert_eq!(parse_mem_total("MemFree:  1000 kB\n"), None);
+        // A figure whose byte count overflows is unknown too, not a wrapped or panicking value.
+        assert_eq!(parse_mem_total("MemTotal: 18446744073709551615 kB\n"), None);
     }
 
     /// A kernel too old to report `MemAvailable` must produce `None`, not a figure derived from
@@ -416,14 +486,8 @@ mod tests {
         let avail = available()
             .map(|a| a.bytes)
             .expect("linux always has /proc/meminfo");
-        let text = std::fs::read_to_string("/proc/meminfo").expect("meminfo");
-        let total: u64 = text
-            .lines()
-            .find(|l| l.starts_with("MemTotal:"))
-            .and_then(|l| l.split_whitespace().nth(1))
-            .and_then(|v| v.parse::<u64>().ok())
-            .expect("MemTotal")
-            * 1024;
+        let total = total().expect("linux always has MemTotal");
+        eprintln!("available {avail} B of total {total} B");
         assert!(avail > 0, "available must be non-zero");
         assert!(avail <= total, "available {avail} exceeds total {total}");
     }
@@ -439,6 +503,7 @@ mod tests {
             status.ullTotalPhys > 0,
             "total physical memory must be non-zero"
         );
+        assert_eq!(total(), Some(status.ullTotalPhys));
         assert!(
             avail <= status.ullTotalPhys,
             "available {avail} exceeds total {}",
@@ -509,6 +574,7 @@ mod tests {
     #[test]
     fn a_platform_without_a_probe_answers_none() {
         assert_eq!(available(), None);
+        assert_eq!(total(), None);
     }
 
     /// The probe must agree with itself on the machine running the tests: a plausible, non-zero
@@ -519,6 +585,12 @@ mod tests {
         let got = available().expect("macos host_statistics64 should answer");
         assert_eq!(got.source, Source::MacosVmStatistics64);
         assert!(got.bytes > 0, "available must be non-zero");
+        let total = total().expect("macos hw.memsize should answer");
+        assert!(
+            got.bytes <= total,
+            "available {} exceeds total {total}",
+            got.bytes
+        );
     }
 
     /// Every branch of the shared clamp, from literals, exercised through the Job Object wrapper —

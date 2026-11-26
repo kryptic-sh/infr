@@ -40,9 +40,9 @@ const HEADROOM_MIN: u64 = 1 << 30;
 /// Windows box, with 43.97 GB available, it sized a 38.47 GB arena for DeepSeek V4-Flash, and
 /// available memory fell from 42109 MB to 10957 MB within a minute, where a watchdog stopped the
 /// run. A fixed margin would not scale instead: the test guard's
-/// `UNIFIED_HOST_MARGIN` (`infr-llama/tests/cpu_backend.rs`) is what a shared development box owes
-/// its other sessions, and as a floor it would turn the tier off on any host with less than that
-/// available. On that box half is the larger of the two.
+/// `UNIFIED_HOST_MARGIN` cap (`infr-llama/tests/support/hostroom.rs`) is what a shared development
+/// box owes its other sessions, and as a floor it would turn the tier off on any host with less
+/// than that available. On that box half is the larger of the two.
 const HEADROOM_FRACTION: u64 = 2;
 
 /// Below this an arena is not worth building: the tier costs a copy per streamed block, and a

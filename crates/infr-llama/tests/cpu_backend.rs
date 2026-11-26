@@ -11,6 +11,8 @@
 //!   INFR_TEMP=0 cargo test --release -p infr-llama --test cpu_backend -- \
 //!     --include-ignored --nocapture
 
+#[path = "support/hostroom.rs"]
+mod hostroom;
 #[path = "support/row_identity.rs"]
 mod row_identity;
 
@@ -45,53 +47,6 @@ macro_rules! need_model {
     };
 }
 
-/// Host memory a model resident on a unified-memory device must still leave free. The gate runs
-/// on a box other sessions share, and a gate run on the integrated GPU that took the host down to
-/// its last few GB was killed for low memory and took other sessions' runs with it, so the floor
-/// is the headroom those sessions are owed, not what this run needs to finish.
-const UNIFIED_HOST_MARGIN: u64 = 12 << 30;
-
-/// Host bytes a resident load takes on a unified-memory device per byte of GGUF: the device copy,
-/// which is system RAM there, plus the mapped file pages the upload read through, which stay in the
-/// process's working set while the model is up. Measured on Windows on 2026-11-15 with the
-/// integrated GPU, each test run alone: Qwen3-30B-A3B Q4_K_M's 18.56 GB file took available memory
-/// from 38058 MiB to 3596 MiB (1.95 bytes per file byte), and ERNIE-4.5-21B-A3B Q4_K_M's 13.33 GB
-/// file from 35444 MiB to 11135 MiB (1.91), rounded up here.
-const UNIFIED_RESIDENT_FACTOR: u64 = 2;
-
-/// Whether a test may load a `model_bytes` model, given whether the device's memory is the host's
-/// (`unified`) and the host memory `available` now. `Err` carries why not.
-///
-/// A discrete device always runs: its VRAM is its own pool and the host only maps the file. A
-/// unified device runs when the load, priced at [`UNIFIED_RESIDENT_FACTOR`] per file byte, leaves
-/// [`UNIFIED_HOST_MARGIN`] free, and skips when it would not — or when the platform cannot say how
-/// much is free, since that is no evidence it fits.
-fn resident_verdict(unified: bool, available: Option<u64>, model_bytes: u64) -> Result<(), String> {
-    if !unified {
-        return Ok(());
-    }
-    let gb = |b: u64| b as f64 / 1e9;
-    let need = model_bytes
-        .saturating_mul(UNIFIED_RESIDENT_FACTOR)
-        .saturating_add(UNIFIED_HOST_MARGIN);
-    match available {
-        None => Err(format!(
-            "({:.1} GB) on a unified-memory device: no host-memory probe on this platform, so \
-             nothing shows it fits",
-            gb(model_bytes)
-        )),
-        Some(avail) if avail < need => Err(format!(
-            "({:.1} GB) on a unified-memory device needs {:.1} GB of host memory \
-             ({UNIFIED_RESIDENT_FACTOR} x the model + a {:.1} GB margin); {:.1} GB available",
-            gb(model_bytes),
-            gb(need),
-            gb(UNIFIED_HOST_MARGIN),
-            gb(avail)
-        )),
-        Some(_) => Ok(()),
-    }
-}
-
 /// The model at `path`'s size on disk, summed over every shard of a split GGUF (opening any one
 /// shard opens the whole set).
 fn model_file_bytes(path: &std::path::Path) -> u64 {
@@ -103,16 +58,12 @@ fn model_file_bytes(path: &std::path::Path) -> u64 {
         .sum()
 }
 
-/// [`resident_verdict`] for a `model_bytes` model on `dev`, with the reason naming the device. The
-/// unified flag is the device listing's `integrated`, the same device-type test the Vulkan backend
-/// sets `Capabilities::unified_memory` from, so nothing is allocated before the decision.
+/// [`hostroom::host_room`] for a `model_bytes` model on `dev`, with the reason naming the device.
+/// The unified flag is the device listing's `integrated`, the same device-type test the Vulkan
+/// backend sets `Capabilities::unified_memory` from, so nothing is allocated before the decision.
 fn device_room(dev: &infr_vulkan::DeviceInfo, model_bytes: u64) -> Result<(), String> {
-    resident_verdict(
-        dev.integrated,
-        infr_core::hostmem::available_bytes(),
-        model_bytes,
-    )
-    .map_err(|why| format!("{why}, on Vulkan{} ({})", dev.index, dev.name))
+    hostroom::host_room(dev.integrated, model_bytes)
+        .map_err(|why| format!("{why}, on Vulkan{} ({})", dev.index, dev.name))
 }
 
 /// [`device_room`] for the model at `path` on the device these tests load on (`INFR_DEV`, else the
@@ -210,25 +161,52 @@ fn kv_types(cfg: &mut infr_llama::EngineConfig, k: &str, v: &str) {
 }
 
 /// The residency rule decides without a GPU: discrete always runs, unified runs only with room for
-/// the load and the margin, and an unknown amount of free memory never counts as room.
+/// the load and the margin, the margin is the smaller of its cap and the host's share, and an
+/// unknown amount of free memory never counts as room.
 #[test]
 fn resident_verdict_skips_only_what_starves_a_unified_host() {
+    use hostroom::{
+        resident_verdict, unified_host_margin, UNIFIED_HOST_FRACTION, UNIFIED_HOST_MARGIN,
+        UNIFIED_RESIDENT_FACTOR,
+    };
+    const GIB: u64 = 1 << 30;
+
+    // The margin: capped on a big host, the host's share on a small one, the cap when unknown.
+    let big = Some(256 * GIB);
+    let small = Some(15 * GIB);
+    assert_eq!(unified_host_margin(big), UNIFIED_HOST_MARGIN);
+    assert_eq!(unified_host_margin(small), 15 * GIB / UNIFIED_HOST_FRACTION);
+    assert!(unified_host_margin(small) < UNIFIED_HOST_MARGIN);
+    assert_eq!(unified_host_margin(None), UNIFIED_HOST_MARGIN);
+
     let model: u64 = 16 << 30;
     let need = model * UNIFIED_RESIDENT_FACTOR + UNIFIED_HOST_MARGIN;
 
     // A discrete device runs whatever the host has, even nothing or an unknown amount.
-    assert!(resident_verdict(false, Some(0), model).is_ok());
-    assert!(resident_verdict(false, None, model).is_ok());
-    // A unified device runs exactly at the boundary and skips a byte short of it.
-    assert!(resident_verdict(true, Some(need), model).is_ok());
-    let why = resident_verdict(true, Some(need - 1), model).expect_err("a byte short must skip");
+    assert!(resident_verdict(false, Some(0), big, model).is_ok());
+    assert!(resident_verdict(false, None, None, model).is_ok());
+    // A unified device on a big host runs exactly at the boundary and skips a byte short of it.
+    assert!(resident_verdict(true, Some(need), big, model).is_ok());
+    let why =
+        resident_verdict(true, Some(need - 1), big, model).expect_err("a byte short must skip");
     assert!(why.contains("available"), "reason names the memory: {why}");
+    assert!(why.contains("margin"), "reason names the margin: {why}");
+    // An unknown total holds the load to the full margin, at the same boundary.
+    assert!(resident_verdict(true, Some(need), None, model).is_ok());
+    assert!(resident_verdict(true, Some(need - 1), None, model).is_err());
     // Room for the model alone, without the margin, is not room.
-    assert!(resident_verdict(true, Some(model * UNIFIED_RESIDENT_FACTOR), model).is_err());
+    assert!(resident_verdict(true, Some(model * UNIFIED_RESIDENT_FACTOR), big, model).is_err());
     // A model a quarter the size runs on what was a byte short for the larger one.
-    assert!(resident_verdict(true, Some(need - 1), model / 4).is_ok());
+    assert!(resident_verdict(true, Some(need - 1), big, model / 4).is_ok());
+    // On a small host the margin is its share: a small model runs with less free than the cap,
+    // exactly at its boundary, and skips a byte short of it.
+    let tiny: u64 = 1 << 30;
+    let small_need = tiny * UNIFIED_RESIDENT_FACTOR + unified_host_margin(small);
+    assert!(small_need < UNIFIED_HOST_MARGIN);
+    assert!(resident_verdict(true, Some(small_need), small, tiny).is_ok());
+    assert!(resident_verdict(true, Some(small_need - 1), small, tiny).is_err());
     // No probe on a unified device is a skip, not a pass.
-    assert!(resident_verdict(true, None, model / 4).is_err());
+    assert!(resident_verdict(true, None, big, model / 4).is_err());
 }
 
 // ─── CPU-only correctness (no GPU) ───────────────────────────────────────────────

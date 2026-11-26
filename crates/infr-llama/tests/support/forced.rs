@@ -13,6 +13,9 @@ pub use infr_llama::tolerance::gate::{
 use infr_llama::tolerance::oracle::{Mode, RefCache};
 use infr_llama::tolerance::{PathClass, RunScore};
 
+/// The residency rule that keeps a model off an integrated device without the host memory for it.
+#[path = "hostroom.rs"]
+mod hostroom;
 /// The routed-expert (MoE) half: the synthetic model, the routing comparison, its self-check.
 #[path = "routed.rs"]
 mod routed;
@@ -716,13 +719,6 @@ pub fn gpu_config_edit(name: &str) -> fn(&mut EngineConfig) {
         .edit
 }
 
-/// Host bytes a model resident on a unified-memory device takes per byte of its file, and the
-/// headroom left for everything else on the machine: `cpu_backend`'s `UNIFIED_RESIDENT_FACTOR` and
-/// `UNIFIED_HOST_MARGIN`, the measured figures for a resident load. A run that cannot have both
-/// is skipped rather than left to starve the host.
-const UNIFIED_RESIDENT_FACTOR: u64 = 2;
-const UNIFIED_HOST_MARGIN: u64 = 12 << 30;
-
 /// The device the tests load on, if a Vulkan backend opens: `(integrated, name)`.
 fn test_device() -> Option<(bool, String)> {
     infr_testkit::gpu_or_skip(infr_vulkan::VulkanBackend::new_with(std::sync::Arc::new(
@@ -760,21 +756,9 @@ pub fn device_for(key: &str, bytes: u64) -> Option<String> {
         eprintln!("skip: no Vulkan device");
         return None;
     };
-    if integrated {
-        let need = bytes * UNIFIED_RESIDENT_FACTOR + UNIFIED_HOST_MARGIN;
-        match infr_core::hostmem::available_bytes() {
-            Some(avail) if avail >= need => {}
-            avail => {
-                eprintln!(
-                    "skip: {key} on {device}, a unified-memory device, needs {:.1} GB of free host \
-                     memory ({UNIFIED_RESIDENT_FACTOR} x the model + a {:.1} GB margin); {} free",
-                    need as f64 / 1e9,
-                    UNIFIED_HOST_MARGIN as f64 / 1e9,
-                    avail.map_or("unknown".to_string(), |a| format!("{:.1} GB", a as f64 / 1e9)),
-                );
-                return None;
-            }
-        }
+    if let Err(why) = hostroom::host_room(integrated, bytes) {
+        eprintln!("skip: {key} {why}, on {device}");
+        return None;
     }
     Some(device)
 }

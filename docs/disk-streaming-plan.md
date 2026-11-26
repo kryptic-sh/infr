@@ -582,8 +582,8 @@ testable without a machine that happens to have the right amount of RAM free.
   trained context capped at 8192, priced f16), the weights too small to page, a
   1 GiB activation reserve, and the repack cache budget where the fused Q4_K
   expert path can fill it (`seam::cpu_repack_reserve`). Half, not a fixed
-  margin, so it scales: the shared-box test guard's 12 GiB `UNIFIED_HOST_MARGIN`
-  as a floor would turn the tier off on any host with less available, while an
+  margin, so it scales: the shared-box test guard's `UNIFIED_HOST_MARGIN` cap as
+  a floor would turn the tier off on any host with less available, while an
   eighth (the rule until 2026-11-16) gave DeepSeek V4-Flash a 38.47 GB arena on
   a host with 43.97 GB available and starved it. Verified on that file with no
   `INFR_DRAM_CACHE`: 45.48 GB available gave a 21.56 GB arena beside 1.19 GB

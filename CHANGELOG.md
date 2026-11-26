@@ -115,6 +115,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`infr_plat::mem::total`**, the host's physical memory (`MemTotal` on Linux,
+  `ullTotalPhys` on Windows, `hw.memsize` on macOS, `None` elsewhere). The GPU
+  model tests on an integrated GPU use it to size the host memory they leave
+  free: the smaller of the fixed margin and a quarter of total memory, so a 16
+  GB laptop runs them on small models instead of skipping every one.
 - **The GPU tolerance gate caches its CPU reference on disk**
   (`infr_llama::tolerance::oracle`, `docs/gpu-tolerance.md` "The reference
   cache"). The `gpu_seam_tolerance_*` cases read it through the new

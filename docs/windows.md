@@ -123,12 +123,13 @@ On an integrated GPU the device's memory is the host's, and a model held
 resident there costs more host RAM than its file size: the device copy plus the
 mapped file pages the upload read, priced at `UNIFIED_RESIDENT_FACTOR` per file
 byte. The `cpu_backend` tests that hold a multi-GB model resident check this
-first (`resident_room`): where the load would leave less than
-`UNIFIED_HOST_MARGIN` of host memory available, they print a `skip:` line naming
-the device, the model size and the memory found, and do not run.
-`gpu_seam_paged_moe_matches_resident_and_cpu` skips only its resident leg and
-still holds the paged run to the CPU reference. On a discrete GPU every one of
-them runs.
+first (`resident_room`): where the load would leave less than a margin of host
+memory available, the smaller of `UNIFIED_HOST_MARGIN` and the host's total
+memory over `UNIFIED_HOST_FRACTION` (`tests/support/hostroom.rs`), they print a
+`skip:` line naming the device, the model size and the memory found, and do not
+run. `gpu_seam_paged_moe_matches_resident_and_cpu` skips only its resident leg
+and still holds the paged run to the CPU reference. On a discrete GPU every one
+of them runs.
 
 On a discrete GPU the mapped pages a resident upload read are released from the
 working set after each weight's upload (`paging.release_uploaded`), so they sit

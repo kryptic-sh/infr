@@ -153,11 +153,39 @@ pub trait ChatGenerator: Send + Sync {
         Ok(None)
     }
 
+    /// [`complete`](Self::complete) with per-token log probabilities. Default: refuse a request that
+    /// asked for them rather than return text without the promised data; backends that support the
+    /// dense seam override it. `on_text` still receives the generated text.
+    fn complete_with_logprobs(
+        &self,
+        prompt: &str,
+        params: &GenParams,
+        cancel: &Arc<AtomicBool>,
+        on_text: &mut dyn FnMut(&str),
+        _on_logprob: &mut dyn FnMut(infr_engine::TokenLogprob),
+    ) -> anyhow::Result<ChatOutcome> {
+        if params.logprobs {
+            return Err(ParamError {
+                param: "logprobs",
+                message: "logprobs: returning log probabilities is not supported by this backend"
+                    .into(),
+            }
+            .into());
+        }
+        self.complete(prompt, params, cancel, on_text)
+    }
+
     /// Where this generator runs and how much room it has, read fresh on each call, for
     /// `GET /status` and the device gauges in `/metrics`. Report `None` for what the backend
     /// cannot see rather than a placeholder. It must not wait on a generation: both routes call it
     /// while requests are running.
     fn status(&self) -> GeneratorStatus;
+
+    /// Does this backend produce log probabilities? Checked before the response headers so a
+    /// request for them is a `400` naming the field, not a reply shaped as if it had them.
+    fn supports_logprobs(&self) -> bool {
+        false
+    }
 
     /// How many token ids this generator's model has — the length of the logits row a
     /// `logit_bias` is applied to — so a request's `logit_bias` may name only ids below it. The
@@ -354,7 +382,7 @@ impl std::error::Error for ContextLengthExceeded {}
 /// Unknown fields are IGNORED (no `deny_unknown_fields`) — an OpenAI client sending `user`,
 /// `logprobs: false`, … must not 400. Known-but-invalid VALUES do 400, via
 /// [`GenParams::from_request`], and so do the known fields asking for a feature the server does
-/// not have (`n > 1`, `logprobs`), rather than being answered as if they had been honoured.
+/// not have (`n > 1`), rather than being answered as if they had been honoured.
 #[derive(Debug, Deserialize)]
 pub struct ChatRequest {
     pub model: String,
@@ -405,10 +433,11 @@ pub struct ChatRequest {
     /// reason as `logit_bias`; see [`GenParams::from_request`].
     #[serde(default)]
     pub n: Option<serde_json::Value>,
-    /// OpenAI `logprobs`. Not supported: `true` is a `400`.
+    /// OpenAI `logprobs`: include each generated token's log probability.
     #[serde(default)]
     pub logprobs: Option<bool>,
-    /// OpenAI `top_logprobs`. Not supported: anything above zero is a `400`. A raw value, as `n`.
+    /// OpenAI `top_logprobs`: how many most likely alternatives to include per token, 0..=20.
+    /// Absent with `logprobs: true` means 20, as in llama.cpp. A raw value, as `n`.
     #[serde(default)]
     pub top_logprobs: Option<serde_json::Value>,
     /// OpenAI `stream_options`; only `include_usage` is read.
@@ -623,6 +652,12 @@ pub struct GenParams {
     /// `(token id, bias)` pairs in ascending id order. Ids are checked against the model's
     /// vocabulary by [`check_vocab`](Self::check_vocab), which needs the routed generator.
     pub logit_bias: Vec<(u32, f32)>,
+    /// OpenAI `logprobs`: include each generated token's log probability in the reply.
+    pub logprobs: bool,
+    /// How many most likely alternatives to include per token. `0` with `logprobs` on reports
+    /// only the chosen token. Defaults to 20, OpenAI's upper bound, when `top_logprobs` is
+    /// absent, matching llama.cpp.
+    pub top_logprobs: usize,
     /// Already normalised: empty strings dropped (an empty stop would fire on the first token).
     pub stop: Vec<String>,
     /// `None` for free text. Not sampling, but the same "what this request asked for" the rest of
@@ -660,12 +695,15 @@ impl ParamError {
     }
 }
 
+/// OpenAI's upper bound for `top_logprobs`.
+const MAX_TOP_LOGPROBS: usize = 20;
+
 impl GenParams {
     /// Validate + normalise the request's sampling fields. Out-of-range values are a 400, NEVER a
     /// silent clamp and never a panic (OpenAI's own ranges: temperature 0..2, top_p 0..1,
     /// presence/frequency -2..2, logit_bias -100..100, at most 4 stop sequences; min_p 0..1).
-    /// `n > 1`, `logprobs: true` and `top_logprobs > 0` are a 400 too: the server returns one
-    /// choice and no log probabilities, and a reply shaped as if it had would be wrong.
+    /// `n > 1` is a 400 too: the server returns one choice, and a reply shaped as if it had more
+    /// would be wrong.
     pub fn from_request(req: &ChatRequest) -> Result<Self, ParamError> {
         let unsupported = |param: &'static str, what: &str| ParamError {
             param,
@@ -681,18 +719,31 @@ impl GenParams {
             }
             Some(n) => return Err(unsupported("n", &format!("returning {n} choices"))),
         }
-        if req.logprobs == Some(true) {
-            return Err(unsupported("logprobs", "returning log probabilities"));
-        }
-        match whole_number("top_logprobs", req.top_logprobs.as_ref())? {
-            None | Some(0) => {}
+        let logprobs = req.logprobs.unwrap_or(false);
+        // llama.cpp's default when `logprobs` is true and `top_logprobs` is absent; an explicit 0
+        // asks for the chosen token's probability and no alternatives.
+        let top_logprobs = match whole_number("top_logprobs", req.top_logprobs.as_ref())? {
+            None if logprobs => MAX_TOP_LOGPROBS,
+            None | Some(0) => 0,
             Some(k) if k < 0 => {
                 return Err(ParamError {
                     param: "top_logprobs",
                     message: format!("top_logprobs must be >= 0, got {k}"),
                 })
             }
-            Some(_) => return Err(unsupported("top_logprobs", "returning log probabilities")),
+            Some(k) if k > MAX_TOP_LOGPROBS as i64 => {
+                return Err(ParamError {
+                    param: "top_logprobs",
+                    message: format!("top_logprobs must be at most {MAX_TOP_LOGPROBS}, got {k}"),
+                })
+            }
+            Some(k) => k as usize,
+        };
+        if top_logprobs > 0 && !logprobs {
+            return Err(ParamError {
+                param: "top_logprobs",
+                message: "top_logprobs requires logprobs to be set to true".into(),
+            });
         }
 
         let rng = |param: &'static str,
@@ -778,6 +829,8 @@ impl GenParams {
             repeat_penalty: req.repeat_penalty,
             min_p: rng("min_p", req.min_p, 0.0, 1.0)?,
             logit_bias,
+            logprobs,
+            top_logprobs,
             stop,
             response_format: ResponseFormat::from_request(req.response_format.as_ref())?,
         })
@@ -1157,7 +1210,62 @@ pub struct ChatCompletionResponse {
 pub struct CompletionChoice {
     pub index: u32,
     pub message: AssistantMessage,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<ChatLogprobs>,
     pub finish_reason: String,
+}
+
+/// OpenAI's `choice.logprobs` / `choice.delta.logprobs`.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatLogprobs {
+    pub content: Vec<ChatTokenLogprob>,
+}
+
+/// One token's entry in [`ChatLogprobs::content`]. `id` is a llama.cpp-style extension; OpenAI
+/// clients ignore unknown fields.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatTokenLogprob {
+    pub id: u32,
+    pub token: String,
+    pub bytes: Vec<u8>,
+    pub logprob: f32,
+    pub top_logprobs: Vec<ChatTokenLogprobAlt>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatTokenLogprobAlt {
+    pub id: u32,
+    pub token: String,
+    pub bytes: Vec<u8>,
+    pub logprob: f32,
+}
+
+impl ChatLogprobs {
+    /// The wire shape for a run of generated tokens. Text and bytes come from the backend that
+    /// filled the [`TokenLogprob`](infr_engine::TokenLogprob) entries in.
+    pub fn from_tokens(tokens: &[infr_engine::TokenLogprob]) -> Self {
+        Self {
+            content: tokens
+                .iter()
+                .map(|t| ChatTokenLogprob {
+                    id: t.token,
+                    token: t.text.clone(),
+                    bytes: t.bytes.clone(),
+                    logprob: t.logprob,
+                    top_logprobs: t
+                        .top
+                        .iter()
+                        .map(|a| ChatTokenLogprobAlt {
+                            id: a.token,
+                            token: a.text.clone(),
+                            bytes: a.bytes.clone(),
+                            logprob: a.logprob,
+                        })
+                        .collect(),
+                })
+                .collect(),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -1236,6 +1344,8 @@ pub struct ChatCompletionChunk {
 pub struct ChunkChoice {
     pub index: u32,
     pub delta: DeltaPayload,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<ChatLogprobs>,
     pub finish_reason: Option<String>,
 }
 
@@ -2064,6 +2174,16 @@ async fn chat_completions_handler(
     // The response `model` field echoes the entry ACTUALLY served, not the raw request string, so a
     // client that omitted/mis-named the model sees which one answered.
     let entry = state.route(&req.model);
+    if params.logprobs {
+        if let Some(engine) = &entry.engine {
+            if !engine.supports_logprobs() {
+                return param_error(
+                    Some("logprobs"),
+                    "logprobs: returning log probabilities is not supported by this backend".into(),
+                );
+            }
+        }
+    }
     // `logit_bias` ids depend on the model, so they are checked only once it is known, and only
     // when there are any. No engine (a headless state) answers 500 further on, whatever the ids.
     if let (false, Some(engine)) = (params.logit_bias.is_empty(), &entry.engine) {
@@ -2470,11 +2590,13 @@ async fn non_streaming(
 ) -> Response {
     let cid_blk = ctx.cid.clone();
     let stats_blk = ctx.stats.clone();
+    let want_logprobs = params.logprobs;
 
     let ran = run_unary(&entry, &ctx, CHAT_INPUT, move |engine, cancel| {
         let mut reasoning = String::new();
         let mut content = String::new();
         let mut tool_calls: Vec<OAIToolCall> = Vec::new();
+        let mut logprobs: Vec<infr_engine::TokenLogprob> = Vec::new();
         // Per-request tally: plain locals, folded into the shared counters once at the end.
         let mut tally = ReqTally::new();
 
@@ -2504,13 +2626,14 @@ async fn non_streaming(
                         function: OAIFunction { name, arguments },
                     });
                 }
+                Delta::Logprob(t) => logprobs.push(t),
             },
         )?;
 
-        Ok((reasoning, content, tool_calls, outcome, tally))
+        Ok((reasoning, content, tool_calls, logprobs, outcome, tally))
     })
     .await;
-    let ((reasoning, content, tool_calls, outcome, tally), deadline_hit) = match ran {
+    let ((reasoning, content, tool_calls, logprobs, outcome, tally), deadline_hit) = match ran {
         Ok(ran) => ran,
         Err(resp) => return *resp,
     };
@@ -2571,6 +2694,7 @@ async fn non_streaming(
                     Some(tool_calls)
                 },
             },
+            logprobs: want_logprobs.then(|| ChatLogprobs::from_tokens(&logprobs)),
             finish_reason: finish.as_str().into(),
         }],
         usage: UsageInfo::from_outcome(&outcome),
@@ -2614,6 +2738,7 @@ async fn streaming(
                 ..Default::default()
             },
             None,
+            None,
         ));
 
         let Some(engine) = job.engine.clone() else {
@@ -2625,6 +2750,9 @@ async fn streaming(
 
         let mut tc_index = 0usize;
         let mut saw_tool_call = false;
+        // Log probabilities wait here for the text delta they belong to. The decode layer emits
+        // each token's entry just before the piece's text, so a chunk carries both together.
+        let mut pending_logprobs: Vec<infr_engine::TokenLogprob> = Vec::new();
         // Per-request tally: plain locals inside the generation, folded in once below.
         let mut tally = ReqTally::new();
 
@@ -2638,6 +2766,10 @@ async fn streaming(
             &job.cancel,
             &mut |delta| {
                 let payload = match delta {
+                    Delta::Logprob(t) => {
+                        pending_logprobs.push(t);
+                        return;
+                    }
                     Delta::Reasoning(t) => {
                         tally.on_text_delta(&stats);
                         DeltaPayload {
@@ -2667,7 +2799,14 @@ async fn streaming(
                         }
                     }
                 };
-                job.send(sse_chunk(&cid, &model_id, created, payload, None));
+                let logprobs = if pending_logprobs.is_empty() {
+                    None
+                } else {
+                    Some(ChatLogprobs::from_tokens(&std::mem::take(
+                        &mut pending_logprobs,
+                    )))
+                };
+                job.send(sse_chunk(&cid, &model_id, created, payload, logprobs, None));
             },
         );
 
@@ -2680,12 +2819,19 @@ async fn streaming(
                 } else {
                     job.finish(outcome.finish)
                 };
-                // Finish chunk: empty delta + finish_reason.
+                // Finish chunk: empty delta + finish_reason. Any log probabilities emitted after
+                // the last text piece (a token that decoded to nothing) ride here.
+                let last_logprobs = if pending_logprobs.is_empty() {
+                    None
+                } else {
+                    Some(ChatLogprobs::from_tokens(&pending_logprobs))
+                };
                 job.send(sse_chunk(
                     &cid,
                     &model_id,
                     created,
                     DeltaPayload::default(),
+                    last_logprobs,
                     Some(finish.as_str().into()),
                 ));
                 if include_usage {
@@ -2804,6 +2950,7 @@ fn sse_chunk(
     model: &str,
     created: i64,
     delta: DeltaPayload,
+    logprobs: Option<ChatLogprobs>,
     finish_reason: Option<String>,
 ) -> Event {
     let chunk = ChatCompletionChunk {
@@ -2814,6 +2961,7 @@ fn sse_chunk(
         choices: vec![ChunkChoice {
             index: 0,
             delta,
+            logprobs,
             finish_reason,
         }],
         usage: None,
@@ -3350,6 +3498,53 @@ mod tests {
         }
     }
 
+    /// A generator that reports one token's log probability and then its text.
+    struct LogprobGen;
+    impl ChatGenerator for LogprobGen {
+        fn status(&self) -> GeneratorStatus {
+            cpu_status()
+        }
+
+        fn vocab_size(&self) -> usize {
+            TEST_VOCAB
+        }
+
+        fn supports_logprobs(&self) -> bool {
+            true
+        }
+
+        fn chat(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: Option<&serde_json::Value>,
+            _tool_choice: Option<&str>,
+            params: &GenParams,
+            _cancel: &Arc<AtomicBool>,
+            on_delta: &mut dyn FnMut(Delta),
+        ) -> anyhow::Result<ChatOutcome> {
+            assert!(params.logprobs, "the server only asks when requested");
+            on_delta(Delta::Logprob(infr_engine::TokenLogprob {
+                token: 7,
+                text: "hi".into(),
+                bytes: b"hi".to_vec(),
+                logprob: -0.25,
+                top: vec![infr_engine::TokenLogprobAlt {
+                    token: 9,
+                    text: "ho".into(),
+                    bytes: b"ho".to_vec(),
+                    logprob: -1.5,
+                }],
+            }));
+            on_delta(Delta::Content("hi".into()));
+            Ok(ChatOutcome {
+                finish: Finish::Stop,
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                cached_tokens: 0,
+            })
+        }
+    }
+
     fn multi_router() -> Router {
         let a: Arc<dyn ChatGenerator> = Arc::new(EchoGen("alpha"));
         let b: Arc<dyn ChatGenerator> = Arc::new(EchoGen("beta"));
@@ -3588,6 +3783,7 @@ mod tests {
                     reasoning_content: None,
                     tool_calls: None,
                 },
+                logprobs: None,
                 finish_reason: "stop".into(),
             }],
             usage: UsageInfo {
@@ -3622,6 +3818,7 @@ mod tests {
                     reasoning_content: Some("I thought about it".into()),
                     tool_calls: None,
                 },
+                logprobs: None,
                 finish_reason: "stop".into(),
             }],
             usage: UsageInfo {
@@ -3662,6 +3859,7 @@ mod tests {
                         },
                     }]),
                 },
+                logprobs: None,
                 finish_reason: "tool_calls".into(),
             }],
             usage: UsageInfo {
@@ -3697,6 +3895,7 @@ mod tests {
                     role: Some("assistant".into()),
                     ..Default::default()
                 },
+                logprobs: None,
                 finish_reason: None,
             }],
             usage: None,
@@ -3724,6 +3923,7 @@ mod tests {
                     content: Some("hello".into()),
                     ..Default::default()
                 },
+                logprobs: None,
                 finish_reason: None,
             }],
             usage: None,
@@ -3746,6 +3946,7 @@ mod tests {
                     reasoning_content: Some("thinking...".into()),
                     ..Default::default()
                 },
+                logprobs: None,
                 finish_reason: None,
             }],
             usage: None,
@@ -3776,6 +3977,7 @@ mod tests {
                     }]),
                     ..Default::default()
                 },
+                logprobs: None,
                 finish_reason: None,
             }],
             usage: None,
@@ -3797,6 +3999,7 @@ mod tests {
             choices: vec![ChunkChoice {
                 index: 0,
                 delta: DeltaPayload::default(), // empty delta {}
+                logprobs: None,
                 finish_reason: Some("stop".into()),
             }],
             usage: None,
@@ -3937,6 +4140,29 @@ mod tests {
     }
 
     #[test]
+    fn logprobs_are_accepted_and_bounded() {
+        let p = GenParams::from_request(&req(
+            r#"{"model":"m","messages":[],"logprobs":true,"top_logprobs":5}"#,
+        ))
+        .unwrap();
+        assert!(p.logprobs);
+        assert_eq!(p.top_logprobs, 5);
+
+        // llama.cpp's default: logprobs on with no `top_logprobs` reports 20 alternatives.
+        let p = GenParams::from_request(&req(r#"{"model":"m","messages":[],"logprobs":true}"#))
+            .unwrap();
+        assert!(p.logprobs);
+        assert_eq!(p.top_logprobs, MAX_TOP_LOGPROBS);
+
+        let p = GenParams::from_request(&req(
+            r#"{"model":"m","messages":[],"logprobs":true,"top_logprobs":0}"#,
+        ))
+        .unwrap();
+        assert!(p.logprobs);
+        assert_eq!(p.top_logprobs, 0);
+    }
+
+    #[test]
     fn stop_accepts_a_bare_string() {
         let p =
             GenParams::from_request(&req(r#"{"model":"m","messages":[],"stop":"\n"}"#)).unwrap();
@@ -4009,7 +4235,6 @@ mod tests {
             ),
             (r#"{"model":"m","messages":[],"n":2}"#, "n"),
             (r#"{"model":"m","messages":[],"n":0}"#, "n"),
-            (r#"{"model":"m","messages":[],"logprobs":true}"#, "logprobs"),
             (
                 r#"{"model":"m","messages":[],"top_logprobs":3}"#,
                 "top_logprobs",
@@ -4049,6 +4274,10 @@ mod tests {
             ),
             (
                 r#"{"model":"m","messages":[],"top_logprobs":[]}"#,
+                "top_logprobs",
+            ),
+            (
+                r#"{"model":"m","messages":[],"logprobs":true,"top_logprobs":21}"#,
                 "top_logprobs",
             ),
         ] {
@@ -5576,6 +5805,55 @@ mod tests {
             frames.iter().all(|f| !f.contains("\"usage\"")),
             "usage was not asked for: {frames:?}"
         );
+    }
+
+    /// `logprobs` on a non-streaming chat reply: the chosen token's text, bytes and probability,
+    /// plus the requested alternatives.
+    #[tokio::test]
+    async fn logprobs_are_returned_on_the_non_streaming_choice() {
+        let body = r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                       "logprobs":true,"top_logprobs":1}"#;
+        let v = body_json(post_chat(router_for(Arc::new(LogprobGen)), body).await).await;
+        assert_eq!(v["choices"][0]["message"]["content"], "hi");
+        let lp = &v["choices"][0]["logprobs"]["content"][0];
+        assert_eq!(lp["id"], 7);
+        assert_eq!(lp["token"], "hi");
+        assert_eq!(lp["bytes"], serde_json::json!([104, 105]));
+        assert_eq!(lp["logprob"], -0.25);
+        assert_eq!(lp["top_logprobs"][0]["id"], 9);
+        assert_eq!(lp["top_logprobs"][0]["token"], "ho");
+        assert_eq!(lp["top_logprobs"][0]["logprob"], -1.5);
+    }
+
+    /// A streamed reply carries the token's logprob on the SAME chunk as its text, which is what
+    /// an OpenAI client pairs together.
+    #[tokio::test]
+    async fn logprobs_ride_the_streaming_text_chunk() {
+        let body = r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                       "stream":true,"logprobs":true,"top_logprobs":1}"#;
+        let frames = sse_frames(post_chat(router_for(Arc::new(LogprobGen)), body).await).await;
+        let chunk = frames
+            .iter()
+            .filter(|f| *f != "[DONE]")
+            .map(|f| serde_json::from_str::<serde_json::Value>(f).unwrap())
+            .find(|v| v["choices"][0]["delta"]["content"] == "hi")
+            .expect("a content chunk");
+        let lp = &chunk["choices"][0]["logprobs"]["content"][0];
+        assert_eq!(lp["token"], "hi");
+        assert_eq!(lp["logprob"], -0.25);
+        assert_eq!(lp["top_logprobs"][0]["token"], "ho");
+    }
+
+    /// A backend that cannot report logprobs answers a `400` naming the field instead of a reply
+    /// without them.
+    #[tokio::test]
+    async fn logprobs_on_a_backend_without_them_is_a_400() {
+        let body = r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                       "logprobs":true}"#;
+        let resp = post_chat(router_for(Arc::new(EchoGen("a"))), body).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let v = body_json(resp).await;
+        assert_eq!(v["error"]["param"], "logprobs");
     }
 
     /// A generator whose prompt does not fit the context.

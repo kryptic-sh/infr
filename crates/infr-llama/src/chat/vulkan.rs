@@ -143,6 +143,10 @@ impl ChatModel for DenseSeamChat {
         crate::with_profiling_suppressed(|| self.warmup_session())
     }
 
+    fn supports_logprobs(&self) -> bool {
+        true
+    }
+
     fn generate(
         &mut self,
         prompt: &str,
@@ -150,7 +154,8 @@ impl ChatModel for DenseSeamChat {
         req: Option<&crate::sampling::RequestCtx>,
         on_piece: &mut dyn FnMut(&str),
     ) -> Result<GenStats> {
-        if self.wants_mtp()? {
+        let mtp_ok = !crate::sampling::adjusts_logits(req);
+        if mtp_ok && self.wants_mtp()? {
             self.ensure_mtp_backend()?;
             let head = self.mtp_head.as_ref().expect("wants_mtp loaded it");
             let vk = self.mtp_vk.as_ref().expect("ensure_mtp_backend set it");

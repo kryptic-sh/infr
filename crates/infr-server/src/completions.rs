@@ -61,15 +61,38 @@ pub(crate) struct CompletionRequest {
     /// names is served, so this is refused unless it asks for the same.
     #[serde(default)]
     best_of: Option<u32>,
-    /// OpenAI `logprobs` on the legacy route is a COUNT, not the chat route's flag. Neither shape
-    /// is served here.
+    /// OpenAI `logprobs` on the legacy route is a COUNT, where the chat route's is a flag. Both
+    /// spellings are accepted: `true` with no `top_logprobs` means 20, and a number `n` means
+    /// `top_logprobs: n` (evaluation harnesses send the number).
     #[serde(default)]
-    logprobs: Option<serde_json::Value>,
+    logprobs: Option<LogprobsArg>,
+    /// OpenAI `top_logprobs`: how many most likely alternatives to include per token.
+    #[serde(default)]
+    top_logprobs: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(untagged)]
+enum LogprobsArg {
+    Flag(bool),
+    Count(u32),
 }
 
 impl CompletionRequest {
     /// The sampling fields in the shape [`GenParams::from_request`] validates.
     fn sampling_shape(&self) -> ChatRequest {
+        // The legacy count spelling folds into the chat shape's flag plus a `top_logprobs` number.
+        // An explicit `top_logprobs` wins; `0` means "this token only", so the flag goes off.
+        let (logprobs, top_logprobs) = match self.logprobs {
+            Some(LogprobsArg::Flag(b)) => (Some(b), self.top_logprobs.clone()),
+            Some(LogprobsArg::Count(n)) => (
+                Some(n > 0),
+                self.top_logprobs
+                    .clone()
+                    .or_else(|| Some(serde_json::Value::from(n))),
+            ),
+            None => (None, self.top_logprobs.clone()),
+        };
         ChatRequest {
             model: self.model.clone(),
             messages: Vec::new(),
@@ -89,8 +112,8 @@ impl CompletionRequest {
             min_p: self.min_p,
             logit_bias: self.logit_bias.clone(),
             n: None,
-            logprobs: None,
-            top_logprobs: None,
+            logprobs,
+            top_logprobs,
             stream_options: None,
             response_format: None,
         }
@@ -137,14 +160,6 @@ impl CompletionRequest {
                 message: "only best_of = 1 is supported".into(),
             });
         }
-        // Refused rather than dropped: a client that sets this is asking for something this server
-        // will not do, and answering as if the field were absent hides that.
-        if self.logprobs.as_ref().is_some_and(|v| !v.is_null()) {
-            return Err(ParamError {
-                param: "logprobs",
-                message: "logprobs is not supported on /v1/completions".into(),
-            });
-        }
         Ok(())
     }
 }
@@ -163,11 +178,18 @@ struct TextCompletionResponse {
 struct TextChoice {
     text: String,
     index: usize,
-    logprobs: Option<serde_json::Value>,
+    logprobs: Option<ChatLogprobs>,
     finish_reason: Option<String>,
 }
 
-fn text_event(cid: &str, model: &str, created: i64, text: &str, finish: Option<&str>) -> Event {
+fn text_event(
+    cid: &str,
+    model: &str,
+    created: i64,
+    text: &str,
+    logprobs: Option<ChatLogprobs>,
+    finish: Option<&str>,
+) -> Event {
     Event::default()
         .json_data(serde_json::json!({
             "id": cid,
@@ -177,7 +199,7 @@ fn text_event(cid: &str, model: &str, created: i64, text: &str, finish: Option<&
             "choices": [{
                 "text": text,
                 "index": 0,
-                "logprobs": null,
+                "logprobs": logprobs,
                 "finish_reason": finish,
             }],
         }))
@@ -230,6 +252,16 @@ pub(crate) async fn completions_handler(
     if let (false, Some(engine)) = (params.logit_bias.is_empty(), &entry.engine) {
         if let Err(e) = params.check_vocab(engine.vocab_size()) {
             return param_error(Some(e.param), e.message);
+        }
+    }
+    if params.logprobs {
+        if let Some(engine) = &entry.engine {
+            if !engine.supports_logprobs() {
+                return param_error(
+                    Some("logprobs"),
+                    "logprobs: returning log probabilities is not supported by this backend".into(),
+                );
+            }
         }
     }
     let ctx = ReqCtx {
@@ -310,17 +342,25 @@ async fn non_streaming(
     ctx: ReqCtx,
 ) -> Response {
     let stats_blk = ctx.stats.clone();
+    let want_logprobs = params.logprobs;
     let ran = run_unary(&entry, &ctx, INPUT, move |engine, cancel| {
         let mut text = if echo { prompt.clone() } else { String::new() };
+        let mut logprobs = Vec::new();
         let mut tally = ReqTally::new();
-        let outcome = engine.complete(&prompt, &params, cancel, &mut |piece| {
-            tally.on_text_delta(&stats_blk);
-            text.push_str(piece);
-        })?;
-        Ok((text, outcome, tally))
+        let outcome = engine.complete_with_logprobs(
+            &prompt,
+            &params,
+            cancel,
+            &mut |piece| {
+                tally.on_text_delta(&stats_blk);
+                text.push_str(piece);
+            },
+            &mut |lp| logprobs.push(lp),
+        )?;
+        Ok((text, logprobs, outcome, tally))
     })
     .await;
-    let ((text, outcome, tally), deadline_hit) = match ran {
+    let ((text, logprobs, outcome, tally), deadline_hit) = match ran {
         Ok(ran) => ran,
         Err(resp) => return *resp,
     };
@@ -350,7 +390,7 @@ async fn non_streaming(
         choices: vec![TextChoice {
             text,
             index: 0,
-            logprobs: None,
+            logprobs: want_logprobs.then(|| ChatLogprobs::from_tokens(&logprobs)),
             finish_reason: Some(finish.as_str().into()),
         }],
         usage: UsageInfo::from_outcome(&outcome),
@@ -382,21 +422,41 @@ async fn streaming(
             return;
         };
         if echo {
-            job.send(text_event(&cid, &model_id, created, &prompt, None));
+            job.send(text_event(&cid, &model_id, created, &prompt, None, None));
         }
         let mut tally = ReqTally::new();
-        let res = engine.complete(&prompt, &params, &job.cancel, &mut |piece| {
-            tally.on_text_delta(&stats);
-            job.send(text_event(&cid, &model_id, created, piece, None));
-        });
+        let pending_logprobs = std::cell::RefCell::new(Vec::new());
+        let res = engine.complete_with_logprobs(
+            &prompt,
+            &params,
+            &job.cancel,
+            &mut |piece| {
+                tally.on_text_delta(&stats);
+                let mut pending = pending_logprobs.borrow_mut();
+                let logprobs = if pending.is_empty() {
+                    None
+                } else {
+                    Some(ChatLogprobs::from_tokens(&std::mem::take(&mut *pending)))
+                };
+                job.send(text_event(&cid, &model_id, created, piece, logprobs, None));
+            },
+            &mut |lp| pending_logprobs.borrow_mut().push(lp),
+        );
         match res {
             Ok(outcome) => {
                 let finish = job.finish(outcome.finish);
+                let pending_logprobs = pending_logprobs.into_inner();
+                let last_logprobs = if pending_logprobs.is_empty() {
+                    None
+                } else {
+                    Some(ChatLogprobs::from_tokens(&pending_logprobs))
+                };
                 job.send(text_event(
                     &cid,
                     &model_id,
                     created,
                     "",
+                    last_logprobs,
                     Some(finish.as_str()),
                 ));
                 if include_usage {
@@ -477,6 +537,64 @@ mod tests {
         }
     }
 
+    /// A generator that reports one token's log probability and then its text.
+    struct LogprobCompleteGen;
+    impl ChatGenerator for LogprobCompleteGen {
+        fn status(&self) -> GeneratorStatus {
+            GeneratorStatus {
+                backend: "cpu",
+                device: None,
+                ctx_per_slot: None,
+                memory: None,
+            }
+        }
+        fn vocab_size(&self) -> usize {
+            1000
+        }
+        fn supports_logprobs(&self) -> bool {
+            true
+        }
+        fn chat(
+            &self,
+            _: &[ChatMessage],
+            _: Option<&serde_json::Value>,
+            _: Option<&str>,
+            _: &GenParams,
+            _: &Arc<AtomicBool>,
+            _: &mut dyn FnMut(Delta),
+        ) -> anyhow::Result<ChatOutcome> {
+            anyhow::bail!("chat not used")
+        }
+        fn complete_with_logprobs(
+            &self,
+            _prompt: &str,
+            _params: &GenParams,
+            _cancel: &Arc<AtomicBool>,
+            on_text: &mut dyn FnMut(&str),
+            on_logprob: &mut dyn FnMut(infr_engine::TokenLogprob),
+        ) -> anyhow::Result<ChatOutcome> {
+            on_logprob(infr_engine::TokenLogprob {
+                token: 7,
+                text: "hi".into(),
+                bytes: b"hi".to_vec(),
+                logprob: -0.25,
+                top: vec![infr_engine::TokenLogprobAlt {
+                    token: 9,
+                    text: "ho".into(),
+                    bytes: b"ho".to_vec(),
+                    logprob: -1.5,
+                }],
+            });
+            on_text("hi");
+            Ok(ChatOutcome {
+                finish: Finish::Stop,
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                cached_tokens: 0,
+            })
+        }
+    }
+
     fn router() -> Router {
         router_for(Arc::new(RawGen::default()))
     }
@@ -541,6 +659,93 @@ mod tests {
         assert_eq!(fin["choices"][0]["finish_reason"], "length");
     }
 
+    /// The legacy route's `logprobs` is a COUNT, not the chat route's flag: an integer must be
+    /// accepted as `top_logprobs`, not turned into a serde `400` with no field named.
+    #[tokio::test]
+    async fn the_legacy_integer_logprobs_spelling_is_accepted() {
+        for body in [
+            r#"{"model":"m","prompt":"a","logprobs":2}"#,
+            r#"{"model":"m","prompt":"a","logprobs":2,"top_logprobs":1}"#,
+        ] {
+            let g: Arc<dyn ChatGenerator> = Arc::new(LogprobCompleteGen);
+            let r = build_router(AppState::new(g, "m", 1, Arc::new(Config::default())));
+            let resp = r
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/completions")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_owned()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{body}");
+            let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+            let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                v["choices"][0]["logprobs"]["content"][0]["token"], "hi",
+                "{body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn logprobs_are_returned_on_a_text_completion() {
+        let g: Arc<dyn ChatGenerator> = Arc::new(LogprobCompleteGen);
+        let r = build_router(AppState::new(g, "m", 1, Arc::new(Config::default())));
+        let resp = r
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model":"m","prompt":"a","logprobs":true,"top_logprobs":1}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["choices"][0]["text"], "hi");
+        let lp = &v["choices"][0]["logprobs"]["content"][0];
+        assert_eq!(lp["token"], "hi");
+        assert_eq!(lp["logprob"], -0.25);
+        assert_eq!(lp["top_logprobs"][0]["token"], "ho");
+    }
+
+    #[tokio::test]
+    async fn streaming_completion_logprobs_ride_the_text_chunk() {
+        let g: Arc<dyn ChatGenerator> = Arc::new(LogprobCompleteGen);
+        let r = build_router(AppState::new(g, "m", 1, Arc::new(Config::default())));
+        let resp = r
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model":"m","prompt":"a","stream":true,"logprobs":true,"top_logprobs":1}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        let chunk = body
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .filter(|f| *f != "[DONE]")
+            .map(|f| serde_json::from_str::<serde_json::Value>(f).unwrap())
+            .find(|v| v["choices"][0]["text"] == "hi")
+            .expect("a text chunk");
+        assert_eq!(chunk["choices"][0]["logprobs"]["content"][0]["token"], "hi");
+    }
+
     #[tokio::test]
     async fn bad_requests_are_openai_400s() {
         for (body, param) in [
@@ -549,9 +754,10 @@ mod tests {
             (r#"{"prompt":[1,2]}"#, "prompt"),
             (r#"{"prompt":"a","n":2}"#, "n"),
             (r#"{"prompt":"a","suffix":"b"}"#, "suffix"),
+            (r#"{"prompt":"a","logprobs":true}"#, "logprobs"),
+            (r#"{"prompt":"a","top_logprobs":2}"#, "top_logprobs"),
             (r#"{"prompt":"a","temperature":9}"#, "temperature"),
             (r#"{"prompt":"a","best_of":3}"#, "best_of"),
-            (r#"{"prompt":"a","logprobs":2}"#, "logprobs"),
             (r#"{"prompt":"a","logit_bias":{"1":-150}}"#, "logit_bias"),
             (r#"{"prompt":"a","logit_bias":{"2000":-1}}"#, "logit_bias"),
         ] {

@@ -8,6 +8,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Breaking
 
+- **`infr_engine::Delta` gains `Logprob`**, so an exhaustive match on it must
+  handle the variant. It carries one generated token's log probability, emitted
+  ahead of the text delta it belongs to.
+- **`infr_server::GenParams` gains `logprobs` and `top_logprobs`**, and
+  `infr_llama::sampling::RequestSampling` gains `logprobs`, so a struct literal
+  of either must set them or use `..Default::default()`.
+- **`infr_server`'s `CompletionChoice` and `ChunkChoice` gain a public
+  `logprobs` field**, so a struct literal of them must set it.
+- **A request that asks for `logprobs` takes the host sampling path.** That
+  turns off GPU argmax and GPU sampling for the request, and skips the MTP
+  draft-verify loop, because the draft head has no logprob tap. Results are
+  unchanged; the request is slower than an equivalent one without them.
 - **`infr_core::graph::Op` gains `AttnTemp`**, the position-dependent attention
   temperature, so an exhaustive match on `Op` must handle it.
 - **`infr_cpu::op_tap::TappedOp` gains `Mla`, `MulVec` and `AttnTemp`**, so an
@@ -130,6 +142,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `infr_server::ParamError::empty_prompt`, the same `400`. `suffix`, token-array
   prompts, `n > 1`, `best_of > 1` and `logprobs` answer `400`. The route is
   always registered — it cannot be switched off in the configuration.
+- **OpenAI `logprobs` and `top_logprobs` on both generation endpoints**, in the
+  chat response shape and streaming: each generated token's log probability and
+  its most likely alternatives, taken from the model's own distribution — the
+  logits after `logit_bias` and the penalties, before temperature.
+  `top_logprobs` defaults to 20 when absent, as in llama.cpp, and on
+  `/v1/completions` the legacy integer spelling (`"logprobs": 5`) is accepted as
+  that count. A request that asks for them takes the host sampling path: GPU
+  sampling and MTP are off for it, so it is slower but identical otherwise. A
+  backend that cannot report them answers `400` naming `logprobs`, as does a
+  grammar-constrained request (`tool_choice` or `response_format`), whose
+  constrained decode has no tap.
 - **Experimental: the Vulkan tuning parameter `quant_q8.experts_hi`** (off by
   default; `--set kernels.vulkan.tune.quant_q8.experts_hi=true`). With it on, a
   MoE model's batched prefill quantizes the routed experts' activations with an

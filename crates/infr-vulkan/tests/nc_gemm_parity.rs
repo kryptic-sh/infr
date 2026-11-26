@@ -594,10 +594,17 @@ struct KqFmaError {
 }
 
 /// The tile's RMS error allowed against the f64 reference, as a fraction of the RMS of the
-/// reference's outputs, in units of `f32::EPSILON`. The comparison with the GEMV alone would pass
-/// a tile that got worse together with the GEMV, and could fail one that did not regress on a
-/// driver whose GEMV rounds a little better; this bound holds the tile to the reference itself.
-const KQ_FMA_REL_BOUND_EPS: f64 = 2.0;
+/// reference's outputs, in units of `f32::EPSILON`. It is a second, independent requirement, not a
+/// relaxation of the first: the comparison with the GEMV alone would pass a tile that got worse
+/// together with the GEMV, so this bound holds the tile to the reference itself, and a case fails
+/// when it crosses either. The GEMV comparison stays strict, so a change that makes `native_gemv`
+/// more accurate can turn these tests red with no regression in the tile; then check the tile
+/// against this bound and the previous figures, and either improve the tile or bring the change
+/// to the owner, rather than loosening the comparison. The value sits above the compensated
+/// tile's worst case with a margin and below what most cases give with the carry dropped, so the
+/// bound on its own catches a lost compensation; the figures are in `docs/gpu-tolerance.md`, "The fp32
+/// K-quant prefill GEMM in the float runs".
+const KQ_FMA_REL_BOUND_EPS: f64 = 1.2;
 
 impl KqFmaError {
     /// Why this shape fails, if it does: the tile further from the reference than the GEMV, past

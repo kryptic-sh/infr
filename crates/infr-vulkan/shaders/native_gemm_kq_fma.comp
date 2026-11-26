@@ -183,6 +183,20 @@ void storeTile(uint k0) {
 #endif
 }
 
+// One Kahan step: adds `p` into `acc` and returns the rounding error the add dropped, which
+// becomes the next tile's starting partial. `precise` keeps the compiler from folding
+// `p - (t - acc)` to zero or reassociating it. It lives in its own function because glslang
+// propagates `precise` backward through everything that feeds a precise value within a function:
+// written inline in `main`, it marked the whole kernel NoContraction, the products and the
+// dequantization in `storeTile` included. A parameter stops that propagation, so only the three
+// compensation operations carry it.
+vec4 kahanStep(inout vec4 acc, vec4 p) {
+    precise vec4 t = acc + p;
+    precise vec4 carry = p - (t - acc);
+    acc = t;
+    return carry;
+}
+
 void main() {
     w_addr = arena_base(pc.arena_lo, pc.arena_hi);
     li = gl_LocalInvocationIndex;
@@ -198,12 +212,12 @@ void main() {
     uint k0b = slice * (pc.k / pc.splits);
     uint k0e = k0b + pc.k / pc.splits;
 
-    // Summation: one f32 running sum over the whole k range drifts with k (its rounding is
-    // relative to the running sum, not to each term), which put this tile further from the
-    // reference than the per-row GEMV it replaces. So each K tile's BK products go into `part`
-    // with fused multiply-adds, and `part` is Kahan-added into `acc` once per tile; the
-    // compensation is carried as the next tile's starting `part`, so no third register set is
-    // needed. `precise` keeps the compiler from folding `t - acc` away or reassociating it.
+    // Summation: one f32 running sum over the whole k range rounds against the running total at
+    // every term, so its error grows with k rather than with the terms themselves. So each K
+    // tile's BK products go into `part` with fused multiply-adds, and `part` is Kahan-added into
+    // `acc` once per tile (`kahanStep`); the compensation is carried as the next tile's starting
+    // `part`, so no third register set is needed. What this buys against the per-row GEMV is in
+    // docs/gpu-tolerance.md, "The fp32 K-quant prefill GEMM in the float runs".
     // Overflow: once a partial or the sum reaches +-inf the compensation is inf - inf, so the
     // output is NaN where a plain sum would write inf. Finite sums are not affected.
     vec4 acc[8][TNV];
@@ -237,12 +251,8 @@ void main() {
             }
         }
         [[unroll]] for (uint i = 0u; i < 8u; i++) {
-            [[unroll]] for (uint j = 0u; j < TNV; j++) {
-                precise vec4 t = acc[i][j] + part[i][j];
-                precise vec4 carry = part[i][j] - (t - acc[i][j]);
-                part[i][j] = carry;
-                acc[i][j] = t;
-            }
+            [[unroll]] for (uint j = 0u; j < TNV; j++)
+                part[i][j] = kahanStep(acc[i][j], part[i][j]);
         }
         barrier();
         if (more) {
@@ -257,9 +267,11 @@ void main() {
         uint r = wgRow + (i < 4u ? tr * 4u + i : 64u + tr * 4u + i - 4u);
         if (r < mpad) {
             [[unroll]] for (uint j = 0u; j < TNV; j++) {
-                // The last carry folded in: a k slice's sum is otherwise short by it.
-                precise vec4 o = acc[i][j] + part[i][j];
-                c4[pbase + ((r * pc.n + wgCol + j * 64u + tc * 4u) >> 2u)] = o;
+                // The last carry folded in: a k slice's sum is otherwise short by it. A plain
+                // add: neither operand is a product, so there is nothing to contract, and a
+                // `precise` here would spread back over the whole kernel (see `kahanStep`).
+                c4[pbase + ((r * pc.n + wgCol + j * 64u + tc * 4u) >> 2u)] =
+                    acc[i][j] + part[i][j];
             }
         }
     }

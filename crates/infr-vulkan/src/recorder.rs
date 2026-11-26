@@ -3817,8 +3817,9 @@ impl<'a> Recorder<'a> {
             return;
         }
         let mpad = m.div_ceil(64) * 64;
-        // The compensated build: a plain f32 sum of the slice planes left this path further from
-        // the reference than the per-row GEMV it replaces on some Linears.
+        // The compensated build: a plain f32 sum of the slice planes would round against the
+        // running total at every plane, the error the tile compensates within each slice
+        // (docs/gpu-tolerance.md, "The fp32 K-quant prefill GEMM in the float runs").
         self.label_gemm("splitk_reduce_kahan", m, k, n);
         let rk = self.be.kernel(
             "splitk_reduce_kahan",

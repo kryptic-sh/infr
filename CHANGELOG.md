@@ -379,9 +379,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   the integrated Ryzen GPU (worst KL 2.65e-3 against a bound of 1.8e-3; the
   per-row GEMV it replaces gives 7.1e-4). The GCN tier itself could not be
   measured here. `INFR_TUNE=gemm.kq_fma=true` turns it on and `infr tune show`
-  reports it; a device whose shared memory cannot hold the kernel's tile, or a
-  shape whose grid would pass the device's `maxComputeWorkGroupCount[0]` even
-  without splitting k, keeps the kernels it ran without it.
+  reports it; a device whose shared memory cannot hold the kernel's tile, a
+  shape whose tile grid would pass the device's `maxComputeWorkGroupCount[0]`
+  even without splitting k, or a weight past the 2³² addressing cap keeps the
+  kernels it ran without it. The split-k sum pass, one thread per output, splits
+  its grid in two dimensions past 65,535 workgroups, Vulkan's guaranteed
+  minimum, on every device, whatever limit the device reports.
 
 - **Tuning parameter `attn_split.decode_min_chunk`: the chunk floor of decode
   split-K attention.** Decode attention cuts each head's keys into chunks of
@@ -1474,6 +1477,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Expert-parallel MoE prefill on Vulkan stays inside the guaranteed workgroup
+  limit.** The band remap after each MoE layer's top-k (`moe_ep_band_remap`)
+  dispatched one workgroup per (token, slot) assignment where each workgroup
+  covers 64 of them, so `INFR_EXPERT_PARALLEL` with a top-8 model at an 8192-row
+  chunk (`INFR_UBATCH=8192`) asked for 65,536 workgroups in one dimension, past
+  the 65,535 that a device enforcing Vulkan's minimum (Mesa ANV) accepts. It now
+  dispatches 64 times fewer; the output is unchanged.
 - **A `</think>` with no `<think>` before it no longer panics `infr serve`.** A
   reply that streamed content and then emitted a stray closer panicked the
   reasoning/content splitter (`ChatStream`), failing the request; pushed in one

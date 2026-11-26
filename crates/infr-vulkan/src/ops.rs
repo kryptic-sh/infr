@@ -605,6 +605,8 @@ impl VulkanBackend {
             .collect::<Result<Vec<_>>>()?;
         let binding = self.eager_bind(&k, &vk_bufs)?;
 
+        #[cfg(test)]
+        crate::recorder::note_test_grid(k.name, [groups, 1, 1]);
         let shared = &self.shared;
         self.one_shot(|cmd| unsafe {
             shared
@@ -713,13 +715,108 @@ impl VulkanBackend {
         push[4..8].copy_from_slice(&(nh as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(nkv as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&(hd as u32).to_ne_bytes());
-        self.run_kernel(kern, &[q, k, v], t * nh * hd, &push, (t * nh) as u32)
+        let groups = (t * nh).div_ceil(crate::recorder::ATTENTION_WG) as u32;
+        self.run_kernel(kern, &[q, k, v], t * nh * hd, &push, groups)
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// Host RoPE over `x` `[t, nh, hd]` as `rope.comp` computes it: token `p` at position
+    /// `pos0 + p`, the first `rd` lanes rotated (interleaved NORM pairs, or NEOX split halves), the
+    /// angle divided by `ff[pair]` when given and its sine negated for the backward build, and
+    /// lanes `rd..hd` passed through.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn host_rope(
+        x: &[f32],
+        t: usize,
+        nh: usize,
+        hd: usize,
+        rd: usize,
+        theta: f32,
+        pos0: usize,
+        ff: Option<&[f32]>,
+        neox: bool,
+        backward: bool,
+    ) -> Vec<f32> {
+        let mut want = x.to_vec();
+        let hf = rd / 2;
+        for p in 0..t {
+            for h in 0..nh {
+                let base = (p * nh + h) * hd;
+                for i in 0..hf {
+                    let freq = (theta as f64).powf(-2.0 * i as f64 / rd as f64) as f32;
+                    let mut ang = (pos0 + p) as f32 * freq;
+                    if let Some(ff) = ff {
+                        ang /= ff[i];
+                    }
+                    let (mut s, co) = ang.sin_cos();
+                    if backward {
+                        s = -s;
+                    }
+                    let (i0, i1) = if neox {
+                        (i, i + hf)
+                    } else {
+                        (2 * i, 2 * i + 1)
+                    };
+                    let (a, b) = (x[base + i0], x[base + i1]);
+                    want[base + i0] = a * co - b * s;
+                    want[base + i1] = a * s + b * co;
+                }
+            }
+        }
+        want
+    }
+
+    /// Host causal GQA attention with a standard softmax: q `[t, nh, hd]`, k/v `[t, nkv, hd]` →
+    /// `[t, nh, hd]`, as `attention.comp` computes it with an online one.
+    pub(crate) fn host_attention(
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        t: usize,
+        nh: usize,
+        nkv: usize,
+        hd: usize,
+    ) -> Vec<f32> {
+        let scale = 1.0 / (hd as f32).sqrt();
+        let group = nh / nkv;
+        let mut want = vec![0f32; t * nh * hd];
+        for ti in 0..t {
+            for h in 0..nh {
+                let kvh = h / group;
+                let qv = &q[(ti * nh + h) * hd..(ti * nh + h) * hd + hd];
+                let mut scores = vec![0f32; ti + 1];
+                let mut mx = f32::NEG_INFINITY;
+                for j in 0..=ti {
+                    let kv = &k[(j * nkv + kvh) * hd..(j * nkv + kvh) * hd + hd];
+                    let mut d = 0f32;
+                    for x in 0..hd {
+                        d += qv[x] * kv[x];
+                    }
+                    d *= scale;
+                    scores[j] = d;
+                    mx = mx.max(d);
+                }
+                let mut sum = 0f32;
+                for s in scores.iter_mut() {
+                    *s = (*s - mx).exp();
+                    sum += *s;
+                }
+                let ob = (ti * nh + h) * hd;
+                for j in 0..=ti {
+                    let p = scores[j] / sum;
+                    let vv = &v[(j * nkv + kvh) * hd..(j * nkv + kvh) * hd + hd];
+                    for x in 0..hd {
+                        want[ob + x] += p * vv[x];
+                    }
+                }
+            }
+        }
+        want
+    }
 
     #[test]
     fn wave64_pins_every_pipeline_to_64_and_full_only_where_allowed() {
@@ -963,21 +1060,7 @@ mod tests {
         let x: Vec<f32> = (0..t * nh * hd).map(|i| (i as f32) * 0.03).collect();
         let got = be.rope(&x, t, nh, hd, rd, theta).unwrap();
         // host reference (ggml NORM interleaved)
-        let mut want = x.clone();
-        for pos in 0..t {
-            for h in 0..nh {
-                let base = (pos * nh + h) * hd;
-                for i in 0..rd / 2 {
-                    let freq = (theta as f64).powf(-2.0 * i as f64 / rd as f64) as f32;
-                    let ang = pos as f32 * freq;
-                    let (s, co) = ang.sin_cos();
-                    let a = x[base + 2 * i];
-                    let b = x[base + 2 * i + 1];
-                    want[base + 2 * i] = a * co - b * s;
-                    want[base + 2 * i + 1] = a * s + b * co;
-                }
-            }
-        }
+        let want = host_rope(&x, t, nh, hd, rd, theta, 0, None, false, false);
         for (g, w) in got.iter().zip(want.iter()) {
             assert!((g - w).abs() < 1e-4, "{g} vs {w}");
         }
@@ -1015,51 +1098,25 @@ mod tests {
     #[ignore = "requires a Vulkan GPU"]
     fn attention_matches_host() {
         let be = VulkanBackend::new().unwrap();
-        let (t, nh, nkv, hd) = (5usize, 4usize, 2usize, 8usize);
+        // More (token, head) pairs than one workgroup holds, the last workgroup ragged, so a grid
+        // sized short of them leaves rows unwritten (the readback buffer starts zeroed, which no
+        // row of this output is).
+        let (t, nh, nkv, hd) = (13usize, 12usize, 4usize, 8usize);
         let q: Vec<f32> = (0..t * nh * hd).map(|i| (i as f32 * 0.013).sin()).collect();
         let k: Vec<f32> = (0..t * nkv * hd)
             .map(|i| (i as f32 * 0.017).cos())
             .collect();
-        let v: Vec<f32> = (0..t * nkv * hd).map(|i| i as f32 * 0.011).collect();
-        let got = be.attention(&q, &k, &v, t, nh, nkv, hd).unwrap();
-
-        // host reference: causal GQA with standard softmax
-        let scale = 1.0 / (hd as f32).sqrt();
-        let group = nh / nkv;
-        let mut want = vec![0f32; t * nh * hd];
-        for ti in 0..t {
-            for h in 0..nh {
-                let kvh = h / group;
-                let qv = &q[(ti * nh + h) * hd..(ti * nh + h) * hd + hd];
-                let mut scores = vec![0f32; ti + 1];
-                let mut mx = f32::NEG_INFINITY;
-                for j in 0..=ti {
-                    let kv = &k[(j * nkv + kvh) * hd..(j * nkv + kvh) * hd + hd];
-                    let mut d = 0f32;
-                    for x in 0..hd {
-                        d += qv[x] * kv[x];
-                    }
-                    d *= scale;
-                    scores[j] = d;
-                    mx = mx.max(d);
-                }
-                let mut sum = 0f32;
-                for s in scores.iter_mut() {
-                    *s = (*s - mx).exp();
-                    sum += *s;
-                }
-                let ob = (ti * nh + h) * hd;
-                for j in 0..=ti {
-                    let p = scores[j] / sum;
-                    let vv = &v[(j * nkv + kvh) * hd..(j * nkv + kvh) * hd + hd];
-                    for x in 0..hd {
-                        want[ob + x] += p * vv[x];
-                    }
-                }
-            }
-        }
+        let v: Vec<f32> = (0..t * nkv * hd).map(|i| 0.1 + i as f32 * 0.011).collect();
+        let (got, grids) = crate::recorder::capture_test_grids(|| {
+            be.attention(&q, &k, &v, t, nh, nkv, hd).unwrap()
+        });
+        let want = host_attention(&q, &k, &v, t, nh, nkv, hd);
+        assert_eq!(got.len(), want.len());
         for (g, w) in got.iter().zip(want.iter()) {
             assert!((g - w).abs() < 1e-4, "{g} vs {w}");
         }
+        // One thread per (token, head) pair: the grid is the pairs in `ATTENTION_WG`-wide groups.
+        let groups = (t * nh).div_ceil(crate::recorder::ATTENTION_WG) as u32;
+        assert_eq!(grids, [("attention", [groups, 1, 1])]);
     }
 }

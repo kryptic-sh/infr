@@ -322,6 +322,18 @@ fn assert_native_k(kernel: &str, in_f: usize) {
 /// `rope_wg_matches_shader` fails on a drift.
 pub(crate) const ROPE_WG: usize = 64;
 
+/// Threads per `attention.comp` workgroup, one per (token, head), as [`ROPE_WG`] is for rope.
+/// MIRRORS the shader's `local_size_x`; `attention_wg_matches_shader` fails on a drift.
+pub(crate) const ATTENTION_WG: usize = 64;
+
+/// Threads per `splitk_reduce.comp` workgroup, one per output element.
+/// MIRRORS the shader's `local_size_x`; `splitk_reduce_wg_matches_shader` fails on a drift.
+pub(crate) const SPLITK_REDUCE_WG: usize = 64;
+
+/// Threads per `moe_ep_band_remap.comp` workgroup, one per packed (token, slot) assignment.
+/// MIRRORS the shader's `local_size_x`; `moe_ep_band_remap_wg_matches_shader` fails on a drift.
+pub(crate) const MOE_EP_BAND_REMAP_WG: usize = 64;
+
 /// 32-element blocks `quant_q8.comp` quantizes per workgroup, one subgroup each. MIRRORS the
 /// shader's `QUANT_Q8_BLOCKS_PER_WG`; `quant_q8_blocks_per_wg_matches_shader` fails on a drift.
 pub(crate) const QUANT_Q8_BLOCKS_PER_WG: usize = 8;
@@ -903,6 +915,33 @@ pub(crate) fn bda_chunk_caps(vk: &infr_core::config::VulkanCfg) -> (u64, u64) {
 #[cfg(test)]
 thread_local! {
     static TEST_CHUNK_CAP: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
+}
+// The grids dispatched on this test thread while a capture is open, each with its kernel: what
+// `Recorder::dispatch3` and the eager `VulkanBackend::run_kernel` asked for, so a test can pin the
+// workgroup count a dispatch site computes. Thread-scoped like `TEST_CHUNK_CAP`, and off (`None`)
+// until a test opens a capture. Compiled only under `cfg(test)`.
+#[cfg(test)]
+pub(crate) type TestGrids = Vec<(&'static str, [u32; 3])>;
+#[cfg(test)]
+thread_local! {
+    static TEST_GRIDS: std::cell::RefCell<Option<TestGrids>> =
+        const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+pub(crate) fn note_test_grid(kernel: &'static str, grid: [u32; 3]) {
+    TEST_GRIDS.with(|g| {
+        if let Some(v) = g.borrow_mut().as_mut() {
+            v.push((kernel, grid));
+        }
+    });
+}
+/// Run `f` and return what it returned with every grid it dispatched on this thread, in order.
+#[cfg(test)]
+pub(crate) fn capture_test_grids<R>(f: impl FnOnce() -> R) -> (R, TestGrids) {
+    let prev = TEST_GRIDS.with(|g| g.replace(Some(Vec::new())));
+    let r = f();
+    let grids = TEST_GRIDS.with(|g| g.replace(prev)).unwrap_or_default();
+    (r, grids)
 }
 #[cfg(test)]
 fn test_chunk_cap_override() -> Option<(u64, u64)> {
@@ -1878,6 +1917,8 @@ impl<'a> Recorder<'a> {
                 );
             }
         }
+        #[cfg(test)]
+        note_test_grid(k.name, [gx, gy, gz]);
         self.record_dispatch(k, buffers, push, [gx, gy, gz]);
     }
 
@@ -2961,7 +3002,7 @@ impl<'a> Recorder<'a> {
             &[Self::vkb(partials), Self::vkb(c)],
             1,
             &rp,
-            (n_elems as u32).div_ceil(64),
+            (n_elems as u32).div_ceil(SPLITK_REDUCE_WG as u32),
         );
     }
 
@@ -3784,12 +3825,14 @@ impl<'a> Recorder<'a> {
         rp[0..4].copy_from_slice(&(n_elems as u32).to_ne_bytes());
         rp[4..8].copy_from_slice(&(splits as u32).to_ne_bytes());
         rp[8..12].copy_from_slice(&(n_elems as u32).to_ne_bytes());
-        self.dispatch(
+        // One thread per output element: a tall chunk of a wide output passes the guaranteed
+        // `maxComputeWorkGroupCount[0]` even where the GEMM's own tile grid stays inside it.
+        self.dispatch_wide(
             rk,
             &[Self::vkb(partials), Self::vkb(c)],
             1,
             &rp,
-            (n_elems as u32).div_ceil(64),
+            (n_elems as u32).div_ceil(SPLITK_REDUCE_WG as u32),
         );
     }
 
@@ -8908,7 +8951,7 @@ impl<'a> Recorder<'a> {
             &[Self::vkb(q), Self::vkb(k), Self::vkb(v), Self::vkb(o)],
             1,
             &push,
-            (t * nh) as u32,
+            (t * nh).div_ceil(ATTENTION_WG) as u32,
         );
     }
 
@@ -9910,7 +9953,13 @@ impl<'a> Recorder<'a> {
         push[8..12].copy_from_slice(&hi.to_ne_bytes());
         // ids + wts are both read-modify-write — bind both in the WRITE slots (n_out = 2) so the
         // downstream expert GEMVs get a RAW barrier against this rewrite.
-        self.dispatch(k, &[Self::vkb(ids), Self::vkb(wts)], 2, &push, n as u32);
+        self.dispatch(
+            k,
+            &[Self::vkb(ids), Self::vkb(wts)],
+            2,
+            &push,
+            n.div_ceil(MOE_EP_BAND_REMAP_WG) as u32,
+        );
     }
 
     /// llama4 weight-before-FFN: in-place per-row scale `y[row*width+i] *= w[row]` — applied to the
@@ -12377,6 +12426,32 @@ mod tests {
     }
 
     #[test]
+    fn attention_wg_matches_shader() {
+        let src = include_str!("../shaders/attention.comp");
+        let want =
+            format!("layout(local_size_x = {ATTENTION_WG}, local_size_y = 1, local_size_z = 1)");
+        assert!(src.contains(&want), "attention.comp lacks `{want}`");
+    }
+
+    #[test]
+    fn splitk_reduce_wg_matches_shader() {
+        let src = include_str!("../shaders/splitk_reduce.comp");
+        let want = format!(
+            "layout(local_size_x = {SPLITK_REDUCE_WG}, local_size_y = 1, local_size_z = 1)"
+        );
+        assert!(src.contains(&want), "splitk_reduce.comp lacks `{want}`");
+    }
+
+    #[test]
+    fn moe_ep_band_remap_wg_matches_shader() {
+        let src = include_str!("../shaders/moe_ep_band_remap.comp");
+        let want = format!(
+            "layout(local_size_x = {MOE_EP_BAND_REMAP_WG}, local_size_y = 1, local_size_z = 1)"
+        );
+        assert!(src.contains(&want), "moe_ep_band_remap.comp lacks `{want}`");
+    }
+
+    #[test]
     fn quant_q8_hi_ratio_matches_shader() {
         let src = include_str!("../shaders/quant_q8.comp");
         let want = format!("#define QUANT_Q8_HI_RATIO {QUANT_Q8_HI_RATIO:.1}");
@@ -12708,9 +12783,12 @@ mod tests {
         // Not a multiple of the workgroup width or of `SPLIT_AT`, so the split grid has a ragged
         // last workgroup and padding workgroups after it.
         const N: usize = 64 * 10 + 5;
-        // Row-shaped cases. The rope family takes ROWS tokens of W heads: one thread per (token,
-        // head) pair in `ROPE_WG`-wide workgroups, so its grid is N threads like the elementwise
-        // kernels'.
+        // Row-shaped cases. The rope family and `attention` take ROWS tokens of W heads: one
+        // thread per (token, head) pair in `ROPE_WG`- / `ATTENTION_WG`-wide workgroups, so their
+        // grid is N threads like the elementwise kernels'. Both runs here use one grid, so a grid
+        // sized short of the pairs leaves the same rows unwritten in both and passes:
+        // `rope_recorder_matches_host` and `attention_recorder_matches_host` hold the sizing to a
+        // host reference.
         const ROWS: usize = 5;
         const W: usize = 129;
         const _: () = assert!(ROWS * W == N);
@@ -12723,7 +12801,7 @@ mod tests {
         const NQ8: usize = 32 * 11;
         // `quant_q8`: QUANT_Q8_BLOCKS_PER_WG blocks per workgroup, the last workgroup ragged.
         const NQ8B: usize = 32 * (QUANT_Q8_BLOCKS_PER_WG * 4 + 3);
-        // Workgroup-per-unit kernels (attention, qk_norm_rope, linear_bf16).
+        // Workgroup-per-unit kernels (attention_kv, qk_norm_rope, linear_bf16).
         const HD: usize = 64;
         const UNITS: usize = 5;
         // `linear_f32_mo` outputs.
@@ -13320,6 +13398,402 @@ mod tests {
                 "{name}: the split grid wrote different bytes"
             );
         }
+    }
+
+    /// Record `op` on `be` with `dispatch_wide`'s split point at `split` (`None` = the real one)
+    /// and return how many dispatches took the 2-D split and every grid recorded.
+    fn record_counting_grids(
+        be: &VulkanBackend,
+        split: Option<u32>,
+        op: impl FnOnce(&Recorder),
+    ) -> (u32, crate::recorder::TestGrids) {
+        use std::cell::Cell;
+        WIDE_SPLIT_AT.with(|c| c.set(split));
+        WIDE_SPLITS.with(|c| c.set(0));
+        let ((), grids) = crate::recorder::capture_test_grids(|| {
+            let rec = be.recorder().unwrap();
+            op(&rec);
+            rec.finish().unwrap();
+        });
+        WIDE_SPLIT_AT.with(|c| c.set(None));
+        (WIDE_SPLITS.with(Cell::get), grids)
+    }
+
+    /// The grid `dispatch_wide` records for `groups` workgroups at split point `split`.
+    fn wide_grid(groups: u32, split: Option<u32>) -> [u32; 3] {
+        match split {
+            Some(s) if groups > s => [s, groups.div_ceil(s), 1],
+            _ => [groups, 1, 1],
+        }
+    }
+
+    /// A buffer of `bytes` bytes of `usage` holding `0x7FC0` in every 16-bit word: an f16 NaN, and
+    /// two of them an f32 NaN, so an element no dispatch wrote fails any bound.
+    fn nan_buffer(be: &VulkanBackend, bytes: usize, usage: BufferUsage) -> Box<dyn Buffer> {
+        const NAN16: [u8; 2] = 0x7FC0u16.to_ne_bytes();
+        let b = be.alloc(bytes, usage).unwrap();
+        let fill: Vec<u8> = NAN16.iter().copied().cycle().take(bytes).collect();
+        be.upload(b.as_ref(), &fill).unwrap();
+        b
+    }
+
+    fn download_f32(be: &VulkanBackend, b: &dyn Buffer, n: usize) -> Vec<f32> {
+        let mut v = vec![0u8; n * 4];
+        be.download(b, &mut v).unwrap();
+        v.as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_ne_bytes(*c))
+            .collect()
+    }
+
+    fn download_f16(be: &VulkanBackend, b: &dyn Buffer, n: usize) -> Vec<f32> {
+        let mut v = vec![0u8; n * 2];
+        be.download(b, &mut v).unwrap();
+        v.as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| half::f16::from_ne_bytes(*c).to_f32())
+            .collect()
+    }
+
+    /// Every recorder rope dispatch site against `ops::tests::host_rope`, through `dispatch_wide`
+    /// at two shapes: one whose last workgroup is ragged, and, with the split point lowered, one
+    /// whose grid takes the 2-D split and ends in a padding workgroup. Each output starts NaN, so a
+    /// (token, head) pair the grid leaves out fails the bound; the grid each site recorded is
+    /// pinned to one thread per pair in `ROPE_WG`-wide workgroups, so a grid too large fails too.
+    /// `elementwise_ops_split_wide_grids` cannot catch a short grid: both of its runs use one.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn rope_recorder_matches_host() {
+        use crate::ops::tests::host_rope;
+        const HD: usize = 16;
+        // Short of HD, so the pass-through tail is covered too.
+        const RD: usize = 12;
+        const THETA: f32 = 1e4;
+        // The device's pow/sin/cos against the host's, at positions under 32, on inputs in
+        // [-1, 1]: the eager `rope_matches_host`'s bound.
+        const TOL_F32: f32 = 1e-4;
+        // The f16 builds also round outputs under 2 in magnitude to half precision, half an ulp
+        // of which is 2^-11 (4.9e-4) in [1, 2).
+        const TOL_F16: f32 = 1e-3;
+        const POS: usize = 2;
+        // The record-once builds read their position from `params`.
+        const P_POS: u32 = 3;
+        #[derive(Clone, Copy)]
+        enum Out {
+            F32,
+            F16,
+            F16At,
+        }
+        type RopeOp<'a> = Box<dyn Fn(&Recorder, &dyn Buffer, usize, usize) + 'a>;
+
+        let be = be_with(|_| {});
+        let ff: Vec<f32> = (0..RD / 2).map(|i| 1.0 + 0.5 * i as f32).collect();
+        let ffb = upf32(&be, &ff);
+        let params = be.alloc(8, BufferUsage::Activations).unwrap();
+        be.upload(params.as_ref(), bytemuck::cast_slice(&[P_POS, 0]))
+            .unwrap();
+        let (ffb, params) = (ffb.as_ref(), params.as_ref());
+        // (tokens, heads, split point): 143 pairs in three workgroups, the last ragged; then 645
+        // pairs in 11 workgroups, split at three into a 3 x 4 grid with one padding workgroup.
+        for (t, nh, split) in [(13usize, 11usize, None), (5, 129, Some(3u32))] {
+            let n = t * nh * HD;
+            let x: Vec<f32> = (0..n)
+                .map(|i| ((i * 37) % 101) as f32 * 0.02 - 1.0)
+                .collect();
+            let xb = upf32(&be, &x);
+            let xb = xb.as_ref();
+            let rope = |neox, back, ff: bool| -> RopeOp {
+                Box::new(move |r, y, t, nh| {
+                    let ff = ff.then_some(ffb);
+                    r.rope(xb, y, t, nh, HD, RD, THETA, POS, ff, neox, back)
+                })
+            };
+            let cases: Vec<(&str, Out, u32, bool, bool, bool, RopeOp)> = vec![
+                (
+                    "rope",
+                    Out::F32,
+                    POS as u32,
+                    false,
+                    false,
+                    false,
+                    rope(false, false, false),
+                ),
+                (
+                    "rope_neox",
+                    Out::F32,
+                    POS as u32,
+                    false,
+                    true,
+                    false,
+                    rope(true, false, false),
+                ),
+                (
+                    "rope_back",
+                    Out::F32,
+                    POS as u32,
+                    false,
+                    false,
+                    true,
+                    rope(false, true, false),
+                ),
+                (
+                    "rope_ff",
+                    Out::F32,
+                    POS as u32,
+                    true,
+                    false,
+                    false,
+                    rope(false, false, true),
+                ),
+                (
+                    "rope_ff_neox",
+                    Out::F32,
+                    POS as u32,
+                    true,
+                    true,
+                    false,
+                    rope(true, false, true),
+                ),
+                (
+                    "rope_ff_back",
+                    Out::F32,
+                    POS as u32,
+                    true,
+                    false,
+                    true,
+                    rope(false, true, true),
+                ),
+                (
+                    "rope_f16",
+                    Out::F16,
+                    POS as u32,
+                    false,
+                    false,
+                    false,
+                    Box::new(|r, y, t, nh| r.rope_f16(xb, y, t, nh, HD, RD, THETA, POS, 0, None)),
+                ),
+                (
+                    "rope_f16_ff",
+                    Out::F16,
+                    POS as u32,
+                    true,
+                    false,
+                    false,
+                    Box::new(|r, y, t, nh| {
+                        r.rope_f16(xb, y, t, nh, HD, RD, THETA, POS, 0, Some(ffb))
+                    }),
+                ),
+                (
+                    "rope_f16_dyn",
+                    Out::F16,
+                    P_POS,
+                    false,
+                    false,
+                    false,
+                    Box::new(|r, y, t, nh| {
+                        r.rope_f16_dyn(xb, params, y, t, nh, HD, RD, THETA, 0, None)
+                    }),
+                ),
+                (
+                    "rope_f16_dyn_ff",
+                    Out::F16,
+                    P_POS,
+                    true,
+                    false,
+                    false,
+                    Box::new(|r, y, t, nh| {
+                        r.rope_f16_dyn(xb, params, y, t, nh, HD, RD, THETA, 0, Some(ffb))
+                    }),
+                ),
+                (
+                    "rope_f16_bda",
+                    Out::F16At,
+                    POS as u32,
+                    false,
+                    false,
+                    false,
+                    Box::new(|r, y, t, nh| {
+                        let a = y.device_addr().unwrap();
+                        r.rope_f16_at(xb, y, a, t, nh, HD, RD, THETA, POS, 0, None)
+                    }),
+                ),
+                (
+                    "rope_f16_ff_bda",
+                    Out::F16At,
+                    POS as u32,
+                    true,
+                    false,
+                    false,
+                    Box::new(|r, y, t, nh| {
+                        let a = y.device_addr().unwrap();
+                        r.rope_f16_at(xb, y, a, t, nh, HD, RD, THETA, POS, 0, Some(ffb))
+                    }),
+                ),
+                (
+                    "rope_f16_dyn_bda",
+                    Out::F16At,
+                    P_POS,
+                    false,
+                    false,
+                    false,
+                    Box::new(|r, y, t, nh| {
+                        let a = y.device_addr().unwrap();
+                        r.rope_f16_dyn_at(xb, params, y, a, t, nh, HD, RD, THETA, 0, None)
+                    }),
+                ),
+                (
+                    "rope_f16_dyn_ff_bda",
+                    Out::F16At,
+                    P_POS,
+                    true,
+                    false,
+                    false,
+                    Box::new(|r, y, t, nh| {
+                        let a = y.device_addr().unwrap();
+                        r.rope_f16_dyn_at(xb, params, y, a, t, nh, HD, RD, THETA, 0, Some(ffb))
+                    }),
+                ),
+            ];
+            for (name, out, pos0, with_ff, neox, back, op) in &cases {
+                let (y, tol) = match out {
+                    Out::F32 => (nan_buffer(&be, n * 4, BufferUsage::Activations), TOL_F32),
+                    Out::F16 => (nan_buffer(&be, n * 2, BufferUsage::Activations), TOL_F16),
+                    Out::F16At => (nan_buffer(&be, n * 2, BufferUsage::KvCache), TOL_F16),
+                };
+                let (n_split, grids) =
+                    record_counting_grids(&be, split, |r| op(r, y.as_ref(), t, nh));
+                assert_eq!(n_split > 0, split.is_some(), "{name} {t}x{nh}: split taken");
+                let got = match out {
+                    Out::F32 => download_f32(&be, y.as_ref(), n),
+                    Out::F16 | Out::F16At => download_f16(&be, y.as_ref(), n),
+                };
+                let ff = with_ff.then_some(&ff[..]);
+                let want = host_rope(&x, t, nh, HD, RD, THETA, *pos0 as usize, ff, *neox, *back);
+                let worst = got
+                    .iter()
+                    .zip(&want)
+                    .fold(0f32, |a, (g, w)| a.max((g - w).abs()));
+                eprintln!("{name} {t}x{nh}: worst |gpu - host| {worst:.3e}");
+                for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                    assert!(
+                        (g - w).abs() <= tol,
+                        "{name} {t}x{nh}: element {i} (token {}, head {}): {g} vs {w}",
+                        i / (nh * HD),
+                        i / HD % nh,
+                    );
+                }
+                let groups = (t * nh).div_ceil(ROPE_WG) as u32;
+                assert_eq!(
+                    grids,
+                    [(*name, wide_grid(groups, split))],
+                    "{name} {t}x{nh}"
+                );
+            }
+        }
+    }
+
+    /// `Recorder::attention` against `ops::tests::host_attention` at a ragged last workgroup and,
+    /// with the split point lowered, through `dispatch_wide`'s 2-D split with a padding workgroup.
+    /// The output starts NaN, so a (token, head) pair the grid leaves out fails the bound; the
+    /// recorded grid is pinned to one thread per pair in `ATTENTION_WG`-wide workgroups, so a grid
+    /// too large fails too.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn attention_recorder_matches_host() {
+        use crate::ops::tests::host_attention;
+        const HD: usize = 16;
+        const NKV: usize = 4;
+        // An f32 online softmax against the host's two-pass one over at most 13 keys.
+        const TOL: f32 = 1e-4;
+        let be = be_with(|_| {});
+        // (tokens, heads, split point): 156 pairs in three workgroups, the last ragged; then 660
+        // pairs in 11 workgroups, split at three into a 3 x 4 grid with one padding workgroup.
+        for (t, nh, split) in [(13usize, 12usize, None), (5, 132, Some(3u32))] {
+            let q: Vec<f32> = (0..t * nh * HD).map(|i| (i as f32 * 0.013).sin()).collect();
+            let k: Vec<f32> = (0..t * NKV * HD)
+                .map(|i| (i as f32 * 0.017).cos())
+                .collect();
+            let v: Vec<f32> = (0..t * NKV * HD)
+                .map(|i| ((i * 37) % 101) as f32 * 0.02 - 1.0)
+                .collect();
+            let (qb, kb, vb) = (upf32(&be, &q), upf32(&be, &k), upf32(&be, &v));
+            let o = nan_buffer(&be, t * nh * HD * 4, BufferUsage::Activations);
+            let (n_split, grids) = record_counting_grids(&be, split, |r| {
+                r.attention(
+                    qb.as_ref(),
+                    kb.as_ref(),
+                    vb.as_ref(),
+                    o.as_ref(),
+                    t,
+                    nh,
+                    NKV,
+                    HD,
+                )
+            });
+            assert_eq!(n_split > 0, split.is_some(), "{t}x{nh}: split taken");
+            let got = download_f32(&be, o.as_ref(), t * nh * HD);
+            let want = host_attention(&q, &k, &v, t, nh, NKV, HD);
+            for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                assert!(
+                    (g - w).abs() <= TOL,
+                    "{t}x{nh}: element {i} (token {}, head {}): {g} vs {w}",
+                    i / (nh * HD),
+                    i / HD % nh,
+                );
+            }
+            let groups = (t * nh).div_ceil(ATTENTION_WG) as u32;
+            assert_eq!(grids, [("attention", wide_grid(groups, split))], "{t}x{nh}");
+        }
+    }
+
+    /// `Recorder::moe_ep_band_remap` against the host remap it implements, over a packed
+    /// assignment count whose last workgroup is ragged. Every id starts nonzero and outside
+    /// `[0, hi - lo)`, and every weight nonzero, so an assignment the grid leaves out keeps a value
+    /// the remap never produces; the recorded grid is pinned to one thread per assignment in
+    /// `MOE_EP_BAND_REMAP_WG`-wide workgroups, so a grid too large fails too.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn moe_ep_band_remap_matches_host() {
+        // 13 rows of top-8: 104 assignments in two workgroups, the last ragged.
+        const N: usize = 13 * 8;
+        const N_EXPERT: u32 = 32;
+        let (lo, hi) = (8u32, 16u32);
+        let be = be_with(|_| {});
+        // Ids 1..N_EXPERT: in band for some assignments, below and above it for others.
+        let ids: Vec<u32> = (0..N as u32)
+            .map(|i| 1 + (i * 7) % (N_EXPERT - 1))
+            .collect();
+        let wts: Vec<f32> = (0..N).map(|i| 0.1 + i as f32 * 0.01).collect();
+        let in_band = |id: u32| (lo..hi).contains(&id);
+        assert!(ids.iter().any(|&id| in_band(id)) && ids.iter().any(|&id| !in_band(id)));
+        let want_ids: Vec<u32> = ids
+            .iter()
+            .map(|&id| if in_band(id) { id - lo } else { 0 })
+            .collect();
+        let want_wts: Vec<f32> = ids
+            .iter()
+            .zip(&wts)
+            .map(|(&id, &w)| if in_band(id) { w } else { 0.0 })
+            .collect();
+        // The remap's own guard: no starting value equals what the remap writes there.
+        assert!(ids.iter().zip(&want_ids).all(|(a, b)| a != b));
+        let idb = be.alloc(N * 4, BufferUsage::Activations).unwrap();
+        be.upload(idb.as_ref(), bytemuck::cast_slice(&ids)).unwrap();
+        let wb = upf32(&be, &wts);
+        let (_, grids) = record_counting_grids(&be, None, |r| {
+            r.moe_ep_band_remap(idb.as_ref(), wb.as_ref(), N, lo, hi)
+        });
+        let bits = |v: &[f32]| v.iter().map(|w| w.to_bits()).collect::<Vec<_>>();
+        // Ids are read back through the f32 helper's bytes: the remap writes them exactly.
+        let got_ids = bits(&download_f32(&be, idb.as_ref(), N));
+        let got_wts = download_f32(&be, wb.as_ref(), N);
+        assert_eq!(got_ids, want_ids);
+        // Exact: the remap copies a weight or writes 0.0.
+        assert_eq!(bits(&got_wts), bits(&want_wts));
+        let groups = N.div_ceil(MOE_EP_BAND_REMAP_WG) as u32;
+        assert_eq!(grids, [("moe_ep_band_remap", [groups, 1, 1])]);
     }
 
     /// The dense tiled GEMMs without matrix units (`matmul_mmq_at` for every

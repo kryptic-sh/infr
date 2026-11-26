@@ -6261,11 +6261,14 @@ fn nc_gemm_choice(
         return None;
     }
     // A K-quant tile needs whole superblocks along k and an aligned weight base, and a plan this
-    // device can build and dispatch; anything else falls through to the arms below.
+    // device can build and dispatch; anything else falls through to the arms below. A weight past
+    // the BDA addressing cap is declined too: the tiled GEMMs cannot read it, and the caller's
+    // kernel choice for it must be the one it makes with the parameter off.
     let kq_fma = (be_.tuning().gemm_kq_fma
         && crate::gemm::native_gemm_kq_fma_supported(dt)
         && in_f.is_multiple_of(256)
-        && w_off.is_multiple_of(256))
+        && w_off.is_multiple_of(256)
+        && !crate::recorder::bda_weight_breaches(dt, in_f, out_f, &be_.cfg().kernels.vulkan))
     .then(|| {
         kq_fma_plan(
             m,
@@ -8898,6 +8901,70 @@ mod tests {
         assert_eq!(kq_fma_plan(2, 4096, 256, 16, big, 3), None);
     }
 
+    /// A backend on the `INFR_DEV` device without its coopmat tier and with the tuning parameter
+    /// `gemm.kq_fma` on, after `f` edits the rest of its Vulkan config; `None` without a GPU.
+    fn kq_fma_backend(f: impl FnOnce(&mut infr_core::config::VulkanCfg)) -> Option<VulkanBackend> {
+        let mut cfg = crate::test_config();
+        cfg.kernels.vulkan.coopmat = false;
+        cfg.kernels
+            .vulkan
+            .tune
+            .entries
+            .push(infr_core::config::TuneEntry {
+                key: "gemm.kq_fma".into(),
+                value: "true".into(),
+                level: infr_core::config::TuneLevel::Cli,
+            });
+        f(&mut cfg.kernels.vulkan);
+        infr_testkit::gpu_or_skip_noted(VulkanBackend::new_with(std::sync::Arc::new(cfg)))
+    }
+
+    /// One `[m, in_f] x [out_f, in_f]ᵀ` Q4_K `Op::Linear` graph: its input, weight and output ids.
+    fn q4k_linear_graph(
+        m: usize,
+        in_f: usize,
+        out_f: usize,
+    ) -> (Graph, TensorId, TensorId, TensorId) {
+        let mut g = Graph::new();
+        let xi = g.input(TensorDesc::new(vec![m, in_f], DType::F32));
+        let wi = g.weight(TensorDesc::new(vec![out_f, in_f], DType::Q4K));
+        let yi = g.output(TensorDesc::new(vec![m, out_f], DType::F32));
+        g.push(Op::Linear {
+            x: xi,
+            weight: wi,
+            dst: yi,
+            m: m as u32,
+            in_f: in_f as u32,
+            out_f: out_f as u32,
+            w_off: 0,
+        });
+        (g, xi, wi, yi)
+    }
+
+    /// The input, the Q4_K weight bytes and the host reference of a `q4k_linear_graph` shape.
+    fn q4k_linear_case(m: usize, in_f: usize, out_f: usize) -> (Vec<f32>, Vec<u8>, Vec<f32>) {
+        let x: Vec<f32> = (0..m * in_f)
+            .map(|i| ((i % 89) as f32 - 44.0) * 0.013)
+            .collect();
+        let w: Vec<f32> = (0..out_f * in_f)
+            .map(|i| (i as f32 * 0.031).sin() * 0.4)
+            .collect();
+        let wq = q4k(&w);
+        let want = infr_testkit::ref_linear(&x, &deq_q4k(&wq), m, in_f, out_f);
+        (x, wq, want)
+    }
+
+    /// The largest absolute difference of `got` from `want`, as a fraction of `want`'s RMS.
+    fn worst_of_rms(got: &[f32], want: &[f32]) -> f64 {
+        assert_eq!(got.len(), want.len());
+        let rms =
+            (want.iter().map(|v| (*v as f64).powi(2)).sum::<f64>() / want.len() as f64).sqrt();
+        let worst = got.iter().zip(want).fold(0f64, |a, (g, w)| {
+            infr_testkit::nan_max64(a, (*g as f64 - *w as f64).abs())
+        });
+        worst / rms
+    }
+
     /// End to end on a device without coopmat, with `gemm.kq_fma` on: a prefill `Linear` whose
     /// fp32 K-quant grid is wider than the device's `maxComputeWorkGroupCount[0]` (played smaller
     /// through `TEST_KERNEL_LIMITS`) still runs and matches the host, on the kernels the tier
@@ -8906,20 +8973,7 @@ mod tests {
     #[ignore = "requires a Vulkan-capable GPU"]
     fn kq_fma_grid_past_the_limit_takes_the_other_arms() {
         let (m, in_f, out_f) = (130usize, 256usize, 512usize);
-        let backend = || {
-            let mut cfg = crate::test_config();
-            cfg.kernels.vulkan.coopmat = false;
-            cfg.kernels
-                .vulkan
-                .tune
-                .entries
-                .push(infr_core::config::TuneEntry {
-                    key: "gemm.kq_fma".into(),
-                    value: "true".into(),
-                    level: infr_core::config::TuneLevel::Cli,
-                });
-            infr_testkit::gpu_or_skip_noted(VulkanBackend::new_with(std::sync::Arc::new(cfg)))
-        };
+        let backend = || kq_fma_backend(|_| {});
         let Some(probe) = backend() else {
             return; // no GPU — self-skip
         };
@@ -8932,14 +8986,7 @@ mod tests {
             return;
         };
         let gx = crate::recorder::kq_fma_grid_x(m, out_f, bn, splits, u32::MAX).unwrap();
-        let x: Vec<f32> = (0..m * in_f)
-            .map(|i| ((i % 89) as f32 - 44.0) * 0.013)
-            .collect();
-        let w: Vec<f32> = (0..out_f * in_f)
-            .map(|i| (i as f32 * 0.031).sin() * 0.4)
-            .collect();
-        let wq = q4k(&w);
-        let want = infr_testkit::ref_linear(&x, &deq_q4k(&wq), m, in_f, out_f);
+        let (x, wq, want) = q4k_linear_case(m, in_f, out_f);
         for (limit, kq) in [(gx, true), (gx - 1, false)] {
             let Some(be_) = backend() else { return };
             crate::TEST_KERNEL_LIMITS.with(|l| {
@@ -8948,19 +8995,7 @@ mod tests {
                     ..be_.shared.kernel_limits
                 }))
             });
-            let mut g = Graph::new();
-            let xi = g.input(TensorDesc::new(vec![m, in_f], DType::F32));
-            let wi = g.weight(TensorDesc::new(vec![out_f, in_f], DType::Q4K));
-            let yi = g.output(TensorDesc::new(vec![m, out_f], DType::F32));
-            g.push(Op::Linear {
-                x: xi,
-                weight: wi,
-                dst: yi,
-                m: m as u32,
-                in_f: in_f as u32,
-                out_f: out_f as u32,
-                w_off: 0,
-            });
+            let (g, xi, wi, yi) = q4k_linear_graph(m, in_f, out_f);
             let got = infr_testkit::run_graph(
                 &be_,
                 &g,
@@ -8975,19 +9010,179 @@ mod tests {
                 kq,
                 "limit {limit} against a grid of {gx}: built {built:?}"
             );
-            let rms =
-                (want.iter().map(|v| (*v as f64).powi(2)).sum::<f64>() / want.len() as f64).sqrt();
-            let worst = got.iter().zip(&want).fold(0f64, |a, (g, w)| {
-                infr_testkit::nan_max64(a, (*g as f64 - *w as f64).abs())
-            });
             // The f32 tile is held tighter than the int8 arm it replaces.
-            let bound = if kq { 1e-4 } else { 2e-2 };
+            let bound = if kq { KQ_FMA_BOUND } else { 2e-2 };
+            let off = worst_of_rms(&got, &want);
             assert!(
-                worst / rms < bound,
-                "limit {limit}: {:.2e} of the output RMS off the host",
-                worst / rms
+                off < bound,
+                "limit {limit}: {off:.2e} of the output RMS off the host"
             );
         }
+    }
+
+    /// The fp32 K-quant tile's bound against the host, as a fraction of the output RMS.
+    const KQ_FMA_BOUND: f64 = 1e-4;
+
+    /// The adapter's split-K route for the fp32 K-quant GEMM: `in_f` deep enough and the grid small
+    /// enough that `kq_fma_plan` takes k slices, so the Linear builds the GEMM and its
+    /// `splitk_reduce` pass, sums through the pooled partials buffer, and writes its `m` rows
+    /// (not a multiple of 64) through the padded destination. It must match the host at the f32
+    /// tile's bound.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn kq_fma_split_k_linear_matches_host() {
+        let (m, in_f, out_f) = (130usize, 1024usize, 256usize);
+        let Some(be_) = kq_fma_backend(|_| {}) else {
+            return; // no GPU — self-skip
+        };
+        let plan = kq_fma_plan(
+            m,
+            in_f,
+            out_f,
+            be_.caps().compute_units.max(1) as usize,
+            be_.caps().max_shared_memory_bytes,
+            be_.kernel_limits().workgroup_count_x,
+        );
+        let Some((_, splits)) = plan else {
+            eprintln!("skip: this device cannot take the fp32 K-quant GEMM at all");
+            return;
+        };
+        if splits == 1 {
+            eprintln!("skip: this device fills at one k slice, so the split-K route is not taken");
+            return;
+        }
+        let (x, wq, want) = q4k_linear_case(m, in_f, out_f);
+        let (g, xi, wi, yi) = q4k_linear_graph(m, in_f, out_f);
+        let got = infr_testkit::run_graph(
+            &be_,
+            &g,
+            &[(xi, infr_testkit::f32_bytes(&x)), (wi, wq)],
+            yi,
+            m * out_f,
+        );
+        let built = be_.built_kernel_names();
+        assert!(
+            built.iter().any(|k| k.starts_with("native_gemm_kq_fma"))
+                && built.contains(&"splitk_reduce"),
+            "{splits} k slices planned, built {built:?}"
+        );
+        let off = worst_of_rms(&got, &want);
+        assert!(
+            off < KQ_FMA_BOUND,
+            "{off:.2e} of the output RMS off the host"
+        );
+    }
+
+    /// `matmul_kq_fma_splitk_at`'s sum pass is one thread per output element, so a short chunk of
+    /// a wide output passes the guaranteed `maxComputeWorkGroupCount[0]` where the GEMM's own tile
+    /// grid stays far inside it (here 2050 tiles against a 65,600-workgroup sum). It must record
+    /// through `dispatch_wide`'s 2-D split, which this checks by the grid it recorded, and still
+    /// match the host. The recording devices here report a far larger x limit, so the unsplit grid
+    /// would run here too; the grid is what shows the split.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn kq_fma_split_k_sum_past_the_limit_splits() {
+        let (m, k, n, bn, splits) = (2usize, 512usize, 65_600usize, 64usize, 2usize);
+        let max_x = Recorder::MAX_GROUP_COUNT_X;
+        let Some(be_) = kq_fma_backend(|_| {}) else {
+            return; // no GPU — self-skip
+        };
+        if crate::gemm::native_gemm_kq_fma_shared_bytes(bn) > be_.caps().max_shared_memory_bytes {
+            eprintln!("skip: this device's shared memory cannot hold the t{bn} fp32 K-quant tile");
+            return;
+        }
+        let mpad = m.div_ceil(64) * 64;
+        let groups = (mpad * n).div_ceil(crate::recorder::SPLITK_REDUCE_WG) as u32;
+        assert!(groups > max_x);
+        let (x, wq, want) = q4k_linear_case(m, k, n);
+        let w = be_.alloc(wq.len(), BufferUsage::Weights).unwrap();
+        be_.upload(w.as_ref(), &wq).unwrap();
+        let xb = be_.alloc(m * k * 4, BufferUsage::Activations).unwrap();
+        be_.upload(xb.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+        let parts = be_
+            .alloc(splits * mpad * n * 4, BufferUsage::Activations)
+            .unwrap();
+        let c = be_.alloc(mpad * n * 4, BufferUsage::Activations).unwrap();
+        let ((), grids) = crate::recorder::capture_test_grids(|| {
+            let rec = be_.recorder().unwrap();
+            rec.matmul_kq_fma_splitk(
+                DType::Q4K,
+                bn,
+                xb.as_ref(),
+                w.as_ref(),
+                0,
+                parts.as_ref(),
+                c.as_ref(),
+                m,
+                k,
+                n,
+                splits,
+            );
+            rec.finish().unwrap();
+        });
+        let mut got = vec![0u8; m * n * 4];
+        be_.download(c.as_ref(), &mut got).unwrap();
+        let got: Vec<f32> = got
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_ne_bytes(*b))
+            .collect();
+        let off = worst_of_rms(&got, &want);
+        assert!(
+            off < KQ_FMA_BOUND,
+            "{off:.2e} of the output RMS off the host"
+        );
+        let reduce: Vec<_> = grids
+            .iter()
+            .filter(|(k, _)| *k == "splitk_reduce")
+            .collect();
+        assert_eq!(
+            reduce,
+            [&("splitk_reduce", [max_x, groups.div_ceil(max_x), 1])]
+        );
+    }
+
+    /// With `gemm.kq_fma` on, a weight past the BDA addressing cap (lowered here to this weight's
+    /// size) keeps the kernels it gets with the parameter off: on a device with neither coopmat
+    /// nor int8 dot that is the GEMV, which chunks the weight. A row count past the multi-row
+    /// band keeps the Linear off the band's own fallback, so a tiled-GEMM choice is refused.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn kq_fma_declines_a_breaching_weight() {
+        let (m, in_f, out_f) = (130usize, 512usize, 256usize);
+        let Some(be_) = kq_fma_backend(|vk| {
+            vk.i8_dot = false;
+            vk.bda_chunk_elems = Some((in_f * out_f) as u64);
+        }) else {
+            return; // no GPU — self-skip
+        };
+        assert!(crate::recorder::bda_weight_breaches(
+            DType::Q4K,
+            in_f,
+            out_f,
+            &be_.cfg().kernels.vulkan
+        ));
+        assert!(!be_.caps().i8_dot && !be_.caps().f16_coopmat());
+        let (x, wq, want) = q4k_linear_case(m, in_f, out_f);
+        let (g, xi, wi, yi) = q4k_linear_graph(m, in_f, out_f);
+        let got = infr_testkit::run_graph(
+            &be_,
+            &g,
+            &[(xi, infr_testkit::f32_bytes(&x)), (wi, wq)],
+            yi,
+            m * out_f,
+        );
+        let built = be_.built_kernel_names();
+        assert!(
+            !built.iter().any(|k| k.starts_with("native_gemm_kq_fma")),
+            "built {built:?}"
+        );
+        let off = worst_of_rms(&got, &want);
+        assert!(
+            off < KQ_FMA_BOUND,
+            "{off:.2e} of the output RMS off the host"
+        );
     }
 
     /// The mrow m-ladder moved to the shared `infr_core::tier` policy (candidate F): the two

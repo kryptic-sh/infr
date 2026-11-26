@@ -373,7 +373,10 @@ device runs what it ran before them; `gemm.kq_fma` is off everywhere unless set;
   ([`gpu-tolerance.md`](gpu-tolerance.md), "Mixing f32 and int8 prefill Linears"
   and "The fp32 K-quant prefill GEMM in the float runs"). Set, it still leaves a
   shape to the kernels it ran without it when the device's shared memory cannot
-  hold the tile or the grid would pass `maxComputeWorkGroupCount[0]`.
+  hold the tile, the tile grid would pass `maxComputeWorkGroupCount[0]`, or the
+  weight is past the 2³² addressing cap. Its split-k sum pass splits its grid in
+  two dimensions past 65,535 workgroups, Vulkan's guaranteed minimum, on every
+  device, whatever limit the device reports.
 - `attn_split.decode_min_chunk` is the fewest keys per chunk of decode split-K
   attention. Default: 16 on a discrete device in the slow class (wave64-only, or
   neither matrix units nor an accelerated int8 dot), 64 elsewhere. It changes

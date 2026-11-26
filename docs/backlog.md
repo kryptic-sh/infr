@@ -347,22 +347,50 @@ To fix, none done yet:
 outlier-quantizer commits.** No wrong-result defect found. The pair nobody had
 reviewed together is clean: PR #111's prefetch writes only per-thread registers,
 and the outlier term reads the current block's staged data and its own `hres`
-entry. To fix, none done yet:
+entry.
 
-6. **Two more kernels sized in threads where the shader is 64 wide** (the defect
-   PR #115 fixed for rope; wasted work, not wrong output): `attention.comp` from
-   `Recorder::attention` and `ops.rs::attention` (tests and the eager path
-   only), and `moe_ep_band_remap` from the recorder's plain `dispatch`
-   (production under expert parallelism; 8192 workgroups where 128 do at a
-   1024-row chunk with top-8, and past a 65535 workgroup limit at an 8192-row
-   chunk, the second part inferred). The comment above
-   `elementwise_ops_split_wide_grids` still lists attention as one workgroup per
-   unit.
-7. **`elementwise_ops_split_wide_grids` cannot catch a rope grid that is too
-   small:** both of its runs use the same grid and start from the same data, so
-   rows left unwritten match. `rope_matches_host` catches it on the eager path
-   only; `rope_wg_matches_shader` checks the shader's layout line, not a
-   dispatch site. Give the recorder's rope sites a host oracle.
+Items 6 and 7 (the attention and expert-parallel remap grids, the recorder rope
+oracle) are fixed. Left from them:
+
+- **Plain `Recorder::dispatch` sites whose 1-D count can pass the guaranteed
+  65,535 at a real shape, not changed** (each runs only where the tier is taken;
+  RADV reports an x limit of 4,294,967,295, so nothing here can show a failure):
+  the int8-coopmat prefill GEMMs (`matmul_i8cm_*`, `m/128 * n/16` workgroups:
+  114,688 at an 8192-row chunk of a 28,672-wide FFN); the f16 coopmat GEMMs
+  (`matmul_native_off`, `_f16a`, `_f32a`, `matmul_f8cm_*`, `matmul_bf16cm`, at
+  most `m/64 * n/64`: 57,344 there, past the limit only above an 8192-row
+  chunk); `matmul_native_cm8` (the Arc opt-in tier, on ANV, which enforces the
+  minimum) at a multi-row lm_head; the flash-attention prefill's combine
+  (`mpad * nh`, 524,288 at 8192 rows of 64 heads) and `tile_wg`; the split-KV
+  combine in `attention_kv_split_impl` (`rows * nh * 4`, past the limit once
+  `rows * nh` passes 16,383; whether that path takes so many rows was not
+  checked). The fix is `dispatch_wide` plus the flat-index rebuild in each
+  shader, which most of these do not have.
+- **`moe_ep_band_remap` still records through plain `dispatch`:** its shader
+  indexes by `gl_GlobalInvocationID.x`, so it cannot take `dispatch_wide`'s
+  split without a shader change. Correctly sized it passes the limit only past
+  4,194,240 assignments (a 524,288-row chunk at top-8).
+- **Not reproduced:** the old remap's 65,536-workgroup grid at an 8192-row top-8
+  chunk was shown by arithmetic, not on a device that enforces the minimum (no
+  such device here). The resized remap was run on a real model only at world=1
+  (Qwen3-30B-A3B Q4_K_M, `INFR_EXPERT_PARALLEL=Vulkan0`, greedy text the same
+  with the old and new sizing); world=2 on a real model was not run, since the
+  integrated GPU here lost the device holding the replicated 30B model before
+  (`ep_matches_single_device_synthetic` covers world=2 on tiny experts).
+
+- **A recorder dropped without `finish` leaks its segment timestamp pool:**
+  under the validation layer,
+  `embed_gather_refuses_a_forced_fold_on_an_unaligned_row`,
+  `moe_topk_refuses_above_the_expert_ceiling` and
+  `moe_topk_refuses_groups_it_cannot_route` each end in
+  `VUID-vkDestroyDevice-device-05137`, "1 leaked objects … VkQueryPool", on both
+  GPUs, on `5135b8b5` as well. Each test gets a refusal from a recorder op and
+  drops the `Recorder` unfinished; `Recorder` has no `Drop`, and
+  `seg_query_pool` is destroyed only on the finish and discard paths. Whether a
+  production error path drops a recorder the same way was not checked.
+
+To fix, none done yet:
+
 8. **Builds no op-level test dispatches:** `native_gemm_mmq_q4k_xpg` (the paged
    64-row tile); the dense resident and `_streamed` builds are held to the host
    only at a loose bound and to each other bit for bit, on shared staging code;
@@ -379,8 +407,39 @@ The standing fact behind several of these: CI runs no Vulkan GPU test (it passes
 `--include-ignored` for the Metal crate only), so every claim about a kernel
 rests on local runs.
 
-Still to audit: #112's merge and follow-up, and the server endpoints (#117,
-#118) with their follow-ups, all pushed on 2026-11-26.
+**Third part done 2026-11-26: #112, #117, #118 and their follow-ups**, by
+reading (nothing run on a GPU). The kernel findings (the split-K sum pass past
+the workgroup limit, `gemm.kq_fma` turning a breaching weight into an error, no
+test of the adapter's split-K route) were fixed the same day. The shader's index
+arithmetic was worked by hand for several shapes and found consistent; the
+shared-memory figure matches the shader's arrays. To fix, none done yet:
+
+10. **The MTP gating for penalties and `logit_bias` is unobservable, and the
+    changelog describes it as live.** `mtp_enabled()` returns `false` (MTP is
+    parked), yet a `Fixed` entry says an MTP-enabled model now applies a
+    request's penalties and `logit_bias`, and the logprobs entries describe
+    skipping the MTP draft-verify loop. Correct the wording. If MTP is
+    un-parked: no MTP entry point (`generate_mtp_spec_*`) takes a `RequestCtx`,
+    so that path would also ignore the request's temperature, top-p, top-k, seed
+    and min-p, miss the stop-sequence abort, and never see the server's deadline
+    or a disconnect; a slot would be held until `max_new`.
+11. **`SpecMetalChat::generate` drops the penalties silently** (macOS, read from
+    code, not run): `refuse_seam_only_fields` refuses `logit_bias`, `min_p` and
+    `logprobs` but not `presence_penalty`, `frequency_penalty` or
+    `repeat_penalty`, and `generate_metal_spec` gets no request. Refuse them
+    there or apply them.
+12. **`/v1/completions` parsing:** `prompt: []` answers "batched prompts are not
+    supported" (an empty array matches the batched arm) where "prompt is
+    required" is meant; `n`, `best_of` and the legacy `logprobs` count are plain
+    integers, so `"n": 1.0` is a generic body-parse 400 where the chat route
+    accepts it.
+
+Not looked at in the third part: the tolerance-doc and harness edits of
+`022f34c9`; whether resident buffers and streamed arena slots leave the few
+bytes of tail slack the Q4_0 decoder reads past a weight's last block (the same
+pattern the existing word-load decoders use); `cancel_on_hangup`, `arm_deadline`
+and `DoneGuard` beyond their call sites; the Metal backend; the CI workflow
+edits.
 
 ### B-IMAGE-INPUT — image input for vision models: how it is to be built (2026-11-26)
 

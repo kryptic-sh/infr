@@ -31,9 +31,15 @@ launch is sized in workgroups by `rope_groups`: `ceil(t · n_heads · hd2 / 64)`
 
 ## The numbers
 
-RX 580 (RADV POLARIS10, wave64-only), `--config /dev/null`, Vulkan0, 3 reps,
+RX 580 (RADV POLARIS10, wave64-only), `radv` / Mesa 26.2.7
+(`mesa-vulkan-drivers-26.2.7-1.fc44`), `--config /dev/null`, Vulkan0, 3 reps,
 alternating base/new with 20s cooldowns, base = `kryptic-sh/infr` main at
 `4e93a740`:
+
+```sh
+infr --config /dev/null bench "$M" -p 0 -n 128 -r 3 --dev Vulkan0
+infr --config /dev/null bench "$M" -p 512 -n 0 -r 3 --dev Vulkan0
+```
 
 | shape                                   |      base | slot threads |                        delta |
 | --------------------------------------- | --------: | -----------: | ---------------------------: |
@@ -65,8 +71,10 @@ wave — a prefill ubatch — is flat, which is what the pp512 row shows.
 ## Correctness gates
 
 - `ops::tests::rope_partial_matches_host` — new. A partial rope's tail slots
-  against a host reference, which no existing test covered: every rope test ropes
-  the full head, so the tail-copy path had no oracle before.
+  against a host reference, which the rope tests here did not cover because they
+  rope the full head. (`seam_op_parity::rope_neox_and_norm_parity` does rope a
+  partial head, at hd 24 / rope_dim 12, so a partial rotation was not untested —
+  the eager `rope()` helper's tail slots were.)
 - `ops::tests::rope_matches_host`, `recorder::tests::qk_norm_rope_matches_cpu`
   (the fused kernel, unchanged), and the ring-cache/graph refusals in `adapter`.
 - `recorder::tests::rope_groups_size_the_slot_grid` — new host test: coverage at a

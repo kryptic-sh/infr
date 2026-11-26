@@ -63,7 +63,8 @@ pub(crate) struct CompletionRequest {
     best_of: Option<u32>,
     /// OpenAI `logprobs` on the legacy route is a COUNT, where the chat route's is a flag. Both
     /// spellings are accepted: `true` with no `top_logprobs` means 20, and a number `n` means
-    /// `top_logprobs: n` (evaluation harnesses send the number).
+    /// `top_logprobs: n` (evaluation harnesses send the number). `0` still asks for the chosen
+    /// tokens' log probabilities, with no alternatives.
     #[serde(default)]
     logprobs: Option<LogprobsArg>,
     /// OpenAI `top_logprobs`: how many most likely alternatives to include per token.
@@ -82,11 +83,12 @@ impl CompletionRequest {
     /// The sampling fields in the shape [`GenParams::from_request`] validates.
     fn sampling_shape(&self) -> ChatRequest {
         // The legacy count spelling folds into the chat shape's flag plus a `top_logprobs` number.
-        // An explicit `top_logprobs` wins; `0` means "this token only", so the flag goes off.
+        // An explicit `top_logprobs` wins. Any count turns the flag on: `0` is "the chosen token
+        // only", not "off" (that is an absent or null `logprobs`).
         let (logprobs, top_logprobs) = match self.logprobs {
             Some(LogprobsArg::Flag(b)) => (Some(b), self.top_logprobs.clone()),
             Some(LogprobsArg::Count(n)) => (
-                Some(n > 0),
+                Some(true),
                 self.top_logprobs
                     .clone()
                     .or_else(|| Some(serde_json::Value::from(n))),
@@ -159,6 +161,16 @@ impl CompletionRequest {
                 param: "best_of",
                 message: "only best_of = 1 is supported".into(),
             });
+        }
+        // The count becomes `top_logprobs` only when that is absent; checked here so the error
+        // names the field the client sent.
+        if let (Some(LogprobsArg::Count(n)), None) = (self.logprobs, &self.top_logprobs) {
+            if n as usize > MAX_TOP_LOGPROBS {
+                return Err(ParamError {
+                    param: "logprobs",
+                    message: format!("logprobs must be at most {MAX_TOP_LOGPROBS}, got {n}"),
+                });
+            }
         }
         Ok(())
     }
@@ -568,22 +580,25 @@ mod tests {
         fn complete_with_logprobs(
             &self,
             _prompt: &str,
-            _params: &GenParams,
+            params: &GenParams,
             _cancel: &Arc<AtomicBool>,
             on_text: &mut dyn FnMut(&str),
             on_logprob: &mut dyn FnMut(infr_engine::TokenLogprob),
         ) -> anyhow::Result<ChatOutcome> {
+            assert!(params.logprobs, "the server only asks when requested");
+            let mut top = vec![infr_engine::TokenLogprobAlt {
+                token: 9,
+                text: "ho".into(),
+                bytes: b"ho".to_vec(),
+                logprob: -1.5,
+            }];
+            top.truncate(params.top_logprobs);
             on_logprob(infr_engine::TokenLogprob {
                 token: 7,
                 text: "hi".into(),
                 bytes: b"hi".to_vec(),
                 logprob: -0.25,
-                top: vec![infr_engine::TokenLogprobAlt {
-                    token: 9,
-                    text: "ho".into(),
-                    bytes: b"ho".to_vec(),
-                    logprob: -1.5,
-                }],
+                top,
             });
             on_text("hi");
             Ok(ChatOutcome {
@@ -690,6 +705,80 @@ mod tests {
         }
     }
 
+    /// The legacy `logprobs: 0` asks for the chosen tokens' log probabilities with no
+    /// alternatives: entries with an empty `top_logprobs`, not "off" and not a `400`.
+    #[tokio::test]
+    async fn a_zero_legacy_logprobs_count_returns_entries_without_alternatives() {
+        for body in [
+            r#"{"model":"m","prompt":"a","logprobs":0}"#,
+            r#"{"model":"m","prompt":"a","logprobs":0,"stream":true}"#,
+        ] {
+            let g: Arc<dyn ChatGenerator> = Arc::new(LogprobCompleteGen);
+            let r = build_router(AppState::new(g, "m", 1, Arc::new(Config::default())));
+            let resp = r
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/completions")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_owned()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{body}");
+            let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+            let body_text = String::from_utf8(bytes.to_vec()).unwrap();
+            let v: serde_json::Value = match body_text.strip_prefix("data: ") {
+                Some(_) => body_text
+                    .lines()
+                    .filter_map(|l| l.strip_prefix("data: "))
+                    .filter(|f| *f != "[DONE]")
+                    .map(|f| serde_json::from_str::<serde_json::Value>(f).unwrap())
+                    .find(|v| v["choices"][0]["text"] == "hi")
+                    .expect("a text chunk"),
+                None => serde_json::from_str(&body_text).unwrap(),
+            };
+            let lp = &v["choices"][0]["logprobs"]["content"][0];
+            assert_eq!(lp["token"], "hi", "{body}");
+            assert_eq!(lp["logprob"], -0.25, "{body}");
+            assert_eq!(lp["top_logprobs"], serde_json::json!([]), "{body}");
+        }
+    }
+
+    /// `echo` returns the prompt ahead of the reply, but the entries are the generated tokens'
+    /// only: they spell the text after the prompt.
+    #[tokio::test]
+    async fn echoed_prompt_text_carries_no_entries() {
+        let g: Arc<dyn ChatGenerator> = Arc::new(LogprobCompleteGen);
+        let r = build_router(AppState::new(g, "m", 1, Arc::new(Config::default())));
+        let resp = r
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model":"m","prompt":"say ","echo":true,"logprobs":1}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let text = v["choices"][0]["text"].as_str().unwrap();
+        let spelled: String = v["choices"][0]["logprobs"]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["token"].as_str().unwrap())
+            .collect();
+        assert_eq!(text, "say hi");
+        assert_eq!(spelled, "hi");
+    }
+
     #[tokio::test]
     async fn logprobs_are_returned_on_a_text_completion() {
         let g: Arc<dyn ChatGenerator> = Arc::new(LogprobCompleteGen);
@@ -758,6 +847,7 @@ mod tests {
             (r#"{"prompt":"a","top_logprobs":2}"#, "top_logprobs"),
             (r#"{"prompt":"a","temperature":9}"#, "temperature"),
             (r#"{"prompt":"a","best_of":3}"#, "best_of"),
+            (r#"{"prompt":"a","logprobs":21}"#, "logprobs"),
             (r#"{"prompt":"a","logit_bias":{"1":-150}}"#, "logit_bias"),
             (r#"{"prompt":"a","logit_bias":{"2000":-1}}"#, "logit_bias"),
         ] {

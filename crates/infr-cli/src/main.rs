@@ -2034,6 +2034,12 @@ trait GenBackend: Send + Sync {
         None
     }
 
+    /// Whether `id` is a special token the streamed text leaves out, so its `logprobs` entry
+    /// belongs to no returned text.
+    fn token_hidden(&self, _id: u32) -> bool {
+        false
+    }
+
     /// The reply budget for a request that names none: `sampling.max_new` (`INFR_MAX_NEW`; the
     /// default is `SamplingCfg`'s) off the config this backend's renderer was opened with. A
     /// trait method rather than a free function because the config is per-backend state — and
@@ -2078,6 +2084,10 @@ impl GenBackend for SeamGenerator {
 
     fn token_text(&self, id: u32) -> Option<(String, Vec<u8>)> {
         self.renderer.token_text(id)
+    }
+
+    fn token_hidden(&self, id: u32) -> bool {
+        self.renderer.token_is_hidden(id)
     }
 
     fn request_ctx(
@@ -2162,6 +2172,10 @@ impl GenBackend for ParallelGenerator {
 
     fn token_text(&self, id: u32) -> Option<(String, Vec<u8>)> {
         self.renderer.token_text(id)
+    }
+
+    fn token_hidden(&self, id: u32) -> bool {
+        self.renderer.token_is_hidden(id)
     }
 
     fn request_ctx(
@@ -2419,20 +2433,23 @@ fn run_completion(
     let req = be
         .request_ctx(request_sampling(params))
         .with_cancel(cancel.clone());
-    let mut stops = infr_server::StopMatcher::new(params.stop.clone());
-    let stats = be
-        .generate(&prompt, max_new, None, &req, &mut |piece: &str| {
+    let mut stops = infr_server::LogprobStops::new(params.stop.clone());
+    let mut send = |out: Vec<infr_server::TokenText>| {
+        for run in out {
             if let Some(cb) = on_logprob.as_mut() {
-                for lp in req.take_logprobs() {
-                    cb(resolve_logprob(be, lp));
+                for lp in run.logprobs {
+                    cb(lp);
                 }
             }
-            let safe = stops.push(piece);
-            if !safe.is_empty() {
-                on_text(&safe);
+            if !run.text.is_empty() {
+                on_text(&run.text);
             }
+        }
+    };
+    let stats = be
+        .generate(&prompt, max_new, None, &req, &mut |piece: &str| {
+            send(stops.push(piece, piece_logprobs(be, &req)));
             if stops.hit() {
-                let _ = req.take_logprobs();
                 req.abort();
             }
         })
@@ -2443,15 +2460,7 @@ fn run_completion(
                 .or_else(|| unsupported_sampling(&e))
                 .unwrap_or(e)
         })?;
-    if let Some(cb) = on_logprob.as_mut() {
-        for lp in req.take_logprobs() {
-            cb(resolve_logprob(be, lp));
-        }
-    }
-    let tail = stops.flush();
-    if !tail.is_empty() {
-        on_text(&tail);
-    }
+    send(stops.flush());
     // `finish_reason`/`chat_outcome`, not a copy: `ctx_full` and `natural_stop` decide `length`
     // versus `stop`, and `prompt_tokens` is the WHOLE prompt, cached part included.
     Ok(chat_outcome(
@@ -2483,28 +2492,20 @@ fn forced_tool_call(body: &str) -> Option<(String, String)> {
     Some((name, serde_json::to_string(&arguments).ok()?))
 }
 
-/// Resolve every token id the decode loop has queued since the last text callback into the
-/// tokenizer-dependent fields (`token`, `bytes`) and append them to `pending`. The ids are queued
-/// before the text callback, so this runs at the start of the callback and the entries wait for
-/// the piece they belong to.
-fn collect_logprobs(
+/// The entries of the tokens that produced the piece the decode loop is handing over: every one
+/// it queued since the previous piece (each token's entry is queued before its text is decoded,
+/// and a token that completes no text yet adds no piece of its own), resolved against the
+/// tokenizer. A special token the stream leaves out has no text in the reply, so its entry is
+/// dropped rather than attached to text it did not produce.
+fn piece_logprobs(
     be: &dyn GenBackend,
     req: &infr_llama::sampling::RequestCtx,
-    pending: &mut Vec<infr_engine::TokenLogprob>,
-) {
-    for lp in req.take_logprobs() {
-        pending.push(resolve_logprob(be, lp));
-    }
-}
-
-/// Emit every queued logprob ahead of the text delta it belongs to.
-fn flush_logprobs(
-    pending: &mut Vec<infr_engine::TokenLogprob>,
-    on_delta: &mut dyn FnMut(infr_engine::Delta),
-) {
-    for lp in pending.drain(..) {
-        on_delta(infr_engine::Delta::Logprob(lp));
-    }
+) -> Vec<infr_engine::TokenLogprob> {
+    req.take_logprobs()
+        .into_iter()
+        .filter(|lp| !be.token_hidden(lp.token))
+        .map(|lp| resolve_logprob(be, lp))
+        .collect()
 }
 
 /// Fill one token's `text`/`bytes` (and its alternatives') from the backend's tokenizer.
@@ -2807,9 +2808,7 @@ fn run_prepared(
             // THIS sequence's own `RequestCtx`, which its decode loop polls after the current
             // token. The matcher and the latch are both per-call locals, so N concurrent requests
             // each stop on their OWN stop strings and nobody else's.
-            let mut stops = infr_server::StopMatcher::new(params.stop.clone());
-            // Log probabilities whose text the stop matcher has not released yet.
-            let mut pending_logprobs: Vec<infr_engine::TokenLogprob> = Vec::new();
+            let mut stops = infr_server::LogprobStops::new(params.stop.clone());
             let stats = {
                 let od = &mut *on_delta;
                 // Template-prefilled thinking (the PROMPT ends with the `<think>` opener): inject
@@ -2818,35 +2817,25 @@ fn run_prepared(
                 if infr_engine::prompt_prefills_think(&prompt) {
                     stream.push("<think>", &mut *od);
                 }
+                let mut send =
+                    |out: Vec<infr_server::TokenText>, od: &mut dyn FnMut(infr_engine::Delta)| {
+                        for run in out {
+                            stream.push_with_logprobs(&run.text, run.logprobs, od);
+                        }
+                    };
                 let stats = be
                     .generate(&prompt, max_new, None, &req, &mut |piece: &str| {
-                        let safe = stops.push(piece);
-                        collect_logprobs(be, &req, &mut pending_logprobs);
-                        if !safe.is_empty() {
-                            stream.push_with_logprobs(&safe, &mut pending_logprobs, &mut *od);
-                        }
+                        send(stops.push(piece, piece_logprobs(be, &req)), &mut *od);
                         // A stop sequence hit aborts THIS sequence's decode at its next poll,
                         // freeing the GPU slot promptly (the server's `cancel` already reaches it
                         // through `req`).
                         if stops.hit() {
-                            pending_logprobs.clear();
-                            let _ = req.take_logprobs();
                             req.abort();
                         }
                     })
                     .map_err(|e| refusal(&e, None).unwrap_or(e))?;
                 // No stop fired: whatever the matcher was holding back was never a stop prefix.
-                let tail = stops.flush();
-                if !stops.hit() {
-                    collect_logprobs(be, &req, &mut pending_logprobs);
-                }
-                if !tail.is_empty() {
-                    stream.push_with_logprobs(&tail, &mut pending_logprobs, &mut *od);
-                }
-                // A token that decoded to no text has no delta to ride; the finish chunk carries it.
-                if !stops.hit() {
-                    flush_logprobs(&mut pending_logprobs, &mut *od);
-                }
+                send(stops.flush(), &mut *od);
                 stats
             };
             stream.finish(on_delta);
@@ -6853,6 +6842,271 @@ mod tests {
             .expect("generates");
     }
 
+    // --- logprobs alignment -------------------------------------------------------------------
+
+    /// A serve backend whose decode is scripted token by token, as the seam decode loop runs:
+    /// each token's entry is queued on the request before its text, and the text arrives as the
+    /// detokenizer releases it — nothing for a special token the stream skips, or for the first
+    /// half of a character split across two tokens.
+    struct TokenScript {
+        be: ScriptBackend,
+        /// `(id, the token's own bytes, the text the stream releases once it is decoded)`.
+        tokens: Vec<(u32, &'static [u8], &'static str)>,
+        hidden: Vec<u32>,
+    }
+
+    impl TokenScript {
+        fn new(tokens: &[(u32, &'static [u8], &'static str)], hidden: &[u32]) -> Self {
+            Self {
+                be: ScriptBackend::new(false, &[]),
+                tokens: tokens.to_vec(),
+                hidden: hidden.to_vec(),
+            }
+        }
+    }
+
+    impl GenBackend for TokenScript {
+        fn renderer(&self) -> &infr_llama::chat::OaiRenderer {
+            self.be.renderer()
+        }
+        fn weights(&self) -> &infr_llama::WeightWatch {
+            self.be.weights()
+        }
+        fn token_text(&self, id: u32) -> Option<(String, Vec<u8>)> {
+            let (_, bytes, _) = self.tokens.iter().find(|t| t.0 == id)?;
+            Some((String::from_utf8_lossy(bytes).into_owned(), bytes.to_vec()))
+        }
+        fn token_hidden(&self, id: u32) -> bool {
+            self.hidden.contains(&id)
+        }
+        fn max_new_default(&self) -> usize {
+            64
+        }
+        fn request_ctx(
+            &self,
+            sampling: infr_llama::sampling::RequestSampling,
+        ) -> infr_llama::sampling::RequestCtx {
+            infr_llama::sampling::RequestCtx::new(sampling)
+        }
+        fn can_constrain(&self) -> bool {
+            false
+        }
+        fn max_prompt_tokens(&self) -> Option<usize> {
+            Some(4095)
+        }
+        fn generate(
+            &self,
+            _prompt: &str,
+            _max_new: usize,
+            _constraint: Option<&mut infr_llama::grammar::Constraint>,
+            req: &infr_llama::sampling::RequestCtx,
+            on_piece: &mut dyn FnMut(&str),
+        ) -> anyhow::Result<infr_llama::GenStats> {
+            let mut n_gen = 0;
+            for &(id, _, piece) in &self.tokens {
+                n_gen += 1;
+                req.push_logprob(infr_engine::TokenLogprob::unresolved(
+                    id,
+                    -(id as f32) / 100.0,
+                    Vec::new(),
+                ));
+                if !piece.is_empty() {
+                    on_piece(piece);
+                }
+                if req.aborted() {
+                    return Ok(infr_llama::GenStats {
+                        n_gen,
+                        ..Default::default()
+                    });
+                }
+            }
+            Ok(infr_llama::GenStats {
+                n_gen,
+                natural_stop: true,
+                ..Default::default()
+            })
+        }
+    }
+
+    fn logprob_params(stop: &[&str]) -> infr_server::GenParams {
+        infr_server::GenParams {
+            logprobs: true,
+            stop: stop.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// One reply as a streaming client receives it: each text chunk with the entries the server
+    /// puts on it (those emitted since the previous chunk), and the entries left for the finish
+    /// chunk.
+    type Chunks = (
+        Vec<(String, Vec<infr_engine::TokenLogprob>)>,
+        Vec<infr_engine::TokenLogprob>,
+    );
+
+    /// `/v1/completions` on `be`: entries arrive through `on_logprob` ahead of the text they ride.
+    fn completion_chunks(be: &TokenScript, params: &infr_server::GenParams) -> Chunks {
+        let pending = std::cell::RefCell::new(Vec::new());
+        let mut chunks = Vec::new();
+        run_completion(
+            be,
+            "a",
+            params,
+            &Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            &mut |text| chunks.push((text.to_owned(), pending.take())),
+            Some(&mut |lp| pending.borrow_mut().push(lp)),
+        )
+        .expect("generate");
+        (chunks, pending.take())
+    }
+
+    /// The chat route on `be`: entries arrive as `Delta::Logprob` ahead of the content they ride.
+    /// Only content chunks are kept; an entry riding anything else fails the test.
+    fn chat_chunks(be: &TokenScript, params: &infr_server::GenParams) -> Chunks {
+        let mut pending = Vec::new();
+        let mut chunks = Vec::new();
+        run_chat(
+            be,
+            &user_hi(),
+            None,
+            None,
+            params,
+            &Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            &mut |d| match d {
+                infr_engine::Delta::Logprob(lp) => pending.push(lp),
+                infr_engine::Delta::Content(text) => {
+                    chunks.push((text, std::mem::take(&mut pending)))
+                }
+                other => assert!(pending.is_empty(), "{pending:?} rode {other:?}"),
+            },
+        )
+        .expect("generate");
+        (chunks, pending)
+    }
+
+    fn ids(chunks: &Chunks) -> Vec<u32> {
+        chunks
+            .0
+            .iter()
+            .flat_map(|c| &c.1)
+            .chain(&chunks.1)
+            .map(|lp| lp.token)
+            .collect()
+    }
+
+    fn text(chunks: &Chunks) -> String {
+        chunks.0.iter().map(|c| c.0.as_str()).collect()
+    }
+
+    /// Every chunk's entries spell exactly its text, byte for byte, and none is left over.
+    fn assert_aligned(route: &str, chunks: &Chunks) {
+        for (text, lps) in &chunks.0 {
+            let bytes: Vec<u8> = lps.iter().flat_map(|lp| lp.bytes.clone()).collect();
+            assert_eq!(
+                bytes,
+                text.as_bytes(),
+                "{route}: chunk {text:?} has {lps:?}"
+            );
+        }
+        assert!(chunks.1.is_empty(), "{route}: left over {:?}", chunks.1);
+    }
+
+    /// A stop sequence spanning tokens: the reply ends before it, and so do the entries — the
+    /// stop's own tokens, and the one after it, report nothing. Both routes.
+    #[test]
+    fn logprobs_stop_with_the_text_at_a_stop_sequence() {
+        let be = TokenScript::new(
+            &[
+                (1, b"The", "The"),
+                (2, b" cat", " cat"),
+                (3, b"EN", "EN"),
+                (4, b"D", "D"),
+                (5, b" x", " x"),
+            ],
+            &[],
+        );
+        let params = logprob_params(&["END"]);
+        for (route, chunks) in [
+            ("completions", completion_chunks(&be, &params)),
+            ("chat", chat_chunks(&be, &params)),
+        ] {
+            assert_eq!(text(&chunks), "The cat", "{route}");
+            assert_eq!(ids(&chunks), [1, 2], "{route}");
+            assert_aligned(route, &chunks);
+        }
+    }
+
+    /// A stop sequence that starts inside a token: the token's head is returned, so its entry is
+    /// too — the whole sampled token, as every entry is. Both routes.
+    #[test]
+    fn a_token_cut_by_a_stop_keeps_its_entry() {
+        let be = TokenScript::new(
+            &[
+                (1, b"The", "The"),
+                (2, b" ca", " ca"),
+                (3, b"tEND", "tEND"),
+                (4, b" x", " x"),
+            ],
+            &[],
+        );
+        let params = logprob_params(&["END"]);
+        for (route, chunks) in [
+            ("completions", completion_chunks(&be, &params)),
+            ("chat", chat_chunks(&be, &params)),
+        ] {
+            assert_eq!(text(&chunks), "The cat", "{route}");
+            assert_eq!(ids(&chunks), [1, 2, 3], "{route}");
+            // The cut token's entry rides the chunk that ends with what it returned.
+            let last = chunks.0.last().expect("a chunk");
+            assert!(last.0.ends_with('t'), "{route}: {last:?}");
+            assert_eq!(last.1.last().map(|lp| lp.text.as_str()), Some("tEND"));
+            assert!(chunks.1.is_empty(), "{route}: left over {:?}", chunks.1);
+        }
+    }
+
+    /// A special token the stream skips, in the middle of a reply, and a character split across
+    /// two tokens: the special token has no text in the reply and reports nothing, and every
+    /// entry after it still rides the chunk with its own text. Both routes.
+    #[test]
+    fn a_hidden_token_mid_reply_neither_stalls_nor_shifts_entries() {
+        let be = TokenScript::new(
+            &[
+                (1, b"Hi", "Hi"),
+                (2, b"<|im_start|>", ""),
+                (3, b" there", " there"),
+                (4, &[0xE4, 0xB8], ""),
+                (5, &[0xAD], "\u{4E2D}"),
+                (6, b"!", "!"),
+            ],
+            &[2],
+        );
+        let params = logprob_params(&[]);
+        for (route, chunks) in [
+            ("completions", completion_chunks(&be, &params)),
+            ("chat", chat_chunks(&be, &params)),
+        ] {
+            assert_eq!(text(&chunks), "Hi there\u{4E2D}!", "{route}");
+            assert_eq!(ids(&chunks), [1, 3, 4, 5, 6], "{route}");
+            assert_aligned(route, &chunks);
+        }
+    }
+
+    /// The renderer's hidden-token test reads the tokenizer's special flag: a control token is
+    /// left out of streamed text, a marker the stream keeps is not, and neither is plain text.
+    #[test]
+    fn control_tokens_are_hidden_and_markers_are_not() {
+        let be = ScriptBackend::new(false, &[]);
+        let r = &be.renderer;
+        let id = |t: &str| {
+            (0..1024)
+                .find(|&i| r.decode_ids(&[i]).is_ok_and(|d| d == t))
+                .unwrap_or_else(|| panic!("no token {t:?}"))
+        };
+        assert!(r.token_is_hidden(id("<|im_start|>")));
+        assert!(!r.token_is_hidden(id("<think>")));
+        assert!(!r.token_is_hidden(id("a")));
+    }
+
     // --- /v1/completions on a real model ----------------------------------------------------
 
     /// The served model these tests load when it is in the HF cache. With
@@ -6976,5 +7230,197 @@ mod tests {
         assert_eq!(v["usage"]["prompt_tokens"], prompt_tokens);
         assert_eq!(v["usage"]["completion_tokens"], MAX_TOKENS);
         assert_eq!(v["usage"]["total_tokens"], prompt_tokens + MAX_TOKENS);
+    }
+
+    /// `logprobs` on `/v1/completions`, served by the real serve adapter on the CPU backend, are the
+    /// model's: the first reply token's entry equals the log-softmax of the engine's own logits row
+    /// for that step (within [`LOGPROB_BOUND`]), the alternatives are that row's most likely
+    /// tokens, and none of it moves with `temperature` — the numbers are taken before it. The
+    /// entries' bytes spell the returned text, and `logprobs: 0` returns entries with no
+    /// alternatives.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn completions_logprobs_are_the_models_on_a_real_model() {
+        /// How far a reported log probability may sit from the reference's: the report is a
+        /// binary32 value with a binary64 normalizer, the reference a binary64 log-softmax of
+        /// the same row.
+        const LOGPROB_BOUND: f64 = 1e-5;
+        const MAX_TOKENS: usize = 6;
+        const TOP: usize = 5;
+        let Some(gguf) = cached_qwen3_0_6b() else {
+            return;
+        };
+        let prompt = "The capital of France is";
+        let cfg = Arc::new(resolve_cfg(
+            &[("INFR_DEV", "cpu"), ("INFR_CTX", "512")],
+            PartialConfig::default(),
+            &[],
+        ));
+        let renderer = infr_llama::chat::OaiRenderer::open_with_tokenizer(&gguf, None, cfg.clone())
+            .expect("renderer");
+
+        // The reference: the engine's logits row for the first reply token, on its own instance.
+        let direct = build_chat_model(&gguf, None, false, &cfg).expect("load");
+        let ids = direct
+            .render_model()
+            .encode(&renderer.with_bos(prompt))
+            .expect("encode");
+        let row = direct
+            .render_model()
+            .prefill_logits_cpu(&ids)
+            .expect("logits");
+        drop(direct);
+        let max = row
+            .iter()
+            .fold(f64::NEG_INFINITY, |m, &l| m.max(f64::from(l)));
+        let lse = max
+            + row
+                .iter()
+                .map(|&l| (f64::from(l) - max).exp())
+                .sum::<f64>()
+                .ln();
+        let reference = |id: u64| f64::from(row[id as usize]) - lse;
+        let greedy = (0..row.len())
+            .max_by(|&a, &b| row[a].total_cmp(&row[b]))
+            .expect("a row") as u64;
+
+        let served = build_chat_model(&gguf, None, false, &cfg).expect("load");
+        let generator: Arc<dyn infr_server::ChatGenerator> = Arc::new(
+            SeamGenerator::new(&gguf, None, served, "cpu", cfg.clone()).expect("generator"),
+        );
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|l| l.local_addr())
+            .expect("a free port")
+            .port();
+        let addr: std::net::SocketAddr = ([127, 0, 0, 1], port).into();
+        let server = tokio::spawn(infr_server::serve(
+            generator,
+            "qwen3".into(),
+            addr,
+            1,
+            cfg.clone(),
+        ));
+        let mut ready = false;
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(ready, "the server never accepted a connection");
+
+        let complete = |body: serde_json::Value| async move {
+            let (status, out) = http_post(port, "/v1/completions", &body.to_string()).await;
+            assert_eq!(status, 200, "{body}: {out}");
+            let v: serde_json::Value = serde_json::from_str(&out).expect("a JSON body");
+            let text = v["choices"][0]["text"].as_str().expect("text").to_owned();
+            let entries = v["choices"][0]["logprobs"]["content"]
+                .as_array()
+                .expect("logprobs.content")
+                .clone();
+            let finish = v["choices"][0]["finish_reason"]
+                .as_str()
+                .expect("finish_reason")
+                .to_owned();
+            (text, entries, finish)
+        };
+        let num = |e: &serde_json::Value| e["logprob"].as_f64().expect("a numeric logprob");
+        // The entries cover the returned text byte for byte, one per generated token: all of
+        // the budget unless the model ended the reply. Bytes rather than each token's text, since
+        // a sampled character may be split across two tokens.
+        let covers = |at: &str, text: &str, entries: &[serde_json::Value], finish: &str| {
+            match finish {
+                "length" => assert_eq!(entries.len(), MAX_TOKENS, "{at}"),
+                "stop" => assert!((1..=MAX_TOKENS).contains(&entries.len()), "{at}"),
+                other => panic!("{at}: finish_reason {other}"),
+            }
+            let bytes: Vec<u8> = entries
+                .iter()
+                .flat_map(|e| e["bytes"].as_array().expect("bytes").clone())
+                .map(|b| b.as_u64().expect("a byte") as u8)
+                .collect();
+            assert_eq!(bytes, text.as_bytes(), "{at}");
+        };
+
+        let mut first: Option<serde_json::Value> = None;
+        for temperature in [0.0, 0.1, 1.5] {
+            let (text, entries, finish) = complete(serde_json::json!({
+                "prompt": prompt,
+                "max_tokens": MAX_TOKENS,
+                "temperature": temperature,
+                "seed": 7,
+                "logprobs": true,
+                "top_logprobs": TOP,
+            }))
+            .await;
+            let at = format!("temperature {temperature}");
+            covers(&at, &text, &entries, &finish);
+            for e in &entries {
+                let top = e["top_logprobs"].as_array().expect("top_logprobs");
+                assert_eq!(top.len(), TOP, "{at}");
+                for lp in std::iter::once(num(e)).chain(top.iter().map(num)) {
+                    assert!(lp.is_finite() && lp <= 0.0, "{at}: {e}");
+                }
+                assert!(
+                    top.windows(2).all(|w| num(&w[0]) >= num(&w[1])),
+                    "{at}: not descending: {e}"
+                );
+                if num(e) > num(&top[TOP - 1]) {
+                    assert!(
+                        top.iter().any(|a| a["id"] == e["id"]),
+                        "{at}: the chosen token is in the top {TOP} but not listed: {e}"
+                    );
+                }
+            }
+
+            // The first reply token: its alternatives, and its own value when it is the same
+            // token, are the reference row's and do not move with temperature.
+            let e = &entries[0];
+            let id = e["id"].as_u64().expect("an id");
+            assert!(
+                (num(e) - reference(id)).abs() <= LOGPROB_BOUND,
+                "{at}: token {id} reported {} against {}",
+                num(e),
+                reference(id)
+            );
+            for a in e["top_logprobs"].as_array().expect("top") {
+                let aid = a["id"].as_u64().expect("an id");
+                assert!(
+                    (num(a) - reference(aid)).abs() <= LOGPROB_BOUND,
+                    "{at}: alternative {aid} reported {} against {}",
+                    num(a),
+                    reference(aid)
+                );
+            }
+            assert_eq!(e["top_logprobs"][0]["id"], greedy, "{at}");
+            match &first {
+                None => {
+                    assert_eq!(id, greedy, "temperature 0 is greedy");
+                    first = Some(e.clone());
+                }
+                Some(f) => {
+                    assert_eq!(e["top_logprobs"], f["top_logprobs"], "{at}");
+                    if e["id"] == f["id"] {
+                        assert_eq!(e["logprob"], f["logprob"], "{at}");
+                    }
+                }
+            }
+        }
+
+        // The legacy count `0`: the chosen tokens' entries, with no alternatives.
+        let (text, entries, finish) = complete(serde_json::json!({
+            "prompt": prompt,
+            "max_tokens": MAX_TOKENS,
+            "temperature": 0,
+            "logprobs": 0,
+        }))
+        .await;
+        server.abort();
+        covers("logprobs 0", &text, &entries, &finish);
+        let first = first.expect("the greedy run");
+        assert_eq!(entries[0]["logprob"], first["logprob"]);
+        for e in &entries {
+            assert_eq!(e["top_logprobs"], serde_json::json!([]), "{e}");
+        }
     }
 }

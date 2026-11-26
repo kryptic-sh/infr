@@ -199,18 +199,39 @@ Per-request sampling fields: `temperature`, `top_p`, `top_k`, `min_p`, `seed`,
 and `max_tokens` / `max_completion_tokens`. `n` above 1 is not supported and
 answers `400`.
 
-`logprobs: true` returns each generated token's log probability and, up to
-`top_logprobs` (20 when absent), its most likely alternatives — the chat shape
-(`choices[].logprobs.content[].logprob`), on `/v1/completions` as well rather
-than the legacy `tokens`/`token_logprobs` arrays. `/v1/completions` also accepts
-that route's original spelling, an integer `"logprobs": 5`, as the count. The
-numbers come from the model's own distribution: the logits after `logit_bias`
-and the penalties, before temperature, so they do not move with `temperature`.
+`logprobs` and `top_logprobs` work on both `/v1/chat/completions` and
+`/v1/completions`. `logprobs: true` returns each returned token's log
+probability and, up to `top_logprobs` (20 when absent, none at `0`), its most
+likely alternatives, in the chat shape (`choices[].logprobs.content[]` with
+`token`, `bytes`, `logprob`, `top_logprobs` and an `id`) on both routes: on
+`/v1/completions` as well, rather than the legacy `tokens`/`token_logprobs`
+arrays. `/v1/completions` also accepts that route's original spelling, an
+integer `"logprobs": 5`, as the count; `"logprobs": 0` returns the entries with
+no alternatives. The numbers are the log-softmax of the model's logits row after
+`logit_bias` and the penalties, before temperature and the truncating samplers
+(`top_k`, `top_p`, `min_p`), so they do not move with `temperature`. llama.cpp's
+server reports from the raw logits instead, without bias or penalties, so the
+two differ on a request that carries either. A value with no finite logarithm is
+reported as the lowest finite float, as llama.cpp does, not as `null`.
+
+The entries cover exactly the returned text. On the chat route that is
+`content`: reasoning, the `<think>` markers and a parsed tool call get no
+entries, while prose before, between and after calls keeps its tokens' entries.
+A stop sequence's tokens get none, while a token a stop sequence cut in the
+middle keeps its entry, which names the whole sampled token. A special token the
+reply leaves out gets none. With `echo`, the echoed prompt has no entries: they
+start at the generated text (OpenAI's legacy API also scores the prompt's
+tokens; this server does not). Streamed, each chunk carries the entries of the
+tokens whose text it carries.
+
 A request that asks for them reads the full logits row back on the host every
-token, which turns off GPU sampling and the MTP draft loop for that request; it
-is slower, not different. A backend that cannot report them answers `400`
-naming `logprobs`, and so does a grammar-constrained request (`tool_choice` or
-`response_format`), whose constrained decode has no tap.
+token, which turns off GPU sampling and the MTP draft loop for that request. It
+is slower; greedy output is the same, and a sampled request draws from the same
+distribution, but on a backend that samples on the GPU or runs MTP it may not
+reproduce the tokens a seed gives without `logprobs`. A backend that cannot
+report them (the Metal backends served on macOS, and diffusion models) answers
+`400` naming `logprobs`, and so does a grammar-constrained request
+(`tool_choice` or `response_format`), whose constrained decode has no tap.
 
 `POST /v1/completions` serves the same models through the legacy text-completion
 shape: a raw prompt continued as text, with no chat template, which is what FIM
@@ -220,10 +241,10 @@ string or a one-element array, plus `stream`, `stop`, `echo`,
 included; `-1` for `max_tokens` or `seed` means unset, as on the chat route, and
 `user` is accepted and ignored. A prompt that comes to no tokens at all (empty
 text on a model that adds no BOS), or one longer than the model's context,
-answers `400` naming `prompt`. `suffix`, token-array prompts, `n` above 1,
-`best_of` above 1 and `logprobs` answer `400`. The route is always registered:
-no configuration key turns it off, and it sits behind the same API key, `Host`
-check and body limit as the chat route.
+answers `400` naming `prompt`. `suffix`, token-array prompts, `n` above 1 and
+`best_of` above 1 answer `400`; `logprobs` is served as described above. The
+route is always registered: no configuration key turns it off, and it sits
+behind the same API key, `Host` check and body limit as the chat route.
 
 ## Performance
 

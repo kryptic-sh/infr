@@ -654,11 +654,11 @@ const NUCLEUS_PROBE_K: usize = 1024;
 /// `top_p >= 1` now skips the selection entirely (see [`truncated_softmax`]).
 const NUCLEUS_WIDEN: usize = 8;
 
-/// The floor a reported log probability is clamped to. A probability that underflows to 0 in
-/// binary32 has no finite logarithm, and `serde_json` writes `-inf` as `null` — a client reading
-/// `logprob` as a number would choke. llama.cpp clamps instead, and so does this: the value stays
-/// numeric and still reads as "vanishingly unlikely".
-const LOGPROB_FLOOR: f32 = -9999.0;
+/// The value reported for a probability that underflowed to 0 in binary32, which has no finite
+/// logarithm: `serde_json` writes `-inf` as `null`, and a client reading `logprob` as a number
+/// would choke. llama.cpp's server (`completion_token_output::logarithm`) reports the lowest
+/// finite float in that case, and so does this.
+const LOGPROB_FLOOR: f32 = f32::MIN;
 
 /// Build the truncated, normalized sampling support shared by [`sample_logits`] and
 /// [`truncated_dist`]: top-k select, temperature softmax, normalize, then the top-p (nucleus)
@@ -907,13 +907,11 @@ pub(crate) fn truncated_dist(logits: &[f32], s: Sampler) -> Vec<(u32, f32)> {
         .collect()
 }
 
-/// One token's log probability and up to `top_n` most likely alternatives, from the full
-/// temperature-scaled softmax over the logits row. Top-k/top-p/min-p truncate the SAMPLING
-/// support, but they are not part of the model's distribution: renormalizing over the nucleus
-/// reports 0.0 for a token the model was merely the most likely to emit, which is exactly the
-/// confidence signal a logprobs client reads. `temp <= 0` (greedy) reports the raw softmax, as
-/// llama.cpp's distribution sampler does when `n_probs` is set. Text is left empty for the caller
-/// that owns the tokenizer.
+/// One token's log probability and up to `top_n` most likely alternatives: the log-softmax of the
+/// whole logits row. Top-k/top-p/min-p truncate the SAMPLING support, but they are not part of
+/// the model's distribution: renormalizing over the nucleus reports 0.0 for a token the model was
+/// merely the most likely to emit, which is exactly the confidence signal a logprobs client
+/// reads. Text is left empty for the caller that owns the tokenizer.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn token_logprob(
     logits: &[f32],
@@ -924,23 +922,31 @@ pub(crate) fn token_logprob(
     // distribution is fixed, and llama.cpp's `n_probs` reports without it too), and no top-k /
     // top-p / min-p truncation, which narrows the sampling support rather than the distribution.
     // `logits` reach here after `logit_bias` and the penalties were applied, so those ARE included.
-    // `truncated_softmax` with an open support IS the full-vocab softmax: top_k 0 keeps every
-    // token, top_p 1 skips the nucleus cut, min_p 0 cuts nothing, and its denominator is the sum
-    // over the whole row. Its `(idx, probs)` are in ascending id order.
-    let (idx, probs) = truncated_softmax(logits, 1.0, 0, 1.0, 0.0);
-    let logprob = idx
-        .iter()
-        .position(|&id| id as u32 == selected)
-        .map_or(LOGPROB_FLOOR, |j| math::ln(probs[j]).max(LOGPROB_FLOOR));
+    //
+    // `ln p_i = l_i - max - ln(sum_j e^(l_j - max))`, taken directly rather than as the logarithm
+    // of a normalized probability, so a token whose probability underflows binary32 still gets
+    // its finite value. The normalizer is summed in binary64, because a binary32 running sum over
+    // a whole vocabulary accumulates a rounding error per term and shifts every reported value by
+    // the same amount. Its logarithm is binary32 (`math::ln`, correctly rounded): platform `ln`
+    // is barred here because its last bits differ across platforms (`tests/no_platform_libm.rs`
+    // in `infr-core`), and `infr_core::math` has no binary64 logarithm.
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let sum: f64 = logits.iter().map(|&l| f64::from(math::exp(l - max))).sum();
+    let norm = f64::from(max) + f64::from(math::ln(sum as f32));
+    // A `-inf` logit, or a value past binary32's range, has no finite report: clamped, as below.
+    let logprob_of = |l: f32| ((f64::from(l) - norm) as f32).max(LOGPROB_FLOOR);
+    let logprob = logits
+        .get(selected as usize)
+        .map_or(LOGPROB_FLOOR, |&l| logprob_of(l));
     if top_n == 0 {
         return infr_chat::TokenLogprob::unresolved(selected, logprob, Vec::new());
     }
-    let mut dist: Vec<(u32, f32)> = idx
-        .into_iter()
-        .zip(probs)
-        .map(|(id, p)| (id as u32, p))
+    let mut dist: Vec<(u32, f32)> = logits
+        .iter()
+        .enumerate()
+        .map(|(id, &l)| (id as u32, l))
         .collect();
-    // Select the top n in O(n), then sort only those n.
+    // Select the top n in O(n), then sort only those n. Log probabilities order as the logits do.
     let cmp = |a: &(u32, f32), b: &(u32, f32)| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0));
     if dist.len() > top_n {
         dist.select_nth_unstable_by(top_n - 1, cmp);
@@ -949,11 +955,11 @@ pub(crate) fn token_logprob(
     dist.sort_unstable_by(cmp);
     let top = dist
         .into_iter()
-        .map(|(id, p)| infr_chat::TokenLogprobAlt {
+        .map(|(id, l)| infr_chat::TokenLogprobAlt {
             token: id,
             text: String::new(),
             bytes: Vec::new(),
-            logprob: math::ln(p).max(LOGPROB_FLOOR),
+            logprob: logprob_of(l),
         })
         .collect();
     infr_chat::TokenLogprob::unresolved(selected, logprob, top)
@@ -1082,13 +1088,66 @@ mod tests {
         assert!(token_logprob(&logits, 2, 0).logprob > scaled);
     }
 
+    /// Over a whole vocabulary the report stays within [`BOUND`] of an f64 log-softmax of the
+    /// row: a binary32 running normalizer accumulates a rounding error per term, which moves every
+    /// reported value by the same amount.
+    #[test]
+    fn token_logprob_is_the_log_softmax_of_a_vocabulary_sized_row() {
+        /// The report's own roundings: the binary32 logarithm of the normalizer and the final
+        /// binary32 value, each half an ulp of a number below 32.
+        const BOUND: f64 = 1e-5;
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let logits: Vec<f32> = (0..151_936)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                ((state >> 40) as f32 / (1u64 << 24) as f32) * 12.0 - 6.0
+            })
+            .collect();
+        let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let lse = f64::from(max)
+            + logits
+                .iter()
+                .map(|&l| (f64::from(l) - f64::from(max)).exp())
+                .sum::<f64>()
+                .ln();
+        let mut worst = 0f64;
+        for id in [0u32, 1, 77_777, 151_935] {
+            let lp = token_logprob(&logits, id, 3);
+            let want = f64::from(logits[id as usize]) - lse;
+            let err = (f64::from(lp.logprob) - want).abs();
+            worst = worst.max(err);
+            assert!(err < BOUND, "token {id}: {} against {want}", lp.logprob);
+            for alt in &lp.top {
+                let want = f64::from(logits[alt.token as usize]) - lse;
+                let err = (f64::from(alt.logprob) - want).abs();
+                worst = worst.max(err);
+                assert!(
+                    err < BOUND,
+                    "token {}: {} against {want}",
+                    alt.token,
+                    alt.logprob
+                );
+            }
+        }
+        eprintln!("worst error {worst:e} against the bound {BOUND:e}");
+    }
+
     #[test]
     fn an_underflowing_probability_is_clamped_not_infinite() {
-        // e^0 next to e^2000 is 0 in binary32, so its logarithm does not exist.
+        // e^0 next to e^2000 is 0 in binary32, but its log probability is still -2000 exactly:
+        // the report is the log-softmax, not the logarithm of an underflowed probability.
         let logits = [0.0f32, 2000.0];
         let lp = token_logprob(&logits, 0, 0);
         assert!(lp.logprob.is_finite(), "got {}", lp.logprob);
+        assert_eq!(lp.logprob, -2000.0);
+        // A token the row rules out has no finite log probability at all: clamped.
+        let lp = token_logprob(&[f32::NEG_INFINITY, 0.0], 0, 2);
         assert_eq!(lp.logprob, LOGPROB_FLOOR);
+        assert_eq!(lp.top[1].logprob, LOGPROB_FLOOR);
+        // llama.cpp's value, `std::numeric_limits<float>::lowest()`.
+        assert_eq!(lp.logprob, f32::MIN);
     }
 
     /// The PROCESS-default sampling config these tests layer their per-request overrides over —

@@ -30,22 +30,15 @@ Provenance tags point at the finding that opened the item:
 
 **Kind:** work raised and not finished, in the order it should be picked up.
 
-1. (PR #111 was measured, merged and pushed on 2026-11-26; see the changelog.)
-2. **PR #110 (Gemma 4 image input) is reviewed; the owner gives the verdict.**
-   Confirmed against llama.cpp: image spans need non-causal attention
-   (`mtmd_decode_use_non_causal` returns true for GEMMA4V) and the PR feeds them
-   through causal prefill; the per-layer output scale (`ls_out_w` in `clip.cpp`)
-   is not applied. Reported and not confirmed by us: the first image request
-   dequantises the whole token-embedding table to host RAM. It adds `gemm` and
-   `image` as always-on dependencies of `infr-llama`.
-3. **Plan 15 slice R0:** confirm with a run, then fix, that a spilled KV cache
+1. **Plan 15 slice R0:** confirm with a run, then fix, that a spilled KV cache
    is refused at load when the weights stream and the host tier sizes itself
    (read from code only).
-4. **Plan 14 slices L and W** (placement label; bounded wait at start-up).
-5. **Owner decisions still open:** the defaults of `quant_q8.experts_hi` (now
-   about 1% of MoE prefill) and `mmv_mw.moe_float` (free on Qwen3-30B-A3B, 3.3%
-   of decode on ERNIE on the RX 7900 XTX, 18.4% on the integrated GPU).
-6. Then B-DECISIONS-2026-11-25 from item 3 on.
+2. **Plan 14 slices L and W** (placement label; bounded wait at start-up).
+3. **The default flips decided in B-DECISIONS-2026-11-26**
+   (`quant_q8.experts_hi`, `mmv_mw.moe_float`) are not built.
+4. Then B-DECISIONS-2026-11-25 from item 3 on.
+
+PR #110 (Gemma 4 image input) waits on its contributor's rework: B-IMAGE-INPUT.
 
 Not verified in the follow-ups to PRs 113–116 (one KV format resolver,
 `seam::kv_ladder_fmts`; per-block `head_count_kv`; the eager rope grid): no
@@ -98,28 +91,74 @@ yet.
   shrinkable arena from plan 15 (slice R3) first, so D follows R3, or drops the
   tier with a log line until R3 exists.
 
-### B-REFERENCE-CACHE — cache the CPU reference so tolerance runs are fast (2026-11-26)
+### B-REFERENCE-CACHE — what slice 1 of the reference cache left (2026-11-26)
 
-**Kind:** planned, next slice after the PR #112 follow-up; the owner raised its
-priority on 2026-11-26 because it speeds our own work and every contributor's.
+**Kind:** remaining work and gaps; slice 1 shipped (plan 17,
+`docs/gpu-tolerance.md` "The reference cache").
 
-Every test that scores a GPU or CPU-production run against the CPU reference
-recomputes the reference: there is no cache. In one release run on ERNIE-21B-A3B
-the reference took 4.6 to 10.5 s a prompt against 1.1 to 6.4 s for each GPU
-configuration; the whole `gpu_seam_tolerance` gate took 408 s on the RX 7900 XTX
-and 1166 s on the integrated GPU, and one follow-up slice ran it four times plus
-isolation runs. Not measured: the split between the reference, model loading,
-device set-up and the GPU runs across the whole gate.
+- **The cache saves less than hoped, because the reference is about a quarter of
+  the gate.** `gpu_seam_tolerance`, 14 of 14 in every run, not in a quiet
+  window: on the RX 7900 XTX 401 s with the cache off, 284 to 289 s warm; on the
+  integrated GPU 989 s warm against 1087 to 1166 s in earlier uncached runs of
+  other commits (not a same-commit comparison). The rest is the GPU side: every
+  forced run and greedy generation opens a fresh Vulkan backend and uploads the
+  weights again. Plan 17's slice 3 (one backend per configuration) is the larger
+  saving and is not built.
+- **Slice 2 is not done:** the quiet-window measurement, cache off against cold
+  against warm, alternated, on both GPUs.
+- **Not checked:** Windows (renaming over a file being read, symlinks, the
+  lock); the memory and time of the second model load the separately loaded
+  reference costs on large models; whether any code the CPU reference runs lives
+  in a crate the fingerprint does not hash, beyond a spot check (a test now
+  fails when a new workspace crate is reachable and unclassified).
+- **Known limits:** the canary recomputes one run per case, so a key gap that
+  only affects longer prompts or the KV-format and forced-along runs is caught
+  by `INFR_TOL_REFCACHE=verify`, not by `on`. The fingerprint does not cover
+  external crates' feature unification or a local `[patch]`. A generation is
+  about 2.2 GB and a new one starts with most commits that touch the hashed
+  crates; old ones go after three days or past the 6 GB cap.
 
-To build: an on-disk cache of what a comparison takes from the reference run,
-keyed by weight content, prompt tokens, token count, KV formats, every setting
-that can change reference output, and a fingerprint of the CPU reference's own
-code; a bypass switch; a verify mode that recomputes and compares bit for bit;
-hit and miss logged; never read by a test whose subject is the CPU reference.
-The danger it must rule out is a stale entry serving as the oracle. Then measure
-the gate cold against warm on both GPUs, and document for contributors how to
-run the tolerance tests with it (and add a pointer in `AGENTS.md`, "Before
-opening a pull request"). A design pass is in progress.
+### B-SERVE-COMPLETIONS-LOGPROBS — what the `/v1/completions` and logprobs follow-ups left (2026-11-26)
+
+**Kind:** decisions for the owner and gaps, after the follow-ups to PRs #117 and
+#118.
+
+- **Decision: what a reported logprob includes.** Values come from the logits
+  after `logit_bias` and the penalties and before temperature and the truncating
+  samplers, as the contributor wrote it. llama.cpp's server reports from the raw
+  logits. Documented in the README; changing it is a small edit in the seam
+  runner (`token_logprob`'s caller) plus the docs.
+- **Decision: `max_tokens: -1`** means the server's default budget on both
+  routes (`sampling.max_new`), not llama.cpp's "until the context is full". The
+  chat route's doc comment says this is deliberate; completions follows it.
+- **`/v1/completions` returns logprobs in the chat shape**, not the legacy
+  `tokens` / `token_logprobs` arrays, and `echo` gives the prompt no entries, so
+  an evaluation harness that sends the legacy integer still cannot read the
+  reply. With `top_logprobs` absent the default is the llama.cpp one (twenty
+  alternatives); OpenAI's chat route defaults to none. Not changed.
+- **A logprobs request can change a seeded sampled reply** on a backend that
+  samples on the GPU or runs MTP: it moves to the host sampler and plain decode,
+  which draw from the same distribution but not the same tokens. Greedy output
+  is the same. Not measured: how often they differ.
+- **The normalizer's log is binary32** (`infr_core::math::ln`), because the
+  platform `ln` is forbidden in production code (`no_platform_libm`); a binary64
+  `ln` in `infr_core::math` would remove the last few 1e-7 of error.
+- **Decision: a stray `</think>` in a streamed reply is content text.**
+  `ChatStream` used to panic on one (and, pushed whole, drop the text before
+  it). `split_think`, the non-streaming history parser, reads the text before a
+  stray closer as reasoning; a stream can only match that by holding every
+  reply's content back until it ends. The two now disagree on such a reply.
+- **Not re-timed:** the tool-call parsers after their tracing was made opt-in (a
+  review measured the always-tracing version at about ten times HEAD on a 148 KB
+  reply, once, not in a quiet window).
+- **Test nits not fixed:**
+  `completions_route_matches_the_engine_on_a_real_model` binds port 0, drops the
+  listener and lets the server bind (a race), because `infr_server::serve` takes
+  an address, not a listener; `cached_qwen3_0_6b` repeats `infr-llama`'s
+  crate-private `test_hub_gguf`. Fixing either needs a new public function or a
+  dependency edge.
+- **Not checked:** GPU, Metal, the parallel generator and Windows for the
+  logprobs paths (read only); the real-model tests run on the CPU backend.
 
 ### B-SAFETENSORS-EXL3 — safetensors first, then EXL3; both need a plan and a dependency policy (2026-11-26)
 
@@ -283,8 +322,8 @@ The standing fact behind several of these: CI runs no Vulkan GPU test (it passes
 `--include-ignored` for the Metal crate only), so every claim about a kernel
 rests on local runs.
 
-Still to audit: #112 once pushed, and the server endpoints (#117, #118) once
-merged.
+Still to audit: #112's merge and follow-up, and the server endpoints (#117,
+#118) with their follow-ups, all pushed on 2026-11-26.
 
 ### B-IMAGE-INPUT — image input for vision models: how it is to be built (2026-11-26)
 
@@ -7774,23 +7813,22 @@ shader bodies.
   window from the prompt. Fix the doc either way.
 - **What is left of `logit_bias`, `min_p`, `logprobs` and `n`.** `infr serve`
   now applies `logit_bias` (in `Penalties::apply`, ahead of the penalties) and
-  `min_p` (in `truncated_softmax`) on the dense seam decode loop, and answers
-  `n > 1`, `logprobs: true` and `top_logprobs > 0` with a 400. Still open:
-  DiffusionGemma's denoise sampler and `SpecMetalChat` apply neither, and now
-  refuse a request carrying either (`refuse_seam_only_fields`, a 400) — applying
-  them there is separate work, and both still ignore the penalties without a
-  word; the parked MTP paths read only the process sampler; `infr run` has no
-  `--min-p`, which needs a `sampling.min_p` config key, its env and manifest
-  entries and the flag, and the GGUF's `general.sampling.min_p` is still ignored
-  (see `unapplied_sampling_keys`). Returning several choices or log
-  probabilities is feature work nobody has asked for. `sample_from_dist` (MTP's
-  draw over `truncated_dist`, id order when `top_p` is 1) keeps the zero-draw
-  shape `sample_logits` was fixed for: a uniform of exactly 0 takes the lowest
-  id with any mass. `top_k` is still typed `Option<i64>`, so `"top_k": 40.0` or
-  a string is a body-parse 400 that names no parameter, where `n` and
-  `top_logprobs` now name theirs. The `SpecMetalChat` refusal compiles only on
-  macOS and has not been built or run. B137 records what JSON mode
-  (`response_format`) left.
+  `min_p` (in `truncated_softmax`) on the dense seam decode loop, answers
+  `n > 1` with a 400, and returns `logprobs` (B-SERVE-COMPLETIONS-LOGPROBS).
+  Still open: DiffusionGemma's denoise sampler and `SpecMetalChat` apply
+  neither, and now refuse a request carrying either (`refuse_seam_only_fields`,
+  a 400) — applying them there is separate work, and both still ignore the
+  penalties without a word; the parked MTP paths read only the process sampler;
+  `infr run` has no `--min-p`, which needs a `sampling.min_p` config key, its
+  env and manifest entries and the flag, and the GGUF's `general.sampling.min_p`
+  is still ignored (see `unapplied_sampling_keys`). Returning several choices is
+  feature work nobody has asked for. `sample_from_dist` (MTP's draw over
+  `truncated_dist`, id order when `top_p` is 1) keeps the zero-draw shape
+  `sample_logits` was fixed for: a uniform of exactly 0 takes the lowest id with
+  any mass. `top_k` is still typed `Option<i64>`, so `"top_k": 40.0` or a string
+  is a body-parse 400 that names no parameter, where `n` and `top_logprobs` now
+  name theirs. The `SpecMetalChat` refusal compiles only on macOS and has not
+  been built or run. B137 records what JSON mode (`response_format`) left.
 - **MTP's `residual_dist` is quadratic in the support.** `dist_prob` is a linear
   search and `residual_dist` (`seam/model.rs`) calls it per entry, so two
   distributions spanning the vocabulary cost about the square of its size per

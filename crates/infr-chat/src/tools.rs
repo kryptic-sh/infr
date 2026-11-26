@@ -79,45 +79,134 @@ fn read_hex4(s: &[u8], i: usize) -> Option<u32> {
     Some(v)
 }
 
+/// [`remove_spans_traced`] on plain text, for the tests.
+#[cfg(test)]
+fn remove_spans(text: &str, spans: Vec<(usize, usize)>) -> String {
+    remove_spans_traced(text, &(), spans).text
+}
+
 /// Remove the given byte `spans` (non-overlapping, on char boundaries) from `text` — the shared
-/// removal machinery both tool-call parsers use. Where a removed span sat between whitespace on
-/// both sides, one gap survives, not two: the side holding a line break (the longer, if both do),
-/// so a call on its own line vanishes without joining the paragraphs around it, and otherwise a
-/// single space, so an inline call leaves one.
-fn remove_spans(text: &str, mut spans: Vec<(usize, usize)>) -> String {
+/// removal machinery both tool-call parsers use — carrying `origin` along for the bytes that
+/// survive. Where a removed span sat between whitespace on both sides, one gap survives, not two:
+/// the side holding a line break (the longer, if both do), so a call on its own line vanishes
+/// without joining the paragraphs around it, and otherwise a single space, so an inline call
+/// leaves one.
+fn remove_spans_traced<O: Trace>(
+    text: &str,
+    origin: &O,
+    mut spans: Vec<(usize, usize)>,
+) -> Traced<O> {
     spans.sort_unstable_by_key(|&(start, _)| start);
-    let mut out = String::with_capacity(text.len());
+    let mut out = Traced::<O>::default();
     let mut from = 0;
     for (start, end) in spans {
-        out.push_str(&text[from..start]);
+        out.push_from(text, origin, from..start);
         from = end;
         // Whitespace on one side only is the gap itself, and stays.
         let after = &text[end..];
         let right = &after[..after.len() - after.trim_start().len()];
-        let left_len = out.len() - out.trim_end().len();
+        let left_len = out.text.len() - out.text.trim_end().len();
         if left_len == 0 || right.is_empty() {
             continue;
         }
-        let left_nl = out[out.len() - left_len..].contains('\n');
+        let left_nl = out.text[out.text.len() - left_len..].contains('\n');
         let right_nl = right.contains('\n');
         let keep_left = match (left_nl, right_nl) {
             (true, false) => true,
             (false, true) => false,
             (true, true) => left_len >= right.len(),
             (false, false) => {
-                out.truncate(out.len() - left_len);
-                out.push(' ');
+                out.truncate(out.text.len() - left_len);
+                out.push_synthetic(' ');
                 true
             }
         };
         if keep_left {
             from += right.len();
         } else {
-            out.truncate(out.len() - left_len);
+            out.truncate(out.text.len() - left_len);
         }
     }
-    out.push_str(&text[from..]);
+    out.push_from(text, origin, from..text.len());
     out
+}
+
+/// `src` with every occurrence of `needle` removed, as `str::replace(needle, "")` does.
+fn remove_all<O: Trace>(src: Traced<O>, needle: &str) -> Traced<O> {
+    if !src.text.contains(needle) {
+        return src;
+    }
+    let mut out = Traced::<O>::default();
+    let mut from = 0;
+    for (at, _) in src.text.match_indices(needle) {
+        out.push_from(&src.text, &src.origin, from..at);
+        from = at + needle.len();
+    }
+    out.push_from(&src.text, &src.origin, from..src.text.len());
+    out
+}
+
+/// Where the bytes a parser keeps came from in its input. The parsers are written once, generic
+/// over this: [`Origins`] records it, for a caller that must tell which of the model's tokens
+/// survived into the content left around parsed calls; `()` records nothing, so a caller that
+/// does not need it pays nothing.
+pub(crate) trait Trace: Default {
+    /// The trace of an input: every byte is its own origin.
+    fn identity(len: usize) -> Self;
+    /// Append the trace of `src`'s bytes in `range`.
+    fn copy(&mut self, src: &Self, range: std::ops::Range<usize>);
+    fn truncate(&mut self, len: usize);
+    /// Append `len` bytes the parser wrote itself.
+    fn synthetic(&mut self, len: usize);
+}
+
+impl Trace for () {
+    fn identity(_: usize) -> Self {}
+    fn copy(&mut self, _: &Self, _: std::ops::Range<usize>) {}
+    fn truncate(&mut self, _: usize) {}
+    fn synthetic(&mut self, _: usize) {}
+}
+
+/// Each output byte's input byte, `None` for one the parser wrote itself.
+pub(crate) type Origins = Vec<Option<usize>>;
+
+impl Trace for Origins {
+    fn identity(len: usize) -> Self {
+        (0..len).map(Some).collect()
+    }
+    fn copy(&mut self, src: &Self, range: std::ops::Range<usize>) {
+        self.extend_from_slice(&src[range]);
+    }
+    fn truncate(&mut self, len: usize) {
+        Vec::truncate(self, len);
+    }
+    fn synthetic(&mut self, len: usize) {
+        self.extend(std::iter::repeat_n(None, len));
+    }
+}
+
+/// Text a parser produced, with its [`Trace`].
+#[derive(Default)]
+pub(crate) struct Traced<O> {
+    pub(crate) text: String,
+    pub(crate) origin: O,
+}
+
+impl<O: Trace> Traced<O> {
+    fn push_from(&mut self, text: &str, origin: &O, range: std::ops::Range<usize>) {
+        self.text.push_str(&text[range.clone()]);
+        self.origin.copy(origin, range);
+    }
+
+    fn truncate(&mut self, len: usize) {
+        self.text.truncate(len);
+        self.origin.truncate(len);
+    }
+
+    fn push_synthetic(&mut self, c: char) {
+        self.text.push(c);
+        self.origin.synthetic(c.len_utf8());
+    }
 }
 
 /// Hard ceiling on `{`/`[` nesting in [`parse_value`].
@@ -386,6 +475,12 @@ fn parse_value(s: &[u8], mut i: usize, depth: usize) -> Option<(Value, usize)> {
 ///   whitespace on both sides only one gap survives (see [`parse_hermes_tool_calls`]).
 /// - the parsed [`ToolCall`] list.
 pub fn parse_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
+    let (clean, calls) = parse_tool_calls_traced(text, &());
+    (clean.text, calls)
+}
+
+/// [`parse_tool_calls`], carrying `origin` (the trace of `text`) along to the clean text.
+fn parse_tool_calls_traced<O: Trace>(text: &str, origin: &O) -> (Traced<O>, Vec<ToolCall>) {
     let mut calls = Vec::new();
 
     // Work on the original text for finding blocks; collect spans to remove.
@@ -441,7 +536,9 @@ pub fn parse_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
 
     let clean = MARKERS
         .iter()
-        .fold(remove_spans(text, spans), |out, m| out.replace(m, ""));
+        .fold(remove_spans_traced(text, origin, spans), |out, m| {
+            remove_all(out, m)
+        });
     (clean, calls)
 }
 
@@ -468,6 +565,12 @@ const HERMES_CLOSE: &str = "</tool_call>";
 /// call on its own line does not join the paragraphs around it, and otherwise one space, so
 /// `A <call> B` reads `A B`.
 pub fn parse_hermes_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
+    let (clean, calls) = parse_hermes_tool_calls_traced(text, &());
+    (clean.text, calls)
+}
+
+/// [`parse_hermes_tool_calls`], carrying `origin` (the trace of `text`) along to the clean text.
+fn parse_hermes_tool_calls_traced<O: Trace>(text: &str, origin: &O) -> (Traced<O>, Vec<ToolCall>) {
     let mut calls = Vec::new();
     let mut spans: Vec<(usize, usize)> = Vec::new();
     let mut from = 0usize;
@@ -486,7 +589,7 @@ pub fn parse_hermes_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
             spans.push((open_abs, close_abs));
         }
     }
-    (remove_spans(text, spans), calls)
+    (remove_spans_traced(text, origin, spans), calls)
 }
 
 /// Parse one `<tool_call>` body into a [`ToolCall`]. Two body dialects exist in the wild:
@@ -568,8 +671,15 @@ fn parse_xml_function_body(body: &str) -> Option<ToolCall> {
 /// misparsed. Callers
 /// gate on tools-present (`allow_tools`) as before.
 pub fn parse_any_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
-    let (clean, mut calls) = parse_hermes_tool_calls(text);
-    let (clean, pipe) = parse_tool_calls(&clean);
+    let (clean, calls) = parse_any_tool_calls_traced::<()>(text);
+    (clean.text, calls)
+}
+
+/// [`parse_any_tool_calls`], with the clean text's [`Trace`] back to `text`.
+pub(crate) fn parse_any_tool_calls_traced<O: Trace>(text: &str) -> (Traced<O>, Vec<ToolCall>) {
+    let identity = O::identity(text.len());
+    let (clean, mut calls) = parse_hermes_tool_calls_traced(text, &identity);
+    let (clean, pipe) = parse_tool_calls_traced(&clean.text, &clean.origin);
     calls.extend(pipe);
     if !calls.is_empty() {
         return (clean, calls);
@@ -584,9 +694,13 @@ pub fn parse_any_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
     // holds IS the call, and echoing it back as content would print the raw JSON to the
     // user on top of dispatching the call.
     if let Some(call) = parse_bare_json_call(text) {
-        return (String::new(), vec![call]);
+        return (Traced::default(), vec![call]);
     }
-    (text.trim().to_owned(), Vec::new())
+    let lo = text.len() - text.trim_start().len();
+    let hi = lo + text.trim().len();
+    let mut trimmed = Traced::default();
+    trimmed.push_from(text, &identity, lo..hi);
+    (trimmed, Vec::new())
 }
 
 /// Llama-3.x dialect: the whole body is one JSON object `{"name": .., "parameters"|"arguments":
@@ -1169,6 +1283,25 @@ mod tests {
         let (_, calls) = parse_tool_calls(text);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].arguments, json!({"a,b}c": "v"}));
+    }
+
+    /// The traced parse gives the same clean text as the plain one, and each kept byte's origin
+    /// in the reply: a gap the cut rewrote is the parser's own, and markers leave no trace.
+    #[test]
+    fn traced_parse_maps_kept_bytes_to_the_reply() {
+        let reply = "A <tool_call>{\"name\": \"f\"}</tool_call>\tB<|channel>C";
+        let (clean, calls) = parse_any_tool_calls_traced::<Origins>(reply);
+        assert_eq!(calls.len(), 1);
+        assert_eq!((clean.text.clone(), calls), parse_any_tool_calls(reply));
+        assert_eq!(clean.text, "A BC");
+        let b = reply.find('B').unwrap();
+        let c = reply.find('C').unwrap();
+        assert_eq!(clean.origin, [Some(0), None, Some(b), Some(c)]);
+        for (i, o) in clean.origin.iter().enumerate() {
+            if let Some(o) = o {
+                assert_eq!(clean.text.as_bytes()[i], reply.as_bytes()[*o]);
+            }
+        }
     }
 
     #[test]

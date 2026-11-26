@@ -9,8 +9,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Breaking
 
 - **`infr_engine::Delta` gains `Logprob`**, so an exhaustive match on it must
-  handle the variant. It carries one generated token's log probability, emitted
-  ahead of the text delta it belongs to.
+  handle the variant. It carries one answer token's log probability, emitted
+  ahead of the `Content` delta that carries the token's text; reasoning, marker
+  and parsed tool-call tokens get none.
 - **`infr_server::GenParams` gains `logprobs` and `top_logprobs`**, and
   `infr_llama::sampling::RequestSampling` gains `logprobs`, so a struct literal
   of either must set them or use `..Default::default()`.
@@ -18,8 +19,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `logprobs` field**, so a struct literal of them must set it.
 - **A request that asks for `logprobs` takes the host sampling path.** That
   turns off GPU argmax and GPU sampling for the request, and skips the MTP
-  draft-verify loop, because the draft head has no logprob tap. Results are
-  unchanged; the request is slower than an equivalent one without them.
+  draft-verify loop, because the draft head has no logprob tap. It is slower
+  than the same request without them. Greedy output is the same; a sampled
+  request draws from the same distribution, but on a backend that samples on the
+  GPU or runs MTP it may not reproduce the tokens the same seed gives without
+  `logprobs`.
 - **`infr_core::graph::Op` gains `AttnTemp`**, the position-dependent attention
   temperature, so an exhaustive match on `Op` must handle it.
 - **`infr_cpu::op_tap::TappedOp` gains `Mla`, `MulVec` and `AttnTemp`**, so an
@@ -140,19 +144,37 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `context_length_exceeded`, the limit and the prompt's token count). A
   generator signals an empty prompt with the new
   `infr_server::ParamError::empty_prompt`, the same `400`. `suffix`, token-array
-  prompts, `n > 1`, `best_of > 1` and `logprobs` answer `400`. The route is
-  always registered — it cannot be switched off in the configuration.
+  prompts, `n > 1` and `best_of > 1` answer `400`. The route is always
+  registered — it cannot be switched off in the configuration.
 - **OpenAI `logprobs` and `top_logprobs` on both generation endpoints**, in the
-  chat response shape and streaming: each generated token's log probability and
-  its most likely alternatives, taken from the model's own distribution — the
-  logits after `logit_bias` and the penalties, before temperature.
-  `top_logprobs` defaults to 20 when absent, as in llama.cpp, and on
-  `/v1/completions` the legacy integer spelling (`"logprobs": 5`) is accepted as
-  that count. A request that asks for them takes the host sampling path: GPU
-  sampling and MTP are off for it, so it is slower but identical otherwise. A
-  backend that cannot report them answers `400` naming `logprobs`, as does a
-  grammar-constrained request (`tool_choice` or `response_format`), whose
-  constrained decode has no tap.
+  chat response shape (`logprobs.content[]`, on `/v1/completions` too rather
+  than the legacy `tokens`/`token_logprobs` arrays) and streaming: each returned
+  token's log probability and its most likely alternatives, the log-softmax of
+  the model's logits row after `logit_bias` and the penalties, before
+  temperature and the truncating samplers (llama.cpp's server reports from the
+  raw logits instead, without bias or penalties). `top_logprobs` defaults to 20
+  when absent, as in llama.cpp, and `top_logprobs: 0` returns entries with no
+  alternatives; on `/v1/completions` the legacy integer spelling
+  (`"logprobs": 5`) is accepted as that count, `0` included. The entries cover
+  exactly the returned text: a stop sequence's tokens get none, a token a stop
+  sequence cut keeps its whole-token entry, reasoning and parsed tool calls are
+  not in `content` and get none (prose around a call keeps its tokens' entries),
+  nor does a special token the reply leaves out; echoed prompt text has none
+  either. A value with no finite logarithm is reported as the lowest finite
+  float, as llama.cpp does, never as `null`. A request that asks for them reads
+  the full logits row back each token and takes the host sampling path, with GPU
+  sampling and MTP off: it is slower, greedy output is the same, and a sampled
+  request draws from the same distribution but, on a backend that samples on the
+  GPU or runs MTP, may not reproduce the tokens a seed gives without `logprobs`.
+  A backend that cannot report them (the Metal backends served on macOS,
+  diffusion) answers `400` naming `logprobs`, as does a grammar-constrained
+  request (`tool_choice` or `response_format`), whose constrained decode has no
+  tap. New public API: `infr_engine::{TokenLogprob, TokenLogprobAlt}`,
+  `ChatStream::push_with_logprobs`,
+  `infr_server::{ChatLogprobs, ChatTokenLogprob, ChatTokenLogprobAlt, LogprobStops, TokenText}`,
+  the `ChatGenerator` methods `supports_logprobs` and `complete_with_logprobs`
+  (both with defaults), `RequestCtx::{push_logprob, take_logprobs}` and
+  `OaiRenderer::{token_text, token_is_hidden}`.
 - **Experimental: the Vulkan tuning parameter `quant_q8.experts_hi`** (off by
   default; `--set kernels.vulkan.tune.quant_q8.experts_hi=true`). With it on, a
   MoE model's batched prefill quantizes the routed experts' activations with an
@@ -1412,6 +1434,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **A `</think>` with no `<think>` before it no longer panics `infr serve`.** A
+  reply that streamed content and then emitted a stray closer panicked the
+  reasoning/content splitter (`ChatStream`), failing the request; pushed in one
+  piece, the same reply silently lost the text before the closer. Only a closer
+  after an opener ends reasoning now, and a stray one is shown as content text,
+  so the split no longer depends on how the reply was chunked. The non-streaming
+  history parser (`split_think`) still reads the text before a stray closer as
+  reasoning, which a stream cannot do once that text has gone out.
+- **An MTP-enabled model applies a request's penalties and `logit_bias`.** The
+  MTP draft-verify loop applies neither, so a request that carries
+  `presence_penalty`, `frequency_penalty`, `repeat_penalty` or `logit_bias` now
+  runs the ordinary decode instead (on the CPU, Vulkan and Metal backends);
+  requests without them still take MTP.
 - **Qwen3.5 files that write `attention.head_count_kv` per block load.** The key
   may be one entry per block, 0 on the gated-DeltaNet blocks, where infr read
   only the scalar form. The full-attention blocks must agree on one positive

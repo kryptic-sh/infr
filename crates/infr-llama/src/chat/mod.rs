@@ -93,12 +93,14 @@ pub trait ChatModel {
         None
     }
 
-    /// Whether this backend's decode loop can report per-token log probabilities. Default false.
+    /// Whether this backend's decode loop can report per-token log probabilities. Default false,
+    /// and the server answers a `logprobs` request on such a backend with a `400`.
     ///
-    /// The dense seam overrides it: `DenseSeamChat` (Vulkan) and `CpuDenseChat` answer true, and so
-    /// does `CpuDenseChat::new_metal`, which drives the same decode loop through the reference
-    /// Metal backend. `MetalSeamChat` (the native Metal seam) and the diffusion backend keep the
-    /// default, and the server answers a `logprobs` request on them with a `400`.
+    /// True for `CpuDenseChat` (the CPU backend) and `DenseSeamChat` (the Vulkan seam). No Metal
+    /// backend `infr serve` runs reports them: on macOS it serves `MetalSeamChat` or
+    /// `SpecMetalChat`, which keep the default. `CpuDenseChat::new_metal` answers true, since its
+    /// reference-Metal decode is the same loop, but the CLI builds it only off macOS, where it
+    /// cannot generate at all. The diffusion backend keeps the default.
     fn supports_logprobs(&self) -> bool {
         false
     }
@@ -496,6 +498,14 @@ impl OaiRenderer {
     pub fn token_text(&self, id: u32) -> Option<(String, Vec<u8>)> {
         let bytes = self.token_bytes(id)?;
         Some((String::from_utf8_lossy(&bytes).into_owned(), bytes))
+    }
+
+    /// Whether `id` is a special token that streamed text leaves out: the stream decodes with
+    /// special tokens skipped, so such a token adds nothing to a reply. A token that decodes to
+    /// nothing either way (a lone word-boundary marker) is not one.
+    pub fn token_is_hidden(&self, id: u32) -> bool {
+        let text = |skip: bool| self.tokenizer.decode(&[id], skip).ok();
+        text(true).is_some_and(|t| t.is_empty()) && text(false).is_some_and(|t| !t.is_empty())
     }
 
     /// A token's raw bytes: the byte-level alphabet mapped back, `<0xXX>` byte-fallback tokens

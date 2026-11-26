@@ -11,7 +11,9 @@ pub struct TokenLogprob {
     pub text: String,
     /// The bytes of `text`, as OpenAI's `bytes` array.
     pub bytes: Vec<u8>,
-    /// Natural log of the token's probability in the distribution it was sampled from.
+    /// Natural log of the token's probability: the log-softmax of the logits row it was sampled
+    /// from, after `logit_bias` and the penalties, before temperature and the truncating samplers
+    /// (top-k, top-p, min-p).
     pub logprob: f32,
     /// The most likely tokens at this position, at most the request's `top_logprobs`, descending
     /// by probability. Does not necessarily contain `token`.

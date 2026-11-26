@@ -52,9 +52,11 @@ use tokio::sync::Semaphore;
 
 mod completions;
 mod host;
+mod logprobs;
 mod metrics;
 mod status;
 
+pub use logprobs::{ChatLogprobs, ChatTokenLogprob, ChatTokenLogprobAlt, LogprobStops, TokenText};
 pub use status::{DeviceMemory, GeneratorStatus};
 
 /// Why generation ended — the OpenAI `finish_reason`. The generator reports it; the handlers
@@ -1213,59 +1215,6 @@ pub struct CompletionChoice {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logprobs: Option<ChatLogprobs>,
     pub finish_reason: String,
-}
-
-/// OpenAI's `choice.logprobs` / `choice.delta.logprobs`.
-#[derive(Debug, Clone, Serialize)]
-pub struct ChatLogprobs {
-    pub content: Vec<ChatTokenLogprob>,
-}
-
-/// One token's entry in [`ChatLogprobs::content`]. `id` is a llama.cpp-style extension; OpenAI
-/// clients ignore unknown fields.
-#[derive(Debug, Clone, Serialize)]
-pub struct ChatTokenLogprob {
-    pub id: u32,
-    pub token: String,
-    pub bytes: Vec<u8>,
-    pub logprob: f32,
-    pub top_logprobs: Vec<ChatTokenLogprobAlt>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct ChatTokenLogprobAlt {
-    pub id: u32,
-    pub token: String,
-    pub bytes: Vec<u8>,
-    pub logprob: f32,
-}
-
-impl ChatLogprobs {
-    /// The wire shape for a run of generated tokens. Text and bytes come from the backend that
-    /// filled the [`TokenLogprob`](infr_engine::TokenLogprob) entries in.
-    pub fn from_tokens(tokens: &[infr_engine::TokenLogprob]) -> Self {
-        Self {
-            content: tokens
-                .iter()
-                .map(|t| ChatTokenLogprob {
-                    id: t.token,
-                    token: t.text.clone(),
-                    bytes: t.bytes.clone(),
-                    logprob: t.logprob,
-                    top_logprobs: t
-                        .top
-                        .iter()
-                        .map(|a| ChatTokenLogprobAlt {
-                            id: a.token,
-                            token: a.text.clone(),
-                            bytes: a.bytes.clone(),
-                            logprob: a.logprob,
-                        })
-                        .collect(),
-                })
-                .collect(),
-        }
-    }
 }
 
 #[derive(Debug, Serialize)]
@@ -2750,8 +2699,9 @@ async fn streaming(
 
         let mut tc_index = 0usize;
         let mut saw_tool_call = false;
-        // Log probabilities wait here for the text delta they belong to. The decode layer emits
-        // each token's entry just before the piece's text, so a chunk carries both together.
+        // Log probabilities wait here for the content delta they belong to. The splitter emits
+        // each answer token's entry just before the delta carrying its text, so a chunk carries
+        // both together.
         let mut pending_logprobs: Vec<infr_engine::TokenLogprob> = Vec::new();
         // Per-request tally: plain locals inside the generation, folded in once below.
         let mut tally = ReqTally::new();
@@ -2819,8 +2769,8 @@ async fn streaming(
                 } else {
                     job.finish(outcome.finish)
                 };
-                // Finish chunk: empty delta + finish_reason. Any log probabilities emitted after
-                // the last text piece (a token that decoded to nothing) ride here.
+                // Finish chunk: empty delta + finish_reason. Entries a generator emitted with no
+                // text after them ride here rather than being lost.
                 let last_logprobs = if pending_logprobs.is_empty() {
                     None
                 } else {
@@ -3523,17 +3473,19 @@ mod tests {
             on_delta: &mut dyn FnMut(Delta),
         ) -> anyhow::Result<ChatOutcome> {
             assert!(params.logprobs, "the server only asks when requested");
+            let mut top = vec![infr_engine::TokenLogprobAlt {
+                token: 9,
+                text: "ho".into(),
+                bytes: b"ho".to_vec(),
+                logprob: -1.5,
+            }];
+            top.truncate(params.top_logprobs);
             on_delta(Delta::Logprob(infr_engine::TokenLogprob {
                 token: 7,
                 text: "hi".into(),
                 bytes: b"hi".to_vec(),
                 logprob: -0.25,
-                top: vec![infr_engine::TokenLogprobAlt {
-                    token: 9,
-                    text: "ho".into(),
-                    bytes: b"ho".to_vec(),
-                    logprob: -1.5,
-                }],
+                top,
             }));
             on_delta(Delta::Content("hi".into()));
             Ok(ChatOutcome {
@@ -5823,6 +5775,18 @@ mod tests {
         assert_eq!(lp["top_logprobs"][0]["id"], 9);
         assert_eq!(lp["top_logprobs"][0]["token"], "ho");
         assert_eq!(lp["top_logprobs"][0]["logprob"], -1.5);
+    }
+
+    /// `top_logprobs: 0` asks for the chosen tokens' log probabilities with no alternatives.
+    #[tokio::test]
+    async fn zero_top_logprobs_returns_entries_without_alternatives() {
+        let body = r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                       "logprobs":true,"top_logprobs":0}"#;
+        let v = body_json(post_chat(router_for(Arc::new(LogprobGen)), body).await).await;
+        let lp = &v["choices"][0]["logprobs"]["content"][0];
+        assert_eq!(lp["token"], "hi");
+        assert_eq!(lp["logprob"], -0.25);
+        assert_eq!(lp["top_logprobs"], serde_json::json!([]));
     }
 
     /// A streamed reply carries the token's logprob on the SAME chunk as its text, which is what

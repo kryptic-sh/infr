@@ -197,11 +197,12 @@ jobs:
           cargo nextest run -p infr-llama --test cpu_backend --locked --color never \
             -E 'test(=cpu_golden_qwen3) | test(=cpu_golden_qwen35)' 2>&1 | tee goldens.log
           grep -E "Summary .* 2 tests run: 2 passed" goldens.log
-          # `/v1/completions` served from Qwen3-0.6B and checked against the engine.
+          # `/v1/completions` served from Qwen3-0.6B and checked against the engine:
+          # its text, and its `logprobs` against the engine's own logits.
           cargo nextest run -p infr-cli --locked --color never \
-            -E 'test(=tests::completions_route_matches_the_engine_on_a_real_model)' 2>&1 \
+            -E 'test(=tests::completions_route_matches_the_engine_on_a_real_model) | test(=tests::completions_logprobs_are_the_models_on_a_real_model)' 2>&1 \
             | tee completions.log
-          grep -E "Summary .* 1 test run: 1 passed" completions.log
+          grep -E "Summary .* 2 tests run: 2 passed" completions.log
       # The int8 kernels' speed at each SIMD tier this runner has, scalar
       # against the NEON `dotprod` kernels (`infr-cpu`'s `kernels/bench.rs`):
       # one release test binary, the tiers interleaved round by round, medians
@@ -310,16 +311,18 @@ jobs:
             grep -E "^test $t \.\.\. ok$" goldens.log
           done
       # `/v1/completions` served from Qwen3-0.6B through the real serve adapter and
-      # checked against the engine; it lives in the `infr` binary's tests, which
-      # the model-less matrix only ever runs as a skip.
+      # checked against the engine, its text and its `logprobs`; these live in the
+      # `infr` binary's tests, which the model-less matrix only ever runs as a skip.
       - name: The completions route on a real model
         shell: bash
         env:
           INFR_TEST_REQUIRE_MODELS: "1"
         run: |
-          t=tests::completions_route_matches_the_engine_on_a_real_model
-          cargo test --release -p infr-cli --bin infr --locked -- --exact "$t" --color never 2>&1 | tee completions.log
-          grep -E "^test $t \.\.\. ok$" completions.log
+          tests="tests::completions_route_matches_the_engine_on_a_real_model tests::completions_logprobs_are_the_models_on_a_real_model"
+          cargo test --release -p infr-cli --bin infr --locked -- --exact $tests --color never 2>&1 | tee completions.log
+          for t in $tests; do
+            grep -E "^test $t \.\.\. ok$" completions.log
+          done
       # The library's model-gated tests (forced-tool grammar masking, special-token
       # handling in user text) return early without a model, so the model-less
       # matrix reports them as passed; this job has the models, and requires them.

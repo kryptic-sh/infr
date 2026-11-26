@@ -22,8 +22,10 @@ pub enum Delta {
         name: String,
         arguments: String,
     },
-    /// One sampled token's log probability. Emitted before the text delta it belongs to, so a
-    /// streaming server can attach it to the chunk that carries that text.
+    /// One sampled token's log probability, emitted just before the [`Delta::Content`] that
+    /// carries its token's text, so a streaming server can attach it to that chunk. Only answer
+    /// tokens get one: a token whose text is reasoning, a `<think>` marker or a parsed tool call
+    /// is not part of `content`, and its entry is dropped.
     Logprob(crate::TokenLogprob),
 }
 
@@ -56,16 +58,17 @@ pub struct ChatStream {
     cur_pipe: Cursor,  // gemma4/E2B/DG `<|tool_call>`
     cur_final: Cursor, // channel-format `<channel|>`
     bare: BareJson,
-    /// Token log probabilities waiting for the byte range of `raw` they cover to be emitted.
+    /// Token log probabilities waiting for the content delta that carries their text.
     logprobs: Vec<TokenSpan>,
 }
 
-/// One sampled token's bytes inside [`ChatStream::raw`], with its log probability.
+/// The bytes of [`ChatStream::raw`] one group of sampled tokens produced, with their log
+/// probabilities.
 #[derive(Clone, Debug)]
 struct TokenSpan {
     start: usize,
     end: usize,
-    lp: crate::TokenLogprob,
+    lps: Vec<crate::TokenLogprob>,
 }
 
 /// Incremental scan for a bare-JSON tool call at the head of a content region: skips leading
@@ -220,40 +223,35 @@ impl ChatStream {
         }
     }
 
-    /// [`push`](Self::push) with the sampled tokens' log probabilities. Each entry is tagged with
-    /// the byte range of `piece` its token's bytes cover, so `emit` can attach it to the text delta
-    /// that actually carries those bytes. A delta never splits a tagged token: the splitter backs
-    /// its safe end up to the last token boundary, so a chunk's `content` and `logprobs.content`
-    /// describe the same tokens.
+    /// [`push`](Self::push) with the log probabilities of the tokens that produced `piece`. The
+    /// entries ride, ahead of it, the first content delta that carries any of the piece's text.
+    /// While streaming, a delta does not split the piece — the splitter backs its safe end up to
+    /// the piece's start — so a chunk's `content` and `logprobs.content` describe the same tokens.
+    /// A piece that straddles a region's end (a reasoning or tool-call marker) is split there, and
+    /// its entries ride the part that is content. The piece is the unit because only the decoder
+    /// knows how its tokens' bytes became text.
     pub fn push_with_logprobs(
         &mut self,
         piece: &str,
-        logprobs: &mut Vec<crate::TokenLogprob>,
+        logprobs: Vec<crate::TokenLogprob>,
         on_delta: &mut dyn FnMut(Delta),
     ) {
         let start = self.raw.len();
         self.raw.push_str(piece);
-        // A token belongs to this piece only while its bytes still fit: `piece` is the text the
-        // stop matcher released, and the rest of the pending entries wait for the next release.
-        // Byte lengths are exact for the byte-level and byte-fallback vocabularies; a decoder that
-        // changes a token's bytes in context leaves its entry tagged with the whole piece.
-        let piece_end = start + piece.len();
-        let mut at = start;
-        let mut take = 0;
-        for lp in logprobs.iter() {
-            if at + lp.bytes.len() > piece_end {
-                break;
-            }
-            at += lp.bytes.len();
-            take += 1;
-        }
-        let mut at = start;
-        for lp in logprobs.drain(..take) {
-            let end = at + lp.bytes.len();
-            self.logprobs.push(TokenSpan { start: at, end, lp });
-            at = end;
+        if !logprobs.is_empty() && !piece.is_empty() {
+            self.logprobs.push(TokenSpan {
+                start,
+                end: self.raw.len(),
+                lps: logprobs,
+            });
         }
         self.emit(false, on_delta);
+    }
+
+    /// How many token groups are waiting for their content delta.
+    #[cfg(test)]
+    fn queued_logprobs(&self) -> usize {
+        self.logprobs.len()
     }
 
     pub fn push(&mut self, piece: &str, on_delta: &mut dyn FnMut(Delta)) {
@@ -266,11 +264,8 @@ impl ChatStream {
     /// when it holds none.
     pub fn finish(&mut self, on_delta: &mut dyn FnMut(Delta)) {
         self.emit(true, on_delta);
-        // Tokens whose text never became part of a delta (a parsed-away call, a special token)
-        // still get their entry; the server attaches these to the finish chunk.
-        for span in self.logprobs.drain(..) {
-            on_delta(Delta::Logprob(span.lp));
-        }
+        // What is left never reached `content` (reasoning, a marker, a parsed-away call).
+        self.logprobs.clear();
     }
 
     /// The earliest tool-call opener at/after `cs`, across every dialect `finish()` parses — Hermes
@@ -353,26 +348,28 @@ impl ChatStream {
             return; // head could still become a channel marker — hold
         }
         let think_open = self.cur_think_open.find(&self.raw, TO);
-        let think_close = self.cur_think_close.find(&self.raw, TC);
+        // Only a closer after the opener closes the reasoning. One with no opener before it is
+        // text: content already streamed cannot be taken back as reasoning, so reading it any
+        // other way would make the reply depend on how its text was chunked.
+        let think_close =
+            think_open.and_then(|to| self.cur_think_close.find_from(&self.raw, TC, to + TO.len()));
         // Content before a `<think>` later in the reply. Until the opener arrives it streamed as
         // the content region at offset 0, so that region's progress carries over; its end is then
         // fixed, and streaming stops at a tool-call opener in it.
-        let lead = think_open
-            .filter(|&to| think_close.is_none_or(|tc| tc > to))
-            .map(|to| match self.lead {
-                Some(lead) => lead,
-                None => {
-                    self.sent_lead = std::mem::take(&mut self.sent_c);
-                    // The streaming rule even on the final flush: a held opener is judged by
-                    // `settle_held` on the lead-in alone, never with the `<think>` text after it.
-                    let stop = match to {
-                        0 => 0,
-                        _ => self.tool_open_at(0, false).map_or(to, |t| t.min(to)),
-                    };
-                    self.lead = Some((stop, to));
-                    (stop, to)
-                }
-            });
+        let lead = think_open.map(|to| match self.lead {
+            Some(lead) => lead,
+            None => {
+                self.sent_lead = std::mem::take(&mut self.sent_c);
+                // The streaming rule even on the final flush: a held opener is judged by
+                // `settle_held` on the lead-in alone, never with the `<think>` text after it.
+                let stop = match to {
+                    0 => 0,
+                    _ => self.tool_open_at(0, false).map_or(to, |t| t.min(to)),
+                };
+                self.lead = Some((stop, to));
+                (stop, to)
+            }
+        });
         if let Some((stop, end)) = lead {
             let unsent = self.sent_lead < end;
             let from = self.sent_lead;
@@ -491,59 +488,86 @@ fn settle_held(
     logprobs: &mut Vec<TokenSpan>,
     base: usize,
 ) {
-    // A held stretch is usually a tool call: its tokens were sampled, so report them ahead of the
-    // parsed deltas. The text may be edited around a removed call, so byte-level pairing is not
-    // preserved here; the entries stay in generation order.
-    if !logprobs.is_empty() {
-        let end = base + held.len();
-        let mut keep = Vec::with_capacity(logprobs.len());
-        for span in logprobs.drain(..) {
-            if span.start >= base && span.start < end {
-                on_delta(Delta::Logprob(span.lp));
-            } else {
-                keep.push(span);
-            }
-        }
-        *logprobs = keep;
-    }
     let mut fired = Vec::new();
     let spans = reasoning_spans(held);
     // Only the stretch's last text span can end the reply; an earlier one is followed by more.
-    let last_text = spans.iter().rposition(|s| matches!(s, Span::Text(_)));
+    let last_text = spans.iter().rposition(|s| matches!(s, Span::Text(..)));
     for (i, span) in spans.into_iter().enumerate() {
-        let text = match span {
+        let (at, text) = match span {
             Span::Reasoning(r) => {
                 if !r.is_empty() {
                     on_delta(Delta::Reasoning(r.to_owned()));
                 }
                 continue;
             }
-            Span::Text(t) => t,
+            Span::Text(off, t) => (base + off, t),
         };
         // Dialect-aware: hermes JSON + qwen3.5/3.6 XML + gemma pipe-marker + llama3 bare JSON
-        // (hermes-only here silently dropped every non-qwen3 model's calls over serve).
-        let (clean, calls) = crate::parse_any_tool_calls(text);
+        // (hermes-only here silently dropped every non-qwen3 model's calls over serve). The
+        // parse records where kept bytes came from only when there are entries to place.
+        let (clean, calls) = if logprobs.is_empty() {
+            let (clean, calls) = crate::tools::parse_any_tool_calls_traced::<()>(text);
+            (
+                crate::tools::Traced {
+                    text: clean.text,
+                    origin: crate::tools::Origins::new(),
+                },
+                calls,
+            )
+        } else {
+            crate::tools::parse_any_tool_calls_traced::<crate::tools::Origins>(text)
+        };
         let content = if calls.is_empty() {
+            // Emitted verbatim, so the entries of the tokens it holds ride it.
+            if !text.is_empty() {
+                emit_logprobs(
+                    logprobs,
+                    |s| s.start < at + text.len() && s.end > at,
+                    on_delta,
+                );
+            }
             text
         } else {
-            let (opens_with_cut, closes_with_cut) = cut_edges(text, &clean);
-            let mut c = clean.as_str();
+            let (opens_with_cut, closes_with_cut) = cut_edges(text, &clean.text);
+            let (mut lo, mut hi) = (0, clean.text.len());
             if opens_with_cut {
-                let rest = c.trim_start();
-                let gap = &c[..c.len() - rest.len()];
+                let rest = clean.text.trim_start();
+                let gap = &clean.text[..clean.text.len() - rest.len()];
                 let keep = match shown_gap.as_deref() {
                     None => false,
                     Some("") => true,
                     Some(shown) => gap.contains('\n') && !shown.contains('\n'),
                 };
                 if !keep {
-                    c = rest;
+                    lo = gap.len();
                 }
             }
             if at_end && closes_with_cut && Some(i) == last_text {
-                c = c.trim_end();
+                hi = lo + clean.text[lo..].trim_end().len();
             }
-            c
+            // The parser only removes text and rewrites whitespace at a cut, and it traces where
+            // each byte it kept came from: a token is part of this content when any of its bytes
+            // made it in. A space the parser wrote itself belongs to no token.
+            let kept: Vec<usize> = clean
+                .origin
+                .get(lo..hi)
+                .unwrap_or_default()
+                .iter()
+                .flatten()
+                .map(|&o| at + o)
+                .collect();
+            if !kept.is_empty() {
+                emit_logprobs(
+                    logprobs,
+                    // `kept` ascends: the parser keeps bytes in their order.
+                    |s| {
+                        kept.get(kept.partition_point(|&o| o < s.start))
+                            .is_some_and(|&o| o < s.end)
+                    },
+                    on_delta,
+                );
+            }
+            &clean.text[lo..hi]
         };
         if !content.is_empty() {
             note_shown(shown_gap, content);
@@ -551,6 +575,10 @@ fn settle_held(
         }
         fired.extend(calls);
     }
+    // The rest of the stretch is reasoning, markers or calls, none of which is content. A group
+    // that runs on past the stretch's end stays for the content it may still reach.
+    let end = base + held.len();
+    logprobs.retain(|s| s.start < base || s.end > end);
     for call in fired {
         on_delta(Delta::ToolCall {
             name: call.name,
@@ -594,9 +622,10 @@ fn note_shown(gap: &mut Option<String>, text: &str) {
     }
 }
 
-/// One stretch of a held span: text, or the inside of a `<think>…</think>`.
+/// One stretch of a held span: text, with its offset in the span, or the inside of a
+/// `<think>…</think>`.
 enum Span<'a> {
-    Text(&'a str),
+    Text(usize, &'a str),
     Reasoning(&'a str),
 }
 
@@ -605,18 +634,18 @@ fn reasoning_spans(text: &str) -> Vec<Span<'_>> {
     const TO: &str = "<think>";
     const TC: &str = "</think>";
     let mut out = Vec::new();
-    let mut rest = text;
-    while let Some(o) = rest.find(TO) {
-        out.push(Span::Text(&rest[..o]));
-        let inner = &rest[o + TO.len()..];
-        let Some(c) = inner.find(TC) else {
-            out.push(Span::Reasoning(inner));
+    let mut at = 0;
+    while let Some(o) = text[at..].find(TO) {
+        out.push(Span::Text(at, &text[at..at + o]));
+        let inner = at + o + TO.len();
+        let Some(c) = text[inner..].find(TC) else {
+            out.push(Span::Reasoning(&text[inner..]));
             return out;
         };
-        out.push(Span::Reasoning(&inner[..c]));
-        rest = &inner[c + TC.len()..];
+        out.push(Span::Reasoning(&text[inner..inner + c]));
+        at = inner + c + TC.len();
     }
-    out.push(Span::Text(rest));
+    out.push(Span::Text(at, &text[at..]));
     out
 }
 
@@ -631,6 +660,25 @@ fn channel_thought_head(raw: &str) -> Option<usize> {
     CHANNEL_THOUGHT
         .iter()
         .find_map(|m| raw.starts_with(m).then_some(m.len()))
+}
+
+/// Emit, in order, the entries of every token group `in_content` picks — those whose text the
+/// content delta about to go out carries — and forget them. Called just before that delta.
+fn emit_logprobs(
+    logprobs: &mut Vec<TokenSpan>,
+    in_content: impl Fn(&TokenSpan) -> bool,
+    on_delta: &mut dyn FnMut(Delta),
+) {
+    logprobs.retain_mut(|s| {
+        if in_content(s) {
+            for lp in s.lps.drain(..) {
+                on_delta(Delta::Logprob(lp));
+            }
+            false
+        } else {
+            true
+        }
+    });
 }
 
 /// Emit the not-yet-sent slice of `raw[region_start .. region_end]` (past `*sent` bytes), holding back
@@ -657,17 +705,16 @@ fn emit_region(
     } else {
         region_end
     };
-    // Never split a token across two deltas: back the cut up to the last token boundary. When no
-    // boundary fits (the whole token is inside the held tail), hold its text until the next push.
-    if !(!hold && end == region_end) && logprobs.iter().any(|s| s.start >= abs && s.end > end) {
-        match logprobs
-            .iter()
-            .filter(|s| s.end > abs && s.end <= end)
-            .map(|s| s.end)
-            .max()
-        {
-            Some(boundary) => end = boundary,
-            None => return,
+    // Never split a token group across two content deltas: back the cut up to the start of the
+    // group it falls in. When that is at or before where this delta starts, hold the text until
+    // the next push. A cut at the region's own end is structural and stands. Reasoning carries no
+    // entries, so it is cut anywhere.
+    if !reasoning && !(!hold && end == region_end) {
+        if let Some(s) = logprobs.iter().find(|s| s.start < end && s.end > end) {
+            if s.start <= abs {
+                return;
+            }
+            end = s.start;
         }
     }
     while end > abs && !raw.is_char_boundary(end) {
@@ -676,16 +723,12 @@ fn emit_region(
     if end <= abs {
         return;
     }
-    if !logprobs.is_empty() {
-        let mut keep = Vec::with_capacity(logprobs.len());
-        for span in logprobs.drain(..) {
-            if span.start >= abs && span.start < end {
-                on_delta(Delta::Logprob(span.lp));
-            } else {
-                keep.push(span);
-            }
-        }
-        *logprobs = keep;
+    if reasoning {
+        // A group wholly inside reasoning that has gone out can never be content: forget it now,
+        // so a long reasoning span does not leave every content delta scanning its tokens.
+        logprobs.retain(|s| s.start < region_start || s.end > end);
+    } else {
+        emit_logprobs(logprobs, |s| s.start < end && s.end > abs, on_delta);
     }
     let text = &raw[abs..end];
     if text.is_empty() {
@@ -740,8 +783,7 @@ mod chat_stream_tests {
         let mut out: Vec<Delta> = Vec::new();
         let mut s = ChatStream::new(false);
         for c in "abcdefghijklmnop".chars() {
-            let mut one = vec![lp(c)];
-            s.push_with_logprobs(&c.to_string(), &mut one, &mut |d| out.push(d));
+            s.push_with_logprobs(&c.to_string(), vec![lp(c)], &mut |d| out.push(d));
         }
         s.finish(&mut |d| out.push(d));
 
@@ -766,6 +808,272 @@ mod chat_stream_tests {
         }
         assert_eq!(content, "abcdefghijklmnop");
         assert!(queued.is_empty());
+    }
+
+    /// Feed `(piece, token id)` pairs, one token per piece, and pair every content delta with the
+    /// entries emitted just ahead of it, as the server builds its chunks. An entry that is not
+    /// followed by content, or is left over at the end, fails the test.
+    fn content_chunks(pieces: &[(&str, u32)], allow_tools: bool) -> Vec<(String, Vec<u32>)> {
+        let mut out: Vec<Delta> = Vec::new();
+        let mut s = ChatStream::new(allow_tools);
+        for &(piece, id) in pieces {
+            let lp = crate::TokenLogprob {
+                token: id,
+                text: piece.to_owned(),
+                bytes: piece.as_bytes().to_vec(),
+                logprob: -1.0,
+                top: Vec::new(),
+            };
+            s.push_with_logprobs(piece, vec![lp], &mut |d| out.push(d));
+        }
+        s.finish(&mut |d| out.push(d));
+        let mut chunks = Vec::new();
+        let mut queued = Vec::new();
+        for d in out {
+            match d {
+                Delta::Logprob(lp) => queued.push(lp.token),
+                Delta::Content(text) => chunks.push((text, std::mem::take(&mut queued))),
+                other => assert!(queued.is_empty(), "{queued:?} rode {other:?}"),
+            }
+        }
+        assert!(queued.is_empty(), "{queued:?} were left with no content");
+        chunks
+    }
+
+    /// `logprobs.content` describes `content`: the reasoning, and the `<think>` markers around
+    /// it, are not the answer, so their tokens report nothing, and the answer's entries come in
+    /// order on the chunks that carry their text.
+    #[test]
+    fn logprobs_cover_the_answer_and_not_the_reasoning() {
+        let chunks = content_chunks(
+            &[
+                ("<think>", 1),
+                ("\nhmm", 2),
+                ("</think>", 3),
+                ("\n\nYes", 4),
+                (", it", 5),
+                (" is.", 6),
+            ],
+            false,
+        );
+        let ids: Vec<u32> = chunks.iter().flat_map(|c| c.1.clone()).collect();
+        assert_eq!(ids, [4, 5, 6]);
+        let text: String = chunks.iter().map(|c| c.0.as_str()).collect();
+        assert_eq!(text, "\n\nYes, it is.");
+        for (text, ids) in &chunks {
+            assert!(!ids.is_empty(), "{text:?} has no entries");
+        }
+    }
+
+    /// Prose between and after parsed calls is content, and carries its tokens' entries: the
+    /// parser traces each byte it keeps back to the reply. The calls' tokens, and whitespace the
+    /// cut dropped, report nothing.
+    #[test]
+    fn prose_around_parsed_calls_keeps_its_entries() {
+        const CALL: &str = "{\"name\": \"f\", \"arguments\": {}}";
+        let chunks = content_chunks(
+            &[
+                ("A", 1),
+                ("<tool_call>", 2),
+                (CALL, 3),
+                ("</tool_call>", 4),
+                (" then", 5),
+                ("<tool_call>", 6),
+                (CALL, 7),
+                ("</tool_call>", 8),
+                (" done.", 9),
+            ],
+            true,
+        );
+        assert_eq!(
+            chunks,
+            [
+                ("A".to_owned(), vec![1]),
+                (" then done.".to_owned(), vec![5, 9])
+            ]
+        );
+
+        // A call that opens the reply: the line break after it is cut, so its token reports
+        // nothing; the text after it does.
+        let chunks = content_chunks(
+            &[
+                ("<tool_call>", 1),
+                (CALL, 2),
+                ("</tool_call>", 3),
+                ("\n", 4),
+                ("Done", 5),
+                (".", 6),
+            ],
+            true,
+        );
+        assert_eq!(chunks, [("Done.".to_owned(), vec![5, 6])]);
+    }
+
+    /// A group that runs from a held stretch through a whole `<think>…</think>` into later
+    /// content keeps its entry for that content, rather than being dropped with the stretch.
+    #[test]
+    fn a_group_past_a_settled_stretch_keeps_its_entry() {
+        let chunks = content_chunks(
+            &[
+                ("Hi ", 1),
+                ("<tool_call>", 2),
+                ("{\"name\": \"f\", \"arguments\": {}}", 3),
+                ("</tool_call><think>r</think>Done", 4),
+            ],
+            true,
+        );
+        assert_eq!(
+            chunks,
+            [("Hi ".to_owned(), vec![1]), ("Done".to_owned(), vec![4])]
+        );
+    }
+
+    /// The entries of reasoning tokens are dropped as their reasoning goes out, so the queue
+    /// holds only what is still pending however long the reasoning runs.
+    #[test]
+    fn reasoning_entries_do_not_pile_up() {
+        let lp = |id: u32, text: &str| crate::TokenLogprob {
+            token: id,
+            text: text.to_owned(),
+            bytes: text.as_bytes().to_vec(),
+            logprob: -1.0,
+            top: Vec::new(),
+        };
+        let mut s = ChatStream::new(false);
+        let mut out = Vec::new();
+        s.push_with_logprobs("<think>", vec![lp(0, "<think>")], &mut |d| out.push(d));
+        let mut most = 0;
+        for i in 1..=2000 {
+            s.push_with_logprobs("word ", vec![lp(i, "word ")], &mut |d| out.push(d));
+            most = most.max(s.queued_logprobs());
+        }
+        // The opener's group, and the few the reasoning's held-back tail still covers.
+        assert!(most <= 5, "the queue reached {most}");
+        s.push_with_logprobs("</think>", vec![lp(9000, "</think>")], &mut |d| out.push(d));
+        s.push_with_logprobs("Answer", vec![lp(9001, "Answer")], &mut |d| out.push(d));
+        s.finish(&mut |d| out.push(d));
+        let ids: Vec<u32> = out
+            .iter()
+            .filter_map(|d| match d {
+                Delta::Logprob(lp) => Some(lp.token),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, [9001]);
+    }
+
+    /// A `</think>` with no opener before it, after content has streamed: no panic, and the
+    /// closer is text.
+    #[test]
+    fn a_stray_closer_after_streamed_content_does_not_panic() {
+        let (r, c, _) = run(&["abcdefghijklmnopqrstuvwxyz", "</think>"], false);
+        assert_eq!(r, "");
+        assert_eq!(c, "abcdefghijklmnopqrstuvwxyz</think>");
+    }
+
+    /// The same reply pushed whole, a character at a time, and in uneven pieces gives the same
+    /// reasoning, content and calls, with and without logprob entries — stray closers included.
+    #[test]
+    fn output_does_not_depend_on_chunking() {
+        let replies = [
+            "abcdefghijklmnopqrstuvwxyz</think>",
+            "abc</think>def",
+            "x</think>y<think>r</think>z",
+            "</think></think>a",
+            "<think>r</think>a</think>b",
+            "lead</think> <think>think</think>\n\nanswer",
+            "Hi <tool_call>{\"name\": \"f\", \"arguments\": {}}</tool_call></think>done",
+            "<think>why</think>\n\n{\"name\": \"f\", \"arguments\": {}}",
+        ];
+        fn feed(pieces: &[&str], tools: bool, entries: bool) -> (String, String, String) {
+            let mut out = Vec::new();
+            let mut s = ChatStream::new(tools);
+            for (i, p) in pieces.iter().enumerate() {
+                let lps = if entries {
+                    vec![crate::TokenLogprob {
+                        token: i as u32,
+                        text: p.to_string(),
+                        bytes: p.as_bytes().to_vec(),
+                        logprob: -1.0,
+                        top: Vec::new(),
+                    }]
+                } else {
+                    Vec::new()
+                };
+                s.push_with_logprobs(p, lps, &mut |d| out.push(d));
+            }
+            s.finish(&mut |d| out.push(d));
+            let (mut r, mut c, mut t) = (String::new(), String::new(), String::new());
+            for d in out {
+                match d {
+                    Delta::Reasoning(x) => r.push_str(&x),
+                    Delta::Content(x) => c.push_str(&x),
+                    Delta::ToolCall { name, arguments } => {
+                        t.push_str(&format!("{name}{arguments};"))
+                    }
+                    Delta::Logprob(_) => {}
+                }
+            }
+            (r, c, t)
+        }
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        for reply in replies {
+            let chars: Vec<(usize, char)> = reply.char_indices().collect();
+            let bytewise: Vec<&str> = chars
+                .iter()
+                .map(|&(i, ch)| &reply[i..i + ch.len_utf8()])
+                .collect();
+            let mut uneven = Vec::new();
+            let mut at = 0;
+            while at < reply.len() {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let mut end = (at + 1 + (state % 7) as usize).min(reply.len());
+                while !reply.is_char_boundary(end) {
+                    end += 1;
+                }
+                uneven.push(&reply[at..end]);
+                at = end;
+            }
+            for tools in [false, true] {
+                for entries in [false, true] {
+                    let whole = feed(&[reply], tools, entries);
+                    assert_eq!(
+                        feed(&bytewise, tools, entries),
+                        whole,
+                        "{reply:?} char by char, tools {tools}, entries {entries}"
+                    );
+                    assert_eq!(
+                        feed(&uneven, tools, entries),
+                        whole,
+                        "{reply:?} in {uneven:?}, tools {tools}, entries {entries}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A held stretch that turns out to hold no call goes out verbatim with its tokens' entries;
+    /// a parsed call's tokens are not content and report nothing.
+    #[test]
+    fn logprobs_follow_settled_text_and_skip_parsed_calls() {
+        let chunks = content_chunks(&[("Hi ", 1), ("<tool_call>", 2), ("oops", 3)], true);
+        let ids: Vec<u32> = chunks.iter().flat_map(|c| c.1.clone()).collect();
+        assert_eq!(ids, [1, 2, 3]);
+        let text: String = chunks.iter().map(|c| c.0.as_str()).collect();
+        assert_eq!(text, "Hi <tool_call>oops");
+
+        let chunks = content_chunks(
+            &[
+                ("Sure", 1),
+                ("<tool_call>", 2),
+                ("{\"name\": \"f\", \"arguments\": {}}", 3),
+                ("</tool_call>", 4),
+            ],
+            true,
+        );
+        assert_eq!(chunks, [("Sure".to_owned(), vec![1])]);
     }
 
     #[test]

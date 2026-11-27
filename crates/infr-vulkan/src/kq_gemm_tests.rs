@@ -11,6 +11,11 @@
 //! scale, sign or row lands at the size of the terms themselves. What int8 activations cost
 //! against f32 is bounded separately, in `seam_op_parity`'s `kquant_linear_*` tests.
 //!
+//! On activations made only of small blocks, whose f16 scales are subnormal, the same
+//! decomposition also holds the dense `mmq` GEMM and the `mmv_mw` decode GEMV, and `quant_q8`'s
+//! stored scales are held to f16's rounding of `amax / 127`: what a driver that flushes f16
+//! subnormals breaks.
+//!
 //! The same file holds the routed experts' outlier quantizer (`quant_q8.comp`'s `-DHI` build) to
 //! its rule, and the batched expert GEMMs that read it (`-DACT_HI`) to their decomposition plus
 //! each block's carried remainder.
@@ -329,6 +334,152 @@ mod tests {
                 )
             });
             fx.assert_matches_decomposition(dt, "dp4a", &got, &w_host, &mins);
+        }
+    }
+
+    /// Block sizes of [`small_x`]: every one under `127 · 2^-14 ≈ 7.75e-3`, so every scale
+    /// `quant_q8` writes for them is an f16 subnormal, down to one that rounds to f16's least
+    /// subnormal value.
+    const SMALL_AMAX: [f32; 8] = [7e-3, 3e-3, 1e-3, 3e-4, 1e-4, 5e-5, 2e-5, 1e-5];
+
+    /// `M x K` activations made only of small blocks, as gemma-3 has many of: block `b` of row
+    /// `r` reaches `SMALL_AMAX[(r + b) % 8]` at its lane 0 and stays within it elsewhere.
+    fn small_x() -> Vec<f32> {
+        (0..M * K)
+            .map(|i| {
+                let (r, k) = (i / K, i % K);
+                let amax = SMALL_AMAX[(r + k / 32) % SMALL_AMAX.len()];
+                match k % 32 {
+                    0 => amax,
+                    lane => amax * (lane as f32 * 0.61 + r as f32 * 1.7).cos(),
+                }
+            })
+            .collect()
+    }
+
+    /// The int8 kernels keep a block whose scale is an f16 subnormal: `quant_q8` writes each such
+    /// scale as f16 rounds `amax / 127` (to the nearest, within one unit of the last place for the
+    /// device's own division), never zero, and the dense `mmq` GEMM (the non-coopmat tier's
+    /// prefill GEMM), the dp4a K-quant GEMM and the decode GEMV (`mmv_mw`) each match the f64
+    /// decomposition from those very codes and scales. A driver that flushes f16 subnormals to
+    /// zero, which SPIR-V allows where no float-controls mode is declared, fails the first check
+    /// where it stores the scale and the decompositions where it reads one: such a block then drops
+    /// out of the dot, and every row here is made of such blocks. On a device that keeps them both
+    /// pass; this is a check of the driver's f16 handling under the kernels as built.
+    #[test]
+    #[ignore = "requires a Vulkan GPU with int8 dot"]
+    fn int8_kernels_keep_f16_subnormal_scales() {
+        let Some(be) = infr_testkit::gpu_or_skip_noted(VulkanBackend::new()) else {
+            return;
+        };
+        if !be.caps().i8_dot {
+            eprintln!("int8_kernels_keep_f16_subnormal_scales: no int8 dot here — skipped");
+            return;
+        }
+        let x = small_x();
+        let fx = Fixture::with_x(be, &x);
+        let be = &fx.be;
+        let nblk = K / 32;
+        for dt in [DType::Q4K, DType::Q6K] {
+            let (wbuf, w_host, mins) = fx.weights(dt);
+            let w_addr = wbuf.device_addr().expect("weights carry a device address");
+            let got = fx.run(|rec, out| {
+                rec.matmul_dp4a_kq(
+                    dt,
+                    fx.qa.as_ref(),
+                    fx.dact.as_ref(),
+                    fx.sact.as_ref(),
+                    w_addr,
+                    W_BASE,
+                    out,
+                    M,
+                    K,
+                    N,
+                )
+            });
+            // The scales as stored: f16's rounding of amax / 127, subnormal and not zero.
+            let host = fx.host();
+            for r in 0..M {
+                for b in 0..nblk {
+                    let blk = &x[r * K + b * 32..r * K + (b + 1) * 32];
+                    let amax = blk.iter().fold(0f32, |m, v| m.max(v.abs()));
+                    let want = half::f16::from_f32(amax / 127.0);
+                    assert!(
+                        !want.is_normal() && want.to_bits() & 0x7fff != 0,
+                        "row {r} block {b}: not a subnormal case"
+                    );
+                    let i = r * nblk + b;
+                    let got = u16::from_le_bytes([host[1][2 * i], host[1][2 * i + 1]]);
+                    assert!(
+                        got & 0x7fff != 0 && got.abs_diff(want.to_bits()) <= 1,
+                        "row {r} block {b}: scale stored as {:e} (bits {got:#06x}), \
+                         f16 rounds amax / 127 to {:e} (bits {:#06x})",
+                        half::f16::from_bits(got).to_f64(),
+                        want.to_f64(),
+                        want.to_bits()
+                    );
+                }
+            }
+            fx.assert_matches_decomposition(dt, "dp4a, small blocks", &got, &w_host, &mins);
+
+            // The dense mmq GEMM writes whole 64-row tiles: an output of its own, rows past M
+            // unchecked.
+            let mt = M.div_ceil(64) * 64;
+            let out = be.alloc(mt * N * 4, BufferUsage::Activations).unwrap();
+            let rec = be.recorder().unwrap();
+            rec.matmul_mmq_at(
+                dt,
+                fx.qa.as_ref(),
+                fx.dact.as_ref(),
+                fx.sact.as_ref(),
+                w_addr,
+                W_BASE,
+                out.as_ref(),
+                M,
+                K,
+                N,
+            );
+            rec.finish().unwrap();
+            let mut mmq = vec![0f32; mt * N];
+            be.download(out.as_ref(), bytemuck::cast_slice_mut(&mut mmq))
+                .unwrap();
+            // The decode GEMV on row 0 (its activation is the first row of the fixture's).
+            let y = be.alloc(N * 4, BufferUsage::Activations).unwrap();
+            let rec = be.recorder().unwrap();
+            rec.linear_mmv_mw(
+                dt,
+                4,
+                wbuf.as_ref(),
+                W_BASE,
+                fx.qa.as_ref(),
+                fx.dact.as_ref(),
+                fx.sact.as_ref(),
+                None,
+                y.as_ref(),
+                K,
+                N,
+            );
+            rec.finish().unwrap();
+            let mut gemv = vec![0f32; N];
+            be.download(y.as_ref(), bytemuck::cast_slice_mut(&mut gemv))
+                .unwrap();
+            for (what, rows, out) in [("mmq", M, &mmq), ("mmv_mw", 1, &gemv)] {
+                let mut worst = 0f64;
+                for r in 0..rows {
+                    for o in 0..N {
+                        let (want, mag) = decomposition(&host, r, o, &w_host, &mins);
+                        let g = out[r * N + o] as f64;
+                        let err = (g - want).abs();
+                        worst = worst.max(err / mag);
+                        assert!(
+                            err <= 1e-5 * mag,
+                            "{dt:?} {what}, small blocks: row {r} col {o}: got {g} want {want} \
+                             (term sum {mag})"
+                        );
+                    }
+                }
+                eprintln!("{dt:?} {what}, small blocks: worst error / term sum = {worst:e}");
+            }
         }
     }
 

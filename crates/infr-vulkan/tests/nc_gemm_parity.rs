@@ -601,9 +601,15 @@ struct KqFmaError {
 /// more accurate can turn these tests red with no regression in the tile; then check the tile
 /// against this bound and the previous figures, and either improve the tile or bring the change
 /// to the owner, rather than loosening the comparison. The value sits above the compensated
-/// tile's worst case with a margin and below what most cases give with the carry dropped, so the
-/// bound on its own catches a lost compensation; the figures are in `docs/gpu-tolerance.md`, "The fp32
-/// K-quant prefill GEMM in the float runs".
+/// tile's worst case with a margin and below what most direct cases give with the carry dropped,
+/// so on the direct path the bound on its own catches a lost compensation; the figures are in
+/// `docs/gpu-tolerance.md`, "The fp32 K-quant prefill GEMM in the float runs". That margin was
+/// measured on these seeded inputs, one driver release and two GPUs whose shader compilers agree
+/// to the printed digit, and on nothing else: not RADV in these units, not Intel. Before calling
+/// a crossing on a new driver a regression, compare the tile against a host emulation of the same
+/// sum (`f32::mul_add` partials of 32 plus the Kahan step) to see whether the driver fuses
+/// `fma()`; if it does not and the figure is above this bound, raise the constant and write that
+/// figure into the docs.
 const KQ_FMA_REL_BOUND_EPS: f64 = 1.2;
 
 impl KqFmaError {
@@ -756,8 +762,8 @@ fn nc_kq_fma_gemm_is_as_accurate_as_the_gemv() {
     );
 }
 
-/// The split-K twin under the same two bounds as the direct tile, at the slice counts the plan picks
-/// for gemma-3-1b's `attn_output` (k = 1024) and for a deeper k.
+/// The split-K twin under the same two bounds as the direct tile, at the slice counts the plan
+/// picks for gemma-3-1b's `attn_output` (k = 1024) and for a deeper k.
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn nc_kq_fma_splitk_is_as_accurate_as_the_gemv() {
@@ -811,8 +817,8 @@ fn nc_kq_fma_gemm_parity_and_determinism() {
 }
 
 /// The split-K twin: same host-reference parity and run-to-run determinism as the direct tile,
-/// with the k range cut into `splits` slices plus a `splitk_reduce_kahan` pass. Shapes cover a single
-/// row tile, a partial row tile and several (m=512: 4 row tiles) across both column tiles.
+/// with the k range cut into `splits` slices plus a `splitk_reduce_kahan` pass. Shapes cover a
+/// single row tile, a partial row tile and several (m=512: 4 row tiles) across both column tiles.
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn nc_kq_fma_splitk_matches_the_direct_tile() {

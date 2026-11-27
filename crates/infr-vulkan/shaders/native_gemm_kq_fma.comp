@@ -186,10 +186,11 @@ void storeTile(uint k0) {
 // One Kahan step: adds `p` into `acc` and returns the rounding error the add dropped, which
 // becomes the next tile's starting partial. `precise` keeps the compiler from folding
 // `p - (t - acc)` to zero or reassociating it. It lives in its own function because glslang
-// propagates `precise` backward through everything that feeds a precise value within a function:
-// written inline in `main`, it marked the whole kernel NoContraction, the products and the
-// dequantization in `storeTile` included. A parameter stops that propagation, so only the three
-// compensation operations carry it.
+// propagates `precise` backward to every operation whose result reaches a precise value,
+// following writes to the variables it reads (locals, globals and the shared arrays alike) into
+// other functions, so from `main` it would reach the products and the dequantization in
+// `storeTile` and `loadRaw`. A function parameter or return value stops that propagation, so here
+// only the three compensation operations carry it (docs/gpu-tolerance.md, "The fix").
 vec4 kahanStep(inout vec4 acc, vec4 p) {
     precise vec4 t = acc + p;
     precise vec4 carry = p - (t - acc);

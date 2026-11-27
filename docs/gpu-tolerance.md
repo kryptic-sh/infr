@@ -374,14 +374,19 @@ partial, so the tile holds two accumulator sets rather than three; `precise`
 keeps the compiler from folding the compensation away; the last carry is added
 on the write. Its split-K pass is `splitk_reduce_kahan`.
 
-`precise` reaches further than the variable it is written on: glslang marks
-every float operation that feeds a precise value, within the function, as
-`NoContraction`. The fix's first form declared the compensation `precise` inline
-in `main`, and that marked the whole kernel, the dequantization in `storeTile`
-(`dl * q - mm` and the like) included, so the driver could no longer fuse those
-multiply-adds either. Counted with `glslc -O` (the build's flags) and
-`spirv-dis`, Vulkan SDK 1.4.357.0, `NoContraction` decorations in the six builds
-of `native_gemm_kq_fma.comp`:
+`precise` reaches further than the variable it is written on: glslang marks as
+`NoContraction` every float operation whose result reaches a precise value, and
+to find them it follows the writes to each variable that value reads, across
+functions, through locals, globals and the shared arrays alike (`Ws`, which
+`storeTile` fills, and the prefetch registers `loadRaw` writes). A function
+parameter or return value stops it. The fix's first form declared the
+compensation `precise` inline in `main`, and that marked the whole kernel, with
+decorated operations in `storeTile` and `loadRaw` as well (seen in an
+unoptimized build by the second reviewer), the dequantization (`dl * q - mm` and
+the like) included, so the driver could no longer fuse those multiply-adds
+either. Counted with `glslc -O` (the build's flags) and `spirv-dis`, Vulkan SDK
+1.4.357.0, `NoContraction` decorations in the six builds of
+`native_gemm_kq_fma.comp`:
 
 | Build        | `main` (contributed) | first form | `kahanStep` |
 | ------------ | -------------------- | ---------- | ----------- |
@@ -465,11 +470,22 @@ tile or take the question to the owner, rather than loosen the comparison.
 `KQ_FMA_REL_BOUND_EPS` was 2 when the bound was added and is 1.2 since, with the
 fixed tile's worst case (0.930, the same on both GPUs) 1.29 times under it. At 2
 the carry-dropped tile below crossed the bound on only 2 of its 18 direct cases;
-at 1.2 it crosses on 14, so the bound on its own now catches most of a lost
-compensation. Each test was seen to fail on this device, with the kernel changed
-and then restored. The first and third rows ran at the bound of 2 (with the
-first form of the fix), and the bound columns there are its counts; the second
-row ran at 1.2 on the shipped form:
+at 1.2 it crosses on 14, so on the direct path the bound on its own now catches
+most of a lost compensation. On the split-K path it does not: none of the 8
+carry-dropped cases above the GEMV is above the bound, and the 2 cases above the
+bound are below the GEMV, so there the two requirements catch different cases.
+
+The 1.2 margin was measured on the tests' seeded inputs, one driver release
+(2.0.353) and two GPUs whose shader compilers (LLPC on the RX 7900 XTX, AMD's
+proprietary compiler on the integrated GPU) agree to the printed digit; nothing
+was measured in these units under RADV or on Intel. Before calling a crossing on
+a new driver a regression, compare the tile with a host emulation of the same
+sum (`f32::mul_add` partials of 32 plus the Kahan step) to see whether the
+driver fuses `fma()`; if it does not and the figure is above 1.2, raise
+`KQ_FMA_REL_BOUND_EPS` and write that figure here. Each test was seen to fail on
+this device, with the kernel changed and then restored. The first and third rows
+ran at the bound of 2 (with the first form of the fix), and the bound columns
+there are its counts; the second row ran at 1.2 on the shipped form:
 
 | Kernel change                                         | Direct test                                              | Split-K test                                                             | Reduce's host-sum test             |
 | ----------------------------------------------------- | -------------------------------------------------------- | ------------------------------------------------------------------------ | ---------------------------------- |

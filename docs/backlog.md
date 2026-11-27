@@ -83,6 +83,36 @@ serially: 484 run, 475 passed, 9 failed. The failures fall into four groups.
    move) or does not count a buffer before its pages are touched. Not
    investigated further.
 
+**The RoPE fix on the two AMD GPUs (2026-11-27).** `3def4aec` (all four rotary
+shaders take their angle from `rope_angle.glsl`), on the Windows box: RX 7900
+XTX (`Vulkan0`) and Ryzen integrated GPU (`Vulkan1`), AMD Windows driver
+2.0.353, release, serially, reference cache `on`.
+
+- `infr-vulkan` lib ignored tests matching `rope`, `qk_norm`, `mla_`: 12 of 12
+  on each GPU. `rope_angle_matches_f64` printed
+  `rope_sincos over 3668172 angles: worst 1.079e-7 absolute (|x| >= pi/4), 1.19 ulp (|x| < pi/4)`
+  on both. `seam_op_parity` matching `rope`: 2 of 2 on each (the
+  `Rope+ff vulkan pos 131070` err/tol line was not captured).
+- `gpu_seam_tolerance` gate: 13 of 14 on each GPU. Each failure is one that
+  fails identically on `main` before the change: `Vulkan0`
+  `gpu_seam_tolerance_moe_decode_float_reaches_moe_models_only`
+  (B-MOE-FLOAT-BITS-WIN-XTX), `Vulkan1` gemma-3's float greedy check, 95 of 126
+  tokens (B-GEMMA3-FLOAT-GREEDY-WIN-IGPU).
+- Speed, Qwen3-1.7B Q4_K_M, `3def4aec` against `72e8d84f`, 6 rounds alternating
+  the two builds, two copies of each binary rotated, `infr bench -r 3`, total
+  CPU load under 15%:
+
+  | Device               | pp512, t/s           | tg128, t/s               |
+  | -------------------- | -------------------- | ------------------------ |
+  | RX 7900 XTX          | 11545.13 to 11334.35 | 453.43 to 440.48 (-2.9%) |
+  | Ryzen integrated GPU | 230.51 to 225.49     | 27.15 to 27.11           |
+
+  pp512 is 1.8% slower on the RX 7900 XTX (copies of one build 0.5% apart) and
+  2.2% on the integrated GPU (copies 0.08% apart). tg128 on the integrated GPU
+  moved less than its copies differ (0.6%). The RX 7900 XTX decode cost is owned
+  by the Intel session's follow-up (the frequency table computed once on the
+  host).
+
 Everything else in that filter passed on the iGPU, including every float and
 K-quant GEMV/GEMM parity binary, decode split-K attention, the logits tail,
 `seam_op_parity` apart from the RoPE test, and the Intel `caps` unit tests.

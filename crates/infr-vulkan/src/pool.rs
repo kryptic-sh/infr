@@ -1,10 +1,12 @@
 //! What a device-local allocation commits, for the VRAM guard (`VulkanBackend::check_vram_commit`).
 //!
 //! gpu-allocator sub-allocates a buffer below `DEDICATED_MIN` from a shared block of its own, and a
-//! device's live memory budget counts each such block whole from the moment it is opened. A pooled
-//! buffer that lands in the free space of an open block therefore commits nothing new, and one that
-//! opens a block commits the whole block, whatever its own size. gpu-allocator can say which of the
-//! two a request will do only by walking every allocation it holds (`generate_report`), so
+//! device's live memory budget counts each such block whole from the moment it is opened (on a
+//! driver whose own figure does not, the backend holds the reading at the budget it had at open,
+//! which makes it so: `VulkanShared::budget_ceiling`). A pooled buffer that lands in the free space
+//! of an open block therefore commits nothing new, and one that opens a block commits the whole
+//! block, whatever its own size. gpu-allocator can say which of the two a request will do only by
+//! walking every allocation it holds (`generate_report`), so
 //! [`PoolLedger`] keeps its own copy of the shared blocks, updated where the backend allocates and
 //! frees, and answers from that.
 //!

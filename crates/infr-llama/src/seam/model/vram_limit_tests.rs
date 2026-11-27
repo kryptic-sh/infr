@@ -109,9 +109,16 @@ mod tests {
     /// [`IN_USE_STEADY`] consecutive readings, [`IN_USE_PERIOD`] apart, within [`IN_USE_SLACK`]
     /// of each other; one that does not settle within [`IN_USE_WAIT`] fails the test, since no
     /// limit built on it would mean what the test says.
+    ///
+    /// Read off the driver's own figure (`driver_vram`), which is where every backend opened
+    /// after the reading starts from. The reader's `vram` is held at the budget the reader had
+    /// when it opened on a driver whose figure does not drop with allocations (Mesa ANV on the
+    /// integrated GPU, whose budget follows the host's available memory): read through it,
+    /// memory freed after the reader opened would never be seen to land, and memory the host
+    /// takes and gives back during a run would not be seen to move.
     fn settled_use(vk: &infr_vulkan::VulkanBackend) -> u64 {
         let used = || {
-            let v = vk.vram();
+            let v = vk.driver_vram();
             v.total - v.available
         };
         let start = std::time::Instant::now();
@@ -904,7 +911,10 @@ mod tests {
                 DType::F16,
             )
             .expect("an attention model");
-            drop(vk);
+            // The sessions measure their room with one model loaded, their own, as the windows
+            // were measured with the probe's: on a unified-memory device a second model's host
+            // memory would come out of the room.
+            drop((vk, probe));
             // What the probe backend freed lands before the session's own backend measures the
             // room.
             settled_use(reader);
@@ -929,7 +939,9 @@ mod tests {
             ensure((kv.k_fmt, kv.v_fmt) == (DType::F16, DType::F16), || {
                 format!("served in {:?}/{:?}, not f16", kv.k_fmt, kv.v_fmt)
             })?;
-            drop(sess);
+            // Its model too, so the second session measures with one model loaded, as `placed`
+            // was measured.
+            drop((sess, model));
             // What the first session freed lands before the second one's placement measures the
             // room.
             settled_use(reader);

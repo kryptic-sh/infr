@@ -229,41 +229,97 @@ rule in AGENTS.md: output unchanged or no further from the CPU reference.
 - **The core count.** `0xa721` reports `cores:?` (plan 19 S4). Rules scaled by
   core count (split-K windows, grid sizing) take their fallback here.
 
-### B-ANV-UMA-BUDGET-GUARD — the VRAM guard trusts a budget ANV does not move with its own allocations (2026-11-27)
+### B-ANV-UMA-BUDGET-GUARD — what the budget ceiling left on the Intel iGPU (2026-11-27)
 
-**Kind:** product defect, not fixed; the next slice of plan 19 S3.
+**Kind:** findings left by the fix, not fixed.
 
-Measured on the Intel RPL-U iGPU (Mesa 26.3.1 ANV, unified memory) with a
-temporary probe of `VK_EXT_memory_budget`, the guard's `alloc_room` and
-`/proc/meminfo`:
+Mesa ANV on the RPL-U iGPU reports `heapBudget` as `heapUsage` plus about 0.9 ×
+`MemAvailable`, so an unwritten allocation did not lower the free figure. The
+backend now probes this when it opens (`infr_vulkan`'s `probe_budget_ceiling`
+and `budget_ceiling`: three unwritten 64 MiB allocations, `BUDGET_PROBE_BYTES`).
+Only the heap the probe's memory type lives in is measured. A ceiling is set
+only when every round ran and the median drop in that heap's free figure is
+under `BUDGET_PROBE_THRESHOLD` (half the allocation); every reading is then held
+at the per-heap budget read after the probes (`VulkanShared::budget_ceiling`,
+applied in `heap_free` by `vram_info` and `device_local_room`). No ceiling is
+set when the allocation is refused, when the probe heap's free figure before a
+round is below `BUDGET_PROBE_MIN_FREE` (too little for the drop to show), or
+without `VK_EXT_memory_budget`. With a ceiling, memory freed after the backend
+opened is never seen by it. Measured with a probe on the device before the fix:
+a 512 MiB allocation raised budget and usage by the same 536 870 912 bytes, the
+free figure dropped only once the buffer was written, and the usage dropped on
+the free at once while the free figure came back about 2 s later. Left:
 
-- **The budget follows host memory.** `heapBudget - heapUsage` stayed at
-  0.8999–0.9000 × `MemAvailable` in every reading, and drifted 13 MB in 500 ms
-  while the test was idle.
-- **A buffer counts only once its pages are written.** Under the pool test's
-  limit, allocating a 1084227584 B filler raised `heapUsage` and `heapBudget` by
-  the same amount and left `alloc_room` at 1088421888 B. Writing it (`fill_buf`)
-  took `alloc_room` to 0 and `MemAvailable` down by 1.55 GB, and freeing it gave
-  nothing back to the reading.
-- **The effect:** `check_vram_commit` assumes the live budget charges a block
-  from the moment it opens, so on ANV it admits any number of uninitialised
-  (`alloc_uninit`) allocations.
-  `pool::gpu_tests::a_pooled_buffer_in_an_open_block_is_admitted_below_its_size`
-  and `a_pooled_buffer_that_opens_a_block_is_refused_by_the_guard` fail on it,
-  and so do
-  `vram_limit_tests::explicit_ctx_short_of_the_room_after_the_weights_is_refused`
-  (served in Q8_0/Q8_0, not f16) and
-  `auto_ctx_before_the_load_is_the_ctx_after_it` (for example "opened with 2920
-  tokens, ran with 2134: 90144768 bytes promised and not held" at 1536 MiB, or
-  the in-use reading never settling within its 30 s wait).
-
-**Planned fix:** on a unified-memory device whose budget does not move with the
-backend's own allocations, the guard takes the smaller of the live reading and
-its own count of what it has allocated (the count it already keeps where no
-budget extension exists). That stays conservative on every driver. Not verified:
-other unified-memory drivers (RADV on the AMD iGPU, Apple), and whether ANV's
-figure is documented. Mesa's source was not read; the 0.9 × `MemAvailable`
-relation is measured only.
+- **ANV with little host memory at open is left unguarded (accepted).** On ANV
+  the probe heap's free figure is about 0.9 × `MemAvailable`, so with under
+  about 107 MiB available at open the probe is skipped and no ceiling is set.
+  Harmless at first (the room is then below the guard's 256 MiB headroom, so the
+  guard refuses anything it checks), but the backend keeps no ceiling for its
+  life: if the host frees memory later, unwritten allocations are admitted again
+  as before the fix. Accepted rather than probing differently, because a skip is
+  what keeps an honest driver on a nearly full heap from a false ceiling.
+- **Back-to-back opens.** A backend opened on ANV right after another closes
+  reads its ceiling before the closed one's written pages come back (about 2 s),
+  and keeps the lower room for its life. `infr bench`'s MTP arm opens a fresh
+  backend per repetition (`mtp::generate_mtp_spec_vulkan_timed`), so later
+  repetitions can size against less room than the first. Not measured.
+- **False ceilings on honest drivers.** Unchecked, and each fails toward less
+  room: another process freeing 32 MiB or more inside the probe's measurement
+  window; RADV releasing freed buffers late (about half a second, per
+  `settled_use`'s doc in `vram_limit_tests`), which could hide a probe's drop;
+  and drivers whose budget updates lazily (NVIDIA, Windows).
+- **Two backends on one device in one process.** On ANV they do not see each
+  other's unwritten allocations, since each `VkInstance` counts only its own.
+  This predates the ceiling.
+- **Verification gap.** No CPU test checks how `vram_info`'s `held` flag or
+  `device_local_room` is wired to the ceiling; only the ignored pool GPU tests
+  (`a_pooled_buffer_in_an_open_block_is_admitted_below_its_size`,
+  `a_pooled_buffer_that_opens_a_block_is_refused_by_the_guard`) cover it, and
+  only on ANV.
+- **The activations' first shared block is not priced after the load.** On the
+  iGPU no 256 MiB device-local shared block of gpu-allocator's is open when
+  `seam::reclamp_ctx_to_live_room` measures the room (only the 64 MiB host
+  blocks), so the first pooled activation opens one and takes nearly all of
+  `POST_KV_DEVICE_RESERVE`, leaving the activation reserve's own bytes (about 39
+  MB for Qwen3-0.6B) for everything else. In
+  `auto_ctx_before_the_load_is_the_ctx_after_it` the room after the KV cache was
+  about 307 MB in every row, and a run whose host memory moved more than that
+  slack in between was refused with "256.0 MiB requested (the new shared block a
+  16.0 KiB buffer opens)" (seen at 1300, 1400, 1536 and 1600 MiB, before the fix
+  as well). Either open the block before the re-clamp reads the room
+  (gpu-allocator keeps a type's last block open when it empties) or price it
+  there; both change the room on every device, so measure the RX 7900 XTX first.
+  Not checked whether a block is open there at that point.
+- **On the iGPU the device room is host memory.** The live figure follows
+  `MemAvailable`, so other processes, swap and this process's own host
+  allocations move it by tens to hundreds of MB during a run (this box had 15.5
+  GB of swap in use during the measurements). The `vram_limit_tests` sweeps at
+  their tightest rooms pass or fail on that; `retry_if_moved` runs a failed room
+  once more and the second run can fail too.
+- **`explicit_ctx_short_of_the_room_after_the_weights_is_refused` sits 16 MiB
+  from its edge, and the iGPU moves more than that.** Its windows are measured
+  on a probe backend at `IN_USE_SLACK` less room than the sessions get. With the
+  test holding one model at a time (fixed with the ceiling), the remaining
+  failures were runs where the memory in use rose 100 to 186 MB between the
+  first reading and a session's (for example 5 383 145 472 to 5 568 743 424
+  bytes, the second session's placement then seeing 1 340 080 128 bytes of room
+  against the probe's 1 474 297 856; ceiling and driver figure within 7 MB of
+  each other). Whether that is other processes or this process's freed host
+  memory not going back to the system was not measured; the retry passed in that
+  run, and failed in others.
+- **The ceiling does not grow.** Memory the host frees after the backend opened
+  (including pages a previous backend freed that the kernel had not handed back
+  yet) is not room for that backend. Deliberate: the alternative follows the
+  drifting host figure.
+- **Not verified elsewhere.** RADV (RX 7900 XTX and the AMD iGPU), NVIDIA and
+  Windows were not run, so whether their probe leaves the reading as it was is
+  by construction, not by observation. A driver whose `heapUsage` does not move
+  with allocations either would get a ceiling that does nothing; none is known.
+- **The UMA spill is not counted against the guard's own tally.** Without
+  `VK_EXT_memory_budget` on a unified-memory device the guard compares
+  `device_used`, which leaves out spilled buffers (`Backing::Vram { spilled }`),
+  against a total that counts every heap. Found while reading for this fix, not
+  reproduced; no such device is known.
 
 ### B-METAL-F16-PROBE-FLAKE — `f16_native_probe` fills the macOS runner's GPU working set (2026-11-27)
 

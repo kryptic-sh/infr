@@ -438,6 +438,15 @@ struct VulkanShared {
     caps: Capabilities,
     /// VK_EXT_memory_budget enabled → `vram()` can report live free bytes (else total only).
     has_mem_budget: bool,
+    /// The per-heap ceilings every budget reading is held at ([`heap_free`]), set when the backend
+    /// is built ([`probe_budget_ceiling`]): `None` where the driver's free figure drops with this
+    /// process's allocations, which is the reading used as it is; else each heap's `heapBudget`
+    /// read then. The second is for Mesa ANV on a unified-memory iGPU, whose budget is a share of
+    /// the host's available memory plus the usage, so an allocation raises both until its pages
+    /// are written: held at the budget it had, the free figure drops by what the process
+    /// allocates, as the guard (`pool`'s whole-block charging included) assumes. Unset during
+    /// construction, where the readings are used as they are.
+    budget_ceiling: OnceLock<Option<Vec<u64>>>,
     /// `kernels.vulkan.vram_limit`, copied off the backend's `Config` at construction: the cap
     /// [`vram_info`] puts on every snapshot (see [`VramInfo::capped`]).
     vram_limit: Option<SizeSpec>,
@@ -1176,14 +1185,157 @@ fn process_heap_usage(s: &VulkanShared) -> Option<u64> {
     if !s.has_mem_budget {
         return None;
     }
+    Some(heap_reading(s).iter().map(|&(_, usage)| usage).sum())
+}
+
+/// Each allocation [`probe_budget_ceiling`] makes: far above what the desktop moves the free figure
+/// by between two readings taken back to back, and small enough to fit any device the backend
+/// would run on.
+const BUDGET_PROBE_BYTES: u64 = 64 << 20;
+
+/// The drop in the free figure one probe allocation must show for the reading to count as
+/// following this process's allocations: half the allocation, so a driver that rounds or
+/// reports the allocation a little short still counts, while one whose free figure does not move
+/// (Mesa ANV) is far below it.
+const BUDGET_PROBE_THRESHOLD: u64 = BUDGET_PROBE_BYTES / 2;
+
+/// The free figure below which a probe round cannot tell the two kinds of driver apart: the free
+/// figure stops at zero on each heap, so with less free than the allocation plus
+/// [`BUDGET_PROBE_THRESHOLD`] an honest driver could show a drop under the threshold.
+const BUDGET_PROBE_MIN_FREE: u64 = BUDGET_PROBE_BYTES + BUDGET_PROBE_THRESHOLD;
+
+/// Allocations [`probe_budget_ceiling`] makes; odd, so the median is one of them.
+const BUDGET_PROBE_ROUNDS: usize = 3;
+
+/// The device's memory properties and, from the same query, one `VK_EXT_memory_budget` reading:
+/// `(heapBudget, heapUsage)` for each heap, in heap order. The reading is empty on a device
+/// without the extension (`has_mem_budget`).
+fn memory_reading(s: &VulkanShared) -> (vk::PhysicalDeviceMemoryProperties, Vec<(u64, u64)>) {
     let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
-    let mut props2 = vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
+    let mut props2 = vk::PhysicalDeviceMemoryProperties2::default();
+    if s.has_mem_budget {
+        props2 = props2.push_next(&mut budget);
+    }
     unsafe {
         s.instance
             .get_physical_device_memory_properties2(s.physical_device, &mut props2)
     };
-    let heaps = props2.memory_properties.memory_heap_count as usize;
-    Some(budget.heap_usage[..heaps].iter().sum())
+    let mp = props2.memory_properties;
+    let reading = if s.has_mem_budget {
+        let heaps = mp.memory_heap_count as usize;
+        budget.heap_budget[..heaps]
+            .iter()
+            .copied()
+            .zip(budget.heap_usage[..heaps].iter().copied())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    (mp, reading)
+}
+
+/// [`memory_reading`]'s budget reading alone.
+fn heap_reading(s: &VulkanShared) -> Vec<(u64, u64)> {
+    memory_reading(s).1
+}
+
+/// Heap `i`'s ceiling ([`VulkanShared::budget_ceiling`]), if this device has one.
+fn heap_ceiling(s: &VulkanShared, i: usize) -> Option<u64> {
+    s.budget_ceiling.get()?.as_ref()?.get(i).copied()
+}
+
+/// The free bytes one heap's budget reading leaves: `budget` less `usage`, with the budget held at
+/// or below `ceiling` (see [`VulkanShared::budget_ceiling`]) and the result at or below the heap's
+/// `size`. The budget is a ceiling on what the process may hold, not free bytes; the clamp to the
+/// heap size keeps a driver that reports usage past the heap (RADV on an APU, once something has
+/// oversubscribed the synthetic split) from handing back a bogus figure.
+fn heap_free(budget: u64, usage: u64, size: u64, ceiling: Option<u64>) -> u64 {
+    budget
+        .min(ceiling.unwrap_or(u64::MAX))
+        .saturating_sub(usage)
+        .min(size)
+}
+
+/// The per-heap ceilings to hold the budget readings at, or `None` when the driver's free figure
+/// already drops by what this process allocates. `read` takes a budget reading
+/// ([`heap_reading`]); `allocate` takes [`BUDGET_PROBE_BYTES`] of device memory without writing
+/// it, in a memory type of heap `heap`, or `None` when the device refuses, and `free` returns it.
+///
+/// Each of [`BUDGET_PROBE_ROUNDS`] rounds reads heap `heap`'s free figure (budget less usage)
+/// before and after one allocation. Only that heap is measured: the allocation can only move its
+/// figure, and free memory on another heap (a discrete card's host heap) says nothing about
+/// whether this one has room for the probe to show a drop. Where the median drop is at least
+/// [`BUDGET_PROBE_THRESHOLD`], the reading counts this process's allocations, so it is used as it
+/// is. Where it is not (Mesa ANV on a unified-memory iGPU, whose budget grows with the usage until
+/// the pages are written), the budgets read after the probes are the ceilings: the free figure is
+/// then the budget at open less what the process holds now, which drops with every allocation
+/// from the moment it is made, and the live budget still lowers it when it falls below that.
+///
+/// Where the probe cannot tell, the reading is used as it is (`None`): when the allocation is
+/// refused (ANV does not back unwritten pages, so a refusal points at an honest driver on a full
+/// device), when the probe heap's free figure before a round is below [`BUDGET_PROBE_MIN_FREE`]
+/// (on ANV that is under about 107 MiB of host memory available, and the backend then keeps the
+/// unheld reading for its life), and when the reading has no heap `heap`.
+fn budget_ceiling<H>(
+    heap: usize,
+    read: impl Fn() -> Vec<(u64, u64)>,
+    allocate: impl Fn() -> Option<H>,
+    free: impl Fn(H),
+) -> Option<Vec<u64>> {
+    let free_bytes = |r: Vec<(u64, u64)>| {
+        r.get(heap)
+            .map(|&(budget, usage)| budget.saturating_sub(usage))
+    };
+    let mut drops = Vec::with_capacity(BUDGET_PROBE_ROUNDS);
+    for _ in 0..BUDGET_PROBE_ROUNDS {
+        let before = free_bytes(read())?;
+        if before < BUDGET_PROBE_MIN_FREE {
+            return None;
+        }
+        let held = allocate()?;
+        let after = free_bytes(read()).unwrap_or(before);
+        free(held);
+        drops.push(before.saturating_sub(after));
+    }
+    drops.sort_unstable();
+    if drops[BUDGET_PROBE_ROUNDS / 2] >= BUDGET_PROBE_THRESHOLD {
+        return None;
+    }
+    Some(read().into_iter().map(|(budget, _)| budget).collect())
+}
+
+/// [`budget_ceiling`] for this device, probed with unwritten allocations in the first
+/// device-local memory type and measured on that type's heap. `None` without
+/// `VK_EXT_memory_budget`, where the guard counts this backend's own allocations instead
+/// (`device_used`), and on a device with no device-local type. Run once, when the backend is
+/// built; a ceiling it sets is logged at debug level.
+fn probe_budget_ceiling(s: &VulkanShared) -> Option<Vec<u64>> {
+    if !s.has_mem_budget {
+        return None;
+    }
+    let mp = unsafe {
+        s.instance
+            .get_physical_device_memory_properties(s.physical_device)
+    };
+    let ty = (0..mp.memory_type_count).find(|&i| {
+        mp.memory_types[i as usize]
+            .property_flags
+            .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+    })?;
+    let heap = mp.memory_types[ty as usize].heap_index as usize;
+    let allocate = || {
+        let info = vk::MemoryAllocateInfo::default()
+            .allocation_size(BUDGET_PROBE_BYTES)
+            .memory_type_index(ty);
+        unsafe { s.device.allocate_memory(&info, None) }.ok()
+    };
+    let free = |memory| unsafe { s.device.free_memory(memory, None) };
+    let ceiling = budget_ceiling(heap, || heap_reading(s), allocate, free);
+    tracing::debug!(
+        ?ceiling,
+        "memory budget ceiling (set where the free figure does not drop with an allocation)"
+    );
+    ceiling
 }
 
 /// What the driver commits for a dedicated allocation of `buffer`'s memory requirements `req`,
@@ -1367,16 +1519,7 @@ pub const VRAM_GUARD_MIN_ALLOC: u64 = 1 << 20;
 /// minus this process's tracked device-local bytes (`device_used`; UMA-spilled bytes never touch
 /// `device_used`, so they are correctly excluded).
 fn device_local_room(s: &VulkanShared) -> u64 {
-    let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
-    let mut props2 = vk::PhysicalDeviceMemoryProperties2::default();
-    if s.has_mem_budget {
-        props2 = props2.push_next(&mut budget);
-    }
-    unsafe {
-        s.instance
-            .get_physical_device_memory_properties2(s.physical_device, &mut props2)
-    };
-    let mp = props2.memory_properties;
+    let (mp, reading) = memory_reading(s);
     let (mut size, mut avail) = (0u64, 0u64);
     for i in 0..mp.memory_heap_count as usize {
         if mp.memory_heaps[i]
@@ -1384,9 +1527,9 @@ fn device_local_room(s: &VulkanShared) -> u64 {
             .contains(vk::MemoryHeapFlags::DEVICE_LOCAL)
         {
             size += mp.memory_heaps[i].size;
-            avail += budget.heap_budget[i]
-                .saturating_sub(budget.heap_usage[i])
-                .min(mp.memory_heaps[i].size);
+            if let Some(&(budget, usage)) = reading.get(i) {
+                avail += heap_free(budget, usage, mp.memory_heaps[i].size, heap_ceiling(s, i));
+            }
         }
     }
     if s.has_mem_budget {
@@ -1721,17 +1864,11 @@ pub struct VulkanBackend {
 /// actually LAND there once the device-local heap is full. Above the summed budget the failure mode
 /// is the same on both classes (the driver oversubscribes and starts evicting), which is why the
 /// guard exists at all — it just now guards the right number on each.
-fn vram_info(s: &VulkanShared) -> VramInfo {
-    let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
-    let mut props2 = vk::PhysicalDeviceMemoryProperties2::default();
-    if s.has_mem_budget {
-        props2 = props2.push_next(&mut budget);
-    }
-    unsafe {
-        s.instance
-            .get_physical_device_memory_properties2(s.physical_device, &mut props2)
-    };
-    let mp = props2.memory_properties;
+///
+/// `held` applies the device's budget ceiling ([`VulkanShared::budget_ceiling`]), as every
+/// admission and sizing decision does; without it the snapshot is the driver's reading as it is.
+fn vram_info(s: &VulkanShared, held: bool) -> VramInfo {
+    let (mp, reading) = memory_reading(s);
     let uma = s.caps.unified_memory;
 
     // Discrete: device-local heaps only. UMA: every heap (they are one pool of DDR). The live
@@ -1746,15 +1883,12 @@ fn vram_info(s: &VulkanShared) -> VramInfo {
             .contains(vk::MemoryHeapFlags::DEVICE_LOCAL);
         if uma || device_local {
             total += mp.memory_heaps[i].size;
-            available += if s.has_mem_budget {
-                // Live free = budget - usage (the budget is a CEILING, not free bytes). Clamped to
-                // the heap size so a driver that reports usage past the heap (RADV on an APU, once
-                // something has oversubscribed the synthetic split) can't hand back a bogus figure.
-                budget.heap_budget[i]
-                    .saturating_sub(budget.heap_usage[i])
-                    .min(mp.memory_heaps[i].size)
-            } else {
-                mp.memory_heaps[i].size
+            available += match reading.get(i) {
+                Some(&(budget, usage)) => {
+                    let ceiling = held.then(|| heap_ceiling(s, i)).flatten();
+                    heap_free(budget, usage, mp.memory_heaps[i].size, ceiling)
+                }
+                None => mp.memory_heaps[i].size,
             };
         }
     }
@@ -1794,7 +1928,7 @@ impl Drop for WeightProgress {
         // dedicated-allocated (see `Backend::upload`), so by this drop it has fully returned
         // its device memory; what remains is weights + already-allocated session buffers.
         if self.vram_log {
-            let v = vram_info(&self.shared);
+            let v = vram_info(&self.shared, true);
             tracing::info!(
                 "post-load vram in use: {:.2} GiB of {:.2} GiB{} ({})",
                 v.total.saturating_sub(v.available) as f64 / (1u64 << 30) as f64,
@@ -3476,6 +3610,7 @@ impl VulkanBackend {
                 )),
                 caps,
                 has_mem_budget,
+                budget_ceiling: OnceLock::new(),
                 vram_limit,
                 max_mem_alloc_size,
                 kv_alloc_cost: OnceLock::new(),
@@ -3534,12 +3669,16 @@ impl VulkanBackend {
 
         // Before anything reads the memory budget: see `probe_kv_alloc_cost`.
         backend.shared.kv_alloc_cost();
+        // After it, so the ceilings are read with none of its probes held, and before anything
+        // else reads the budget.
+        let ceiling = probe_budget_ceiling(&backend.shared);
+        backend.shared.budget_ceiling.get_or_init(|| ceiling);
 
         // `kernels.vulkan.vram_limit`: say what every budget on this device will be measured
         // against, beside the device's own figure, so a limited run's numbers are not read as the
         // device's — and say so too when the limit is set but changes nothing.
         if let Some(limit) = vram_limit {
-            let v = vram_info(&backend.shared);
+            let v = vram_info(&backend.shared, true);
             match v.limited_from {
                 Some(real) => tracing::warn!(
                     "[infr] GPU: VRAM LIMIT — budgeting against {} of this device's {} \
@@ -4160,13 +4299,27 @@ impl VulkanBackend {
     /// Create a `vk::Buffer` + gpu-allocator sub-allocation of the requested size/location.
     /// Device-local VRAM: total heap size and currently-available bytes. `available` comes from
     /// VK_EXT_memory_budget (live, accounts for other processes + our own allocations) when the
-    /// extension is present; otherwise it falls back to the total heap size (best effort).
+    /// extension is present, held at the budget the device had when the backend was built where
+    /// the driver's free figure does not drop with our own allocations (`budget_ceiling`, probed
+    /// when the backend is built); otherwise it falls back to the total heap size (best
+    /// effort).
     /// NOTE: the extension's `heapBudget` is a CEILING (how much this process may use in total),
     /// not free bytes — live free = `heapBudget - heapUsage`. Reporting the raw budget here once
     /// made `available` sit ~constant while we allocated GBs, which let the VRAM guard sail past
     /// a 53 GiB KV cache into VK_ERROR_DEVICE_LOST.
     pub fn vram(&self) -> VramInfo {
-        vram_info(&self.shared)
+        vram_info(&self.shared, true)
+    }
+
+    /// [`vram`](Self::vram) as the driver reports it, without the ceiling this backend holds the
+    /// reading at where the driver's free figure does not drop with its own allocations: the
+    /// figure a backend opened now would start from. For measuring what the device holds (a test
+    /// building a `kernels.vulkan.vram_limit` on the memory in use reads it over time on one
+    /// backend); every admission and sizing decision reads [`vram`](Self::vram). Hidden: only a
+    /// test calls it.
+    #[doc(hidden)]
+    pub fn driver_vram(&self) -> VramInfo {
+        vram_info(&self.shared, false)
     }
 
     /// Bytes a new device-local allocation may still take before `check_vram_budget` REFUSES it:
@@ -4289,15 +4442,16 @@ impl VulkanBackend {
 
     /// [`check_vram_budget`](Self::check_vram_budget) for what an allocation commits (see
     /// [`pool::Commit`]). The live budget counts every gpu-allocator block whole from the moment
-    /// it is opened, so a pooled buffer that lands in an open block's free space is charged
-    /// nothing, and is let through unasked, while one that opens a block is charged the whole
-    /// block, whatever its own size. Exact as far as the ledger of shared blocks (`pool`) is
-    /// exact; `make_buf_ex` runs it under the pool's lock, so no other allocation can take the
-    /// free range it counted on. The live budget it reads can still move between the check and
-    /// the allocation: with other processes, and with this process's own allocations that do not
-    /// go through the pool and so do not wait for its lock — the unified-memory spill and
-    /// `INFR_KV_OVERFLOW`'s host KV (`alloc_vram_mapped`), and P2P exports and imports (`p2p.rs`)
-    /// — made on another thread.
+    /// it is opened (held at the budget at open where the driver's own figure does not:
+    /// [`VulkanShared::budget_ceiling`]), so a pooled buffer that lands in an open block's free
+    /// space is charged nothing, and is let through unasked, while one that opens a block is
+    /// charged the whole block, whatever its own size. Exact as far as the ledger of shared blocks
+    /// (`pool`) is exact; `make_buf_ex` runs it under the pool's lock, so no other allocation can
+    /// take the free range it counted on. The live budget it reads can still move between the
+    /// check and the allocation: with other processes, and with this process's own allocations
+    /// that do not go through the pool and so do not wait for its lock — the unified-memory spill
+    /// and `INFR_KV_OVERFLOW`'s host KV (`alloc_vram_mapped`), and P2P exports and imports
+    /// (`p2p.rs`) — made on another thread.
     fn check_vram_commit(&self, commit: pool::Commit) -> Result<()> {
         if self.cfg.kernels.vulkan.no_vram_guard {
             return Ok(());
@@ -7272,6 +7426,276 @@ mod tests {
         );
         // A floor that is not a power of two is raised to one.
         assert_eq!(rounding_that_covers(4, 12, 4), 16);
+    }
+
+    /// How a fake driver's `heapBudget` answers ([`FakeHeap`]).
+    #[derive(Clone, Copy, PartialEq)]
+    enum BudgetShape {
+        /// What the other processes leave of the heap: an allocation of this process's lowers
+        /// the free figure the moment it is made, as RADV and the discrete drivers do.
+        Honest,
+        /// Mesa ANV on a unified-memory iGPU, as measured on the RPL-U: the budget is the usage
+        /// plus nine tenths of the host's available memory, which an allocation lowers only once
+        /// its pages are written.
+        Anv,
+    }
+
+    /// One heap of a fake driver answering `VK_EXT_memory_budget`.
+    struct FakeHeap {
+        shape: BudgetShape,
+        size: u64,
+        /// What everything outside this process holds.
+        others: std::cell::Cell<u64>,
+        /// What this process has allocated.
+        usage: std::cell::Cell<u64>,
+        /// What of `usage` has had its pages written.
+        written: std::cell::Cell<u64>,
+        /// Whether an allocation succeeds.
+        allocates: bool,
+    }
+
+    impl FakeHeap {
+        fn new(shape: BudgetShape, size: u64, others: u64) -> Self {
+            FakeHeap {
+                shape,
+                size,
+                others: others.into(),
+                usage: 0.into(),
+                written: 0.into(),
+                allocates: true,
+            }
+        }
+
+        fn reading(&self) -> Vec<(u64, u64)> {
+            let usage = self.usage.get();
+            let budget = match self.shape {
+                BudgetShape::Honest => self.size - self.others.get(),
+                BudgetShape::Anv => {
+                    usage + (self.size - self.others.get() - self.written.get()) / 10 * 9
+                }
+            };
+            vec![(budget, usage)]
+        }
+
+        fn alloc(&self, bytes: u64) {
+            self.usage.set(self.usage.get() + bytes);
+        }
+
+        fn free(&self, bytes: u64) {
+            self.usage.set(self.usage.get() - bytes);
+            self.written.set(self.written.get().min(self.usage.get()));
+        }
+
+        /// [`budget_ceiling`] probed on this heap.
+        fn ceiling(&self) -> Option<Vec<u64>> {
+            budget_ceiling(
+                0,
+                || self.reading(),
+                || {
+                    self.allocates.then(|| self.alloc(BUDGET_PROBE_BYTES))?;
+                    Some(BUDGET_PROBE_BYTES)
+                },
+                |bytes| self.free(bytes),
+            )
+        }
+
+        /// The heap's free figure as `vram_info` reads it under `ceiling`.
+        fn room(&self, ceiling: &Option<Vec<u64>>) -> u64 {
+            let (budget, usage) = self.reading()[0];
+            heap_free(budget, usage, self.size, ceiling.as_ref().map(|c| c[0]))
+        }
+
+        /// The free figure as it was read before any ceiling existed: budget less usage, at most
+        /// the heap.
+        fn unheld_room(&self) -> u64 {
+            let (budget, usage) = self.reading()[0];
+            budget.saturating_sub(usage).min(self.size)
+        }
+    }
+
+    /// A driver whose free figure drops with this process's allocations gets no ceiling, so every
+    /// reading is what it was before the ceiling existed: after allocations, after their pages
+    /// are written, after other processes take memory and after they free it (where the room
+    /// grows again).
+    #[test]
+    fn an_honest_budget_reading_is_used_as_it_is() {
+        const GIB: u64 = 1 << 30;
+        let heap = FakeHeap::new(BudgetShape::Honest, 24 * GIB, 2 * GIB);
+        let ceiling = heap.ceiling();
+        assert_eq!(ceiling, None, "an honest reading gets no ceiling");
+        let same = |when: &str| {
+            assert_eq!(heap.room(&ceiling), heap.unheld_room(), "{when}");
+        };
+        same("at open");
+        assert_eq!(heap.room(&ceiling), 22 * GIB);
+        heap.alloc(5 * GIB);
+        same("after an allocation");
+        assert_eq!(heap.room(&ceiling), 17 * GIB);
+        heap.written.set(5 * GIB);
+        same("once it is written");
+        heap.others.set(6 * GIB);
+        same("after another process took memory");
+        heap.others.set(GIB);
+        same("after other processes freed memory");
+        assert_eq!(heap.room(&ceiling), 18 * GIB, "the room grows back");
+        heap.free(5 * GIB);
+        same("after the free");
+    }
+
+    /// A driver shaped like ANV gets the budget read at open as its ceiling, and the free figure
+    /// drops by what the process allocates from the moment it allocates — where the reading alone
+    /// does not move until the pages are written. Once they are and the host takes more, the live
+    /// figure, now the lower, is what counts; a free gives the room back as soon as the usage
+    /// drops; and memory the host frees later never raises the room above the budget at open.
+    #[test]
+    fn a_budget_that_grows_with_the_usage_is_held_at_open() {
+        const GIB: u64 = 1 << 30;
+        let heap = FakeHeap::new(BudgetShape::Anv, 16 * GIB, 6 * GIB);
+        let ceiling = heap.ceiling();
+        assert_eq!(
+            ceiling,
+            Some(vec![9 * GIB]),
+            "nine tenths of the 10 GiB available"
+        );
+        let open = heap.room(&ceiling);
+        assert_eq!(open, 9 * GIB);
+        heap.alloc(2 * GIB);
+        assert_eq!(
+            heap.unheld_room(),
+            open,
+            "the reading alone does not see an unwritten allocation"
+        );
+        assert_eq!(heap.room(&ceiling), open - 2 * GIB, "held, it does");
+        heap.alloc(8 * GIB);
+        assert_eq!(heap.room(&ceiling), 0, "no room past the budget at open");
+        assert_eq!(
+            heap.unheld_room(),
+            open,
+            "where the reading alone has it all"
+        );
+        heap.free(8 * GIB);
+        heap.written.set(2 * GIB);
+        heap.others.set(9 * GIB);
+        let live = heap.unheld_room();
+        assert!(
+            live < open - 2 * GIB,
+            "the written pages and the host's own use lower the live figure"
+        );
+        assert_eq!(heap.room(&ceiling), live, "the lower of the two counts");
+        heap.others.set(6 * GIB);
+        heap.free(2 * GIB);
+        assert_eq!(heap.room(&ceiling), open, "a free gives the room back");
+        heap.others.set(2 * GIB);
+        assert_eq!(
+            heap.room(&ceiling),
+            open,
+            "memory the host frees later does not raise the room past the budget at open"
+        );
+        assert!(heap.unheld_room() > open);
+    }
+
+    /// A device that refuses the probe's allocation cannot say whether its reading counts
+    /// allocations. ANV does not back unwritten pages, so a refusal points at an honest driver on
+    /// a full device: the reading is used as it is, with no ceiling.
+    #[test]
+    fn a_refused_probe_sets_no_ceiling() {
+        const GIB: u64 = 1 << 30;
+        for shape in [BudgetShape::Honest, BudgetShape::Anv] {
+            let mut heap = FakeHeap::new(shape, 24 * GIB, 2 * GIB);
+            heap.allocates = false;
+            assert_eq!(heap.ceiling(), None);
+            assert_eq!(heap.usage.get(), 0, "nothing left allocated");
+        }
+    }
+
+    /// With less free than the probe can show a drop against ([`BUDGET_PROBE_MIN_FREE`]), the free
+    /// figure stops at zero, so an honest driver would show a drop under the threshold: the probe
+    /// does not measure, allocates nothing, and sets no ceiling.
+    #[test]
+    fn too_little_free_to_probe_sets_no_ceiling() {
+        const MIB: u64 = 1 << 20;
+        let heap = FakeHeap::new(BudgetShape::Honest, 8192 * MIB, 8192 * MIB - 20 * MIB);
+        assert!(heap.room(&None) < BUDGET_PROBE_THRESHOLD);
+        assert_eq!(heap.ceiling(), None);
+        assert_eq!(heap.usage.get(), 0, "nothing left allocated");
+    }
+
+    /// [`budget_ceiling`] on an ANV-shaped heap whose free figure is `free` and never moves with
+    /// an allocation, with how many allocations the probe made.
+    fn anv_ceiling_at(free: u64) -> (Option<Vec<u64>>, u64) {
+        let usage = std::cell::Cell::new(0u64);
+        let allocations = std::cell::Cell::new(0u64);
+        let ceiling = budget_ceiling(
+            0,
+            || vec![(usage.get() + free, usage.get())],
+            || {
+                allocations.set(allocations.get() + 1);
+                usage.set(usage.get() + BUDGET_PROBE_BYTES);
+                Some(())
+            },
+            |()| usage.set(usage.get() - BUDGET_PROBE_BYTES),
+        );
+        (ceiling, allocations.get())
+    }
+
+    /// The skip's boundary, on a driver whose free figure never drops (so only the skip can say
+    /// `None`): one byte under [`BUDGET_PROBE_MIN_FREE`] the probe allocates nothing and sets no
+    /// ceiling; at exactly it the probe runs and sets the ceiling.
+    #[test]
+    fn the_probe_skip_starts_below_its_minimum_free() {
+        assert_eq!(anv_ceiling_at(BUDGET_PROBE_MIN_FREE - 1), (None, 0));
+        assert_eq!(
+            anv_ceiling_at(BUDGET_PROBE_MIN_FREE),
+            (
+                Some(vec![BUDGET_PROBE_MIN_FREE]),
+                BUDGET_PROBE_ROUNDS as u64
+            )
+        );
+    }
+
+    /// Only the heap the probe allocates into is measured. A discrete card with its device-local
+    /// heap nearly full beside a free host heap: the sum of the two has room for the probe, but
+    /// the probe's heap does not, so an honest driver's drop would stop at the little left there.
+    /// No measurement, no ceiling.
+    #[test]
+    fn a_full_probe_heap_beside_a_free_one_sets_no_ceiling() {
+        const MIB: u64 = 1 << 20;
+        const GIB: u64 = 1 << 30;
+        let vram_usage = std::cell::Cell::new(0u64);
+        // Honest: the device-local heap's budget is fixed at 10 MiB above what the process held.
+        let read = || vec![(10 * MIB, vram_usage.get()), (16 * GIB, 0)];
+        let ceiling = budget_ceiling(
+            0,
+            read,
+            || {
+                vram_usage.set(vram_usage.get() + BUDGET_PROBE_BYTES);
+                Some(())
+            },
+            |()| vram_usage.set(vram_usage.get() - BUDGET_PROBE_BYTES),
+        );
+        assert_eq!(ceiling, None);
+        assert_eq!(vram_usage.get(), 0);
+    }
+
+    /// The probe leaves nothing allocated, and a drop of exactly [`BUDGET_PROBE_THRESHOLD`] still
+    /// counts as tracking.
+    #[test]
+    fn the_budget_probe_frees_what_it_takes() {
+        const GIB: u64 = 1 << 30;
+        let heap = FakeHeap::new(BudgetShape::Anv, 16 * GIB, 6 * GIB);
+        heap.ceiling();
+        assert_eq!(heap.usage.get(), 0);
+        let half = std::cell::Cell::new(0u64);
+        let ceiling = budget_ceiling(
+            0,
+            || vec![(10 * GIB, half.get())],
+            || {
+                half.set(BUDGET_PROBE_THRESHOLD);
+                Some(())
+            },
+            |()| half.set(0),
+        );
+        assert_eq!(ceiling, None);
     }
 
     /// The cost the probes support, on hand-made drivers, each probe at memory-requirements

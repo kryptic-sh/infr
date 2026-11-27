@@ -19,6 +19,9 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #endif
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+// The frequencies, which depend only on the op: the workgroup's lanes compute one workgroup's
+// width of them at a time, one each, and every lane's (token, head) reads them back.
+shared float freqs[gl_WorkGroupSize.x];
 
 layout(push_constant) uniform PC {
     uint t; uint nheads; uint hd; uint rope_dim; float theta; uint pos_offset; uint out_base;
@@ -68,6 +71,7 @@ layout(binding = 1) buffer YB { float y[]; };
 #endif
 #endif
 #endif
+#include "rope_angle.glsl"
 #if defined(OUT_F16) && defined(KV_BDA)
 #include "kv_addr.glsl"
 #define KVWH(idx, val) kv_store_half(k_addr, (idx), (val))
@@ -83,7 +87,9 @@ void main() {
     // `maxComputeWorkGroupCount[0]`; equal to `gl_GlobalInvocationID.x` when unsplit.
     uint idx = (gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x) * gl_WorkGroupSize.x
         + gl_LocalInvocationID.x;
-    if (idx >= pc.t * pc.nheads) { return; }
+    // A lane past the last (token, head) still takes part in the frequency table and its
+    // barriers; it only skips the loads and stores.
+    bool live = idx < pc.t * pc.nheads;
 #ifdef USE_PARAMS
     uint pos = p_pos + idx / pc.nheads;
     uint out_base = pc.out_base * p_pos; // pc.out_base is the 0/1 multiplier in dyn mode
@@ -96,37 +102,47 @@ void main() {
     // Passthrough only the un-rotated tail [rope_dim, hd); the rotated loop below overwrites
     // [0, rope_dim), so copying it here too just doubled the store traffic (into the KV cache
     // under KV_BDA). Final bytes are identical (as in qk_norm_rope.comp's partial-RoPE tail).
+    if (live) {
 #ifdef OUT_F16
-    for (uint i = pc.rope_dim; i < pc.hd; i++) { KVWH(obase + i, x[base + i]); }
+        for (uint i = pc.rope_dim; i < pc.hd; i++) { KVWH(obase + i, x[base + i]); }
 #else
-    for (uint i = pc.rope_dim; i < pc.hd; i++) { y[obase + i] = x[base + i]; }
+        for (uint i = pc.rope_dim; i < pc.hd; i++) { y[obase + i] = x[base + i]; }
 #endif
+    }
     uint hf = pc.rope_dim / 2u;
-    for (uint i = 0u; i < hf; i++) {
-        float freq = pow(pc.theta, -2.0 * float(i) / float(pc.rope_dim));
-        float ang = float(pos) * freq;
+    uint lane = gl_LocalInvocationID.x;
+    vec2 ln_theta = rope_ln_theta(pc.theta);
+    for (uint c0 = 0u; c0 < hf; c0 += gl_WorkGroupSize.x) {
+        if (c0 + lane < hf) { freqs[lane] = rope_freq(ln_theta, c0 + lane, pc.rope_dim); }
+        barrier();
+        uint c1 = min(c0 + gl_WorkGroupSize.x, hf);
+        for (uint i = c0; live && i < c1; i++) {
+            precise float ang = float(pos) * freqs[i - c0];
 #ifdef FREQ_FACTORS
-        ang /= ff[i];
+            ang = rope_div(ang, ff[i]);
 #endif
+            vec2 sc = rope_sincos(ang);
 #ifdef BACKWARD
-        float s = -sin(ang);
+            float s = -sc.x;
 #else
-        float s = sin(ang);
+            float s = sc.x;
 #endif
-        float co = cos(ang);
+            float co = sc.y;
 #ifdef NEOX
-        uint i0 = i, i1 = i + hf;
+            uint i0 = i, i1 = i + hf;
 #else
-        uint i0 = 2u * i, i1 = i0 + 1u;
+            uint i0 = 2u * i, i1 = i0 + 1u;
 #endif
-        float a = x[base + i0];
-        float b = x[base + i1];
+            float a = x[base + i0];
+            float b = x[base + i1];
 #ifdef OUT_F16
-        KVWH(obase + i0, a * co - b * s);
-        KVWH(obase + i1, a * s + b * co);
+            KVWH(obase + i0, a * co - b * s);
+            KVWH(obase + i1, a * s + b * co);
 #else
-        y[obase + i0] = a * co - b * s;
-        y[obase + i1] = a * s + b * co;
+            y[obase + i0] = a * co - b * s;
+            y[obase + i1] = a * s + b * co;
 #endif
+        }
+        barrier();
     }
 }

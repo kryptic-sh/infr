@@ -443,6 +443,45 @@ pub(super) struct DecodeHandles {
     weights: Vec<TensorId>, // flat, in declaration == upload order
 }
 
+/// The longest context whose every RoPE angle stays within [`infr_core::math::ROPE_ANGLE_MAX`].
+/// The largest angle is the last position, `ctx - 1`, times pair 0's frequency (`theta^0`,
+/// exactly 1), over the smallest frequency divisor, or over 1 on a layer that divides by none,
+/// hence `min(1, d)`. A divisor that is not a positive number leaves no context at all.
+fn rope_ctx_limit(divisors: impl IntoIterator<Item = f32>) -> usize {
+    let mut d = 1.0f32;
+    for v in divisors {
+        if v.is_nan() || v <= 0.0 {
+            return 0;
+        }
+        d = d.min(v);
+    }
+    // Exact: `d` is a binary32 and the limit a power of two.
+    (infr_core::math::ROPE_ANGLE_MAX as f64 * d as f64).floor() as usize + 1
+}
+
+/// Refuse a `ctx`-token window whose RoPE angles would pass
+/// [`infr_core::math::ROPE_ANGLE_MAX`] (see [`rope_ctx_limit`]), given every divisor the session
+/// binds: `rope_freqs.weight` and the YaRN ramp alike. Past it a binary32 position is no longer
+/// an exact integer, so the CPU reference's angle stops naming the position, and the Vulkan
+/// rotary shaders' `rope_sincos` (rope_angle.glsl) is outside its domain.
+fn refuse_rope_past_angle_limit(
+    ctx: usize,
+    divisors: impl IntoIterator<Item = f32>,
+) -> AResult<()> {
+    let limit = rope_ctx_limit(divisors);
+    if ctx > limit {
+        return Err(anyhow!(
+            "context of {ctx} tokens refused: this model's RoPE addresses at most {limit}. \
+             Past that its largest rotation angle (the last position over the smallest rope \
+             divisor) passes {}, where a binary32 position is no longer exact and the rotation \
+             is not computed faithfully on any backend. Set a smaller context (--ctx or \
+             INFR_CTX) of at most {limit} tokens.",
+            infr_core::math::ROPE_ANGLE_MAX
+        ));
+    }
+    Ok(())
+}
+
 /// Upload each of `h.step_i32`'s values into a buffer of its own, in the same order, for
 /// [`bind_layer_io`] to bind. Empty, and free, for every graph without such inputs.
 fn upload_step_i32(be: &dyn Backend, h: &DecodeHandles) -> AResult<Vec<Box<dyn Buffer>>> {
@@ -1405,6 +1444,18 @@ pub(crate) fn generate_dense_backend_bound(
         let want_ctx = c
             .faithful_ctx_limit()
             .map_or(want_ctx, |limit| want_ctx.min(limit));
+        // Every backend's session sizing passes here, before this session's KV cache exists and
+        // before anything rotates (an MTP draft head allocates its own cache earlier): refuse a
+        // window whose RoPE angles would leave the range every backend computes them in.
+        refuse_rope_past_angle_limit(
+            want_ctx,
+            stable
+                .rope_freqs
+                .iter()
+                .chain(&stable.yarn_ff)
+                .flatten()
+                .copied(),
+        )?;
 
         // ── persistent KV cache buffers, sized per-layer (gemma4 SWA layers are narrower) and
         //    per-side (K and V pick their dtype independently) ────────────────────────────────
@@ -9460,6 +9511,81 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "rope_freqs.weight has 3 elements; rope.dimension_count 16 needs 8"
+        );
+    }
+
+    /// The context refusal's edges: a window whose last position's angle reaches
+    /// `ROPE_ANGLE_MAX` exactly is accepted, one token more is not, with no divisor, with the
+    /// llama3 kind (all at least 1, so the limit is set by the undivided pair), with one below 1
+    /// (which lowers it), and with gemma4's never-rotate 1e30. A divisor that is not positive
+    /// leaves nothing.
+    #[test]
+    fn rope_contexts_past_the_angle_limit_are_refused() {
+        let max = infr_core::math::ROPE_ANGLE_MAX as usize;
+        for (divisors, limit) in [
+            (vec![], max + 1),
+            (llama3_style_rope_freqs(), max + 1),
+            (vec![1.0, 0.5, 4.0], max / 2 + 1),
+            (vec![1.0, 1e30], max + 1),
+        ] {
+            let at = super::refuse_rope_past_angle_limit(limit, divisors.iter().copied());
+            assert!(at.is_ok(), "{divisors:?}: {limit} tokens refused: {at:?}");
+            let err = super::refuse_rope_past_angle_limit(limit + 1, divisors.iter().copied())
+                .expect_err("one token past the limit must be refused");
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "context of {} tokens refused: this model's RoPE addresses at most {limit}. \
+                     Past that its largest rotation angle (the last position over the smallest \
+                     rope divisor) passes {max}, where a binary32 position is no longer exact \
+                     and the rotation is not computed faithfully on any backend. Set a smaller \
+                     context (--ctx or INFR_CTX) of at most {limit} tokens.",
+                    limit + 1
+                )
+            );
+        }
+        for bad in [0.0f32, -1.0, f32::NAN] {
+            assert!(super::refuse_rope_past_angle_limit(1, [1.0, bad]).is_err());
+        }
+    }
+
+    /// The refusal sits on the session sizing path every backend takes: a synthetic llama whose
+    /// `rope_freqs.weight` holds a divisor of 1/2, asked for one token past its halved limit, is
+    /// refused before its KV cache is allocated.
+    #[test]
+    fn a_context_past_the_rope_angle_limit_is_refused_at_session_sizing() {
+        let mut ff = vec![1.0f32; Q35_NE / 4];
+        ff[1] = 0.5;
+        let (g, cfg) = open_synthetic("llama-rope-limit", &llama_gguf("llama", Some(ff)));
+        let limit = infr_core::math::ROPE_ANGLE_MAX as usize / 2 + 1;
+        let be = infr_cpu::CpuBackend::new();
+        let embd = std::sync::OnceLock::new();
+        let err = super::generate_dense_backend(
+            &be,
+            &crate::seam::cpu_upload_bind(&be),
+            &g,
+            &cfg,
+            &EngineConfig::default(),
+            TokenEmbd::new(&embd, &g),
+            None,
+            &[1, 2, 3],
+            1,
+            |_| {},
+            &mut None,
+            limit + 1,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect_err("a context past the rope angle limit must be refused");
+        assert!(
+            err.to_string()
+                .starts_with(&format!("context of {} tokens refused", limit + 1)),
+            "{err}"
         );
     }
 

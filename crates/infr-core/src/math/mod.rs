@@ -81,7 +81,7 @@ mod fast_path_tests;
 pub use exp::{exp, tanh};
 pub use log::{ln, ln_1p};
 pub use pow::powf;
-pub use rope::{rope_freqs, rope_sin_cos};
+pub use rope::{rope_freqs, rope_sin_cos, ROPE_ANGLE_MAX};
 pub use slices::{
     exp_slice, exp_slice_to, exp_sub_slice, gelu_tanh_slice, sigmoid_slice, silu_slice, slice_fns,
     tanh_slice, tier, SliceFns, Tier,

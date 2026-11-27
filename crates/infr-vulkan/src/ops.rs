@@ -1050,6 +1050,171 @@ pub(crate) mod tests {
         }
     }
 
+    /// rope_angle.glsl, which every RoPE shader takes its angle from, against the host: `sin`
+    /// and `cos` against f64 over the RoPE domain (to its 2^24 limit, densely around the odd
+    /// multiples of pi/4, plus tiny and negative angles, and NaN past the limit), and the divide
+    /// and the frequencies bit for bit against the CPU's binary32 `a / b` and `rope_freqs`. The
+    /// trig bound follows from the reduction: `r` is within about 2^-24 ABSOLUTE of
+    /// `x - k*pi/2` over the domain, however small `r` is, and the polynomials and the final
+    /// rounding add about another 2^-24, so 2^-22 absolute has room; below pi/4 there is no
+    /// reduction and the bound is 2 ulp of the result. The GLSL built-ins miss it on drivers
+    /// that use the 2^-11 the spec allows.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn rope_angle_matches_f64() {
+        let be = VulkanBackend::new().unwrap();
+        let spv = crate::gemm::spv_words(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/rope_angle_test.spv"
+        )));
+        let run = |mode: u32, n: usize, theta: f32, rope_dim: u32, x: &[f32]| -> Vec<f32> {
+            let k = be.kernel("rope_angle_test", &spv, 2, 16);
+            let mut push = [0u8; 16];
+            push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
+            push[4..8].copy_from_slice(&mode.to_ne_bytes());
+            push[8..12].copy_from_slice(&theta.to_ne_bytes());
+            push[12..16].copy_from_slice(&rope_dim.to_ne_bytes());
+            let out_len = if mode == 0 { 2 * n } else { n };
+            be.run_kernel(k, &[x], out_len, &push, (n as u32).div_ceil(64))
+                .unwrap()
+        };
+        let thetas = [1e4f32, 1e5, 1.5e5, 5e5, 1e6, 5e6, 1e7, 12345.678];
+        let dims = [16u32, 32, 64, 80, 96, 128, 192, 256, 512];
+        // The frequencies, exactly as the CPU reference rounds them.
+        let mut freq_mismatch = Vec::new();
+        for &theta in &thetas {
+            for &d in &dims {
+                let got = run(2, d as usize / 2, theta, d, &[0.0]);
+                let want = infr_core::math::rope_freqs(theta, d as usize);
+                for (p, (g, w)) in got.iter().zip(&want).enumerate() {
+                    if g.to_bits() != w.to_bits() {
+                        freq_mismatch.push((theta, d, p, *g, *w));
+                    }
+                }
+            }
+        }
+        assert!(
+            freq_mismatch.is_empty(),
+            "rope_freq differs from rope_freqs: {freq_mismatch:?}"
+        );
+
+        // The divide, against binary32 `/`: RoPE's own angle-by-divisor quotients and a spread
+        // of operand magnitudes.
+        let mut pairs: Vec<f32> = Vec::new();
+        for pos in (0..131072u32).step_by(509) {
+            for (i, f) in infr_core::math::rope_freqs(5e5, 64).iter().enumerate() {
+                pairs.extend([pos as f32 * f, 1.0 + i as f32 * 0.25]);
+                // gemma4's "never rotate" divisor.
+                pairs.extend([pos as f32 * f, 1e30]);
+            }
+        }
+        let mut seed = 0x2545_f491u32;
+        for _ in 0..1 << 16 {
+            let mut next = || {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                // Exponents within 2^-20..2^20, any significand: normal operands and quotient.
+                f32::from_bits((seed & 0x007f_ffff) | ((107 + (seed >> 23) % 41) << 23))
+            };
+            pairs.extend([next(), next()]);
+        }
+        let got = run(1, pairs.len() / 2, 0.0, 0, &pairs);
+        let bad: Vec<_> = pairs
+            .chunks(2)
+            .zip(&got)
+            .filter(|(ab, g)| (ab[0] / ab[1]).to_bits() != g.to_bits())
+            .take(8)
+            .map(|(ab, g)| (ab[0], ab[1], *g))
+            .collect();
+        assert!(bad.is_empty(), "rope_div differs from a / b: {bad:?}");
+
+        // sin and cos over the RoPE domain.
+        let mut xs: Vec<f32> = (0..1 << 20)
+            .map(|i| i as f32 * (1.25 * 131072.0 / (1 << 20) as f32))
+            .collect();
+        for &theta in &[1e4f32, 5e5, 1e6] {
+            let freqs = infr_core::math::rope_freqs(theta, 128);
+            for pos in (0..131072u32).step_by(61) {
+                xs.extend(freqs.iter().step_by(7).map(|f| pos as f32 * f));
+            }
+        }
+        // Positions to the domain limit, where pair 0's angle (its frequency is 1) is the
+        // position itself: a spread, and dense samples around the odd multiples of pi/4, where
+        // a rounded `x * 2/pi` picks the wrong quadrant.
+        let mut seed = 0x9e37_79b9u32;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        let limit = infr_core::math::ROPE_ANGLE_MAX;
+        xs.extend(
+            (0..1 << 18).map(|_| 131072.0 + (next() >> 8) as f32 * (limit - 131072.0) / limit),
+        );
+        let odd_max = (limit as f64 / std::f64::consts::FRAC_PI_4) as u32 / 2;
+        for _ in 0..1 << 16 {
+            let j = 2 * (next() % odd_max) + 1;
+            let c = (j as f64 * std::f64::consts::FRAC_PI_4) as f32;
+            for d in -3i32..=3 {
+                let v = f32::from_bits(c.to_bits().wrapping_add_signed(d));
+                if v <= limit {
+                    xs.push(v);
+                }
+            }
+        }
+        xs.push(limit);
+        xs.extend((0..126).map(|e| 2f32.powi(-e)));
+        xs.extend([1e-30f32, 3e-8]);
+        // The quadrant boundaries and their binary32 neighbours.
+        use std::f32::consts::{FRAC_PI_2, FRAC_PI_4, PI, TAU};
+        for c in [FRAC_PI_4, FRAC_PI_2, PI, 3.0 * FRAC_PI_2, TAU] {
+            xs.extend([
+                c,
+                f32::from_bits(c.to_bits() - 1),
+                f32::from_bits(c.to_bits() + 1),
+            ]);
+        }
+        let neg: Vec<f32> = xs.iter().map(|x| -x).collect();
+        xs.extend(neg);
+        let got = run(0, xs.len(), 0.0, 0, &xs);
+        let ulp = |v: f64| {
+            let v = v.abs().max(f32::MIN_POSITIVE as f64);
+            2f64.powi(v.log2().floor() as i32 - 23)
+        };
+        let (mut worst_abs, mut worst_ulp) = (0f64, 0f64);
+        let mut bad = Vec::new();
+        for (i, &x) in xs.iter().enumerate() {
+            let xd = x as f64;
+            for (g, w) in [(got[2 * i], xd.sin()), (got[2 * i + 1], xd.cos())] {
+                let err = (g as f64 - w).abs();
+                let ok = if xd.abs() < std::f64::consts::FRAC_PI_4 {
+                    worst_ulp = worst_ulp.max(err / ulp(w));
+                    err <= 2.0 * ulp(w)
+                } else {
+                    worst_abs = worst_abs.max(err);
+                    err <= 2f64.powi(-22)
+                };
+                if !ok && bad.len() < 8 {
+                    bad.push((x, g, w));
+                }
+            }
+        }
+        println!(
+            "rope_sincos over {} angles: worst {worst_abs:.3e} absolute (|x| >= pi/4), \
+             {worst_ulp:.2} ulp (|x| < pi/4)",
+            xs.len()
+        );
+        assert!(bad.is_empty(), "rope_sincos misses its bound: {bad:?}");
+        let past = [f32::from_bits(limit.to_bits() + 1), 3e7, 1e10, -1e10];
+        let got = run(0, past.len(), 0.0, 0, &past);
+        assert!(
+            got.iter().all(|v| v.is_nan()),
+            "rope_sincos past 2^24 must be NaN: {past:?} -> {got:?}"
+        );
+    }
+
     #[test]
     #[ignore = "requires a Vulkan GPU"]
     fn rope_matches_host() {
@@ -1064,6 +1229,25 @@ pub(crate) mod tests {
         for (g, w) in got.iter().zip(want.iter()) {
             assert!((g - w).abs() < 1e-4, "{g} vs {w}");
         }
+    }
+
+    /// More rotation pairs than `rope.comp` has lanes, so its shared frequency table is filled
+    /// in several chunks, the last one ragged: every pair past the first chunk must still rotate.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn rope_wider_than_a_workgroup_matches_host() {
+        let be = VulkanBackend::new().unwrap();
+        let hd = 2 * (2 * crate::recorder::ROPE_WG + 16);
+        let (t, nh, theta) = (3usize, 5usize, 1e4f32);
+        let x: Vec<f32> = (0..t * nh * hd).map(|i| (i as f32 * 0.37).sin()).collect();
+        let got = be.rope(&x, t, nh, hd, hd, theta).unwrap();
+        let want = host_rope(&x, t, nh, hd, hd, theta, 0, None, false, false);
+        let worst = got
+            .iter()
+            .zip(&want)
+            .map(|(g, w)| (g - w).abs())
+            .fold(0f32, f32::max);
+        assert!(worst < 1e-6, "worst |gpu - host| {worst:e}");
     }
 
     #[test]

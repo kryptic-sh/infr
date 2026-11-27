@@ -115,6 +115,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`infr_core::math::ROPE_ANGLE_MAX`**, the largest RoPE rotation angle any
+  backend computes faithfully; the Vulkan shaders and the context refusal read
+  it.
 - **`infr_plat::mem::total`**, the host's physical memory (`MemTotal` on Linux,
   `ullTotalPhys` on Windows, `hw.memsize` on macOS, `None` elsewhere). The GPU
   model tests on an integrated GPU use it to size the host memory they leave
@@ -735,6 +738,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **A context whose RoPE angles would pass 2^24 rad is refused at session
+  sizing**, on every backend, where it used to be accepted. The largest angle is
+  the last position over the smallest rope frequency divisor
+  (`rope_freqs.weight` or the YaRN ramp), so the limit is 2^24 tokens plus one,
+  lowered in proportion when a divisor is below 1. Past it a binary32 position
+  is no longer an exact integer, so neither the CPU reference nor the Vulkan
+  rotary shaders compute the rotation faithfully; the session used to open and
+  rotate silently wrong. The error names the limit; open the session with a
+  smaller `--ctx` / `INFR_CTX`. The limit is `infr_core::math::ROPE_ANGLE_MAX`,
+  which the shaders read too.
 - **A MoE model on Vulkan runs closer to the CPU reference by default: the
   tuning parameters `quant_q8.experts_hi` and `mmv_mw.moe_float` are now on** on
   every device, integrated GPUs included (both were added off in this release
@@ -1507,6 +1520,24 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Vulkan RoPE takes the CPU reference's angle, and accurate sine and cosine of
+  it, on drivers with loose transcendental built-ins.** Every rotary shader
+  (`rope.comp`, `qk_norm_rope.comp`, `qk_norm_rope_interleaved.comp`,
+  `mla.comp`) took its frequency from GLSL `pow`, its YaRN / `rope_freqs` divide
+  from `/` and its rotation from `sin` and `cos`, which Vulkan lets be off by
+  several ulp and by 2^-11 absolute. Mesa ANV on Intel uses that slack: `pow`
+  was up to 11 ulp off, `sin`/`cos` up to 3.4e-5 below 1000 rad and meaningless
+  past it, so a llama3-style rope at position 131070 missed the reference by 2.7
+  times its tolerance. They now share `rope_angle.glsl`, which takes no
+  transcendental built-in. The angle is bit for bit the CPU's `pos * freq`, then
+  `/ divisor`: the divide equals binary32 `/`, and the frequency equals
+  `rope_freqs` on every base and width the GPU test `rope_angle_matches_f64`
+  covers. Sine and cosine are not bit-identical: they are within 2^-22 absolute
+  of the exact values for angles up to 2^24 rad (1.8 × 2^-24 measured on Intel),
+  which is the domain the test covers; a session that could reach a larger angle
+  is refused (see Changed). The extra arithmetic costs prefill speed: Qwen3-1.7B
+  Q4_K_M pp512 on the Intel iGPU went from 152.1 / 152.2 to 149.2 / 149.2 t/s
+  (two alternated runs each, `infr bench -p 512 -n 0 -r 3`).
 - **Expert-parallel MoE prefill on Vulkan stays inside the guaranteed workgroup
   limit.** The band remap after each MoE layer's top-k (`moe_ep_band_remap`)
   dispatched one workgroup per (token, slot) assignment where each workgroup

@@ -93,6 +93,8 @@ layout(binding = 4) writeonly buffer DB { float dst[]; };
 #define ADD_KEY_BIAS(d, tok, j) (d)
 #endif
 
+#include "rope_angle.glsl"
+
 // The absorbed+roped query (key_len wide) and the V accumulator (kv_lora_rank wide) — shared
 // across the workgroup's 128 lanes, each lane owning a strided slice.
 //
@@ -187,16 +189,18 @@ void main() {
     }
     // Rope q_pe into sq[kv_lora_rank ..]: pair p owned by lane p, p+128, ... (qk_rope_dim ≤ 64,
     // so at most ceil(64/128) = 1 pair per lane); each lane computes sin/cos for its pair.
+    // ln theta inside the loop: a lane runs it at most once, and the lanes without a pair skip it.
     uint hf = pc.qk_rope_dim >> 1u;
     for (uint p = tid; p < hf; p += 128u) {
         uint i0 = 2u * p;
         uint i1 = i0 + 1u;
-        float ang = float(abs_pos) * pow(pc.theta, -2.0 * float(p) / float(pc.qk_rope_dim));
+        precise float ang = float(abs_pos) * rope_freq(rope_ln_theta(pc.theta), p, pc.qk_rope_dim);
 #ifdef FREQ_FACTORS
-        ang /= ff[p];
+        ang = rope_div(ang, ff[p]);
 #endif
-        float s = sin(ang);
-        float c = cos(ang);
+        vec2 sc = rope_sincos(ang);
+        float s = sc.x;
+        float c = sc.y;
         float a = q[q_off + pc.qk_nope_dim + i0];
         float b = q[q_off + pc.qk_nope_dim + i1];
         sq[pc.kv_lora_rank + i0] = a * c - b * s;

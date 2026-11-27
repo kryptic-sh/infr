@@ -8,6 +8,13 @@
 
 use super::{powf, sin_cos};
 
+/// The largest RoPE angle, in radians, a backend is held to: `2^24`, past which a binary32
+/// position is no longer an exact integer, so `pos as f32` (here and on the GPU) stops naming the
+/// position. The Vulkan rotary shaders take their limit from this constant (infr-vulkan's
+/// build.rs writes it into `rope_limits.glsl` as `ROPE_SINCOS_MAX`), and the seam refuses a
+/// context whose angles would pass it.
+pub const ROPE_ANGLE_MAX: f32 = 16_777_216.0;
+
 /// `theta^(-2p/rope_dim)` for every pair `p` in `0..rope_dim/2`, the exponent rounded to
 /// binary32 as `-2.0 * p as f32 / rope_dim as f32` (the expression the call sites wrote).
 pub fn rope_freqs(theta: f32, rope_dim: usize) -> Vec<f32> {

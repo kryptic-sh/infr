@@ -182,6 +182,37 @@ rule in AGENTS.md: output unchanged or no further from the CPU reference.
 - **The core count.** `0xa721` reports `cores:?` (plan 19 S4). Rules scaled by
   core count (split-K windows, grid sizing) take their fallback here.
 
+### B-ROPE-REFUSAL-TIMING — the RoPE context refusal fires at the first generate (2026-11-27)
+
+**Kind:** gap found in review, not fixed (low severity: it needs a context past
+`infr_core::math::ROPE_ANGLE_MAX` tokens).
+
+`refuse_rope_past_angle_limit` runs in `generate_dense_backend_bound`'s init,
+which every path reaches before anything rotates. But a persistent session
+(`vulkan_session*`, `metal_session`, `diffusion_gemma_cpu_session`) stores its
+`max_ctx` at open, and the KV cache and the check come on its first generate. If
+`serve`'s warmup does not generate on the real session's window, an
+`infr serve --ctx` past the limit starts and then fails every request. Not
+checked. The fix is to call the refusal from `SeamModel::session_ctx`, the one
+point every session entry resolves its context through, which needs the rope
+divisors there. Also: `MtpHeadSession::new_vulkan` / `new_cpu` allocate the
+draft head's cache before the check (still refused before any rotation).
+
+### B-METAL-ROPE-BUILTINS — Metal's RoPE still takes the built-in `pow`, `sin` and `cos` (2026-11-27)
+
+**Kind:** accuracy defect, not fixed. **Blocked on:** a Mac to run it on.
+
+The Vulkan RoPE shaders compute their angles and their sine and cosine from a
+shared include (`crates/infr-vulkan/shaders/rope_angle.glsl`) instead of the
+GLSL built-ins, because Mesa ANV's built-ins missed the CPU reference
+(B-INTEL-IGPU). Metal still calls the built-ins: `rope_ffn.metal` (its three
+rope kernels) and `attention.metal` (the MLA rope). Metal's `pow`, `sin` and
+`cos` default to fast math unless the library is built with precise math, and
+neither has been measured against the CPU reference over the RoPE domain. Port
+the include to Metal (`metal::precise::` alone does not make the frequency
+bit-identical to `rope_freqs`), with the same kind of test the Vulkan side has
+(`ops::tests::rope_angle_matches_f64`), and run it on macOS CI or a Mac.
+
 ### B-ORDER-2026-11-27 — the order of work agreed with the owner
 
 **Kind:** a record of an agreement on the order of work (the owner's other

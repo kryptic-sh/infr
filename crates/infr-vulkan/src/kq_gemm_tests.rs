@@ -111,8 +111,14 @@ mod tests {
             let x: Vec<f32> = (0..M * K)
                 .map(|i| (i as f32 * 0.37).sin() * (1.0 + (i % 97) as f32 * 0.05))
                 .collect();
+            Self::with_x(be, &x)
+        }
+
+        /// The fixture on activations `x` (`M x K`).
+        fn with_x(be: VulkanBackend, x: &[f32]) -> Self {
+            assert_eq!(x.len(), M * K);
             let xbuf = be.alloc(M * K * 4, BufferUsage::Activations).unwrap();
-            be.upload(xbuf.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+            be.upload(xbuf.as_ref(), bytemuck::cast_slice(x)).unwrap();
             let nblk = K / 32;
             let qa = be.alloc(M * K, BufferUsage::Activations).unwrap();
             let dact = be.alloc(M * nblk * 2, BufferUsage::Activations).unwrap();
@@ -177,28 +183,11 @@ mod tests {
             w_host: &[f32],
             mins: &[f32],
         ) {
-            let nblk = K / 32;
-            let qa_h = download_bytes(&self.be, self.qa.as_ref());
-            let da_h = download_bytes(&self.be, self.dact.as_ref());
-            let sa_h = download_bytes(&self.be, self.sact.as_ref());
+            let host = self.host();
             let mut worst = 0f64;
             for r in 0..M {
                 for o in 0..N {
-                    let (mut want, mut mag) = (0f64, 0f64);
-                    for b in 0..nblk {
-                        let da = f16_at(&da_h, r * nblk + b);
-                        let sa = f16_at(&sa_h, r * nblk + b);
-                        let min = mins[o * nblk + b] as f64;
-                        let mut dot = 0f64;
-                        for i in b * 32..(b + 1) * 32 {
-                            let q = qa_h[r * K + i] as i8 as f64;
-                            let t = q * (w_host[o * K + i] as f64 - min);
-                            dot += t;
-                            mag += (t * da).abs();
-                        }
-                        want += da * dot + sa * min;
-                        mag += (sa * min).abs();
-                    }
+                    let (want, mag) = decomposition(&host, r, o, w_host, mins);
                     let g = got[r * N + o] as f64;
                     let err = (g - want).abs();
                     worst = worst.max(err / mag);
@@ -214,6 +203,42 @@ mod tests {
                 "{dt:?} {what}: wrote rows past m"
             );
         }
+    }
+
+    impl Fixture {
+        /// The GPU's int8 codes, f16 scales and f16 sums, downloaded.
+        fn host(&self) -> [Vec<u8>; 3] {
+            [&self.qa, &self.dact, &self.sact].map(|b| download_bytes(&self.be, b.as_ref()))
+        }
+    }
+
+    /// Output `(r, o)` from the GPU's own codes, scales and sums (`host`, as [`Fixture::host`]
+    /// returns them), evaluated in f64, and the absolute term sum it is held to.
+    fn decomposition(
+        host: &[Vec<u8>; 3],
+        r: usize,
+        o: usize,
+        w_host: &[f32],
+        mins: &[f32],
+    ) -> (f64, f64) {
+        let [qa_h, da_h, sa_h] = host;
+        let nblk = K / 32;
+        let (mut want, mut mag) = (0f64, 0f64);
+        for b in 0..nblk {
+            let da = f16_at(da_h, r * nblk + b);
+            let sa = f16_at(sa_h, r * nblk + b);
+            let min = mins[o * nblk + b] as f64;
+            let mut dot = 0f64;
+            for i in b * 32..(b + 1) * 32 {
+                let q = qa_h[r * K + i] as i8 as f64;
+                let t = q * (w_host[o * K + i] as f64 - min);
+                dot += t;
+                mag += (t * da).abs();
+            }
+            want += da * dot + sa * min;
+            mag += (sa * min).abs();
+        }
+        (want, mag)
     }
 
     /// Run every K-quant at both tiles; each output checked against the decomposition, both tiles

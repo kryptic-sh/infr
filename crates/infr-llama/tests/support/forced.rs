@@ -384,13 +384,18 @@ pub fn line(tag: &str, s: &Scored) -> String {
 }
 
 /// Configurations for diagnosis, run by [`measure`] only when `INFR_TOL_ONLY` names them and
-/// scored by no gate.
+/// scored by no gate. Each splits the int8 kernels, so each sets the packed int8 dot on
+/// ([`int8_on`]) over a table row that turns it off on the device, which would otherwise leave
+/// nothing int8 to split.
 pub const DIAGNOSIS_CONFIGS: &[GpuConfig] = &[
     // The shipped configuration without the dp4a K-quant prefill GEMM (`kernels.vulkan.dp4a_kq`):
     // its weights then take the `mmq` GEMM, still on int8 activations.
     GpuConfig {
         name: "gpu-no-dp4a-kq",
-        edit: |c| c.kernels.vulkan.dp4a_kq = false,
+        edit: |c| {
+            int8_on(c);
+            c.kernels.vulkan.dp4a_kq = false;
+        },
         reference_kv: None,
     },
     // Where the int8 error a routed-expert model's routers see comes from
@@ -403,6 +408,7 @@ pub const DIAGNOSIS_CONFIGS: &[GpuConfig] = &[
     GpuConfig {
         name: "gpu-ub32-moe-float",
         edit: |c| {
+            int8_on(c);
             c.device.ubatch = Some(SMALL_UBATCH);
             c.kernels.vulkan.moe_small_m = SMALL_UBATCH;
             tune_off(c, "mmv_mw.moe_float");
@@ -461,7 +467,10 @@ pub const DIAGNOSIS_CONFIGS: &[GpuConfig] = &[
     // routed experts already runs this way as shipped (`mmv_mw.moe_float`).
     GpuConfig {
         name: "gpu-dense-decode-float",
-        edit: |c| c.kernels.vulkan.mmv_mw = Some(false),
+        edit: |c| {
+            int8_on(c);
+            c.kernels.vulkan.mmv_mw = Some(false);
+        },
         reference_kv: None,
     },
     // A routed-expert model's one-row `Linear`s back on the int8 decode GEMVs (the tuning
@@ -469,7 +478,10 @@ pub const DIAGNOSIS_CONFIGS: &[GpuConfig] = &[
     // what `gpu` runs (`gpu_seam_tolerance_moe_decode_float_reaches_moe_models_only`).
     GpuConfig {
         name: "gpu-moe-decode-int8",
-        edit: |c| tune_off(c, "mmv_mw.moe_float"),
+        edit: |c| {
+            int8_on(c);
+            tune_off(c, "mmv_mw.moe_float");
+        },
         reference_kv: None,
     },
     // Both MoE switches off: the routed-expert configuration shipped before they went on.
@@ -483,21 +495,34 @@ pub const DIAGNOSIS_CONFIGS: &[GpuConfig] = &[
     },
 ];
 
-/// `gpu-no-experts-hi`'s edit: the tuning parameter `quant_q8.experts_hi` off.
+/// `gpu-no-experts-hi`'s edit: the tuning parameter `quant_q8.experts_hi` off, the packed int8
+/// dot on.
 fn no_experts_hi(c: &mut EngineConfig) {
+    int8_on(c);
     tune_off(c, "quant_q8.experts_hi");
 }
 
-/// The boolean tuning parameter `key` off, at the command line's level, so no other layer of the
-/// test environment overrides it.
+/// The packed int8 dot on (`device.i8_dot`), over a table row that turns it off on the device.
+/// `kernels.vulkan.i8_dot` keeps its own setting: either one off still turns the dot off.
+pub fn int8_on(c: &mut EngineConfig) {
+    tune(c, "device.i8_dot", "true");
+}
+
+/// The boolean tuning parameter `key` off.
 fn tune_off(c: &mut EngineConfig, key: &str) {
+    tune(c, key, "false");
+}
+
+/// The tuning parameter `key` set to `value` at the command line's level, the highest, so neither
+/// a table row nor another layer of the test environment overrides it.
+fn tune(c: &mut EngineConfig, key: &str, value: &str) {
     c.kernels
         .vulkan
         .tune
         .entries
         .push(infr_core::config::TuneEntry {
             key: key.into(),
-            value: "false".into(),
+            value: value.into(),
             level: infr_core::config::TuneLevel::Cli,
         });
 }

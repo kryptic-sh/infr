@@ -46,3 +46,17 @@ driver = "AMD Windows driver (AMD_PROPRIETARY); RADV not run, and docs/igpu.md r
 date = "2026-11-22"
 command = "infr bench Qwen3-1.7B-Q4_K_M -p 0 -n 128 -r 1 and -p 512 -n 0 -r 1, the universal family against the compute-only one (INFR_TUNE=queue.family=graphics against compute), 6 interleaved rounds"
 evidence = "tg128 27.12 -> 27.12 t/s, pp512 230.94 -> 230.84 t/s; the family writes 64 timestamp bits; first_forward_split, work_split_parity, gpu_seam_golden_qwen3 and gpu_seam_tolerance_qwen3/qwen35 pass on it (docs/backlog.md B227)"
+
+[[row]]
+id = "intel-xe-lp-anv-integrated-i8-dot"
+match = { vendor = "intel", arch = "IntelXe1", driver = "INTEL_OPEN_SOURCE_MESA", integrated = true }
+verified = "maintainer"
+params = { "device.i8_dot" = false }
+
+[row.source]
+by = "infr maintainers"
+device = "Intel(R) Graphics (RPL-U, PCI 0xa721, Xe-LP integrated, no cooperative matrices)"
+driver = "Mesa ANV (INTEL_OPEN_SOURCE_MESA), driverVersion 0x6803001"
+date = "2026-11-27"
+command = "infr tune check --dev Vulkan0 unsloth/gemma-3-1b-it-GGUF:Q4_K_M, the row on against --set kernels.vulkan.tuning.rows=false; Qwen3-0.6B and LFM3-1.7B Q4_K_M with the row on; infr bench <model> -p 512 -n 0 -r 3 and -p 0 -n 128 -r 3, the row on against --set kernels.vulkan.tune.device.i8_dot=true, alternated A,B,A,B, load average 0.06 to 1.75"
+evidence = "gemma-3-1b gpu prefill mean KL 5.69e-2 over a 2.7e-2 bound (max KL 0.595 over 0.52, top-k cosine 0.636 under 0.711) and gpu-ub32 prefill mean KL 3.36e-2 without the row; with it every configuration passes, prefill mean KL 2.93e-5; Qwen3-0.6B and LFM3-1.7B pass with it. The cost: pp512 Qwen3-1.7B 149.0/149.3 -> 15.6/15.6 t/s, gemma-3-1b 352.8/352.6 -> 16.0/16.0; tg128 Qwen3-1.7B 18.1/17.7 -> 10.2/10.2, gemma-3-1b 15.2/15.2 -> 9.1/9.1 (docs/backlog.md B-ACCURACY-AUDIT; remove once the dp4a kernels pass here)"

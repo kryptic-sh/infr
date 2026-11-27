@@ -813,6 +813,8 @@ pub fn evaluate_with(
     } = *cmp;
     let mut failures = Vec::new();
     let mut outcomes = Vec::with_capacity(runs.len());
+    // Per run: an Int8-class run that went without the packed int8 dot on some prompt.
+    let mut int8_off = vec![false; runs.len()];
     for &(name, class) in runs {
         outcomes.push(RunOutcome {
             name: name.to_string(),
@@ -842,6 +844,7 @@ pub fn evaluate_with(
                 Some(kv) => reference.along_kv(r, kv)?,
             };
             let g = forced_with(&test.model, on, edit, PrefillHead::All, r)?;
+            int8_off[ri] |= on == ForcedOn::Vulkan && class == Int8 && !g.i8_dot;
             match (entry.route_near_tie, g.routing.is_some()) {
                 (Some(near), true) => {
                     let rs = score_routing(r, &g, near)
@@ -935,10 +938,25 @@ pub fn evaluate_with(
             }
         }
     }
+    // A device or setting that turns the packed int8 dot off runs such a configuration on the
+    // float kernels, so its Int8 row is met without one int8 kernel being scored.
+    let not_exercised = outcomes
+        .iter()
+        .zip(&int8_off)
+        .filter(|&(_, &off)| off)
+        .map(|(o, _)| {
+            format!(
+                "{}: ran without the packed int8 dot (`caps.i8_dot` off: `kernels.vulkan.i8_dot`, \
+                 the `device.i8_dot` tuning parameter or the device), so its Int8 row scored \
+                 the float kernels, not the int8 ones",
+                o.name
+            )
+        })
+        .collect();
     Ok(Evaluation {
         runs: outcomes,
         failures,
-        not_exercised: Vec::new(),
+        not_exercised,
     })
 }
 

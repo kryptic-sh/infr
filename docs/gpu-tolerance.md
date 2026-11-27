@@ -1390,10 +1390,13 @@ that goes away without it was a routing difference, one that stays is
 arithmetic. One configuration is for diagnosis only (`DIAGNOSIS_CONFIGS`): no
 gate scores it, and `measure_gpu_tolerance` runs it only when `INFR_TOL_ONLY`
 names it. `gpu-no-dp4a-kq` is the shipped configuration without the dp4a K-quant
-prefill GEMM. The three `gpu-float-nocoopmat*` configurations (the Float ones
-with the whole cooperative-matrix tier off) were diagnosis too until 2026-11-23;
-they are gated now, for gemma-3, and a default measurement runs them for every
-model.
+prefill GEMM. Every diagnosis configuration splits the int8 kernels, so each
+sets the packed int8 dot on (`device.i8_dot = true` at the command line's level,
+over a table row that turns it off; `forced::int8_on`): on a device whose row
+turns it off they score int8 kernels the shipped run does not take. The three
+`gpu-float-nocoopmat*` configurations (the Float ones with the whole
+cooperative-matrix tier off) were diagnosis too until 2026-11-23; they are gated
+now, for gemma-3, and a default measurement runs them for every model.
 
 **A tuning value left in the environment changes a gate verdict.** `INFR_TUNE`,
 `INFR_TUNE_NO_ROWS` and `INFR_FORCE_WAVE64` reach these tests on purpose, so a
@@ -1713,9 +1716,12 @@ decode that left other KV behind) still fails the command and is listed. **What
 was not exercised** is part of the verdict block, not a log line: on a device
 that runs one decode step per submit (an integrated GPU) no chained decode
 exists to compare, and a PASS there says so right above itself; a model that
-takes no batched prefill, and a routed-expert model's greedy tokens, are named
-the same way (`not_exercised` in the JSON). The log goes to stderr;
-`RUST_LOG=debug` adds every prompt's values.
+takes no batched prefill, a routed-expert model's greedy tokens, and an Int8 run
+(`gpu`, `gpu-ub32`) on a device that uses no packed int8 dot (`caps.i8_dot` off:
+`kernels.vulkan.i8_dot`, the `device.i8_dot` tuning parameter, or the device;
+the integrated Intel Xe1 row turns it off), whose Int8 row the float kernels
+then met, are named the same way (`not_exercised` in the JSON). The log goes to
+stderr; `RUST_LOG=debug` adds every prompt's values.
 
 ```text
 row:      Qwen3-0.6B-Q4_K_M.gguf (matched by file name only)
@@ -2003,7 +2009,7 @@ Float runs, ERNIE):
 **The configurations measured** (`measure_gpu_tolerance`; the last four are
 `DIAGNOSIS_CONFIGS` in `crates/infr-llama/tests/support/forced.rs`, scored by no
 gate, all at the 32-row prefill chunk so every chunk fits the small-batch MoE
-path):
+path, and all with the packed int8 dot set on over a table row):
 
 - `gpu`, `gpu-ub32`: shipped, int8 (the router float, as above).
 - `gpu-float`, `gpu-float-ub32`: every int8 kernel off (the Float class).

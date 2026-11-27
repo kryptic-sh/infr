@@ -705,7 +705,7 @@ pub(crate) fn generate_dense_backend_bound(
     // anything below sizes a cache or a chunk. The multi-device wrappers, named otherwise, get it
     // from their chunk scope (`run_dense_oneshot`).
     if be.name() == "vulkan" {
-        crate::seam::pin_model_chunk_cap(c);
+        crate::seam::pin_model_chunk_cap(c, &caps);
     }
     let (ne, nh) = (c.n_embd, c.n_head);
     // gemma4: per-layer SWA/full dims differ; size shared scratch + KV by the max over layers.

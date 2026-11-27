@@ -331,11 +331,11 @@ fn unix_secs(t: SystemTime) -> u64 {
 /// A [`ForcedLogits`] of the CPU reference in a defined encoding, field by field, little-endian:
 /// `vocab`, `prefill_rows`, the positions, the sequence, the logits' bits, the routing (a tag,
 /// then its layers, `n_used`, `n_expert`, ids and scores' bits). An error for a run that built
-/// kernels: the CPU builds none, and a kernel name cannot be read back.
+/// kernels or used the packed int8 dot: the CPU does neither, and neither is read back.
 fn encode(f: &ForcedLogits) -> Result<Vec<u8>> {
     ensure!(
-        f.kernels.is_empty(),
-        "a run that built kernels is not a CPU reference run"
+        f.kernels.is_empty() && !f.i8_dot,
+        "a run that built kernels or used the int8 dot is not a CPU reference run"
     );
     let mut out = Vec::with_capacity(f.logits.len() * 4 + f.seq.len() * 4 + 64);
     let u = |out: &mut Vec<u8>, v: u64| out.extend_from_slice(&v.to_le_bytes());
@@ -406,6 +406,7 @@ fn decode(b: &[u8]) -> Result<ForcedLogits> {
         prefill_rows,
         seq,
         kernels: Vec::new(),
+        i8_dot: false,
         routing,
     })
 }

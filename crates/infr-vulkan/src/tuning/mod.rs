@@ -249,6 +249,9 @@ impl QueueFamily {
 pub(crate) struct Tuning {
     /// `device.sg_pref`: the subgroup width the decode GEMV/reduction family pins.
     pub sg_pref: u32,
+    /// `device.i8_dot`: the packed int8 dot kernels may run where the device has the dot. ANDed
+    /// into `Capabilities::i8_dot`, so every arm gated on it follows.
+    pub i8_dot: bool,
     /// `gemv.variant`: the multi-row decode GEMV build (`None` = the plain RM path).
     pub gemv_variant: Option<String>,
     /// `gemv.kq_fma`: the fp32 decode GEMVs for devices without an accelerated int8 dot

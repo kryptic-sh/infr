@@ -107,6 +107,25 @@ matrix_units = false
 dot_accelerated = true
 
 [[device]]
+id = "intel-rplu-igpu-anv"
+measured = true
+source = "Vulkan0 on the Intel laptop (Raptor Lake-U integrated, Xe-LP), Mesa ANV, 2026-11-27; the PCI-id table has no Xe-core count for it, so 0"
+name = "Intel(R) Graphics (RPL-U)"
+vendor_id = 0x8086
+device_id = 0xa721
+driver = "INTEL_OPEN_SOURCE_MESA"
+driver_version = 0x6803001
+arch = "IntelXe1"
+integrated = true
+compute_units = 0
+subgroup_min = 8
+subgroup_max = 32
+wave64 = false
+max_shared_memory = 49152
+matrix_units = false
+dot_accelerated = true
+
+[[device]]
 id = "nvidia-rtx2080ti"
 measured = false
 source = "an NVIDIA RTX 2080 Ti (Turing, the card adapter.rs's mmv_mw notes were measured on) under the proprietary driver: subgroup 32 only, 68 SMs, 48 KB shared memory (the flash tile comment in recorder.rs)"

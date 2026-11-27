@@ -104,6 +104,9 @@ fn merge_conservative(mut caps: impl Iterator<Item = Capabilities>) -> Capabilit
         c.max_shared_memory_bytes = c.max_shared_memory_bytes.min(o.max_shared_memory_bytes);
         c.unified_memory &= o.unified_memory;
         c.kv_swa_ring &= o.kv_swa_ring;
+        // Without the dot, MoE prefill takes the small-batch expert path, whose chunk the runner
+        // caps; one rank without it must cap the world's chunk.
+        c.i8_dot &= o.i8_dot;
     }
     c
 }
@@ -129,7 +132,10 @@ mod tests {
     /// merged class is the one that keeps the integrated device inside its watchdog.
     #[test]
     fn merged_capabilities_take_the_weakest_rank() {
-        let discrete = caps(false, 96, 65536);
+        let discrete = Capabilities {
+            i8_dot: true,
+            ..caps(false, 96, 65536)
+        };
         let igpu = caps(true, 2, 32768);
         for order in [[discrete.clone(), igpu.clone()], [igpu, discrete.clone()]] {
             let m = merge_conservative(order.into_iter());
@@ -140,10 +146,12 @@ mod tests {
             assert_eq!(m.compute_units, 2);
             assert_eq!(m.max_shared_memory_bytes, 32768);
             assert!(!m.unified_memory, "budget as the discrete rank does");
+            assert!(!m.i8_dot, "a rank without the int8 dot caps the MoE chunk");
         }
         let one = merge_conservative(std::iter::once(discrete));
         assert!(!one.integrated);
         assert_eq!(one.compute_units, 96);
+        assert!(one.i8_dot);
     }
 
     /// A segment answers for the forward it was cut from: one without an expert layer still says

@@ -29,6 +29,7 @@ fn run(seed: u32) -> ForcedLogits {
         prefill_rows: 2,
         seq: vec![seed, 3, 4, 5],
         kernels: Vec::new(),
+        i8_dot: false,
         routing: Some(Routing {
             layers: vec![1, 3],
             n_used: 1,

@@ -255,7 +255,8 @@ fn gpu_seam_tolerance_prefill_head_leaves_decode_unchanged() {
 const INT8_KERNEL_MARKERS: &[&str] = &["mmq", "i8", "dp4a", "quant_q8", "native_mmv"];
 
 /// The Float class is int8-free: a Float run of a quantized model builds no int8-activation
-/// kernel, while the shipped configuration on the same model does (so the check can fail). On a
+/// kernel, while the shipped configuration on the same model does (so the check can fail), taken
+/// with the packed int8 dot set on over a table row that turns it off (`forced::int8_on`). On a
 /// device whose shipped run builds no int8 kernel either (the fp32 K-quant GEMV and GEMM on, no
 /// coopmat), the check above could not fail; there the Float switches must change nothing, so the
 /// two runs build the same kernels. Kernels are built lazily, when first recorded, so the built
@@ -279,7 +280,7 @@ fn gpu_seam_tolerance_float_runs_build_no_int8_kernel() {
     }
     let r = forced::forced_reference(&case.model, &case.prompts[1], 4);
     let int8 = |k: &str| INT8_KERNEL_MARKERS.iter().any(|m| k.contains(m));
-    let shipped = forced::forced(&case.model, ForcedOn::Vulkan, |_| {}, &r).kernels;
+    let shipped = forced::forced(&case.model, ForcedOn::Vulkan, forced::int8_on, &r).kernels;
     let float = forced::forced(&case.model, ForcedOn::Vulkan, forced::vulkan_float, &r).kernels;
     eprintln!("shipped: {shipped:?}\nfloat: {float:?}");
     let bad: Vec<_> = float.iter().filter(|k| int8(k)).collect();
@@ -350,10 +351,12 @@ fn gpu_seam_tolerance_moe_decode_float_reaches_moe_models_only() {
                 .model
                 .forced_logits(
                     ForcedOn::Vulkan,
-                    |c| {
-                        if let Some(n) = name {
-                            edit(n)(c);
-                        }
+                    |c| match name {
+                        Some(n) => edit(n)(c),
+                        // The diagnosis configurations set the packed int8 dot on over a table
+                        // row that turns it off (`forced::int8_on`); the shipped run compared
+                        // with them does too.
+                        None => forced::int8_on(c),
                     },
                     ids,
                     forced::N_DECODE,

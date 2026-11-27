@@ -145,9 +145,26 @@ the synthetic f16 model passed in every run.
   dp4a decode GEMV (`kernels.vulkan.mmv`) and `mrow`. So the defect is the dp4a
   tier's, shared with the AMD iGPU (B207), and the Windows session owns the fix
   (plan 19 S2b). Not yet split: the decode GEMV from the dense GEMM
-  (`dp4a_kq=false` with `mmv=false`). Open decision for that fix's owner and the
-  user: whether these arms default off on non-coopmat devices until it lands
-  (B-ACCURACY-AUDIT's rule).
+  (`dp4a_kq=false` with `mmv=false`). On this class (integrated Xe1 under ANV:
+  Xe-LP and Xe-LPG, measured on Xe-LP only) they now default off: the table row
+  `intel-xe-lp-anv-integrated-i8-dot` sets the new tuning parameter
+  `device.i8_dot` false, by B-ACCURACY-AUDIT's rule. Remove the row once the
+  dp4a fix passes `infr tune check` here with `device.i8_dot=true`. Not checked:
+  whether the AMD iGPU (B207, the same symptom) is owed a row of its own; that
+  needs `infr tune check` on it.
+- **`gemv.kq_fma` on this class: measured 2026-11-27, not taken.** With the
+  `device.i8_dot` row on, tg128 on Vulkan0 goes from 10.18/10.20 to 19.14/19.18
+  t/s on Qwen3-1.7B Q4_K_M and from 9.13/9.12 to 9.58/9.59 on gemma-3-1b
+  (`-r 3`, alternated, load under 1.6), and `infr tune check` passes with it on
+  gemma-3-1b, Qwen3-0.6B and LFM3-1.7B. The distance does not move one way:
+  gemma-3's decode KL improves in every run (`gpu` mean 1.975e-5 to 1.874e-5),
+  Qwen3-0.6B's `gpu` run improves (mean 1.730e-6 to 1.061e-6) while its
+  `gpu-ub32` decode gets further (mean 1.039e-6 to 1.517e-6, max 1.072e-5 to
+  2.343e-5), and LFM3's `gpu` decode mean goes from 1.392e-7 to 1.409e-7.
+  AGENTS.md takes a speed change only with no accuracy drawback. **The owner
+  declined it on 2026-11-27**: the rule holds even where every run stays inside
+  its bounds. Revisit only with figures that move no run further from the
+  reference, or once the `device.i8_dot` row is gone.
 - **The VRAM-limit tests disagree with ANV's budget.**
   `vram_limit_tests::auto_ctx_before_the_load_is_the_ctx_after_it`: Qwen3-0.6B
   under a 1400 MiB limit opened with 1576 tokens and ran with 1125 ("27525120

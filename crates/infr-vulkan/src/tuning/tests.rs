@@ -1796,3 +1796,29 @@ fn the_kq_fma_gemm_is_off_unless_set() {
         assert!(r.tuning.gemm_kq_fma, "{id}: INFR_TUNE did not set it");
     }
 }
+
+/// `device.i8_dot` is on everywhere but the class its table row names, integrated Xe1 (Xe-LP and
+/// Xe-LPG) under ANV, where the packed int8 dot kernels failed gemma-3's tolerance rows that the
+/// float kernels pass. `rows = false` and `INFR_TUNE` turn it back on there.
+#[test]
+fn i8_dot_is_off_only_on_the_class_its_row_names() {
+    const IGPU: &str = "intel-rplu-igpu-anv";
+    for (id, f) in fixtures() {
+        let r = resolve_with(&f, &Config::default(), table::builtin(), None).unwrap();
+        assert_eq!(r.tuning.i8_dot, id != IGPU, "{id}");
+    }
+    assert_eq!(
+        value_of(&resolve_fixture(IGPU, &Config::default()), "device.i8_dot"),
+        (
+            "false".into(),
+            "row intel-xe-lp-anv-integrated-i8-dot".into()
+        )
+    );
+    // The discrete Xe1 part under the same driver keeps it: the row names `integrated`.
+    assert!(fixture_tuning("intel-arc-a770-anv").i8_dot);
+    let mut cfg = Config::default();
+    cfg.kernels.vulkan.tuning.rows = false;
+    assert!(resolve_fixture(IGPU, &cfg).tuning.i8_dot);
+    let r = resolve_fixture(IGPU, &env_cfg(&[("INFR_TUNE", "device.i8_dot=true")]));
+    assert!(r.tuning.i8_dot);
+}

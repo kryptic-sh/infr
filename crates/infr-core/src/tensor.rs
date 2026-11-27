@@ -266,11 +266,12 @@ pub fn moe_expert_gemm_widths_ok(gate_up_width: usize, ne: usize) -> bool {
 }
 
 /// The tallest prefill chunk the seam runs on Vulkan for a MoE model whose widths fail
-/// [`moe_expert_gemm_widths_ok`], so that every chunk goes through the small-m expert path: the
-/// top of the row range that path was measured at (the table on `moe_small_m_threshold` in
-/// infr-vulkan's adapter), which is also the ceiling of the `moe.small_m` tuning range. Past it
-/// nothing has measured the path, and its per-(row, slot, column) workgroups at a full default
-/// chunk are what that doc records hanging the GPU.
+/// [`moe_expert_gemm_widths_ok`], or for any MoE model on a backend that uses no packed int8 dot
+/// (the batched expert GEMMs are dp4a only), so that every chunk goes through the small-m expert
+/// path: the top of the row range that path was measured at (the table on
+/// `moe_small_m_threshold` in infr-vulkan's adapter), which is also the ceiling of the
+/// `moe.small_m` tuning range. Past it nothing has measured the path, and its per-(row, slot,
+/// column) workgroups at a full default chunk are what that doc records hanging the GPU.
 pub const MOE_SMALL_M_CHUNK_CAP: usize = 64;
 
 pub type Shape = Vec<usize>;

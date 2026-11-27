@@ -1,9 +1,10 @@
 device:  NVIDIA GeForce RTX 2080 Ti (NvidiaTuring, NVIDIA_PROPRIETARY)
 match:   vendor=nvidia arch=NvidiaTuring driver=NVIDIA_PROPRIETARY integrated=false device_id=0x1e07 cu=68 subgroup=32-32 driver_version=0x0
-hash:    bc707d0f
+hash:    37e7cc4f
 rows: none
 
 device.sg_pref               32     default
+device.i8_dot                true   default
 gemv.variant                 reg    default
 gemv.kq_fma                  false  default
 gemv_rm.enabled              true   default

@@ -52,7 +52,7 @@ pub struct TuningReport {
 }
 
 /// What switching the table's rows off means, for `show` and `list`.
-pub const ROWS_OFF_NOTE: &str = "the built-in table's rows are off (`kernels.vulkan.tuning.rows = false` / `INFR_TUNE_NO_ROWS`): every value is its generic default. On AMD's proprietary driver that also turns off the int8 cooperative-matrix K-quant prefill GEMM and the compute-unit-scaled split-K window those rows enable, so prefill takes the f16 coopmat GEMM (about a third slower pp512 on the RX 7900 XTX).";
+pub const ROWS_OFF_NOTE: &str = "the built-in table's rows are off (`kernels.vulkan.tuning.rows = false` / `INFR_TUNE_NO_ROWS`): every value is its generic default. On AMD's proprietary driver that also turns off the int8 cooperative-matrix K-quant prefill GEMM and the compute-unit-scaled split-K window those rows enable, so prefill takes the f16 coopmat GEMM (about a third slower pp512 on the RX 7900 XTX). On an integrated Intel Xe1 GPU (Xe-LP and Xe-LPG) under Mesa ANV it turns the packed int8 dot kernels back on, which fail gemma-3's tolerance rows there.";
 
 impl TuningReport {
     pub(crate) fn new(

@@ -8,6 +8,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Breaking
 
+- **`infr_llama::seam::ForcedLogits` gains `i8_dot`**, whether the Vulkan run
+  used the packed int8 dot (`false` on the CPU), so a struct literal of it must
+  set it.
 - **`infr_engine::Delta` gains `Logprob`**, so an exhaustive match on it must
   handle the variant. It carries one answer token's log probability, emitted
   ahead of the `Content` delta that carries the token's text; reasoning, marker
@@ -211,6 +214,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   float"); tg128 on the RX 7900 XTX is unchanged on Qwen3-30B-A3B and 3.3%
   slower on ERNIE-4.5-21B-A3B, and 18% slower on ERNIE-4.5-21B-A3B on the
   integrated GPU.
+- **The Vulkan tuning parameter `device.i8_dot`** (on by default, off on
+  integrated Intel Xe1 under Mesa ANV by a table row; see Changed). Off, the
+  device takes none of the packed int8 dot kernels (the dp4a decode GEMVs and
+  prefill GEMMs, and every other arm gated on `caps.i8_dot`) and runs what a
+  device without the dot runs. It is ANDed with `kernels.vulkan.i8_dot`
+  (`INFR_NO_I8DOT`), which keeps working: either one off is enough. Unlike that
+  switch it leaves `VK_KHR_shader_integer_dot_product` enabled on the device,
+  and the `dot_accelerated` device fact still reports the driver's answer. Set
+  it with `INFR_TUNE=device.i8_dot=true` or
+  `--set kernels.vulkan.tune.device.i8_dot=true`.
 - **`Op::AttnTemp`** on the CPU, Vulkan and Metal backends: llama.cpp's
   position-dependent attention temperature (`llm_graph_input_attn_temp`), which
   scales each row by `ln(floor((pos + offset) / floor_scale) + 1) * scale + 1`.
@@ -738,6 +751,43 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **A MoE model's prefill chunk on a Vulkan device that uses no packed int8 dot
+  is capped at `infr_core::tensor::MOE_SMALL_M_CHUNK_CAP` rows**, as it already
+  was for a model whose expert widths the batched expert GEMMs cannot cover.
+  Without the dot (`kernels.vulkan.i8_dot`, `device.i8_dot`, or a device that
+  lacks it) every chunk takes the small-m expert path, which was measured only
+  up to that height and can hang the GPU above it; the chunk used to stay at the
+  device's default (128 rows on the Raptor Lake-U iGPU). A multi-device world
+  caps it when any rank lacks the dot. The tolerance gate's Float-class runs of
+  a quantized MoE model clear the dot too, so they now prefill in capped chunks:
+  MoE figures recorded at the old height are not like for like.
+- **`infr tune check` and the `gpu_seam_tolerance_*` gate say when an int8 run
+  scored no int8 kernel**: a `gpu` or `gpu-ub32` run on a device that uses no
+  packed int8 dot adds a `not_exercised` line, since its Int8 row was met by the
+  float kernels. The device banner shows `i8dot:y(off)` where the device has the
+  dot and a switch keeps the backend from using it. The tolerance harness's
+  diagnosis configurations (`DIAGNOSIS_CONFIGS`), which split the int8 kernels,
+  set `device.i8_dot` on over a table row.
+- **On an integrated Intel Xe1 GPU (Xe-LP and Xe-LPG) under Mesa ANV the packed
+  int8 dot kernels are off by default** (table row
+  `intel-xe-lp-anv-integrated-i8-dot`, which sets `device.i8_dot = false`),
+  because they fail gemma-3's tolerance rows there that the float kernels pass.
+  The row matches every integrated part the backend classes as `IntelXe1`
+  (Meteor Lake and Arrow Lake too, which run the same dp4a kernels); it was
+  measured on Xe-LP only. On the Raptor Lake-U iGPU (PCI 0xa721),
+  `infr tune check` on gemma-3-1b Q4_K_M without the row: the `gpu` run's
+  prefill mean KL 5.69e-2 over its 2.7e-2 bound (max KL 0.595 over 0.52, top-k
+  cosine 0.636 under 0.711), `gpu-ub32`'s 3.36e-2; with it every configuration
+  passes, prefill mean KL 2.93e-5. Qwen3-0.6B and LFM3-1.7B Q4_K_M pass with the
+  row as they did without it. The cost is large (`infr bench -r 3`, Vulkan0, two
+  rounds alternated without and with the row, load average under 2): pp512 on
+  Qwen3-1.7B Q4_K_M 148.95/149.33 to 15.62/15.62 t/s and on gemma-3-1b
+  352.80/352.62 to 15.99/15.99; tg128 18.14/17.65 to 10.20/10.20 and 15.20/15.20
+  to 9.12/9.12. Turning `gemm.kq_fma` on as well does not win prefill back
+  (gemma-3-1b pp512 18.85 t/s, one run). Every other device, the discrete Arc
+  A770 under the same driver included, is unchanged. The row goes once the dp4a
+  kernels pass here; `INFR_TUNE=device.i8_dot=true` or
+  `kernels.vulkan.tuning.rows = false` turns them back on meanwhile.
 - **A context whose RoPE angles would pass 2^24 rad is refused at session
   sizing**, on every backend, where it used to be accepted. The largest angle is
   the last position over the smallest rope frequency divisor

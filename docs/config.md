@@ -391,6 +391,19 @@ device runs what it ran before them; `gemm.kq_fma` is off everywhere unless set;
   responsive), and on an integrated GPU under the AMD Windows driver by a table
   row; described under "Which queue inference runs on" below.
 
+`device.i8_dot` lets the packed int8 dot kernels run: the dp4a decode GEMVs and
+prefill GEMMs, and every other kernel choice that needs the device's int8 dot.
+Off, the device runs what a device without the dot runs. Default: on wherever
+the device has the dot, except on an integrated Intel Xe1 GPU (Xe-LP and Xe-LPG,
+measured on Xe-LP only) under Mesa ANV, where a table row turns it off because
+those kernels fail gemma-3's tolerance rows there that the float kernels pass
+(`CHANGELOG.md`). It narrows only what the backend uses, never what the device
+reports: `kernels.vulkan.i8_dot = false` (`INFR_NO_I8DOT`) still turns the dot
+off on every device, and either one off is enough. Unlike that switch, the
+parameter leaves `VK_KHR_shader_integer_dot_product` enabled on the device. The
+device banner shows `i8dot:y(off)` where the device has the dot and either
+switch keeps the backend from using it.
+
 Three parameters are not kernel choices; they decide how a forward is cut into
 submits, so that no submit runs long enough for a driver's watchdog to reset the
 GPU and drop the work. That limit is a time, about 2 s by default on both
@@ -598,8 +611,10 @@ built-in row, including the two the AMD proprietary driver's GEMM choices come
 from: on that driver it turns off the int8 cooperative-matrix K-quant prefill
 GEMM and the compute-unit-scaled split-K window, so prefill takes the f16
 coopmat GEMM — about a third slower pp512 on the RX 7900 XTX (11.9k against 7.5k
-t/s on Qwen3-1.7B Q4_K_M when that GEMM landed). `infr tune show` says
-`rows: off` when it is set. To drop just one row, use `disable` with its id.
+t/s on Qwen3-1.7B Q4_K_M when that GEMM landed). On an integrated Intel Xe1 GPU
+(Xe-LP and Xe-LPG) under ANV it turns the packed int8 dot kernels back on, which
+fail gemma-3's tolerance rows there. `infr tune show` says `rows: off` when it
+is set. To drop just one row, use `disable` with its id.
 
 **`tuning.file` paths.** A relative path in a config file is relative to that
 config file's folder; from `INFR_TUNE_FILE` or `--set` it is relative to the

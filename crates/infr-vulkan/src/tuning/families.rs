@@ -275,6 +275,21 @@ pub(crate) static PARAMS: &[Param] = &[
         get: |t, _| Value::Uint(u64::from(t.sg_pref)),
         set: |t, _, v| t.sg_pref = v.u32(),
     },
+    Param {
+        family: "device",
+        name: "i8_dot",
+        kind: Kind::Variant,
+        ty: Ty::Bool,
+        axis: Axis::None,
+        doc: "the packed int8 dot kernels (the dp4a decode GEMVs and prefill GEMMs, and every \
+              other kernel choice that needs the int8 dot); false runs what a device without \
+              the int8 dot runs. kernels.vulkan.i8_dot = false turns them off too",
+        rule: "true wherever the device has the int8 dot; a table row turns it off on a class \
+               where those kernels failed the tolerance gate",
+        default: |_, _| Value::Bool(true),
+        get: |t, _| Value::Bool(t.i8_dot),
+        set: |t, _, v| t.i8_dot = v.flag(),
+    },
     // ── decode GEMV ──────────────────────────────────────────────────────────
     Param {
         family: "gemv",

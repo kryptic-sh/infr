@@ -921,7 +921,7 @@ pub(crate) fn generate_dense_vulkan_session(
     debug_assert_scope_for(vk);
     // The model's chunk cap, for a caller whose scope was made without it. Before placement,
     // which prices the chunk.
-    pin_model_chunk_cap(cfg);
+    pin_model_chunk_cap(cfg, &vk.capabilities());
     // Placement can allocate + upload (the pager arenas, a weight re-bind), i.e. it RECORDS on the
     // Vulkan command pool — so it takes a turn on the baton like any other GPU region. Scoped: the
     // baton is released before the runner starts stepping. See `StepGate`.
@@ -1296,37 +1296,44 @@ pub(crate) fn ubatch_rows(ec: &EngineConfig) -> usize {
     })
 }
 
-/// The prefill chunk cap a model needs on Vulkan, or `None`: an MoE model whose expert widths fail
-/// [`infr_core::tensor::moe_expert_gemm_widths_ok`] runs every `Op::MoeFfn` through the small-m
-/// expert path, at any chunk height, so its chunks are held to
-/// [`infr_core::tensor::MOE_SMALL_M_CHUNK_CAP`], the rows that path was measured at. Gate/up are
-/// one GEMM of twice `n_ff_exp` when fused ([`Config::dual_moe`], as the runner emits them).
-pub(crate) fn moe_small_m_chunk_cap(cfg: &Config) -> Option<usize> {
+/// The prefill chunk cap a model needs on a Vulkan backend reporting `caps`, or `None`: an MoE
+/// model runs every `Op::MoeFfn` through the small-m expert path, at any chunk height, when its
+/// expert widths fail [`infr_core::tensor::moe_expert_gemm_widths_ok`] or when the backend uses no
+/// packed int8 dot (`caps.i8_dot` off: the batched and paged expert GEMMs are dp4a only), so its
+/// chunks are held to [`infr_core::tensor::MOE_SMALL_M_CHUNK_CAP`], the rows that path was
+/// measured at. Gate/up are one GEMM of twice `n_ff_exp` when fused ([`Config::dual_moe`], as the
+/// runner emits them).
+pub(crate) fn moe_small_m_chunk_cap(
+    cfg: &Config,
+    caps: &infr_core::backend::Capabilities,
+) -> Option<usize> {
     let mc = cfg.moe.as_ref()?;
     let gate_up_width = if cfg.dual_moe() {
         2 * mc.n_ff_exp
     } else {
         mc.n_ff_exp
     };
-    (!infr_core::tensor::moe_expert_gemm_widths_ok(gate_up_width, cfg.n_embd))
+    (!caps.i8_dot || !infr_core::tensor::moe_expert_gemm_widths_ok(gate_up_width, cfg.n_embd))
         .then_some(infr_core::tensor::MOE_SMALL_M_CHUNK_CAP)
 }
 
-/// Pin [`moe_small_m_chunk_cap`] of `cfg` on the current scope's pins: for a Vulkan run of `cfg`
-/// whose scope was made without it. A scope serves one model; the cap only ever lowers. Outside
-/// any scope it does nothing: the process-wide [`FALLBACK_PINS`] serve the CPU and Metal, which
-/// this cap is not for, and every Vulkan entry point runs in a scope of its own.
-pub(crate) fn pin_model_chunk_cap(cfg: &Config) {
+/// Pin [`moe_small_m_chunk_cap`] of `cfg` on a backend reporting `caps` on the current scope's
+/// pins: for a Vulkan run of `cfg` whose scope was made without it. A scope serves one model; the
+/// cap only ever lowers. Outside any scope it does nothing: the process-wide [`FALLBACK_PINS`]
+/// serve the CPU and Metal, which this cap is not for, and every Vulkan entry point runs in a scope
+/// of its own.
+pub(crate) fn pin_model_chunk_cap(cfg: &Config, caps: &infr_core::backend::Capabilities) {
     CURRENT_PINS.with(|c| {
         if let Some(p) = c.borrow().as_ref() {
-            pin_moe_chunk_cap(p, cfg);
+            pin_moe_chunk_cap(p, cfg, caps);
         }
     });
 }
 
-/// Pin [`moe_small_m_chunk_cap`] of `cfg` on `pins` (a no-op for a model that needs none).
-fn pin_moe_chunk_cap(pins: &PlacementPins, cfg: &Config) {
-    if let Some(cap) = moe_small_m_chunk_cap(cfg) {
+/// Pin on `pins` the [`moe_small_m_chunk_cap`] of `cfg` on a backend reporting `caps` (a no-op for a
+/// model that needs none).
+fn pin_moe_chunk_cap(pins: &PlacementPins, cfg: &Config, caps: &infr_core::backend::Capabilities) {
+    if let Some(cap) = moe_small_m_chunk_cap(cfg, caps) {
         lower_moe_chunk_cap(pins, cap);
     }
 }
@@ -1535,7 +1542,7 @@ impl PlacementPins {
     /// capped as that model needs ([`moe_small_m_chunk_cap`]).
     pub(crate) fn for_model(caps: &infr_core::backend::Capabilities, cfg: &Config) -> Self {
         let pins = Self::for_caps(caps);
-        pin_moe_chunk_cap(&pins, cfg);
+        pin_moe_chunk_cap(&pins, cfg, caps);
         pins
     }
 }
@@ -1639,7 +1646,7 @@ pub(crate) fn enter_backend_scope(be: &dyn Backend) -> Option<PlacementScope> {
 /// anything reads a chunk height. A scope serves one model; the cap only ever lowers it.
 pub(crate) fn enter_model_scope(be: &dyn Backend, cfg: &Config) -> Option<PlacementScope> {
     let scope = enter_backend_scope(be);
-    pin_model_chunk_cap(cfg);
+    pin_model_chunk_cap(cfg, &be.capabilities());
     scope
 }
 
@@ -5743,6 +5750,10 @@ pub struct ForcedLogits {
     /// The compute kernels the backend built for the run (Vulkan; empty on the CPU), so a test
     /// can assert which kernel families a configuration actually reached.
     pub kernels: Vec<&'static str>,
+    /// The backend ran with the packed int8 dot (`Capabilities::i8_dot`: the device has it and
+    /// neither `kernels.vulkan.i8_dot` nor `device.i8_dot` turned it off); `false` on the CPU. A
+    /// configuration meant to score the int8 kernels says nothing of them when this is `false`.
+    pub i8_dot: bool,
     /// What the backend's own routers selected at every position the run fed, whether or not
     /// the run was forced along another run's selection; `None` for a model with no
     /// router-selected expert layer.
@@ -5923,6 +5934,7 @@ pub(crate) fn forced_run(
         prefill_rows,
         seq,
         kernels: Vec::new(),
+        i8_dot: false,
         routing,
     })
 }
@@ -5976,6 +5988,7 @@ pub(crate) fn forced_run_vulkan(
         &vk, &bind, g, cfg, ec, token_embd, ple, prompt, n_steps, head, route, false, next,
     )?;
     out.kernels = vk.built_kernel_names();
+    out.i8_dot = vk.capabilities().i8_dot;
     Ok(out)
 }
 
@@ -6471,7 +6484,8 @@ mod seam_helper_tests {
     /// the small-m expert path, so its chunk is capped at
     /// [`infr_core::tensor::MOE_SMALL_M_CHUNK_CAP`]: the default, a placement pin and an explicit
     /// `INFR_UBATCH` alike, and through every candidate height the fit sweeps price. An aligned
-    /// model, fused or split, keeps the default.
+    /// model, fused or split, keeps the default on a backend with the packed int8 dot, and is
+    /// capped on one without it, which takes the small-m path for every chunk.
     #[test]
     fn a_width_failing_moe_model_gets_the_capped_chunk() {
         use infr_core::tensor::{MOE_EXPERT_GEMM_TILE_N, MOE_SMALL_M_CHUNK_CAP};
@@ -6520,6 +6534,11 @@ mod seam_helper_tests {
             },
             ..Default::default()
         };
+        // A backend with the packed int8 dot, so only the widths decide; the class is the default's.
+        let dot = infr_core::backend::Capabilities {
+            i8_dot: true,
+            ..Default::default()
+        };
         let default_rows = {
             let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
             super::ubatch_rows(&unset)
@@ -6529,20 +6548,25 @@ mod seam_helper_tests {
             "the default chunk is already under the cap, so this checks nothing"
         );
         for cfg in aligned.iter().chain([&dense]) {
-            assert_eq!(super::moe_small_m_chunk_cap(cfg), None, "{:?}", cfg.moe);
-            let pins = PlacementPins::for_model(&Default::default(), cfg);
+            assert_eq!(
+                super::moe_small_m_chunk_cap(cfg, &dot),
+                None,
+                "{:?}",
+                cfg.moe
+            );
+            let pins = PlacementPins::for_model(&dot, cfg);
             let _scope = PlacementScope::enter(std::sync::Arc::new(pins));
             assert_eq!(super::ubatch_rows(&unset), default_rows, "{:?}", cfg.moe);
             assert_eq!(super::ubatch_rows(&explicit), 512, "{:?}", cfg.moe);
         }
         for cfg in &failing {
             assert_eq!(
-                super::moe_small_m_chunk_cap(cfg),
+                super::moe_small_m_chunk_cap(cfg, &dot),
                 Some(MOE_SMALL_M_CHUNK_CAP),
                 "{:?}",
                 cfg.moe
             );
-            let pins = PlacementPins::for_model(&Default::default(), cfg);
+            let pins = PlacementPins::for_model(&dot, cfg);
             let _scope = PlacementScope::enter(std::sync::Arc::new(pins));
             assert_eq!(super::ubatch_rows(&unset), MOE_SMALL_M_CHUNK_CAP);
             assert_eq!(super::ubatch_rows(&explicit), MOE_SMALL_M_CHUNK_CAP);
@@ -6555,6 +6579,23 @@ mod seam_helper_tests {
                 "a fit sweep would price a chunk past the cap"
             );
         }
+        // Without the packed int8 dot the batched expert GEMMs are out whatever the widths, so an
+        // aligned MoE model is capped too; a dense model is not.
+        let no_dot = infr_core::backend::Capabilities::default();
+        assert!(!no_dot.i8_dot);
+        for cfg in &aligned {
+            assert_eq!(
+                super::moe_small_m_chunk_cap(cfg, &no_dot),
+                Some(MOE_SMALL_M_CHUNK_CAP),
+                "{:?}",
+                cfg.moe
+            );
+            let pins = PlacementPins::for_model(&no_dot, cfg);
+            let _scope = PlacementScope::enter(std::sync::Arc::new(pins));
+            assert_eq!(super::ubatch_rows(&unset), MOE_SMALL_M_CHUNK_CAP);
+            assert_eq!(super::ubatch_rows(&explicit), MOE_SMALL_M_CHUNK_CAP);
+        }
+        assert_eq!(super::moe_small_m_chunk_cap(&dense, &no_dot), None);
         // The scope a one-shot Vulkan entry point enters for a model carries the cap too, over a
         // scope the caller made without it.
         let _outer = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));

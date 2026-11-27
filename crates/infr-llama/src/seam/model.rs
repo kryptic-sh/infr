@@ -1244,7 +1244,7 @@ impl SeamModel {
     ) -> Result<usize> {
         // The fit below prices the prefill chunk this model's sessions will run: capped when its
         // expert widths need it (`seam::moe_small_m_chunk_cap`), in the caller's scope.
-        crate::seam::pin_model_chunk_cap(&self.cfg);
+        crate::seam::pin_model_chunk_cap(&self.cfg, &vk.capabilities());
         let n_slots = n_slots.max(1);
         // An explicit token count is the user's demand — honour it verbatim, at any N, quantizing
         // the cache to q8_0 when that is what it takes to fit.

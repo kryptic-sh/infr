@@ -2848,6 +2848,8 @@ impl VulkanBackend {
         // logical device even if int8 configs were enumerated, so this is a real dependency, not
         // just symmetry with coopmat_f8 above. `!coopmat`/`!f16` drop it too.
         let coopmat_i8 = coopmat_i8.filter(|_| has_coop_matrix);
+        // What the device has, for the banner, before the switches mask it.
+        let i8_dot_detected = has_i8_dot;
         let has_i8_dot = has_i8_dot && vkcfg.i8_dot;
         // INFR_CM_8X8=1 outcome notice (once, at device init): the tester A/B knob must be loud
         // about whether it actually engaged — on RADV (16x16x16 enumerated) or any device without
@@ -3199,7 +3201,9 @@ impl VulkanBackend {
             f8: has_f8_ext && post_ash.f8,
             coopmat_f8,
             i8: has_int8,
-            i8_dot: has_i8_dot,
+            // The tuning was resolved from facts that do not include this capability
+            // (`DeviceFacts::dot_accelerated` is the driver's report), so no cycle.
+            i8_dot: i8_dot_in_use(has_i8_dot, &tuned),
             coopmat_i8,
             bf16: has_bf16_ext && post_ash.bf16_type,
             coopmat_bf16,
@@ -3254,6 +3258,12 @@ impl VulkanBackend {
         // across `warmup()` + every turn (see `chat/vulkan.rs`'s `mtp_vk`), so an ordinary
         // `INFR_MTP=1` run prints exactly one banner again without needing this dedup.
         let yn = |b: bool| if b { "y" } else { "n" };
+        // `y(off)`: the device has the packed int8 dot and the backend does not use it
+        // (`kernels.vulkan.i8_dot` or the `device.i8_dot` tuning parameter).
+        let i8_dot_banner = match (i8_dot_detected, caps.i8_dot) {
+            (true, false) => "y(off)",
+            (_, used) => yn(used),
+        };
         tracing::info!(
             "[infr] GPU: {} | {:?}/{} | f16:{} f16cm:{} bf16:{} bf16cm:{} f8:{} f8cm:{} i8:{} \
              i8dot:{} i8cm:{} cm2:{} subgroup:{}-{} sgp:{} cores:{} shared:{}KB tune:{}",
@@ -3267,7 +3277,7 @@ impl VulkanBackend {
             yn(caps.f8),
             yn(caps.f8_coopmat()),
             yn(caps.i8),
-            yn(caps.i8_dot),
+            i8_dot_banner,
             yn(caps.i8_coopmat()),
             yn(coopmat2.is_ok()),
             caps.subgroup_min,
@@ -5949,6 +5959,15 @@ pub(crate) fn test_config() -> Config {
     cfg
 }
 
+/// `Capabilities::i8_dot`: the device has the packed int8 dot (`enabled`: detected, and not masked
+/// by `kernels.vulkan.i8_dot`) and the `device.i8_dot` tuning parameter lets the kernels use it.
+/// The parameter gates use only: the tuning is resolved after the extension list is built, so the
+/// device keeps `VK_KHR_shader_integer_dot_product` enabled either way. Pure, so the rule is
+/// testable without a GPU.
+fn i8_dot_in_use(enabled: bool, tuned: &tuning::Tuning) -> bool {
+    enabled && tuned.i8_dot
+}
+
 /// Whether the initial submit cap protects prefill only (`VulkanShared::split_prefill_only`): only
 /// when it is the slow-class seed — the derived default of `submit.initial_dispatches` on a
 /// discrete slow-class device, with `device.submit_dispatches` unset — and splits at all. Any cap
@@ -6689,8 +6708,8 @@ mod tests {
     /// probe result. Clearing `kernels.vulkan.f16` must drop `caps.f16` AND `caps.f16_coopmat()`
     /// (f16 is a coopmat prerequisite — the AND `INFR_NO_F16` has always implied); clearing
     /// `coopmat` alone must drop the coopmat tiers while LEAVING `caps.f16` up; clearing `i8_dot`
-    /// must drop `caps.i8_dot` alone. Each backend is built from a VALUE — no env, no `EnvGuard`,
-    /// no ordering hazard (R7).
+    /// must drop `caps.i8_dot` alone, and so must the `device.i8_dot` tuning parameter. Each
+    /// backend is built from a VALUE — no env, no `EnvGuard`, no ordering hazard (R7).
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn config_masks_the_capability_probe() {
@@ -6727,12 +6746,46 @@ mod tests {
         );
         drop(no_cm);
 
-        let no_i8 = build(&|c| c.kernels.vulkan.i8_dot = false);
+        // `device.i8_dot` set at the command line's level, over any table row, so neither check
+        // below passes because a row already turned the dot off at the defaults.
+        let tune_dot = |c: &mut Config, on: bool| {
+            c.kernels
+                .vulkan
+                .tune
+                .entries
+                .push(infr_core::config::TuneEntry {
+                    key: "device.i8_dot".into(),
+                    value: on.to_string(),
+                    level: infr_core::config::TuneLevel::Cli,
+                })
+        };
+        let has_dot = build(&|c| tune_dot(c, true)).caps().i8_dot;
+        assert!(
+            has_dot,
+            "the device reports no packed int8 dot, so neither switch below can be seen to clear it"
+        );
+
+        let no_i8 = build(&|c| {
+            tune_dot(c, true);
+            c.kernels.vulkan.i8_dot = false;
+        });
         assert!(
             !no_i8.caps().i8_dot,
             "`i8_dot = false` must clear caps.i8_dot"
         );
         assert_eq!(no_i8.caps().f16, f16, "i8_dot must not perturb f16");
+        drop(no_i8);
+
+        let tuned_off = build(&|c| tune_dot(c, false));
+        assert!(
+            !tuned_off.caps().i8_dot,
+            "`device.i8_dot = false` must clear caps.i8_dot"
+        );
+        assert_eq!(
+            tuned_off.caps().f16,
+            f16,
+            "device.i8_dot must not perturb f16"
+        );
     }
 
     /// `device.subgroup_pref` (`INFR_SG`) reaches `caps.sg_pref`, and a value the kernel set has no
@@ -7000,6 +7053,19 @@ mod tests {
         assert!(!prefill_only_seed(None, true, true, true, 128));
         assert!(!prefill_only_seed(None, true, false, false, 64));
         assert!(!prefill_only_seed(None, true, false, true, 0));
+    }
+
+    /// `caps.i8_dot` needs both the device's dot (after `kernels.vulkan.i8_dot`'s mask) and
+    /// `device.i8_dot`: either one off turns it off, so the Intel integrated row clears it on the
+    /// device it names while every other fixture keeps the dot it has.
+    #[test]
+    fn device_i8_dot_false_clears_caps_i8_dot() {
+        let igpu = crate::tuning::tests::fixture_tuning("intel-rplu-igpu-anv");
+        let other = crate::tuning::tests::fixture_tuning("intel-arc-a770-anv");
+        assert!(!i8_dot_in_use(true, &igpu));
+        assert!(i8_dot_in_use(true, &other));
+        assert!(!i8_dot_in_use(false, &other));
+        assert!(!i8_dot_in_use(false, &igpu));
     }
 
     #[test]

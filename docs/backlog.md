@@ -102,6 +102,22 @@ the synthetic f16 model passed in every run.
   check passes. `gpu_seam_tolerance_synthetic_f32` fails the same two runs:
   prefill logit deviation 3.96e-3 at position 115 over 3.9e-3. Plan 19 S2b. The
   same symptom on the AMD iGPU is B207.
+- **Narrowed down (2026-11-27): the dp4a kernels behind `i8_dot`, not an
+  Intel-only cause.** Each probe was `infr tune check --dev Vulkan0` on
+  gemma3-1b with `kernels.vulkan.dp4a_kq=false` added. Turning off
+  `tune.gemv.kq_fma`, `tune.device.sg_pref=32` (the subgroup width), `mmq`, or
+  `mmv_mw` with `mrow` left the 33-token prompt's prefill mean KL at 6.1968e-2
+  each time; decode moved at most from 5.94e-2 to 5.59e-2. With
+  `kernels.vulkan.i8_dot=false` every configuration passes (prefill mean KL
+  3.27e-5, decode 2.31e-5). `dp4a_kq=false` alone clears most of the long
+  prompt's prefill miss. In the non-coopmat tier `i8_dot` alone gates
+  `NcGemm::Mmq`, the dense dp4a mmq GEMM fed by the `quant_q8` prepass, plus the
+  dp4a decode GEMV (`kernels.vulkan.mmv`) and `mrow`. So the defect is the dp4a
+  tier's, shared with the AMD iGPU (B207), and the Windows session owns the fix
+  (plan 19 S2b). Not yet split: the decode GEMV from the dense GEMM
+  (`dp4a_kq=false` with `mmv=false`). Open decision for that fix's owner and the
+  user: whether these arms default off on non-coopmat devices until it lands
+  (B-ACCURACY-AUDIT's rule).
 - **The VRAM-limit tests disagree with ANV's budget.**
   `vram_limit_tests::auto_ctx_before_the_load_is_the_ctx_after_it`: Qwen3-0.6B
   under a 1400 MiB limit opened with 1576 tokens and ran with 1125 ("27525120

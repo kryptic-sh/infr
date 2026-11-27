@@ -71,7 +71,7 @@ the sincos per pair. Hold the angle bit-identity and `rope_angle_matches_f64` as
 they are, and measure tg128 on the XTX (through the Windows session) and
 pp512/tg128 on the Intel iGPU, alternating builds.
 
-## S3. The harness failures
+## S3. The harness failures — the first two done; the pool guard is B-ANV-UMA-BUDGET-GUARD
 
 - The multi-device tests open every enumerated device. They must skip a device
   the backend refuses (llvmpipe here), not panic.

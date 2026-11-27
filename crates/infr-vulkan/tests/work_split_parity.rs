@@ -27,6 +27,9 @@ use infr_core::{DType, Graph, Op, TensorDesc};
 use infr_vulkan::VulkanBackend;
 use std::sync::Arc;
 
+mod slow_class_support;
+use slow_class_support::SlowBy;
+
 /// A backend on the `INFR_DEV` device with the environment's settings, then `extra` over them.
 /// `None` only when the machine has no Vulkan device and none was requested (see the module doc);
 /// any other failure to open panics with the backend's error.
@@ -256,16 +259,6 @@ fn gpu_seam_work_split_kill_switch_keeps_one_submit() {
         .all(|(a, b)| a.to_bits() == b.to_bits()));
 }
 
-/// Whether the `INFR_DEV` device is an integrated GPU.
-fn integrated() -> bool {
-    let env = infr_core::config::ConfigLayer::env().expect("environment config");
-    let cfg = Config::load_from_layers(&[env]);
-    VulkanBackend::enumerate_devices(&cfg)
-        .ok()
-        .and_then(|devs| devs.into_iter().find(|d| d.is_default_pick))
-        .is_some_and(|d| d.integrated)
-}
-
 /// Issue 94's class, simulated: wave64 only, no matrix kernels, no int8 dot, and on a discrete
 /// card the work estimate that class's own tuning gives the RX 580 (`submit.prior_gflops` 288,
 /// its 36 compute units), under the DEFAULT budget. A prefill-sized forward over SmolLM3-3B's
@@ -276,20 +269,29 @@ fn integrated() -> bool {
 /// An integrated GPU is slow for real: its own default tuning is used, and the forward is
 /// smaller, because the one-submit reference of the large one is exactly what its watchdog
 /// resets (four dispatches of about 3 s each on the Ryzen integrated GPU).
+///
+/// Wave64 is forced only where the device can pin 64; one that cannot is run as it is when that
+/// is slow already, and skipped otherwise (`slow_class_support`).
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn gpu_seam_work_split_slow_class_forward_under_the_default_budget() {
-    const SLOW: [(&str, &str); 3] = [
-        ("INFR_FORCE_WAVE64", "1"),
-        ("INFR_NO_COOPMAT", "1"),
-        ("INFR_NO_I8DOT", "1"),
-    ];
+    const MASKS: [(&str, &str); 2] = [("INFR_NO_COOPMAT", "1"), ("INFR_NO_I8DOT", "1")];
+    let Some(facts) = backend(&MASKS).map(|be| be.tuning_report().device.clone()) else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    let Some(by) = slow_class_support::slow_by(&facts) else {
+        return;
+    };
     let with = |extra: &[(&str, &str)]| {
-        let mut v = SLOW.to_vec();
+        let mut v = MASKS.to_vec();
+        if by == SlowBy::Wave64 {
+            v.push(("INFR_FORCE_WAVE64", "1"));
+        }
         v.extend_from_slice(extra);
         backend(&v)
     };
-    let (rows, tuning): (usize, &[(&str, &str)]) = if integrated() {
+    let (rows, tuning): (usize, &[(&str, &str)]) = if facts.integrated {
         (64, &[])
     } else {
         (1024, &[("INFR_TUNE", "submit.prior_gflops=288")])
@@ -305,7 +307,7 @@ fn gpu_seam_work_split_slow_class_forward_under_the_default_budget() {
     let t = std::time::Instant::now();
     let got = run_chain(&bounded, DType::Q4K, rows, &widths);
     println!(
-        "slow class, {rows} rows: first forward {:.0} ms, {} dispatch(es) cut, {} submit(s) \
+        "slow by {by:?}, {rows} rows: first forward {:.0} ms, {} dispatch(es) cut, {} submit(s) \
          opened by the work bound, kernels {:?}, measured GFLOP/s {:?}",
         t.elapsed().as_secs_f64() * 1e3,
         got.splits,

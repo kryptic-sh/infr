@@ -4640,6 +4640,16 @@ fn diffusion_gemma_decode_matches_oracle() {
     );
 }
 
+/// The Vulkan devices the environment lists, less its CPU devices (llvmpipe beside a real GPU is
+/// no second GPU), for the multi-device tests below. `None`, saying so, when the listing fails.
+fn vulkan_gpus() -> Option<Vec<infr_vulkan::DeviceInfo>> {
+    infr_testkit::gpu_devices_but_cpu_noted(
+        infr_vulkan::VulkanBackend::enumerate_devices_from_env(),
+        |d| d.is_default_pick,
+        |d| d.device_type == "cpu",
+    )
+}
+
 // ─── Multi-GPU Slice 1: data-parallel two-models-two-devices ──────────────────────
 //
 // The end-to-end proof that the model-level device pool works: two independent Qwen3-0.6B seam
@@ -4659,9 +4669,9 @@ fn diffusion_gemma_decode_matches_oracle() {
 #[ignore = "requires TWO Vulkan GPUs: run with --include-ignored on a multi-GPU box"]
 fn two_models_two_devices_concurrent() {
     let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
-    let devices =
-        infr_vulkan::VulkanBackend::enumerate_devices(&infr_llama::EngineConfig::default())
-            .expect("enumerate devices");
+    let Some(devices) = vulkan_gpus() else {
+        return;
+    };
     if devices.len() < 2 {
         eprintln!(
             "skip: two_models_two_devices needs >=2 Vulkan devices (found {})",
@@ -4716,8 +4726,8 @@ fn two_models_two_devices_concurrent() {
         })
     };
 
-    let h0 = run_on(0);
-    let h1 = run_on(1);
+    let h0 = run_on(devices[0].index);
+    let h1 = run_on(devices[1].index);
     let out0 = h0.join().expect("device 0 thread");
     let out1 = h1.join().expect("device 1 thread");
 
@@ -4736,11 +4746,13 @@ fn two_models_two_devices_concurrent() {
     // Each session bound exactly the device it was pinned to.
     assert_eq!(
         out0.name, devices[0].name,
-        "Vulkan0 session bound the wrong device"
+        "Vulkan{} session bound the wrong device",
+        out0.dev
     );
     assert_eq!(
         out1.name, devices[1].name,
-        "Vulkan1 session bound the wrong device"
+        "Vulkan{} session bound the wrong device",
+        out1.dev
     );
     assert_ne!(
         out0.name, out1.name,
@@ -4750,12 +4762,14 @@ fn two_models_two_devices_concurrent() {
     // Both produce coherent greedy output, concurrently.
     assert!(
         out0.text.contains("Paris"),
-        "Vulkan0 output not coherent: {:?}",
+        "Vulkan{} output not coherent: {:?}",
+        out0.dev,
         out0.text
     );
     assert!(
         out1.text.contains("Paris"),
-        "Vulkan1 output not coherent: {:?}",
+        "Vulkan{} output not coherent: {:?}",
+        out1.dev,
         out1.text
     );
 
@@ -4765,7 +4779,8 @@ fn two_models_two_devices_concurrent() {
     if out1.live {
         assert!(
             out1.avail_after < out1.avail_before,
-            "Vulkan1 available VRAM did not drop ({} -> {}) — weights/KV did not land on device 1",
+            "Vulkan{} available VRAM did not drop ({} -> {}) — weights/KV did not land on it",
+            out1.dev,
             out1.avail_before,
             out1.avail_after
         );
@@ -4794,8 +4809,9 @@ fn two_models_two_devices_concurrent() {
 #[ignore = "requires TWO Vulkan GPUs: run with --include-ignored on a multi-GPU box"]
 fn pipeline_matches_single_device() {
     let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
-    let devs = infr_vulkan::VulkanBackend::enumerate_devices(&infr_llama::EngineConfig::default())
-        .expect("enumerate devices");
+    let Some(devs) = vulkan_gpus() else {
+        return;
+    };
     if devs.len() < 2 {
         eprintln!(
             "skip: pipeline_matches_single_device needs >=2 Vulkan devices (found {})",
@@ -4876,8 +4892,9 @@ fn pipeline_matches_single_device() {
 #[ignore = "requires TWO Vulkan GPUs: run with --include-ignored on a multi-GPU box"]
 fn tensor_parallel_matches_single_device() {
     let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
-    let devs = infr_vulkan::VulkanBackend::enumerate_devices(&infr_llama::EngineConfig::default())
-        .expect("enumerate devices");
+    let Some(devs) = vulkan_gpus() else {
+        return;
+    };
     if devs.len() < 2 {
         eprintln!(
             "skip: tensor_parallel_matches_single_device needs >=2 Vulkan devices (found {})",
@@ -4952,8 +4969,9 @@ fn tensor_parallel_matches_single_device() {
 #[ignore = "requires TWO Vulkan GPUs + the Qwen3-30B-A3B MoE model: run with --include-ignored on a multi-GPU box"]
 fn expert_parallel_matches_single_device() {
     let path = need_model!(qwen3moe_30b(), "Qwen3-30B-A3B");
-    let devs = infr_vulkan::VulkanBackend::enumerate_devices(&infr_llama::EngineConfig::default())
-        .expect("enumerate devices");
+    let Some(devs) = vulkan_gpus() else {
+        return;
+    };
     if devs.len() < 2 {
         eprintln!(
             "skip: expert_parallel_matches_single_device needs >=2 Vulkan devices (found {})",

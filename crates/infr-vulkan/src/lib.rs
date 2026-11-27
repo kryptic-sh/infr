@@ -5959,6 +5959,18 @@ pub(crate) fn test_config() -> Config {
     cfg
 }
 
+/// The Vulkan devices the environment lists, less its CPU devices (llvmpipe, lavapipe), for the
+/// unit tests that use more than one device; `None`, saying so, when the listing fails
+/// ([`infr_testkit::gpu_devices_but_cpu_noted`]).
+#[cfg(test)]
+pub(crate) fn test_gpus() -> Option<Vec<DeviceInfo>> {
+    infr_testkit::gpu_devices_but_cpu_noted(
+        VulkanBackend::enumerate_devices_from_env(),
+        |d| d.is_default_pick,
+        |d| d.device_type == "cpu",
+    )
+}
+
 /// `Capabilities::i8_dot`: the device has the packed int8 dot (`enabled`: detected, and not masked
 /// by `kernels.vulkan.i8_dot`) and the `device.i8_dot` tuning parameter lets the kernels use it.
 /// The parameter gates use only: the tuning is resolved after the extension list is built, so the

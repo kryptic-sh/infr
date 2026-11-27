@@ -6,8 +6,9 @@
 //! already; helpers that start from `Config::default()` must apply it with [`honour_env`]. And a
 //! helper that SKIPS when no backend opens must not skip when the knob is set, nor when `INFR_DEV`
 //! names a Vulkan device: there the failure to open IS the result, so [`gpu_or_skip`] panics with
-//! it instead. [`gpu_or_skip_noted`] also writes the skip line, and [`gpu_devices_or_skip_noted`]
-//! is its twin for a test that lists the devices.
+//! it instead. [`gpu_or_skip_noted`] also writes the skip line, [`gpu_devices_or_skip_noted`]
+//! is its twin for a test that lists the devices, and [`gpu_devices_but_cpu_noted`] leaves the
+//! CPU devices out of that listing.
 
 use std::fmt::Display;
 use std::io::Write;
@@ -147,6 +148,31 @@ pub fn gpu_devices_or_skip_noted<D, E: Display>(
     }
 }
 
+/// [`gpu_devices_or_skip_noted`] for a test that counts or opens several of the listed devices:
+/// the listing without its CPU devices (`is_cpu`: llvmpipe, lavapipe), which enumerate beside a
+/// real GPU but are no second GPU, and which the backend refuses. Each one left out gets a
+/// `skip:` line; the pick is kept whatever it is, so a CPU device the environment names still
+/// fails to open loudly. Every other device is kept, so one that does not open fails the test
+/// rather than turning it into a skip.
+pub fn gpu_devices_but_cpu_noted<D, E: Display>(
+    listed: Result<Vec<D>, E>,
+    is_pick: impl Fn(&D) -> bool,
+    is_cpu: impl Fn(&D) -> bool,
+) -> Option<Vec<D>> {
+    let devs = gpu_devices_or_skip_noted(listed, &is_pick)?;
+    let mut gpus = Vec::with_capacity(devs.len());
+    for (pos, dev) in devs.into_iter().enumerate() {
+        if is_cpu(&dev) && !is_pick(&dev) {
+            note_skip(&format_args!(
+                "listed device {pos} is left out: it is a CPU device, not a GPU"
+            ));
+        } else {
+            gpus.push(dev);
+        }
+    }
+    Some(gpus)
+}
+
 /// The test environment's config with Vulkan tuning parameters forced on top of it, at
 /// command-line level, so each wins over the table, a tuning file and `INFR_TUNE`. For a test
 /// that must run one side of a tuning parameter on every device, whatever the device's default:
@@ -240,6 +266,25 @@ mod tests {
                 assert_eq!(cfg, want, "{}={value:?}", key.env);
             }
         }
+    }
+
+    /// A listed CPU device is left out, so it is never counted as another GPU, and every other
+    /// device is kept in listing order, so one that does not open fails the test that opens it.
+    /// The pick is a GPU, so this holds whatever `INFR_DEV` the run sets.
+    #[test]
+    fn only_a_listed_cpu_device_is_left_out() {
+        let listed: Result<Vec<(usize, bool)>, String> =
+            Ok(vec![(0, false), (1, true), (2, false)]);
+        let gpus = gpu_devices_but_cpu_noted(listed, |d| d.0 == 0, |d| d.1);
+        assert_eq!(gpus, Some(vec![(0, false), (2, false)]));
+    }
+
+    /// A CPU device that is the pick stays, so a run naming it fails where it opens.
+    #[test]
+    fn a_cpu_device_that_is_the_pick_is_kept() {
+        let listed: Result<Vec<(usize, bool)>, String> = Ok(vec![(0, true), (1, false)]);
+        let gpus = gpu_devices_but_cpu_noted(listed, |d| d.0 == 0, |d| d.1);
+        assert_eq!(gpus, Some(vec![(0, true), (1, false)]));
     }
 
     /// A Vulkan device is named by whatever the backend's resolver takes as an index, however it

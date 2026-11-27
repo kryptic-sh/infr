@@ -5,9 +5,10 @@
 //! On every other discrete device nothing is cut.
 //!
 //! The slow class is forced on the hardware here with `kernels.vulkan.force_wave64`
-//! (`INFR_FORCE_WAVE64`); the reference for the output is the same forced backend with the
-//! splitter off (`device.submit_dispatches = 0`), since the wave64 path runs other kernels than
-//! the native one.
+//! (`INFR_FORCE_WAVE64`) where the device can pin 64; a device that cannot is run as it is when
+//! that is slow already (`slow_class_support`), and skipped otherwise. The reference for the
+//! output is the same backend with the splitter off (`device.submit_dispatches = 0`), since the
+//! wave64 path runs other kernels than the native one.
 //!
 //! Observable: `VulkanBackend::segment_cuts().watchdog`, the submits a forward cut before its
 //! recording ended because the splitter's cap was reached.
@@ -18,6 +19,9 @@ use infr_core::config::{Config, ConfigLayer};
 use infr_core::{DType, Graph, Op, TensorDesc};
 use infr_vulkan::VulkanBackend;
 use std::sync::Arc;
+
+mod slow_class_support;
+use slow_class_support::SlowBy;
 
 const DT: DType = DType::Q8_0;
 const DIM: usize = 256;
@@ -124,12 +128,16 @@ fn assert_bitwise(label: &str, got: &[f32], want: &[f32]) {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn gpu_seam_first_forward_split_on_a_slow_device() {
-    let (want, unsplit_cuts) = run(&backend(true, Some(0)), ROWS);
+    let Some(by) = slow_class_support::slow_by(&backend(false, None).tuning_report().device) else {
+        return;
+    };
+    let wave64 = by == SlowBy::Wave64;
+    let (want, unsplit_cuts) = run(&backend(wave64, Some(0)), ROWS);
     assert_eq!(unsplit_cuts, 0);
-    let be = backend(true, None);
-    println!("forced wave64: initial cap {}", be.submit_cap_now());
+    let be = backend(wave64, None);
+    println!("slow by {by:?}: initial cap {}", be.submit_cap_now());
     let (got, cuts) = run(&be, ROWS);
-    println!("forced wave64: first prefill forward cut {cuts} time(s)");
+    println!("slow by {by:?}: first prefill forward cut {cuts} time(s)");
     assert!(
         cuts > 0,
         "the first forward of a slow-class device was not split"

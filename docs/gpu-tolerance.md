@@ -2795,6 +2795,170 @@ float activations), so it needs nothing; the CPU already splits outliers
 (`quantize_q8`, 256-element blocks, "CPU int8 activations"). Windows has run
 none of it.
 
+## gemma-3 on the non-coopmat dp4a tier
+
+Measured 2026-11-27 on the Windows machine (B207, B-DP4A-GEMMA3-INT8): why
+gemma-3-1b Q4_K_M's int8 runs sit far from the CPU reference on a device without
+cooperative matrices that has a packed int8 dot, while its float runs pass. Two
+devices ran that tier: the Ryzen integrated GPU (`Vulkan1`, RDNA2, AMD
+proprietary driver 2.0.353, `driverInfo` "25.10.42 (AMD proprietary shader
+compiler)"), which takes it by default, and the RX 7900 XTX (`Vulkan0`, driver
+2.0.353, "25.10.36 (LLPC)") with `INFR_NO_COOPMAT=1`. Intel (Mesa ANV), RADV and
+GCN did not run here.
+
+### Which switch carries it
+
+Each row is `infr tune check` on the gemma file with `--set` the switch, the
+debug log's per-prompt values of the `gpu` (Int8) configuration, the gate's
+33-token chat prompt (prompt 1): mean and worst KL. The switches' config paths
+are `kernels.vulkan.<name>`; `kq_fma` is the tuning parameter
+`kernels.vulkan.tune.gemv.kq_fma`. Reference cache on.
+
+| Switches                            | integrated, prefill | integrated, decode | 7900 XTX no coopmat, prefill | 7900 XTX no coopmat, decode |
+| ----------------------------------- | ------------------- | ------------------ | ---------------------------- | --------------------------- |
+| defaults                            | 1.09e-2 / 5.10e-2   | 9.18e-3 / 5.33e-2  | 1.35e-2 / 8.09e-2            | 8.27e-3 / 5.57e-2           |
+| `i8_dot=false`                      | 7.71e-5 / 1.62e-3   | 5.76e-5 / 1.04e-3  | 1.45e-5 / 3.01e-4            | 8.37e-6 / 1.35e-4           |
+| `dp4a_kq=false`                     | 1.09e-2 / 5.10e-2   | 9.18e-3 / 5.33e-2  | 1.35e-2 / 8.09e-2            | 8.27e-3 / 5.57e-2           |
+| `mmv=false`                         | 1.09e-2 / 5.10e-2   | 9.18e-3 / 5.33e-2  | 1.35e-2 / 8.09e-2            | 8.27e-3 / 5.57e-2           |
+| `dp4a_kq=false`, `mmv=false`        | 1.09e-2 / 5.10e-2   | 9.18e-3 / 5.33e-2  | 1.35e-2 / 8.09e-2            | 8.27e-3 / 5.57e-2           |
+| `mmv_mw=false`                      | 1.09e-2 / 5.10e-2   | 7.20e-3 / 4.16e-2  | 1.35e-2 / 8.09e-2            | 8.62e-3 / 4.62e-2           |
+| `mrow=false`                        | 1.09e-2 / 5.10e-2   | 9.18e-3 / 5.33e-2  | 1.35e-2 / 8.09e-2            | 8.27e-3 / 5.57e-2           |
+| `mmq=false`                         | 1.09e-2 / 5.10e-2   | 9.18e-3 / 5.33e-2  | not run                      | not run                     |
+| `mmv_mw`, `mmv`, `mrow` all `false` | 1.09e-2 / 5.10e-2   | 7.20e-3 / 4.16e-2  | 1.35e-2 / 8.09e-2            | 8.62e-3 / 4.62e-2           |
+| `mmq_fallback=false`                | 7.71e-5 / 1.62e-3   | 1.45e-3 / 6.97e-3  | 1.45e-5 / 3.01e-4            | 1.64e-3 / 1.22e-2           |
+| `kq_fma=true`                       | 1.09e-2 / 5.10e-2   | 7.64e-3 / 6.33e-2  | 1.35e-2 / 8.09e-2            | 8.36e-3 / 4.60e-2           |
+
+On the 180-token prompt (prompt 2) the same runs give a prefill mean of 9.64e-3
+(integrated) and 5.79e-3 (7900 XTX) at the defaults; with `dp4a_kq=false`
+5.85e-3 and 1.48e-2: one device better, the other worse.
+
+What it says:
+
+- **The prefill GEMM carries it.** In the non-coopmat tier `nc_gemm_choice`
+  picks the int8 `mmq` tile on `caps.i8_dot` and reads neither
+  `kernels.vulkan.mmq` (which names the coopmat tier's `mmq` arm) nor `mmv`;
+  only `mmq_fallback=false`, which takes the whole tier away (the prefill then
+  runs the float per-row GEMVs), or `i8_dot=false` moves it. With the prefill on
+  float the prefill rows come to the float runs' level on both devices.
+- **The decode rows inherit it.** They attend to the KV the int8 prefill wrote:
+  with every int8 decode GEMV off they barely move (9.18e-3 to 7.20e-3), and
+  with only the prefill on float, the int8 decode GEMVs alone leave 1.45e-3 and
+  1.64e-3. The short prompt never reaches the dp4a K-quant GEMM.
+- **No kernel is wrong.** The kernels' decompositions hold
+  (`dp4a_kq_matches_its_decomposition` and the test below, at 1e-7 of the term
+  sum), and the distance is the size the 32-element int8 rounding itself gives:
+  the CPU reference with every quantized `Op::Linear` dotting its activation
+  after a round trip through `quant_q8`'s scheme (`cpu_act_quant`'s
+  `per_position_against_the_reference`,
+  `INFR_AQ_SCHEMES=32:0:0:127 INFR_AQ_SIM32=32:0:0:127`, its own four prompts)
+  measures a mean KL from position 2 on of 3.1e-2, 6.9e-3, 5.4e-3 and 1.2e-2.
+
+### Why a cooperative-matrix device measures less
+
+gemma-3-1b Q4_K_M keeps most of its projections in 32-element formats: every
+layer's `attn_q`, `attn_k`, `ffn_gate` and `ffn_up` are Q5_0, `attn_v` is Q5_0
+or Q8_0, and only `attn_output` (Q4_K) and `ffn_down` (Q4_K or Q6_K) are
+K-quants (the GGUF's tensor table). The two tiers quantize different Linears.
+The kernel lists of the `gpu` run on the 7900 XTX (`measure_gpu_tolerance`,
+`INFR_TOL_ROWS=1`, prompt 1):
+
+- with cooperative matrices: `native_gemm_i8cm_q4k_m` and
+  `native_gemm_i8cm_q6k_m` (int8 activations from `quant_q8`) for the K-quants,
+  and `native_gemm_warp_q5_0_n128`, `native_gemm_warp_q8_0_n128_ag` and
+  `native_gemm_warp_q8_0_sk_ag` (f16 activations) for the rest;
+- without them: `native_gemm_mmq_q4k_streamed`, `native_gemm_mmq_q6k_streamed`,
+  `native_gemm_mmq_q5_0` and `native_gemm_mmq_q8_0`, every one on int8
+  activations.
+
+So the non-coopmat tier adds int8 activations on five of a layer's seven
+projections. In the simulation that share is the larger one: the K-quants'
+inputs alone on int8 give 1.3e-2, 3.4e-3, 2.0e-3 and 1.3e-3; the Q5_0 and Q8_0
+inputs alone 2.0e-2, 4.0e-3, 4.1e-3 and 3.6e-3 (the CPU dispatch splits the
+weights the same way, `linear_tap::uses_q8_32`). On the device the 33-token
+prompt's prefill mean is 1.63e-3 with cooperative matrices (worst 1.16e-2) and
+1.35e-2 without them; that is the "ten times" of B207.
+
+### What changes the int8 rounding would buy
+
+The same simulation, both activation paths on the scheme named, mean KL from
+position 2 on for the four prompts:
+
+| Scheme (`block:keep:ratio:qmax`)               | prompt 0 | prompt 1 | prompt 2 | prompt 3 |
+| ---------------------------------------------- | -------- | -------- | -------- | -------- |
+| 32-element blocks, int8 (the GPU's)            | 3.1e-2   | 6.9e-3   | 5.4e-3   | 1.2e-2   |
+| the same, largest kept exact past 16x the next | 1.8e-2   | 8.8e-3   | 6.7e-3   | 2.1e-3   |
+| the same, two kept past 16x                    | 3.2e-2   | 5.3e-3   | 4.8e-3   | 3.2e-3   |
+| the same, largest kept past 8x                 | 2.5e-2   | 5.3e-3   | 5.9e-3   | 1.9e-3   |
+| the same, largest kept past 4x                 | 1.4e-2   | 4.2e-3   | 3.7e-3   | 2.5e-3   |
+| 16-element blocks                              | 2.2e-2   | 5.7e-3   | 4.4e-3   | 2.7e-3   |
+| 8-element blocks                               | 7.3e-3   | 2.6e-3   | 1.7e-3   | 1.5e-3   |
+| 32-element blocks, int16                       | 4e-6     | 1e-6     | 1e-6     | 1e-6     |
+
+An outlier split like the CPU's, which fixed the routed experts' first rows
+("The routed experts' outlier quantizer"), does not fix gemma-3: its distance is
+the ordinary rounding of every block, amplified by the model (the CPU's B209
+found the same of its own 256-element int8 activations). Only more precision per
+element closes it; 8-element blocks take it down three to eight times, int16
+activations to the float level.
+
+### How unsteady these figures are
+
+The int8 figures move a lot between computations that are no less accurate than
+each other: the same kernel set gives 1.09e-2 on one device and 1.35e-2 on the
+other, and `dp4a_kq=false` lowers the 180-token prompt's prefill mean on one
+device and raises it on the other (above). The Intel figures (B-INTEL-IGPU:
+prefill mean 6.20e-2, decode 5.94e-2 on the same prompt) are larger than both
+AMD devices' by a factor of four to six. Nothing here says which part of that is
+the same rounding landing differently and which an Intel-specific difference;
+the test below is one Intel-specific candidate the Intel session can rule in or
+out.
+
+One measurement is not understood. A scratch build that raised every
+f16-subnormal block scale to f16's least normal value (below) moved the 33-token
+prompt's prefill mean from 1.09e-2 to 2.41e-2 on the integrated GPU and from
+1.35e-2 to 7.02e-2 on the 7900 XTX, although a second scratch build, which wrote
+a NaN scale for exactly those blocks, left that prompt's prefill rows as they
+were and turned position 40 (a decode row) NaN first: by that, no prefill block
+of the prompt has such a scale. Compared on a synthetic 64 x 6912 input on the
+integrated GPU, the first build's codes, scales and sums were bitwise the same
+as the shipped quantizer's, plain and outlier builds. What else that build
+changed on gemma-3's activations was not found.
+
+### f16 subnormal activation scales
+
+`quant_q8` stores each block's scale `amax / 127` as f16, so a block whose
+largest magnitude is under about 7.75e-3 gets an f16 subnormal scale. On the
+gate's prompts only the 33-token one reaches such blocks, in its decode rows
+(first at position 40, by the NaN build above). SPIR-V lets a driver flush f16
+subnormals to zero where no denormal mode is declared, and infr declares none
+(the one float-controls mode it declares is round-to-nearest, armed by a probe,
+`arm_f16_rounding`). A flushed scale drops its block from every int8 dot. Both
+AMD devices keep them. A scratch build that flushed them at the store (the int8
+kernels unchanged) left the prefill as it was on both devices and took the
+33-token prompt's decode mean from 9.18e-3 to 3.96e-2 (worst 0.562) on the
+integrated GPU and from 8.27e-3 to 1.72e-2 (worst 0.225) on the 7900 XTX: a
+driver that flushes them loses decode accuracy on this model.
+
+Raising such a scale to f16's least normal value (2^-14) removes the hazard but
+loses precision on those blocks, and on gemma-3 it moved the figures as the
+previous section gives; it was not kept. What keeps the precision on a flushing
+driver is the float-controls `DenormPreserve` mode for 16-bit floats on the
+kernels that store and read the scales, armed only where a probe shows the
+driver flushing (as the rounding mode is), so that every other device keeps its
+modules; not built (B-DP4A-GEMMA3-INT8).
+
+**`int8_kernels_keep_f16_subnormal_scales`** (`kq_gemm_tests.rs`, ignored, in
+the gate filter through `kind(lib)` of `infr-vulkan`) is the check a device runs
+for it: on activations made only of blocks with subnormal scales, every stored
+scale is f16's rounding of `amax / 127` (within one unit, never zero), and the
+dense `mmq` GEMM, the dp4a K-quant GEMM and the `mmv_mw` decode GEMV match the
+f64 decomposition from those codes and scales within 1e-5 of the term sum (worst
+measured 1.1e-7). It passes on both AMD devices. Red runs: with the quantizer
+flushing the scale at its store, it fails on the stored scale (`0x0000` where
+f16 rounds to `0x039d`); with only the Q4_K dense `mmq` GEMM flushing it on
+read, on that GEMM's decomposition (0.0619 against −0.0022), both on both
+devices.
+
 ## Not measured
 
 - **Metal.** Nothing here ran on Apple hardware; the harness drives the CPU and

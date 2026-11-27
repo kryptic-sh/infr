@@ -996,6 +996,68 @@ every gated model, against today's figures), and a speed A/B of prefill in a
 quiet window, since the compensated sum costs three more adds per plane. Not
 measured: whether its plain sum costs it anything against the reference today.
 
+### B-DP4A-GEMMA3-INT8 — gemma-3's int8 rows on the non-coopmat dp4a tier: localized, the fix needs a decision (2026-11-27)
+
+**Kind:** findings, decision needed, unfinished checks.
+
+Measured on the Windows machine's integrated GPU and on the RX 7900 XTX with
+`INFR_NO_COOPMAT=1` (AMD proprietary driver 2.0.353); the tables are in
+`docs/gpu-tolerance.md`, "gemma-3 on the non-coopmat dp4a tier".
+
+- **Where it comes from.** The non-coopmat tier's prefill GEMM
+  (`nc_gemm_choice`'s `NcGemm::Mmq`, the int8 `native_gemm_mmq_*` tiles on
+  `quant_q8` activations) carries it: with that tier off (`mmq_fallback=false`)
+  the prefill rows come to the float runs' level and the decode rows mostly
+  follow, since they attend to the KV the prefill wrote. `kernels.vulkan.mmq`,
+  `mmv`, `mrow` and `mmv_mw` do not reach that GEMM. On gemma-3-1b Q4_K_M it
+  quantizes all seven projections of a layer, where a cooperative-matrix device
+  keeps the five Q5_0/Q8_0 ones (`attn_q`, `attn_k`, `attn_v`, `ffn_gate`,
+  `ffn_up`) on f16 warp GEMMs. The kernels match their decompositions; the
+  distance is the 32-element int8 rounding itself, and the CPU reference with
+  that rounding simulated (`cpu_act_quant`, `INFR_AQ_SCHEMES`/`INFR_AQ_SIM32`)
+  lands at the same size.
+- **An outlier split does not fix it** (simulated: one or two outliers kept per
+  block, ratios 16, 8 and 4). 8-element blocks take the simulated mean KL down
+  three to eight times; int16 activations to the float level.
+- **Decision needed, options** (none built, none timed):
+  1. Float activations for the 32-element formats in the non-coopmat tier, the
+     split a cooperative-matrix device already has: an fp32 tile for Q5_0 and
+     Q8_0 beside `native_gemm_kq_fma` (which covers Q4_0, Q4_K and Q6_K behind
+     `gemm.kq_fma`, itself not yet accepted, B-KQ-FMA-GEMM-UNVERIFIED). In the
+     simulation that leaves the K-quants' int8 share, a mean KL two to nine
+     times lower. Costs the prefill speed of those Linears on every non-coopmat
+     device with an int8 dot (Intel Arc and iGPUs, AMD iGPUs).
+  2. More precision in every int8 kernel: 8- or 16-element scales, or a second
+     int8 code per element for the remainder (int16-like, two dots per block).
+     Every `quant_q8` consumer changes (`mmq` per format, dp4a and int8-coopmat
+     K-quant GEMMs, `mmv`, `mmv_mw`, `mrow`, the expert GEMMs).
+  3. A default flip under B-ACCURACY-AUDIT (the 32-element formats off the int8
+     `mmq` GEMM in this tier); today that leaves the per-row float GEMVs, far
+     slower.
+- **f16 subnormal scales.** `quant_q8` writes `amax / 127` as f16 for every
+  block, so a block under about 7.75e-3 has a subnormal scale (gemma-3's chat
+  prompt reaches them in its decode). A driver that flushes f16 subnormals drops
+  such blocks: emulated, the 33-token prompt's decode mean went from 9.18e-3 to
+  3.96e-2 on the integrated GPU. Both AMD devices keep them.
+  `int8_kernels_keep_f16_subnormal_scales` (`kq_gemm_tests.rs`) fails on a
+  driver that flushes them at the store or on read; the Intel session runs it
+  next. If it fails there, the fix is a `DenormPreserve` (16-bit) declaration on
+  the kernels that store and read the scales, armed by a probe as
+  `arm_f16_rounding` arms round-to-nearest, so other devices keep their modules.
+  Raising such scales to the least normal value was tried and dropped: it costs
+  those blocks precision, and took the 33-token prompt's prefill mean to 2.41e-2
+  and 7.02e-2 on the two devices. `store_q8.comp` (the q8 KV cache) stores its
+  block scales the same way; not changed.
+- **Not understood:** the raised-scale build moved prompt 1's prefill rows,
+  where a NaN-scale build shows no block with a subnormal scale, while a
+  synthetic comparison found its other blocks bitwise unchanged. And whether
+  Intel's int8 figures, four to six times both AMD devices', are this rounding
+  landing differently or an Intel-specific difference.
+- **Not run:** Intel ANV, RADV, GCN; models other than gemma-3-1b on these
+  switches. B-GEMMA3-FLOAT-GREEDY-WIN-IGPU is a different symptom (its float
+  runs set `i8_dot=false`, so no `quant_q8` consumer runs) and was not looked
+  at.
+
 ### B-GEMMA3-FLOAT-GREEDY-WIN-IGPU — gemma-3's float greedy check fails on the integrated GPU under the AMD Windows driver (2026-11-27)
 
 **Kind:** failing gate test at the shipped defaults, on `main`; not diagnosed.
@@ -9268,21 +9330,27 @@ values. What it leaves:
   completed), so `measure_gpu_tolerance` has not been re-run there to see how
   much room the full head leaves under them.
 - **gemma-3-1b's int8 distance is ten times larger on the integrated GPU than on
-  the RX 7900 XTX, unexplained.** Worst KL from position 2 on, configuration
-  `gpu`: 0.26 on `Vulkan1` (prompt 2, position 115; 0.87 at position 1), 2.6e-2
-  on the 7900 natively (0.33 at position 0), 0.11 with wave64 forced, 1.2e-2
-  with the generic tuning (rows off). The other models' int8 rows stay within
-  about 3x across the same paths, apart from LFM3 Q4_K_M (9x, its rows-off run
-  the low one). The 7900 natively runs the int8 coopmat GEMM
-  (`native_gemm_i8cm_*`); with wave64 forced, and on the integrated GPU, the
-  dp4a `native_gemm_mmq_*` runs instead (the int8-free check's kernel lists, on
-  Qwen3 **[ran]**; on gemma **[I]**). Those are the two far paths, so the mmq
-  GEMM on gemma's large activations was the first guess. A later run on
-  `Vulkan1` under RADV points at the dp4a K-quant GEMM instead
-  (`native_gemm_dp4a_q4k` / `_q6k`: with `kernels.vulkan.dp4a_kq` off, prompt
-  2's decode worst KL goes from 0.180 to 2.17e-2 and its prefill mean from
-  1.53e-2 to 5.9e-3; the entry above on RADV). Not looked into further; it is
-  what makes gemma's Int8 row a smoke check.
+  the RX 7900 XTX: explained 2026-11-27** (`docs/gpu-tolerance.md`, "gemma-3 on
+  the non-coopmat dp4a tier"; B-DP4A-GEMMA3-INT8 has what is left). The model
+  keeps five of a layer's seven projections in Q5_0 or Q8_0; a device with
+  cooperative matrices runs those on f16 warp GEMMs and only the K-quants on
+  int8, while the non-coopmat tier runs all of them on the int8 `mmq` GEMMs
+  (kernel lists of the 7900 XTX with and without `INFR_NO_COOPMAT`). No kernel
+  is wrong; the distance is the 32-element int8 rounding's own. What follows is
+  the record as it stood. Worst KL from position 2 on, configuration `gpu`: 0.26
+  on `Vulkan1` (prompt 2, position 115; 0.87 at position 1), 2.6e-2 on the 7900
+  natively (0.33 at position 0), 0.11 with wave64 forced, 1.2e-2 with the
+  generic tuning (rows off). The other models' int8 rows stay within about 3x
+  across the same paths, apart from LFM3 Q4_K_M (9x, its rows-off run the low
+  one). The 7900 natively runs the int8 coopmat GEMM (`native_gemm_i8cm_*`);
+  with wave64 forced, and on the integrated GPU, the dp4a `native_gemm_mmq_*`
+  runs instead (the int8-free check's kernel lists, on Qwen3 **[ran]**; on gemma
+  **[I]**). Those are the two far paths, so the mmq GEMM on gemma's large
+  activations was the first guess. A later run on `Vulkan1` under RADV points at
+  the dp4a K-quant GEMM instead (`native_gemm_dp4a_q4k` / `_q6k`: with
+  `kernels.vulkan.dp4a_kq` off, prompt 2's decode worst KL goes from 0.180 to
+  2.17e-2 and its prefill mean from 1.53e-2 to 5.9e-3; the entry above on RADV).
+  Not looked into further; it is what makes gemma's Int8 row a smoke check.
 - **The int8-free check's marker list is typed by hand** (`INT8_KERNEL_MARKERS`
   in `tests/gpu_tolerance.rs`): the Vulkan crate has no central list of
   int8-activation kernels, so an int8 kernel named outside the markers would

@@ -11,13 +11,13 @@ Accuracy comes first: no row lands for a device that still fails the gate, and
 no row lands without `infr tune check` showing the device still within its
 tolerance rows with the row's values.
 
-## S1. The model gates run on a small host — done when committed
+## S1. The model gates run on a small host — done (`a9752d37`)
 
 The unified-memory margin scales with total host memory (`unified_host_margin`),
 so the tolerance gate runs small models on a 16 GB laptop instead of skipping
 all of them.
 
-## S2. RoPE within tolerance on Intel
+## S2. RoPE within tolerance on Intel — done (`8e0a650a`, `3def4aec`)
 
 Every RoPE shader (`rope.comp`, `qk_norm_rope.comp`,
 `qk_norm_rope_interleaved.comp`, `mla.comp`) takes the GLSL built-in `sin`,
@@ -52,6 +52,24 @@ agreed between the two sessions:
   numbers.
 - **An Intel-only cause stays here**, for example a 16-wide subgroup in the
   quantizer.
+
+## S2c. Win RoPE's speed back
+
+S2 (`8e0a650a`, `3def4aec`) made RoPE accurate on every device at a cost:
+
+- **Intel iGPU:** Qwen3-1.7B pp512 152.1 / 152.2 to 149.2 / 149.2 t/s.
+- **RX 7900 XTX, AMD Windows driver:** tg128 453.43 to 440.48 t/s (-2.9%, six
+  interleaved rounds).
+- **AMD iGPU:** tg128 27.15 to 27.11, within its spread.
+
+Decode runs one row, so the per-pair work is what shows: each thread derives its
+frequency in double-float (`rope_freq`) and reduces its own angle. The
+frequencies depend only on the op's shape, so compute them once per op on the
+host with `infr_core::math::rope_freqs` (the CPU's own values, so bit-identical
+by construction) and bind them the way `freq_factors` is bound. That leaves only
+the sincos per pair. Hold the angle bit-identity and `rope_angle_matches_f64` as
+they are, and measure tg128 on the XTX (through the Windows session) and
+pp512/tg128 on the Intel iGPU, alternating builds.
 
 ## S3. The harness failures
 

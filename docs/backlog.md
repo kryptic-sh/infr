@@ -229,6 +229,55 @@ rule in AGENTS.md: output unchanged or no further from the CPU reference.
 - **The core count.** `0xa721` reports `cores:?` (plan 19 S4). Rules scaled by
   core count (split-K windows, grid sizing) take their fallback here.
 
+### B-ANV-UMA-BUDGET-GUARD — the VRAM guard trusts a budget ANV does not move with its own allocations (2026-11-27)
+
+**Kind:** product defect, not fixed; the next slice of plan 19 S3.
+
+Measured on the Intel RPL-U iGPU (Mesa 26.3.1 ANV, unified memory) with a
+temporary probe of `VK_EXT_memory_budget`, the guard's `alloc_room` and
+`/proc/meminfo`:
+
+- **The budget follows host memory.** `heapBudget - heapUsage` stayed at
+  0.8999–0.9000 × `MemAvailable` in every reading, and drifted 13 MB in 500 ms
+  while the test was idle.
+- **A buffer counts only once its pages are written.** Under the pool test's
+  limit, allocating a 1084227584 B filler raised `heapUsage` and `heapBudget` by
+  the same amount and left `alloc_room` at 1088421888 B. Writing it (`fill_buf`)
+  took `alloc_room` to 0 and `MemAvailable` down by 1.55 GB, and freeing it gave
+  nothing back to the reading.
+- **The effect:** `check_vram_commit` assumes the live budget charges a block
+  from the moment it opens, so on ANV it admits any number of uninitialised
+  (`alloc_uninit`) allocations.
+  `pool::gpu_tests::a_pooled_buffer_in_an_open_block_is_admitted_below_its_size`
+  and `a_pooled_buffer_that_opens_a_block_is_refused_by_the_guard` fail on it,
+  and so do
+  `vram_limit_tests::explicit_ctx_short_of_the_room_after_the_weights_is_refused`
+  (served in Q8_0/Q8_0, not f16) and
+  `auto_ctx_before_the_load_is_the_ctx_after_it` (for example "opened with 2920
+  tokens, ran with 2134: 90144768 bytes promised and not held" at 1536 MiB, or
+  the in-use reading never settling within its 30 s wait).
+
+**Planned fix:** on a unified-memory device whose budget does not move with the
+backend's own allocations, the guard takes the smaller of the live reading and
+its own count of what it has allocated (the count it already keeps where no
+budget extension exists). That stays conservative on every driver. Not verified:
+other unified-memory drivers (RADV on the AMD iGPU, Apple), and whether ANV's
+figure is documented. Mesa's source was not read; the 0.9 × `MemAvailable`
+relation is measured only.
+
+### B-METAL-F16-PROBE-FLAKE — `f16_native_probe` fills the macOS runner's GPU working set (2026-11-27)
+
+**Kind:** flaky CI test, not fixed.
+
+`crates/infr-metal/tests/gemv_bw.rs` `f16_native_probe` failed once in
+`cargo test (macOS / Metal)` on `91cc4df8` with "dequant-cached f32 weight would
+exceed the GPU working set: 4.64 GiB allocated + 0.28 GiB for this F16 tensor >
+4.67 GiB budget". That commit touched no Metal code, the job passed on
+`3def4aec`, and a re-run of the same job on the same commit passed. The test
+allocates to within a few hundred MB of the runner's working set, so it passes
+or fails on what else the runner holds. Shrink its shapes, or skip it under the
+budget, the way the other bench tests do.
+
 ### B-ROPE-REFUSAL-TIMING — the RoPE context refusal fires at the first generate (2026-11-27)
 
 **Kind:** gap found in review, not fixed (low severity: it needs a context past

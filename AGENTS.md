@@ -71,6 +71,9 @@ missed in a pull request we then had to correct by hand:
 
 - One change per pull request, based on current `main`. A stacked pull request
   names the one it is stacked on.
+- Tick every box in the pull request template's checklist. An item that does not
+  apply is ticked too, with "N/A" and the reason after it, so the list reads
+  complete and an unticked box always means work still owed.
 - Describe behaviour as it is on `main`, not on a fork: check every claim about
   which kernel or path a device takes against this tree.
 - A new dependency is agreed in an issue first and lands as an optional cargo

@@ -14,6 +14,9 @@ could not measure. -->
 
 The reasons are in `AGENTS.md`, "Before opening a pull request".
 
+Tick every box. One that does not apply is ticked too, with "N/A" and the reason
+after it: an unticked box means work still owed.
+
 - [ ] Commit subjects are Conventional Commits of at most 72 characters, with
       bodies wrapped at 72 columns
 - [ ] `CHANGELOG.md` has an entry under `[Unreleased]`; a changed public API is

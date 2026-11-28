@@ -1,6 +1,7 @@
 //! Exact scalar/packed Q4_K metadata parity, including OUTS4 tails and both row caps.
 //! Run headlessly with INFR_DEV=VulkanN; GPU workloads must run serially.
 use infr_core::backend::{Backend, Buffer, BufferUsage};
+use infr_core::config::tune::{TuneEntry, TuneLevel};
 use infr_core::DType;
 use infr_vulkan::{Recorder, VulkanBackend};
 use std::collections::BTreeSet;
@@ -193,24 +194,46 @@ fn check_selection(
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn packed_metadata_matches_scalar_exact() {
-    for (m4, o4) in [(true, true), (false, true), (true, false)] {
-        let old = bench_support::backend_with(|vk| {
-            vk.mmv_q4k_meta = Some(false);
+    // `wide` takes the four-outputs layout at every width (`mmv_mrow.o4_all_widths`, an
+    // integrated GPU's default), so the packed build also runs at the widths of 2048 and over that
+    // an integrated GPU reaches by default, on either device class.
+    for (m4, o4, wide) in [
+        (true, true, false),
+        (false, true, false),
+        (true, true, true),
+        (false, true, true),
+        (true, false, false),
+    ] {
+        let configure = |vk: &mut infr_core::config::VulkanCfg, packed: bool| {
+            vk.mmv_q4k_meta = Some(packed);
             vk.mmv_m4 = m4;
             vk.mmv_o4 = o4;
-        });
-        let new = bench_support::backend_with(|vk| {
-            vk.mmv_q4k_meta = Some(true);
-            vk.mmv_m4 = m4;
-            vk.mmv_o4 = o4;
-        });
+            if wide {
+                vk.tune.entries.push(TuneEntry {
+                    key: "mmv_mrow.o4_all_widths".to_string(),
+                    value: "true".to_string(),
+                    level: TuneLevel::Cli,
+                });
+            }
+        };
+        let old = bench_support::backend_with(|vk| configure(vk, false));
+        let new = bench_support::backend_with(|vk| configure(vk, true));
         let (mut seen_old, mut seen_new) = (BTreeSet::new(), BTreeSet::new());
         // Nonzero element offsets retain the Q4_K 256-element block alignment. The two-output leg
         // covers every K width, including the ones whose `nsub = in_f/32` is not a multiple of 64.
-        // The four-outputs leg stays under 2048 wide, where both device classes take OUTS4 (a
-        // discrete GPU through `o4_max_in_f`'s 2048 default, an integrated one through
-        // `o4_all_widths`), so the expectation below holds on either.
-        let shapes: &[(usize, usize, usize)] = if o4 {
+        // The plain four-outputs leg stays under 2048 wide, where both device classes take OUTS4
+        // (a discrete GPU through `o4_max_in_f`'s 2048 default, an integrated one through
+        // `o4_all_widths`); the wide leg sets `o4_all_widths`, so it takes OUTS4 at 2048 and over
+        // on either. Either way the expectation below holds on both device classes.
+        let shapes: &[(usize, usize, usize)] = if wide {
+            &[
+                (2048, 3, 256),
+                (2560, 5, 768),
+                (2816, 66, 256),
+                (6144, 3, 0),
+                (11008, 5, 768),
+            ]
+        } else if o4 {
             &[(256, 1, 0), (1536, 3, 256), (1024, 5, 512)]
         } else {
             &[

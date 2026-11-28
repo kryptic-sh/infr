@@ -3745,6 +3745,88 @@ dyn_spv!(
     attn_decode_hd512_swa_dynac_spv,
     "attn_decode_hd512_swa_dynac"
 );
+// GQA-batched decode pass 1 (`attn_decode_gqa.comp`): one workgroup per (kv head, chunk) reads each
+// K/V row once for all `g` query heads of the group, instead of `g` workgroups re-streaming it.
+// `_swa` = the `-DSWA -DRING` sliding-window/ring twin, `_dynac` = the `-DUSE_PARAMS -DSELF_CHUNK`
+// record-once replay twin. Selected by `attn_decode_gqa_kernel`, gated in `Recorder::gqa_pass1`.
+dyn_spv!(attn_decode_gqa_hd128_g4_spv, "attn_decode_gqa_hd128_g4");
+dyn_spv!(
+    attn_decode_gqa_hd128_g4_swa_spv,
+    "attn_decode_gqa_hd128_g4_swa"
+);
+dyn_spv!(
+    attn_decode_gqa_hd128_g4_dynac_spv,
+    "attn_decode_gqa_hd128_g4_dynac"
+);
+dyn_spv!(
+    attn_decode_gqa_hd128_g4_swa_dynac_spv,
+    "attn_decode_gqa_hd128_g4_swa_dynac"
+);
+dyn_spv!(attn_decode_gqa_hd128_g8_spv, "attn_decode_gqa_hd128_g8");
+dyn_spv!(
+    attn_decode_gqa_hd128_g8_swa_spv,
+    "attn_decode_gqa_hd128_g8_swa"
+);
+dyn_spv!(
+    attn_decode_gqa_hd128_g8_dynac_spv,
+    "attn_decode_gqa_hd128_g8_dynac"
+);
+dyn_spv!(
+    attn_decode_gqa_hd128_g8_swa_dynac_spv,
+    "attn_decode_gqa_hd128_g8_swa_dynac"
+);
+dyn_spv!(attn_decode_gqa_hd256_g4_spv, "attn_decode_gqa_hd256_g4");
+dyn_spv!(
+    attn_decode_gqa_hd256_g4_swa_spv,
+    "attn_decode_gqa_hd256_g4_swa"
+);
+dyn_spv!(
+    attn_decode_gqa_hd256_g4_dynac_spv,
+    "attn_decode_gqa_hd256_g4_dynac"
+);
+dyn_spv!(
+    attn_decode_gqa_hd256_g4_swa_dynac_spv,
+    "attn_decode_gqa_hd256_g4_swa_dynac"
+);
+dyn_spv!(attn_decode_gqa_hd256_g8_spv, "attn_decode_gqa_hd256_g8");
+dyn_spv!(
+    attn_decode_gqa_hd256_g8_swa_spv,
+    "attn_decode_gqa_hd256_g8_swa"
+);
+dyn_spv!(
+    attn_decode_gqa_hd256_g8_dynac_spv,
+    "attn_decode_gqa_hd256_g8_dynac"
+);
+dyn_spv!(
+    attn_decode_gqa_hd256_g8_swa_dynac_spv,
+    "attn_decode_gqa_hd256_g8_swa_dynac"
+);
+dyn_spv!(attn_decode_gqa_hd512_g4_spv, "attn_decode_gqa_hd512_g4");
+dyn_spv!(
+    attn_decode_gqa_hd512_g4_swa_spv,
+    "attn_decode_gqa_hd512_g4_swa"
+);
+dyn_spv!(
+    attn_decode_gqa_hd512_g4_dynac_spv,
+    "attn_decode_gqa_hd512_g4_dynac"
+);
+dyn_spv!(
+    attn_decode_gqa_hd512_g4_swa_dynac_spv,
+    "attn_decode_gqa_hd512_g4_swa_dynac"
+);
+dyn_spv!(attn_decode_gqa_hd512_g8_spv, "attn_decode_gqa_hd512_g8");
+dyn_spv!(
+    attn_decode_gqa_hd512_g8_swa_spv,
+    "attn_decode_gqa_hd512_g8_swa"
+);
+dyn_spv!(
+    attn_decode_gqa_hd512_g8_dynac_spv,
+    "attn_decode_gqa_hd512_g8_dynac"
+);
+dyn_spv!(
+    attn_decode_gqa_hd512_g8_swa_dynac_spv,
+    "attn_decode_gqa_hd512_g8_swa_dynac"
+);
 /// `INFR_NO_ATTN_DECODE=1` (`kernels.vulkan.attn_decode` = false) — keep the general
 /// `attn_partial` builds on the decode fast path so the specialization can be A/B'd against the
 /// kernel it replaces with one env var and one binary.
@@ -3781,6 +3863,98 @@ pub(crate) fn attn_decode_kernel(
         (512, true, true) => (
             "attn_decode_hd512_swa_dynac",
             attn_decode_hd512_swa_dynac_spv(),
+        ),
+        _ => return None,
+    })
+}
+/// The GQA-batched decode pass-1 build (`attn_decode_gqa.comp`) for `(hd, g, swa, dynac)`, where
+/// `g` is the query heads per kv head (the shader reads each K/V row once for all of them), or
+/// `None` when no build covers the shape. Dispatch it through
+/// [`VulkanBackend::kernel_sg64_native`]: it addresses a real 64-lane subgroup.
+pub(crate) fn attn_decode_gqa_kernel(
+    hd: usize,
+    g: usize,
+    swa: bool,
+    dynac: bool,
+) -> Option<(&'static str, &'static [u32])> {
+    Some(match (hd, g, swa, dynac) {
+        (128, 4, false, false) => ("attn_decode_gqa_hd128_g4", attn_decode_gqa_hd128_g4_spv()),
+        (128, 4, false, true) => (
+            "attn_decode_gqa_hd128_g4_dynac",
+            attn_decode_gqa_hd128_g4_dynac_spv(),
+        ),
+        (128, 4, true, false) => (
+            "attn_decode_gqa_hd128_g4_swa",
+            attn_decode_gqa_hd128_g4_swa_spv(),
+        ),
+        (128, 4, true, true) => (
+            "attn_decode_gqa_hd128_g4_swa_dynac",
+            attn_decode_gqa_hd128_g4_swa_dynac_spv(),
+        ),
+        (128, 8, false, false) => ("attn_decode_gqa_hd128_g8", attn_decode_gqa_hd128_g8_spv()),
+        (128, 8, false, true) => (
+            "attn_decode_gqa_hd128_g8_dynac",
+            attn_decode_gqa_hd128_g8_dynac_spv(),
+        ),
+        (128, 8, true, false) => (
+            "attn_decode_gqa_hd128_g8_swa",
+            attn_decode_gqa_hd128_g8_swa_spv(),
+        ),
+        (128, 8, true, true) => (
+            "attn_decode_gqa_hd128_g8_swa_dynac",
+            attn_decode_gqa_hd128_g8_swa_dynac_spv(),
+        ),
+        (256, 4, false, false) => ("attn_decode_gqa_hd256_g4", attn_decode_gqa_hd256_g4_spv()),
+        (256, 4, false, true) => (
+            "attn_decode_gqa_hd256_g4_dynac",
+            attn_decode_gqa_hd256_g4_dynac_spv(),
+        ),
+        (256, 4, true, false) => (
+            "attn_decode_gqa_hd256_g4_swa",
+            attn_decode_gqa_hd256_g4_swa_spv(),
+        ),
+        (256, 4, true, true) => (
+            "attn_decode_gqa_hd256_g4_swa_dynac",
+            attn_decode_gqa_hd256_g4_swa_dynac_spv(),
+        ),
+        (256, 8, false, false) => ("attn_decode_gqa_hd256_g8", attn_decode_gqa_hd256_g8_spv()),
+        (256, 8, false, true) => (
+            "attn_decode_gqa_hd256_g8_dynac",
+            attn_decode_gqa_hd256_g8_dynac_spv(),
+        ),
+        (256, 8, true, false) => (
+            "attn_decode_gqa_hd256_g8_swa",
+            attn_decode_gqa_hd256_g8_swa_spv(),
+        ),
+        (256, 8, true, true) => (
+            "attn_decode_gqa_hd256_g8_swa_dynac",
+            attn_decode_gqa_hd256_g8_swa_dynac_spv(),
+        ),
+        (512, 4, false, false) => ("attn_decode_gqa_hd512_g4", attn_decode_gqa_hd512_g4_spv()),
+        (512, 4, false, true) => (
+            "attn_decode_gqa_hd512_g4_dynac",
+            attn_decode_gqa_hd512_g4_dynac_spv(),
+        ),
+        (512, 4, true, false) => (
+            "attn_decode_gqa_hd512_g4_swa",
+            attn_decode_gqa_hd512_g4_swa_spv(),
+        ),
+        (512, 4, true, true) => (
+            "attn_decode_gqa_hd512_g4_swa_dynac",
+            attn_decode_gqa_hd512_g4_swa_dynac_spv(),
+        ),
+        (512, 8, false, false) => ("attn_decode_gqa_hd512_g8", attn_decode_gqa_hd512_g8_spv()),
+        (512, 8, false, true) => (
+            "attn_decode_gqa_hd512_g8_dynac",
+            attn_decode_gqa_hd512_g8_dynac_spv(),
+        ),
+        (512, 8, true, false) => (
+            "attn_decode_gqa_hd512_g8_swa",
+            attn_decode_gqa_hd512_g8_swa_spv(),
+        ),
+        (512, 8, true, true) => (
+            "attn_decode_gqa_hd512_g8_swa_dynac",
+            attn_decode_gqa_hd512_g8_swa_dynac_spv(),
         ),
         _ => return None,
     })

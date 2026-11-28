@@ -169,6 +169,11 @@ flash_warp = true
 flash_min_rows = 24
 # flash_splits = 2   # default: unset = the engine's split heuristic
 # pv_splits = 2      # default: unset
+# GQA-batched decode pass (INFR_ATTN_DECODE_GQA=1): one workgroup per kv head
+# and chunk reads each K/V row once for every query head sharing it. Tri-state;
+# unset = off, because it measured slower than attn_decode on the GPUs it has
+# been tried on.
+attn_decode_gqa = false
 
 # Misc.
 push_desc = true

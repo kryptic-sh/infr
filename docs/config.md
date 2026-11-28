@@ -267,7 +267,8 @@ and these exist to force one off when bisecting a correctness or perf problem.
   (runs the wave64 path that AMD GCN takes on a device that can pin 32),
   GEMM/GEMV tiers (`gemm_warp`, `mmq`, `mmv`, `mrow`, `moe_small_m`, the
   `[kernels.vulkan.gemv]` sub-table), attention (`flash_warp`, `flash_splits`,
-  `flash_min_rows`, `pv_splits`), DeltaNet (`dn_chunk_scan`, `dn_chunk`,
+  `flash_min_rows`, `pv_splits`, `attn_decode_gqa` — opt-in GQA-batched decode
+  pass, off by default), DeltaNet (`dn_chunk_scan`, `dn_chunk`,
   `dn_split`), and the plumbing switches (`push_desc`, `pipeline_cache_disk`,
   `no_replay`, `no_vram_guard`, `gfx_queue` — an alias that turns the
   `queue.family` tuning parameter to `graphics` — the BDA chunk caps). Note

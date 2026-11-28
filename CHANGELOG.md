@@ -838,6 +838,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `gpu-moe-decode-int8`, `gpu-moe-switches-off`) in place of `gpu-experts-hi`,
   `gpu-ub32-experts-hi`, `gpu-experts-hi-dense-decode-float` and
   `gpu-moe-decode-float`.
+- **The non-coopmat flash prefill attention unrolls P·V in 8-key groups**
+  instead of over all 64 keys of a block (`attn_nc_fa.comp`), which is faster
+  on RADV GCN and flat elsewhere.
 - **Faster Q4_K prefill on the int8 `mmq` kernels** (`native_gemm_mmq_q4k`, the
   dense tier without matrix units and every batched MoE expert GEMM). A block's
   activations, scales and weight nibbles are staged with 16-byte loads instead

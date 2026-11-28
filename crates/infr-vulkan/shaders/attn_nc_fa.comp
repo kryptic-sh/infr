@@ -259,8 +259,12 @@ void main() {
                 [[unroll]] for (uint i = 0u; i < RO; i++) {
                     uint r = rp * RO + i;
                     vec4 part = vec4(0.0);
-                    for (uint j = 0u; j < BN; j++) {
-                        part += Ss[r * SP + j] * KVs[j * VP4 + dq];
+                    // Unrolled in 8-key groups: a full 64-key unroll hoists every load and spills
+                    // past 256 VGPRs on RADV GCN, which costs more than the hoisting buys.
+                    [[dont_unroll]] for (uint j = 0u; j < BN; j += 8u) {
+                        [[unroll]] for (uint jj = 0u; jj < 8u; jj++) {
+                            part += Ss[r * SP + j + jj] * KVs[(j + jj) * VP4 + dq];
+                        }
                     }
                     acc_o[i][c] = acc_o[i][c] * corr[r] + part;
                 }

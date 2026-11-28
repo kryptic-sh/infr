@@ -53,14 +53,12 @@ agreed between the two sessions:
 - **An Intel-only cause stays here**, for example a 16-wide subgroup in the
   quantizer.
 
-## S2c. Win RoPE's speed back — done on Intel; the XTX measurement is owed
+## S2c. Win RoPE's speed back — done (`100302da`)
 
 The rotary shaders read the CPU's own `rope_freqs` table from a buffer
-(`VulkanBackend::rope_freq_table`) instead of deriving each frequency in
-double-float, and their output is bit-identical to the build before. What is
-left: tg128 on the RX 7900 XTX, through the Windows session, against the build
-before S2 and the one before this slice, alternated. The gemma-3 decode gain
-this slice showed on Intel has no known cause (B-GEMMA-DECODE-ROPE-GAIN).
+(`VulkanBackend::rope_freq_table`), and their output is bit-identical to the
+build before. It wins back what S2 cost on every device measured. The gemma-3
+decode gain on Intel has no known cause (B-GEMMA-DECODE-ROPE-GAIN).
 
 ## S3. The harness failures — the first two done; the pool guard is B-ANV-UMA-BUDGET-GUARD
 

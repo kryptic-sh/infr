@@ -393,6 +393,14 @@ What is known:
 - A review of the diff found no skipped or shortened work: the workgroup counts,
   fused KV writes and record-once path are unchanged.
 
+It is Intel-only. The Windows session ran the same three builds alternated
+(72e8d84f, 0642de45, 100302da; `infr bench -r 3`, six rounds, AMD Windows driver
+2.0.353). gemma-3-1b tg128 on the RX 7900 XTX went 420.96 / 404.29 / 418.93, and
+on the AMD iGPU 20.40 / 20.40 / 20.44. On neither GPU is the result above the
+pre-RoPE build. It is not the GLSL built-ins being slow on Xe1 either: the
+pre-RoPE build used `pow`, `sin` and `cos` and decoded at the same 15.0 t/s as
+0642de45.
+
 A guess, not shown: the decode path's record-once `qk_norm_rope` variants
 (`USE_PARAMS`, BDA) were slow on ANV in a way the static ones are not. Examples
 are register spills, or a heavy per-workgroup lane-0 prologue that serialised a

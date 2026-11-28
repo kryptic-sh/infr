@@ -363,14 +363,24 @@ the free at once while the free figure came back about 2 s later. Left:
 **Kind:** flaky CI test, not fixed.
 
 `crates/infr-metal/tests/gemv_bw.rs` `f16_native_probe` failed in
-`cargo test (macOS / Metal)` on `91cc4df8`, and again on `14aa555d` (a docs-only
-commit) on 2026-11-28, with "dequant-cached f32 weight would exceed the GPU
-working set: 4.64 GiB allocated + 0.28 GiB for this F16 tensor > 4.67 GiB
-budget". Neither commit touched Metal code, and each time a re-run of the job on
-the same commit passed. The test allocates to within a few hundred MB of the
-runner's working set, so it passes or fails on what else the runner holds.
-Shrink its shapes, or skip it under the budget, the way the other bench tests
-do.
+`cargo test (macOS / Metal)` on `91cc4df8`, on `14aa555d` (a docs-only commit)
+and on `0006fdb3` (a tuning-table change), the last two on 2026-11-28. Each time
+it failed with "dequant-cached f32 weight would exceed the GPU working set: 4.64
+GiB allocated + 0.28 GiB for this F16 tensor > 4.67 GiB budget". None of those
+commits touched Metal code. A re-run of the job on the same commit passed the
+first two times.
+
+The likely cause (suspected, not shown): the CI step runs
+`cargo test -p infr-metal --locked -- --include-ignored` with no
+`--test-threads`, so libtest runs this file's bandwidth probes in parallel.
+`f16_native_probe`'s cached-f32 arm alone holds eight 65536 × 1152 f32 weights,
+about 2.25 GiB. Two or three probes at once would pass the runner's 4.67 GiB
+working set, which fits the "4.64 GiB allocated" before its last tensor. Fixes,
+cheapest first:
+
+- serialise the probes in `gemv_bw.rs` behind one static `Mutex`;
+- run that test binary with `--test-threads=1`;
+- shrink the probe shapes.
 
 ### B-GEMMA-DECODE-ROPE-GAIN — gemma-3 decode got 19% faster from the RoPE table, and why is unknown (2026-11-28)
 

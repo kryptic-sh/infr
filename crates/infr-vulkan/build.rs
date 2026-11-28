@@ -3637,8 +3637,8 @@ fn main() {
             // Packed-metadata Q4_K twin of the OUTS4 int8 decode/verify layout (`-DQ4K_PACKED_META`):
             // one aligned 16-byte header load per sub-block instead of the byte/half loads of d,
             // dmin and the twelve packed scale bytes. Same dots, same lane layout — the scalar build
-            // stays beside it for an exact A/B. The fused-quant builds are left alone because they
-            // are not measured: `mmv_mrow.q4k_packed_meta` reaches only the builds that were.
+            // stays beside it for an exact A/B. The fused-quant builds get no twin, so
+            // `mmv_mrow.q4k_packed_meta` does not reach them.
             let f = &base.2;
             if base.0 == "native_mmv_mrow"
                 && f.iter().any(|d| d == "-DFMT_Q4K")

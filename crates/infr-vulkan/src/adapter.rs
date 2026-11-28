@@ -14361,13 +14361,16 @@ mod tests {
         assert!(fell_back > 0, "no Q4_K lookup without a twin was checked");
     }
 
-    /// Who gets the packed-metadata build: by default the integrated fixture and not the discrete
-    /// one, and either way round when the parameter or its `INFR_MMV_Q4K_META` alias says so.
+    /// Who gets the packed-metadata build: by default the AMD integrated fixture, through its
+    /// table row, and neither the discrete one nor the Intel integrated one; the generic default
+    /// alone (`INFR_TUNE_NO_ROWS`) is off; and either way round when the parameter or its
+    /// `INFR_MMV_Q4K_META` alias says so.
     #[test]
     fn mmv_q4k_packed_meta_default_and_overrides() {
         use crate::tuning::tests::fixture_tuning_env;
         const IGPU: &str = "raphael-igpu-amdwin";
         const DGPU: &str = "rx7900xtx-amdwin";
+        const INTEL_IGPU: &str = "intel-rplu-igpu-anv";
         // A Q4_K decode GEMV that takes the four-output build on both device classes.
         let name = |t: &crate::tuning::Tuning| {
             let vk = infr_core::config::VulkanCfg::default();
@@ -14383,9 +14386,11 @@ mod tests {
         };
         // (fixture, environment layer, the parameter it should resolve to)
         type Case = (&'static str, &'static [(&'static str, &'static str)], bool);
-        let cases: [Case; 6] = [
+        let cases: [Case; 8] = [
             (IGPU, &[], true),
             (DGPU, &[], false),
+            (INTEL_IGPU, &[], false),
+            (IGPU, &[("INFR_TUNE_NO_ROWS", "1")], false),
             (
                 IGPU,
                 &[("INFR_TUNE", "mmv_mrow.q4k_packed_meta=false")],

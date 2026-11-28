@@ -130,9 +130,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Tuning parameter `mmv_mrow.q4k_packed_meta`: packed Q4_K header loads in the
   four-output int8 decode GEMV.** It selects a twin of `native_mmv_mrow_q4k_o4`,
   `_o4_m4` and `_o4_m4_res` that reads each super-block header with one 16-byte
-  load instead of eight byte and half loads; the output is bit-identical. On by
-  default on an integrated GPU, off elsewhere. It reaches the four-output builds
-  only, which a discrete GPU takes below `mmv_mrow.o4_max_in_f` and an
+  load instead of six or eight byte reads (two each for `d` and `dmin`, then two
+  or four scale bytes, by sub-block); the output is bit-identical. On by default
+  on AMD RDNA2 integrated GPUs under the AMD Windows driver and RADV, through
+  two tuning-table rows; the generic default is off. It reaches the four-output
+  builds only, which a discrete GPU takes below `mmv_mrow.o4_max_in_f` and an
   integrated GPU at every width. On the Ryzen integrated GPU under the AMD
   Windows driver it makes Qwen3 Q4_K_M decode 5.7% to 20.7% faster; on an RX
   7900 XTX and an RX 580 it changes decode by at most 0.4%.

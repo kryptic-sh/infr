@@ -493,9 +493,8 @@ pub(crate) static PARAMS: &[Param] = &[
         axis: Axis::None,
         doc: "the Q4_K four-outputs builds read each super-block header with one 16-byte load \
               (the output is bit-identical)",
-        rule: "true on an integrated GPU, where the header unpacking bounds decode and it was \
-               measured faster; else false",
-        default: |f, _| Value::Bool(f.integrated),
+        rule: "false (rows turn it on for AMD RDNA2 integrated GPUs)",
+        default: |_, _| Value::Bool(false),
         get: |t, _| Value::Bool(t.mmv_q4k_packed_meta),
         set: |t, _, v| t.mmv_q4k_packed_meta = v.flag(),
     },

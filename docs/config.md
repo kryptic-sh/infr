@@ -394,10 +394,10 @@ device runs what it ran before them; `gemm.kq_fma` is off everywhere unless set;
 
 `mmv_mrow.q4k_packed_meta` makes the Q4_K four-output int8 decode GEMV
 (`native_mmv_mrow_q4k_o4`, `_o4_m4`, `_o4_m4_res`) read each super-block header
-with one 16-byte load instead of eight byte and half loads; the output is
-bit-identical. Default: on an integrated GPU, where the header unpacking bounds
-decode and it measured faster, off elsewhere
-([`perf/vulkan-q4k-packed-meta.md`](perf/vulkan-q4k-packed-meta.md)).
+with one 16-byte load instead of six or eight byte reads, by sub-block; the
+output is bit-identical. Default: off, and on for AMD RDNA2 integrated GPUs
+under the AMD Windows driver and RADV by two table rows, where it was measured
+faster ([`perf/vulkan-q4k-packed-meta.md`](perf/vulkan-q4k-packed-meta.md)).
 `kernels.vulkan.mmv_q4k_meta` (`INFR_MMV_Q4K_META=0|1`) is its alias.
 
 `device.i8_dot` lets the packed int8 dot kernels run: the dp4a decode GEMVs and

@@ -2,14 +2,15 @@
 
 Single-token dense decode on the integer-dot path is `quant_q8` +
 `native_mmv_mrow` with `rows=1`. Q4_K's 16-byte header holds two half scales and
-twelve packed scale/min bytes, and the scalar path reads it with eight separate
-byte and half loads per 32-element sub-block: `d`, `dmin`, and then three words
-re-read a byte at a time by `k4()`.
+twelve packed scale/min bytes, and the scalar path reads it a byte at a time,
+each byte a 32-bit word load and a shift: two bytes each for the half scales `d`
+and `dmin`, then two scale bytes through `k4()` for sub-blocks 0 to 3 and four
+for sub-blocks 4 to 7, so six or eight byte reads per 32-element sub-block.
 
 ## Change
 
 The 144-byte super-block stride keeps every header 16-byte aligned, so one `NW4`
-(a `global_load_b128` with a scalar base on RADV) replaces all eight loads. The
+(a `global_load_b128` with a scalar base on RADV) replaces all of them. The
 six-bit scale and min fields are then extracted in registers with the same masks
 `k4()` applies, including the shared-byte cases for sub-blocks 4..7.
 
@@ -25,19 +26,22 @@ at every width through `o4_all_widths` — the tuning parameter
 `INFR_TUNE=mmv_mrow.q4k_packed_meta=true|false` sets it, and
 `kernels.vulkan.mmv_q4k_meta` (`INFR_MMV_Q4K_META=0|1`) is its alias.
 
-It is **on by default on an integrated GPU and off on a discrete one** (the
-parameter's rule is `integrated`). On the integrated GPU measured below, decode
-is 5.7% to 20.7% faster with it and the packed GEMV takes about 27% less time
-per dispatch (the profile table), because the header unpacking, not the weight
-bandwidth, bounds the decode GEMV there. On the discrete cards it gains at most
-0.4% end to end (the RX 7900 XTX and RX 580 tables below): their decode GEMV is
-bandwidth-bound, and a discrete GPU takes the four-output layout only below
-`o4_max_in_f`, so a model 2048 wide or wider (Qwen3-1.7B) never reaches the
-packed build there. It costs nothing measurable on either class, so the discrete
-default is a choice of leaving their kernels as they were tuned, not a measured
-loss. On the prequantized microbench the packed build is +2.8% to +9.9% on an RX
-580 under RADV, +9.3% to +12.4% on the integrated GPU, and within the run-to-run
-spread on the RX 7900 XTX.
+It is **on by default on the AMD RDNA2 integrated GPUs it was measured on, and
+off everywhere else.** The generic default is off, and two tuning-table rows
+turn it on: `amd-proprietary-rdna2-integrated-q4k-packed-meta` (AMD Windows
+driver, measured here) and `radv-rdna2-integrated-q4k-packed-meta` (RADV, the
+contributor's measurement, a `contributor` row). On the integrated GPU under the
+AMD Windows driver, decode is 5.7% to 20.7% faster with it and the packed GEMV
+takes about 27% less time per dispatch (the decode and profile tables below);
+under RADV the contributor measured +24.8% on one model (below). On the discrete
+cards it changes decode by at most 0.4% (the RX 7900 XTX and RX 580 tables), and
+a discrete GPU takes the four-output layout only below `o4_max_in_f`, so a model
+2048 wide or wider (Qwen3-1.7B) never reaches the packed build there. No other
+integrated GPU (another vendor's, or another AMD architecture) has been
+measured, and no discrete card gained, so they keep the kernels they were tuned
+with; that is a choice, not a measured loss. On the prequantized microbench the
+packed build is +2.8% to +9.9% on an RX 580 under RADV, +9.3% to +12.4% on the
+integrated GPU, and within the run-to-run spread on the RX 7900 XTX.
 
 ## Measurements
 
@@ -89,10 +93,9 @@ repetitions per run, means of the two runs:
 | Qwen2.5-Coder-3B Q4_K_M, tg128         |  63.8 t/s |  63.8 t/s |  0.0% |
 | Qwen3-0.6B Q4_K_M, tg128, default tier | 249.7 t/s | 249.6 t/s |  0.0% |
 
-Per-run spreads were 0.5% or less. Identical results are the expected outcome
-for a bit-identical kernel on a bandwidth-bound device: the header bytes are
-read either way. The last row is the default decode tier, where the int8 GEMV is
-not reached at all.
+Per-run spreads were 0.5% or less. Identical results mean the header loads cost
+nothing measurable on this card. The last row is the default decode tier, where
+the int8 GEMV is not reached at all.
 
 That the packed kernel is what runs with the knob on, rather than a silent
 fallback, is visible in the decode profile:
@@ -101,12 +104,11 @@ fallback, is visible in the decode profile:
 
 ### The integrated GPU where it was found
 
-Measured earlier in this project's campaign, on the device where the header
-unpacking was on the critical path — AMD Ryzen 7 7800X3D integrated GPU, RADV
-RAPHAEL_MENDOCINO, Mesa 25.2.7, `unsloth/gemma-4-E4B-it-GGUF`
-`gemma-4-E4B-it-Q4_K_M.gguf` (4,977,171,584 bytes), decode 16 tokens at depth
-16, context 128, three repetitions per process in
-`scalar / packed / packed / scalar` order, serial headless workloads,
+The contributor's measurement, on the device where the change was found — AMD
+Ryzen 7 7800X3D integrated GPU, RADV RAPHAEL_MENDOCINO, Mesa 25.2.7,
+`unsloth/gemma-4-E4B-it-GGUF` `gemma-4-E4B-it-Q4_K_M.gguf` (4,977,171,584
+bytes), decode 16 tokens at depth 16, context 128, three repetitions per process
+in `scalar / packed / packed / scalar` order, serial headless workloads,
 `INFR_NO_COOPMAT=1 INFR_KQ_FMA_GEMV=0 INFR_KQ_FMA_TIER=0`, an empty config file:
 6.14 and 5.86 tok/s on the scalar metadata (mean 6.00) against 7.66 and 7.31 on
 the packed (mean 7.49), about 24.8% higher. That GPU is not available here, so
@@ -210,11 +212,13 @@ was not measured.
 and packed output bits for rows 1, 2, 3, 4, 5, 8, 9 and 16, both row caps, with
 and without the fused residual, over output tails (1, 3, 5, 66) and weight bases
 0/256/512/768. The two-output leg covers `in_f` 256, 1536, 2048, 2560, 2816,
-6144 and 11008; the four-output leg stays under 2048 so that a discrete device
-takes it through `o4_max_in_f` and an integrated one through `o4_all_widths`,
-which keeps the expectation device-independent. The weight bytes cover zero,
-signed zero, subnormal and signed half scales and both edges of the packed
-scale/min fields.
+6144 and 11008. The plain four-output leg stays under 2048 so that a discrete
+device takes it through `o4_max_in_f` and an integrated one through
+`o4_all_widths`; a second four-output leg sets `mmv_mrow.o4_all_widths` and
+covers `in_f` 2048, 2560, 2816, 6144 and 11008, the widths an integrated GPU
+runs the packed build at by default. Both keep the expectation
+device-independent. The weight bytes cover zero, signed zero, subnormal and
+signed half scales and both edges of the packed scale/min fields.
 
 Because `built_kernel_names` accumulates over a backend's life, the kernel-name
 check compares the names each run _added_ to the names it started with: a run

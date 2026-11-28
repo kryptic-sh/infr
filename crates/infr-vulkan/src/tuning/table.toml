@@ -60,3 +60,31 @@ driver = "Mesa ANV (INTEL_OPEN_SOURCE_MESA), driverVersion 0x6803001"
 date = "2026-11-27"
 command = "infr tune check --dev Vulkan0 unsloth/gemma-3-1b-it-GGUF:Q4_K_M, the row on against --set kernels.vulkan.tuning.rows=false; Qwen3-0.6B and LFM3-1.7B Q4_K_M with the row on; infr bench <model> -p 512 -n 0 -r 3 and -p 0 -n 128 -r 3, the row on against --set kernels.vulkan.tune.device.i8_dot=true, alternated A,B,A,B, load average 0.06 to 1.75"
 evidence = "gemma-3-1b gpu prefill mean KL 5.69e-2 over a 2.7e-2 bound (max KL 0.595 over 0.52, top-k cosine 0.636 under 0.711) and gpu-ub32 prefill mean KL 3.36e-2 without the row; with it every configuration passes, prefill mean KL 2.93e-5; Qwen3-0.6B and LFM3-1.7B pass with it. The cost: pp512 Qwen3-1.7B 149.0/149.3 -> 15.6/15.6 t/s, gemma-3-1b 352.8/352.6 -> 16.0/16.0; tg128 Qwen3-1.7B 18.1/17.7 -> 10.2/10.2, gemma-3-1b 15.2/15.2 -> 9.1/9.1 (docs/backlog.md B-ACCURACY-AUDIT; remove once the dp4a kernels pass here)"
+
+[[row]]
+id = "amd-proprietary-rdna2-integrated-q4k-packed-meta"
+match = { vendor = "amd", arch = "AmdRdna2", driver = "AMD_PROPRIETARY", integrated = true }
+verified = "maintainer"
+params = { "mmv_mrow.q4k_packed_meta" = true }
+
+[row.source]
+by = "infr maintainers"
+device = "AMD Radeon(TM) Graphics (Ryzen integrated, RDNA2, 2 CUs)"
+driver = "AMD Windows driver 2.0.353 (AMD_PROPRIETARY, 0x800161)"
+date = "2026-11-28"
+command = "infr --config <empty> bench <model> -p 0 -n 128 -r 3 and -d 4096, INFR_MMV_Q4K_META=1 against unset, 6 rounds alternated with the order flipped each round, two copies of the binary rotated, total CPU 6.8% mean"
+evidence = "tg128 Qwen3-0.6B Q4_K_M 55.4 -> 61.7 t/s, at d4096 29.5 -> 31.2; Qwen3-1.7B Q4_K_M 26.9 -> 32.4, at d4096 18.8 -> 21.4; output bit-identical (packed_metadata_matches_scalar_exact, and identical tolerance rows); docs/perf/vulkan-q4k-packed-meta.md"
+
+[[row]]
+id = "radv-rdna2-integrated-q4k-packed-meta"
+match = { vendor = "amd", arch = "AmdRdna2", driver = "MESA_RADV", integrated = true }
+verified = "contributor"
+params = { "mmv_mrow.q4k_packed_meta" = true }
+
+[row.source]
+by = "Cappy Ishihara (PR 121)"
+device = "AMD Ryzen 7 7800X3D integrated GPU (RADV RAPHAEL_MENDOCINO, RDNA2)"
+driver = "Mesa 25.2.7 RADV (MESA_RADV)"
+date = "2026-11-26"
+command = "infr bench gemma-4-E4B-it-Q4_K_M decode 16 tokens at depth 16, context 128, 3 repetitions per process in scalar/packed/packed/scalar order, INFR_NO_COOPMAT=1 INFR_KQ_FMA_GEMV=0 INFR_KQ_FMA_TIER=0, an empty config"
+evidence = "6.14 and 5.86 tok/s scalar (mean 6.00) against 7.66 and 7.31 packed (mean 7.49), +24.8%; one model at one depth, not reproduced by the maintainers; the date is the PR commit's, the measurement's own is not recorded; docs/perf/vulkan-q4k-packed-meta.md"

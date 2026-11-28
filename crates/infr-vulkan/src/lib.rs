@@ -1521,14 +1521,12 @@ pub const VRAM_GUARD_MIN_ALLOC: u64 = 1 << 20;
 fn device_local_room(s: &VulkanShared) -> u64 {
     let (mp, reading) = memory_reading(s);
     let (mut size, mut avail) = (0u64, 0u64);
-    for i in 0..mp.memory_heap_count as usize {
-        if mp.memory_heaps[i]
-            .flags
-            .contains(vk::MemoryHeapFlags::DEVICE_LOCAL)
-        {
-            size += mp.memory_heaps[i].size;
+    let heaps = &mp.memory_heaps[..mp.memory_heap_count as usize];
+    for (i, heap) in heaps.iter().enumerate() {
+        if heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL) {
+            size += heap.size;
             if let Some(&(budget, usage)) = reading.get(i) {
-                avail += heap_free(budget, usage, mp.memory_heaps[i].size, heap_ceiling(s, i));
+                avail += heap_free(budget, usage, heap.size, heap_ceiling(s, i));
             }
         }
     }
@@ -1877,18 +1875,17 @@ fn vram_info(s: &VulkanShared, held: bool) -> VramInfo {
     // same DDR is exactly the thing a UMA guard must see.
     let mut total = 0u64;
     let mut available = 0u64;
-    for i in 0..mp.memory_heap_count as usize {
-        let device_local = mp.memory_heaps[i]
-            .flags
-            .contains(vk::MemoryHeapFlags::DEVICE_LOCAL);
+    let heaps = &mp.memory_heaps[..mp.memory_heap_count as usize];
+    for (i, heap) in heaps.iter().enumerate() {
+        let device_local = heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL);
         if uma || device_local {
-            total += mp.memory_heaps[i].size;
+            total += heap.size;
             available += match reading.get(i) {
                 Some(&(budget, usage)) => {
                     let ceiling = held.then(|| heap_ceiling(s, i)).flatten();
-                    heap_free(budget, usage, mp.memory_heaps[i].size, ceiling)
+                    heap_free(budget, usage, heap.size, ceiling)
                 }
-                None => mp.memory_heaps[i].size,
+                None => heap.size,
             };
         }
     }

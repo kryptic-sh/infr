@@ -833,6 +833,13 @@ pub(crate) fn mmv_mrow_variant(
     }
     let o4 = mmv_o4(vk, in_f, o4);
     let m4 = rows <= 4 && vk.mmv_m4;
+    // Q4_K's OUTS4 builds have a packed-metadata twin: same dots, same lanes, one 16-byte header
+    // load instead of eight byte/half loads per sub-block. `mmv_q4k_meta = false` A/Bs the pair.
+    if o4 && dtype == infr_core::DType::Q4K && vk.mmv_q4k_meta {
+        if let Some((n, s)) = crate::gemm::native_mmv_mrow_q4k_meta_spv(m4, res) {
+            return Some((n, s, 4));
+        }
+    }
     crate::gemm::native_mmv_mrow_variant_spv(dtype, o4, m4, res)
         .map(|(n, s)| (n, s, if o4 { 4 } else { 2 }))
 }

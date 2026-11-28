@@ -1271,6 +1271,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_MMV_FUSE_QUANT",
         "INFR_MMV_MW",
         "INFR_MMV_MW_WARPS",
+        "INFR_MMV_Q4K_META",
         "INFR_MROWS_ATTN",
         "INFR_NOBARRIER",
         "INFR_NO_ATTN_DECODE",

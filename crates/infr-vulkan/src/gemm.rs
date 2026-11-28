@@ -710,6 +710,35 @@ pub(crate) fn native_mmv_mrow_variant_spv(
     }
 }
 
+/// Packed-metadata twin of the Q4_K four-outputs builds: one aligned 16-byte header load per
+/// sub-block instead of the byte/half loads of `d`, `dmin` and the twelve packed scale/min bytes.
+/// `(m4, res)` selects the same row caps as [`native_mmv_mrow_variant_spv`]; `None` where that
+/// matrix has no such build (an OUTS4 residual without the rows<=4 specialization). Dots, lane
+/// layout and reduction tree are unchanged, so the output is bit-identical.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_mmv_mrow_q4k_meta_spv(
+    m4: bool,
+    res: bool,
+) -> Option<(&'static str, &'static [u32])> {
+    macro_rules! v {
+        ($name:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            let s = S
+                .get_or_init(|| {
+                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+                })
+                .as_slice();
+            Some(($name, s))
+        }};
+    }
+    match (m4, res) {
+        (false, false) => v!("native_mmv_mrow_q4k_o4_packed_meta"),
+        (true, false) => v!("native_mmv_mrow_q4k_o4_m4_packed_meta"),
+        (true, true) => v!("native_mmv_mrow_q4k_o4_m4_res_packed_meta"),
+        (false, true) => None,
+    }
+}
+
 /// FUSE_QUANT twin of [`native_mmv_mrow_variant_spv`] — kernel-cache name + SPIR-V for the
 /// inline-activation-quantization variants. Q4_K/Q6_K only, m4+res combos only (decode).
 #[cfg_attr(infr_profile, infr_prof::instrument)]

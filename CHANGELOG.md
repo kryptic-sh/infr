@@ -32,6 +32,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   every `qk_norm_rope` form and `mla`. Pass
   `VulkanBackend::rope_freq_table(theta, rope_dim)` (`qk_rope_dim` for `mla`),
   the per-pair frequencies the kernels now read instead of deriving them.
+- **`infr_core::config::VulkanCfg` gains `mmv_q4k_meta`** (off by default,
+  `INFR_MMV_Q4K_META`), the packed Q4_K header load in the four-output int8
+  decode GEMV, so a struct literal of it must set it or use
+  `..Default::default()`.
 - **`infr_core::graph::Op` gains `AttnTemp`**, the position-dependent attention
   temperature, so an exhaustive match on `Op` must handle it.
 - **`infr_cpu::op_tap::TappedOp` gains `Mla`, `MulVec` and `AttnTemp`**, so an

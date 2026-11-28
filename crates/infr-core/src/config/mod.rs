@@ -380,10 +380,10 @@ cfg_struct! {
         mmv_m4: bool = true,
         /// `INFR_MMV_Q4K_META`: one packed 16-byte Q4_K header load per sub-block in the four-output
         /// int8 decode/verify kernel, instead of byte/half loads of `d`, `dmin` and the packed scale
-        /// bytes. OFF by default: it is bit-identical and 7-10% faster on the prequantized
-        /// microbench, but the only end-to-end decode measurement is one integrated GPU, and a
-        /// sub-block-width decode GEMV is bandwidth-bound (so unchanged) on the discrete cards it
-        /// has run on. Turn it on per device with `mmv_q4k_meta = true` / `INFR_MMV_Q4K_META=1`.
+        /// bytes. The output is bit-identical; it is off by default because it only pays where the
+        /// header unpacking, not the weight bandwidth, bounds the decode GEMV, and that has not
+        /// been shown for every device class. The measurements are in
+        /// `docs/perf/vulkan-q4k-packed-meta.md`.
         mmv_q4k_meta: bool = false,
         /// `INFR_NO_MMV_O4` (inverted).
         mmv_o4: bool = true,

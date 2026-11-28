@@ -32,10 +32,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   every `qk_norm_rope` form and `mla`. Pass
   `VulkanBackend::rope_freq_table(theta, rope_dim)` (`qk_rope_dim` for `mla`),
   the per-pair frequencies the kernels now read instead of deriving them.
-- **`infr_core::config::VulkanCfg` gains `mmv_q4k_meta`** (off by default,
-  `INFR_MMV_Q4K_META`), the packed Q4_K header load in the four-output int8
-  decode GEMV, so a struct literal of it must set it or use
-  `..Default::default()`.
+- **`infr_core::config::VulkanCfg` gains `mmv_q4k_meta: Option<bool>`** (unset
+  by default, `INFR_MMV_Q4K_META=0|1`), the alias of the
+  `mmv_mrow.q4k_packed_meta` tuning parameter, so a struct literal of it must
+  set it or use `..Default::default()`.
 - **`infr_core::graph::Op` gains `AttnTemp`**, the position-dependent attention
   temperature, so an exhaustive match on `Op` must handle it.
 - **`infr_cpu::op_tap::TappedOp` gains `Mla`, `MulVec` and `AttnTemp`**, so an
@@ -127,15 +127,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
-- **`kernels.vulkan.mmv_q4k_meta` (`INFR_MMV_Q4K_META=1`)**, off by default,
-  selects a packed-metadata twin of the Q4_K four-output int8 decode GEMV
-  (`native_mmv_mrow_q4k_o4`, `_o4_m4`, `_o4_m4_res`): one 16-byte load of each
-  super-block header instead of eight byte and half loads. The output is
-  bit-identical. It reaches the four-output builds only, which a discrete GPU
-  takes below `mmv_mrow.o4_max_in_f` and an integrated GPU at every width. On
-  the Ryzen integrated GPU under the AMD Windows driver it makes Qwen3 Q4_K_M
-  decode 5.7% to 20.7% faster; on an RX 7900 XTX and an RX 580 it changes decode
-  by at most 0.4%. Figures in `docs/perf/vulkan-q4k-packed-meta.md`.
+- **Tuning parameter `mmv_mrow.q4k_packed_meta`: packed Q4_K header loads in the
+  four-output int8 decode GEMV.** It selects a twin of `native_mmv_mrow_q4k_o4`,
+  `_o4_m4` and `_o4_m4_res` that reads each super-block header with one 16-byte
+  load instead of eight byte and half loads; the output is bit-identical. On by
+  default on an integrated GPU, off elsewhere. It reaches the four-output builds
+  only, which a discrete GPU takes below `mmv_mrow.o4_max_in_f` and an
+  integrated GPU at every width. On the Ryzen integrated GPU under the AMD
+  Windows driver it makes Qwen3 Q4_K_M decode 5.7% to 20.7% faster; on an RX
+  7900 XTX and an RX 580 it changes decode by at most 0.4%.
+  `INFR_TUNE=mmv_mrow.q4k_packed_meta=true|false` sets it either way, and
+  `kernels.vulkan.mmv_q4k_meta` (`INFR_MMV_Q4K_META=0|1`) is an alias. Figures
+  in `docs/perf/vulkan-q4k-packed-meta.md`.
 - **`VulkanBackend::rope_freq_table(theta, rope_dim)`** returns the device
   buffer of the CPU reference's per-pair RoPE frequencies (`rope_freqs`), built
   once per (theta, rope width) and kept for the backend's life: the table the

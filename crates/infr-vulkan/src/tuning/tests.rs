@@ -80,6 +80,11 @@ pub(crate) fn fixture_tuning(id: &str) -> Tuning {
     resolve_fixture(id, &Config::default()).tuning
 }
 
+/// [`fixture_tuning`] under an environment layer of `pairs` (`INFR_*` name, value).
+pub(crate) fn fixture_tuning_env(id: &str, pairs: &[(&str, &str)]) -> Tuning {
+    resolve_fixture(id, &env_cfg(pairs)).tuning
+}
+
 fn value_of(r: &Resolved, key: &str) -> (String, String) {
     let p = r
         .report
@@ -703,6 +708,14 @@ fn every_alias_writes_the_old_value() {
         (&[("INFR_GFX_QUEUE", "1")], &[("queue.family", "graphics")]),
         (&[("INFR_KQ_FMA_GEMV", "1")], &[("gemv.kq_fma", "true")]),
         (&[("INFR_KQ_FMA_GEMV", "0")], &[("gemv.kq_fma", "false")]),
+        (
+            &[("INFR_MMV_Q4K_META", "1")],
+            &[("mmv_mrow.q4k_packed_meta", "true")],
+        ),
+        (
+            &[("INFR_MMV_Q4K_META", "0")],
+            &[("mmv_mrow.q4k_packed_meta", "false")],
+        ),
         (&[("INFR_MOE_SMALL_M", "16")], &[("moe.small_m", "16")]),
         (&[("INFR_MOE_SMALL_M", "100000")], &[("moe.small_m", "64")]),
         (

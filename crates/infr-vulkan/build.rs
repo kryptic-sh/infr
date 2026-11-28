@@ -3638,7 +3638,7 @@ fn main() {
             // one aligned 16-byte header load per sub-block instead of the byte/half loads of d,
             // dmin and the twelve packed scale bytes. Same dots, same lane layout — the scalar build
             // stays beside it for an exact A/B. The fused-quant builds are left alone because they
-            // are not measured: `mmv_q4k_meta` is opt-in on the builds that were.
+            // are not measured: `mmv_mrow.q4k_packed_meta` reaches only the builds that were.
             let f = &base.2;
             if base.0 == "native_mmv_mrow"
                 && f.iter().any(|d| d == "-DFMT_Q4K")

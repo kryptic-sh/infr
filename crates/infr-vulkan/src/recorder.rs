@@ -792,13 +792,16 @@ fn mmv_o4(vk: &infr_core::config::VulkanCfg, in_f: usize, o4: MmvO4) -> bool {
 }
 
 /// When [`mmv_o4`] takes the four-outputs build: the `mmv_mrow.o4_max_in_f` and
-/// `mmv_mrow.o4_all_widths` tuning parameters (the latter on by default on an integrated GPU).
+/// `mmv_mrow.o4_all_widths` tuning parameters (the latter on by default on an integrated GPU),
+/// and whether its Q4_K builds take their packed-metadata twin (`mmv_mrow.q4k_packed_meta`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct MmvO4 {
     /// Below this input width.
     pub max_in_f: usize,
     /// At every width.
     pub all_widths: bool,
+    /// The Q4_K builds read each super-block header with one 16-byte load.
+    pub q4k_packed_meta: bool,
 }
 
 impl MmvO4 {
@@ -806,6 +809,7 @@ impl MmvO4 {
         Self {
             max_in_f: t.mmv_o4_max_in_f,
             all_widths: t.mmv_o4_all_widths,
+            q4k_packed_meta: t.mmv_q4k_packed_meta,
         }
     }
 }
@@ -831,11 +835,13 @@ pub(crate) fn mmv_mrow_variant(
         }
         return crate::gemm::native_mmv_mrow_m16_spv(dtype).map(|(n, s)| (n, s, 2));
     }
+    let packed_meta = o4.q4k_packed_meta;
     let o4 = mmv_o4(vk, in_f, o4);
     let m4 = rows <= 4 && vk.mmv_m4;
     // Q4_K's OUTS4 builds have a packed-metadata twin: same dots, same lanes, one 16-byte header
-    // load instead of eight byte/half loads per sub-block. `mmv_q4k_meta = false` A/Bs the pair.
-    if o4 && dtype == infr_core::DType::Q4K && vk.mmv_q4k_meta {
+    // load instead of eight byte/half loads per sub-block. `mmv_mrow.q4k_packed_meta` A/Bs the
+    // pair.
+    if o4 && dtype == infr_core::DType::Q4K && packed_meta {
         if let Some((n, s)) = crate::gemm::native_mmv_mrow_q4k_meta_spv(m4, res) {
             return Some((n, s, 4));
         }

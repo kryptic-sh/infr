@@ -265,8 +265,8 @@ and these exist to force one off when bisecting a correctness or perf problem.
 - **`[kernels.vulkan]`** (the biggest section): capability masks (`coopmat`,
   `f16`, `i8_dot`, `coopmat_8x8`, `i8_coopmat`), the `force_wave64` testing knob
   (runs the wave64 path that AMD GCN takes on a device that can pin 32),
-  GEMM/GEMV tiers (`gemm_warp`, `mmq`, `mmv`, `mmv_q4k_meta` — opt-in packed
-  Q4_K header loads, see `docs/perf/vulkan-q4k-packed-meta.md` — `mrow`,
+  GEMM/GEMV tiers (`gemm_warp`, `mmq`, `mmv`, `mmv_q4k_meta` — an alias of the
+  `mmv_mrow.q4k_packed_meta` tuning parameter, see below — `mrow`,
   `moe_small_m`, the `[kernels.vulkan.gemv]` sub-table), attention
   (`flash_warp`, `flash_splits`, `flash_min_rows`, `pv_splits`), DeltaNet
   (`dn_chunk_scan`, `dn_chunk`, `dn_split`), and the plumbing switches
@@ -391,6 +391,14 @@ device runs what it ran before them; `gemm.kq_fma` is off everywhere unless set;
   rule, kept by the project owner's decision so that the desktop stays
   responsive), and on an integrated GPU under the AMD Windows driver by a table
   row; described under "Which queue inference runs on" below.
+
+`mmv_mrow.q4k_packed_meta` makes the Q4_K four-output int8 decode GEMV
+(`native_mmv_mrow_q4k_o4`, `_o4_m4`, `_o4_m4_res`) read each super-block header
+with one 16-byte load instead of eight byte and half loads; the output is
+bit-identical. Default: on an integrated GPU, where the header unpacking bounds
+decode and it measured faster, off elsewhere
+([`perf/vulkan-q4k-packed-meta.md`](perf/vulkan-q4k-packed-meta.md)).
+`kernels.vulkan.mmv_q4k_meta` (`INFR_MMV_Q4K_META=0|1`) is its alias.
 
 `device.i8_dot` lets the packed int8 dot kernels run: the dp4a decode GEMVs and
 prefill GEMMs, and every other kernel choice that needs the device's int8 dot.
@@ -628,13 +636,13 @@ on a device that cannot pin a 16-wide subgroup runs at 32, as it always has;
 **The older knobs are aliases.** `device.subgroup_pref` (`INFR_SG`),
 `kernels.vulkan.flash_splits`, `pv_splits`, `flash_min_rows`, `flash_bm32`,
 `mmv_mw_warps`, `moe_small_m`, `canvas_chunk_n`, `i8cm_kq` (`INFR_NO_I8CM_KQ`),
-`kq_fma_gemv` (`INFR_KQ_FMA_GEMV`), `gfx_queue` (`INFR_GFX_QUEUE`) and the whole
-`[kernels.vulkan.gemv]` group keep their names, grammars and meanings —
-including their old clamps and fallbacks — and write the matching parameter at
-the level that set them (`infr tune show` labels it, e.g.
-`env alias INFR_FLASH_SPLITS`). At the same level the new `tune` key wins over
-the alias; across levels the higher level wins whichever spelling it uses. An
-alias set to a value that has no effect — its unset spelling
+`kq_fma_gemv` (`INFR_KQ_FMA_GEMV`), `mmv_q4k_meta` (`INFR_MMV_Q4K_META`),
+`gfx_queue` (`INFR_GFX_QUEUE`) and the whole `[kernels.vulkan.gemv]` group keep
+their names, grammars and meanings — including their old clamps and fallbacks —
+and write the matching parameter at the level that set them (`infr tune show`
+labels it, e.g. `env alias INFR_FLASH_SPLITS`). At the same level the new `tune`
+key wins over the alias; across levels the higher level wins whichever spelling
+it uses. An alias set to a value that has no effect — its unset spelling
 (`--set kernels.vulkan.mmv_mw_warps=none`), `i8cm_kq = true`, `no_rm = false`, a
 `gemv.variant` name with no build — resets the parameter at its level to what
 the defaults, rows and tuning file give, so it still beats a lower level's

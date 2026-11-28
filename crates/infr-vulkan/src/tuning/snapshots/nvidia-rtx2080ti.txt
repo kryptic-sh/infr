@@ -1,6 +1,6 @@
 device:  NVIDIA GeForce RTX 2080 Ti (NvidiaTuring, NVIDIA_PROPRIETARY)
 match:   vendor=nvidia arch=NvidiaTuring driver=NVIDIA_PROPRIETARY integrated=false device_id=0x1e07 cu=68 subgroup=32-32 driver_version=0x0
-hash:    37e7cc4f
+hash:    c660fd4a
 rows: none
 
 device.sg_pref               32     default
@@ -30,6 +30,7 @@ mmv_mw.warps@iq4_nl          8      default
 mmv_mw.moe_float             true   default
 mmv_mrow.o4_max_in_f         2048   default
 mmv_mrow.o4_all_widths       false  default
+mmv_mrow.q4k_packed_meta     false  default
 attn_flash.min_rows          24     default
 attn_flash.force_bm32        false  default
 attn_flash.splits            0      default

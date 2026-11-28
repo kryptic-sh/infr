@@ -304,9 +304,9 @@ cfg_struct! {
     ///
     /// The fields listed in [`tune::TUNE_ALIASES`] (`flash_splits`, `pv_splits`,
     /// `flash_min_rows`, `flash_bm32`, `mmv_mw_warps`, `moe_small_m`, `canvas_chunk_n`,
-    /// `i8cm_kq`, `kq_fma_gemv`, `gfx_queue`, the `gemv` group) are aliases of Vulkan tuning
-    /// parameters: they keep their
-    /// spelling and meaning, and the backend's tuning resolver turns them into the parameter.
+    /// `i8cm_kq`, `kq_fma_gemv`, `mmv_q4k_meta`, `gfx_queue`, the `gemv` group) are aliases of
+    /// Vulkan tuning parameters: they keep their spelling and meaning, and the backend's tuning
+    /// resolver turns them into the parameter.
     VulkanCfg / PartialVulkanCfg {
         subs {
             /// The GEMV family.
@@ -378,13 +378,11 @@ cfg_struct! {
         mmv_decode: bool = false,
         /// `INFR_NO_MMV_M4` (inverted).
         mmv_m4: bool = true,
-        /// `INFR_MMV_Q4K_META`: one packed 16-byte Q4_K header load per sub-block in the four-output
-        /// int8 decode/verify kernel, instead of byte/half loads of `d`, `dmin` and the packed scale
-        /// bytes. The output is bit-identical; it is off by default because it only pays where the
-        /// header unpacking, not the weight bandwidth, bounds the decode GEMV, and that has not
-        /// been shown for every device class. The measurements are in
-        /// `docs/perf/vulkan-q4k-packed-meta.md`.
-        mmv_q4k_meta: bool = false,
+        /// `INFR_MMV_Q4K_META`, TRI-state: an alias of the Vulkan tuning parameter
+        /// `mmv_mrow.q4k_packed_meta` (one packed 16-byte Q4_K header load per sub-block in the
+        /// four-output int8 decode/verify kernel). `Some` sets the parameter, `None` leaves the
+        /// device rule in charge.
+        mmv_q4k_meta: Option<bool> = None,
         /// `INFR_NO_MMV_O4` (inverted).
         mmv_o4: bool = true,
         /// `INFR_MMV_MW`, TRI-state: `None` = vendor default, `Some(false)` = `"0"` (force off),

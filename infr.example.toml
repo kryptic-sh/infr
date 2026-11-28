@@ -162,10 +162,10 @@ force_wave64 = false # testing only: run the wave64 (AMD GCN) path on a wave32 d
 gemm_warp = true
 mmv = true
 # Packed 16-byte Q4_K header loads in the four-output int8 decode GEMV
-# (INFR_MMV_Q4K_META=1). Bit-identical; it pays where the header unpacking,
-# not the weight bandwidth, bounds decode, as on an integrated GPU. See
-# docs/perf/vulkan-q4k-packed-meta.md.
-mmv_q4k_meta = false
+# (INFR_MMV_Q4K_META=0|1): an alias of the mmv_mrow.q4k_packed_meta tuning
+# parameter, on by default on an integrated GPU. Bit-identical. Unset leaves
+# the device rule in charge. See docs/perf/vulkan-q4k-packed-meta.md.
+# mmv_q4k_meta = true
 mrow = true
 moe_small_m = 8 # alias of the moe.small_m tuning parameter; clamped to 0..=64
 

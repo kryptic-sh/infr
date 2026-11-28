@@ -20,17 +20,24 @@ bit-identical.
 `-DQ4K_PACKED_META` is applied to Q4_K's four-output (`-DOUTS4`) builds only:
 `native_mmv_mrow_q4k_o4`, `_o4_m4` and `_o4_m4_res`. Where that layout applies —
 a discrete GPU below `mmv_mrow.o4_max_in_f` (2048 by default), an integrated GPU
-at every width through `o4_all_widths` — `mmv_q4k_meta = true`
-(`INFR_MMV_Q4K_META=1`) selects the packed build instead of the scalar one.
+at every width through `o4_all_widths` — the tuning parameter
+`mmv_mrow.q4k_packed_meta` selects the packed build instead of the scalar one.
+`INFR_TUNE=mmv_mrow.q4k_packed_meta=true|false` sets it, and
+`kernels.vulkan.mmv_q4k_meta` (`INFR_MMV_Q4K_META=0|1`) is its alias.
 
-It is **off by default**. On the prequantized microbench the packed build is
-+2.8% to +9.9% on an RX 580 under RADV and +9.3% to +12.4% on a Ryzen integrated
-GPU under the AMD Windows driver, and it is within the run-to-run spread on an
-RX 7900 XTX. End to end, decode on the integrated GPU is 5.7% to 20.7% faster
-with it, while the discrete cards measured gain at most 0.4%: their decode GEMV
-is bandwidth-bound, and a discrete GPU takes the four-output layout only below
+It is **on by default on an integrated GPU and off on a discrete one** (the
+parameter's rule is `integrated`). On the integrated GPU measured below, decode
+is 5.7% to 20.7% faster with it and the packed GEMV takes about 27% less time
+per dispatch (the profile table), because the header unpacking, not the weight
+bandwidth, bounds the decode GEMV there. On the discrete cards it gains at most
+0.4% end to end (the RX 7900 XTX and RX 580 tables below): their decode GEMV is
+bandwidth-bound, and a discrete GPU takes the four-output layout only below
 `o4_max_in_f`, so a model 2048 wide or wider (Qwen3-1.7B) never reaches the
-packed build there. The figures are below.
+packed build there. It costs nothing measurable on either class, so the discrete
+default is a choice of leaving their kernels as they were tuned, not a measured
+loss. On the prequantized microbench the packed build is +2.8% to +9.9% on an RX
+580 under RADV, +9.3% to +12.4% on the integrated GPU, and within the run-to-run
+spread on the RX 7900 XTX.
 
 ## Measurements
 
@@ -137,13 +144,23 @@ build, which has no packed twin.
 tolerance harness (`measure_gpu_tolerance`,
 `INFR_TOL_MODELS=qwen3-0.6b,qwen3-1.7b INFR_TOL_ROWS=1`, reference cache `on`,
 the default) prints the same 450 `TOL` rows and the same per-position `ROWS` KL
-values, byte for byte, with the knob on and off, on each GPU. The harness does
-not read `INFR_MMV_Q4K_META` (`infr_testkit::honour_env` carries only the tuning
-parameters and capability masks), so the "on" runs were made from a local build
-with the knob's default set to true; their `KERNELS` lines name
-`native_mmv_mrow_q4k_o4_m4_packed_meta` (both models on the integrated GPU,
-Qwen3-0.6B on the RX 7900 XTX) and `_o4_m4_res_packed_meta` (integrated GPU),
-and the "off" runs name no packed build.
+values, byte for byte, with the knob on and off, on each GPU. These runs predate
+the tuning parameter: the harness did not read the old presence key
+(`infr_testkit::honour_env` carries only the tuning parameters and capability
+masks), so the "on" runs were made from a local build with the key's default set
+to true; their `KERNELS` lines name `native_mmv_mrow_q4k_o4_m4_packed_meta`
+(both models on the integrated GPU, Qwen3-0.6B on the RX 7900 XTX) and
+`_o4_m4_res_packed_meta` (integrated GPU), and the "off" runs name no packed
+build.
+
+With the tuning parameter the harness toggles it directly:
+`INFR_TUNE=mmv_mrow.q4k_packed_meta=true` and `=false` on the integrated GPU,
+the same models and knobs, give the same 450 `TOL` rows and per-position `ROWS`
+values as each other and as the earlier runs. With `true`, 30 of the 72
+`KERNELS` lines (the five int8 configurations of every prompt, both models) name
+`native_mmv_mrow_q4k_o4_m4_packed_meta` and
+`native_mmv_mrow_q4k_o4_m4_res_packed_meta`; with `false`, none names a packed
+build and the same lines name `native_mmv_mrow_q4k_o4_m4` and `_o4_m4_res`.
 
 **Microbench**, `packed_metadata_bw` (the command above), two processes per
 device, each running scalar, packed, packed, scalar; means of the four legs per

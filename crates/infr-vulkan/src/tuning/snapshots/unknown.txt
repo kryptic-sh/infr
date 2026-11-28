@@ -1,6 +1,6 @@
 device:  Unknown GPU (Other, driver unreported)
 match:   vendor=other arch=Other driver=unreported integrated=false device_id=0x0001 cu=0 subgroup=32-32 driver_version=0x0
-hash:    d0518796
+hash:    518b62d8
 rows: none
 
 device.sg_pref               32     default
@@ -30,6 +30,7 @@ mmv_mw.warps@iq4_nl          8      default
 mmv_mw.moe_float             true   default
 mmv_mrow.o4_max_in_f         2048   default
 mmv_mrow.o4_all_widths       false  default
+mmv_mrow.q4k_packed_meta     false  default
 attn_flash.min_rows          24     default
 attn_flash.force_bm32        false  default
 attn_flash.splits            0      default

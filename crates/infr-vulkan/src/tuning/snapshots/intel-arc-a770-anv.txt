@@ -1,6 +1,6 @@
 device:  Intel(R) Arc(tm) A770 Graphics (DG2) (IntelXe1, INTEL_OPEN_SOURCE_MESA)
 match:   vendor=intel arch=IntelXe1 driver=INTEL_OPEN_SOURCE_MESA integrated=false device_id=0x56a0 cu=32 subgroup=8-32 driver_version=0x0
-hash:    671909ef
+hash:    01a70e62
 rows: none
 
 device.sg_pref               16     default
@@ -30,6 +30,7 @@ mmv_mw.warps@iq4_nl          8      default
 mmv_mw.moe_float             true   default
 mmv_mrow.o4_max_in_f         2048   default
 mmv_mrow.o4_all_widths       false  default
+mmv_mrow.q4k_packed_meta     false  default
 attn_flash.min_rows          24     default
 attn_flash.force_bm32        false  default
 attn_flash.splits            0      default

@@ -276,6 +276,8 @@ pub(crate) struct Tuning {
     /// `mmv_mrow.*`: when the int8 multi-row GEMV takes its four-outputs-per-workgroup build.
     pub mmv_o4_max_in_f: usize,
     pub mmv_o4_all_widths: bool,
+    /// `mmv_mrow.q4k_packed_meta`: the Q4_K four-outputs builds take their packed-metadata twin.
+    pub mmv_q4k_packed_meta: bool,
     /// `attn_flash.*`: the coopmat flash-attention prefill.
     pub flash: AttnSplit,
     pub flash_min_rows: usize,

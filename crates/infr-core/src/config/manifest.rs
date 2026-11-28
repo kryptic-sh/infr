@@ -189,7 +189,7 @@ knobs! {
     "INFR_NO_MMV"           => "kernels.vulkan.mmv",            PresenceInv, Ignored, "1",  migrated;
     "INFR_MMV_DECODE"       => "kernels.vulkan.mmv_decode",     Presence,    Ignored, "1",  migrated;
     "INFR_NO_MMV_M4"        => "kernels.vulkan.mmv_m4",         PresenceInv, Ignored, "1",  migrated;
-    "INFR_MMV_Q4K_META"     => "kernels.vulkan.mmv_q4k_meta",   Presence,    Ignored, "1",  migrated;
+    "INFR_MMV_Q4K_META"     => "kernels.vulkan.mmv_q4k_meta",   TriState,    Ignored, "1",  migrated;
     "INFR_NO_MMV_O4"        => "kernels.vulkan.mmv_o4",         PresenceInv, Ignored, "1",  migrated;
     "INFR_MMV_MW"           => "kernels.vulkan.mmv_mw",         TriState,    Ignored, "0",  migrated;
     "INFR_MMV_MW_WARPS"     => "kernels.vulkan.mmv_mw_warps",   Int,         Ignored, "4",  migrated;

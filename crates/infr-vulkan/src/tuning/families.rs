@@ -485,6 +485,20 @@ pub(crate) static PARAMS: &[Param] = &[
         get: |t, _| Value::Bool(t.mmv_o4_all_widths),
         set: |t, _, v| t.mmv_o4_all_widths = v.flag(),
     },
+    Param {
+        family: "mmv_mrow",
+        name: "q4k_packed_meta",
+        kind: Kind::Variant,
+        ty: Ty::Bool,
+        axis: Axis::None,
+        doc: "the Q4_K four-outputs builds read each super-block header with one 16-byte load \
+              (the output is bit-identical)",
+        rule: "true on an integrated GPU, where the header unpacking bounds decode and it was \
+               measured faster; else false",
+        default: |f, _| Value::Bool(f.integrated),
+        get: |t, _| Value::Bool(t.mmv_q4k_packed_meta),
+        set: |t, _, v| t.mmv_q4k_packed_meta = v.flag(),
+    },
     // ── attention ────────────────────────────────────────────────────────────
     Param {
         family: "attn_flash",
@@ -1160,6 +1174,16 @@ pub(crate) static ALIASES: &[Alias] = &[
                 .vulkan
                 .kq_fma_gemv
                 .map(|v| vec![("gemv.kq_fma", Value::Bool(v))])
+        },
+    },
+    Alias {
+        path: "kernels.vulkan.mmv_q4k_meta",
+        params: &["mmv_mrow.q4k_packed_meta"],
+        read: |c, _| {
+            c.kernels
+                .vulkan
+                .mmv_q4k_meta
+                .map(|v| vec![("mmv_mrow.q4k_packed_meta", Value::Bool(v))])
         },
     },
     Alias {

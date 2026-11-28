@@ -195,12 +195,12 @@ fn check_selection(
 fn packed_metadata_matches_scalar_exact() {
     for (m4, o4) in [(true, true), (false, true), (true, false)] {
         let old = bench_support::backend_with(|vk| {
-            vk.mmv_q4k_meta = false;
+            vk.mmv_q4k_meta = Some(false);
             vk.mmv_m4 = m4;
             vk.mmv_o4 = o4;
         });
         let new = bench_support::backend_with(|vk| {
-            vk.mmv_q4k_meta = true;
+            vk.mmv_q4k_meta = Some(true);
             vk.mmv_m4 = m4;
             vk.mmv_o4 = o4;
         });
@@ -286,11 +286,11 @@ fn packed_metadata_matches_scalar_exact() {
 fn packed_metadata_bw() {
     use std::cell::Cell;
     let old = bench_support::backend_with(|vk| {
-        vk.mmv_q4k_meta = false;
+        vk.mmv_q4k_meta = Some(false);
         vk.mmv_o4 = true;
     });
     let new = bench_support::backend_with(|vk| {
-        vk.mmv_q4k_meta = true;
+        vk.mmv_q4k_meta = Some(true);
         vk.mmv_o4 = true;
     });
     let shapes = if old.capabilities().integrated {

@@ -103,6 +103,7 @@ pub const TUNE_ALIASES: &[&str] = &[
     "kernels.vulkan.gemv.variant",
     "kernels.vulkan.i8cm_kq",
     "kernels.vulkan.kq_fma_gemv",
+    "kernels.vulkan.mmv_q4k_meta",
     "kernels.vulkan.gfx_queue",
     "kernels.vulkan.mmv_mw_warps",
     "kernels.vulkan.moe_small_m",

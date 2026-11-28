@@ -14285,13 +14285,14 @@ mod tests {
         );
     }
 
-    /// `mmv_q4k_meta` swaps in the packed-metadata twin exactly where one is built: a Q4_K
-    /// four-output build without the fused residual at the plain row cap, or at `m4` with or
-    /// without it. Everywhere else — the knob off, another dtype, the two-output layout, rows past
-    /// 8, an OUTS4 residual without `m4` — the selection is the one the knob-off lookup makes.
+    /// `mmv_mrow.q4k_packed_meta` swaps in the packed-metadata twin exactly where one is built: a
+    /// Q4_K four-output build without the fused residual at the plain row cap, or at `m4` with or
+    /// without it. Everywhere else — the parameter off, another dtype, the two-output layout, rows
+    /// past 8, an OUTS4 residual without `m4` — the selection is the one the parameter-off lookup
+    /// makes.
     #[test]
     fn mmv_q4k_meta_selects_the_packed_twin() {
-        use crate::recorder::mmv_mrow_variant;
+        use crate::recorder::{mmv_mrow_variant, MmvO4};
         let mut packed = std::collections::BTreeSet::new();
         let mut fell_back = 0;
         for integrated in [false, true] {
@@ -14300,21 +14301,17 @@ mod tests {
                     for res in [false, true] {
                         for in_f in [1024usize, 4096] {
                             for rows in 1..=16 {
-                                let vk = |meta| infr_core::config::VulkanCfg {
+                                let vk = infr_core::config::VulkanCfg {
                                     mmv_m4: m4,
-                                    mmv_q4k_meta: meta,
                                     ..Default::default()
                                 };
                                 let pick = |meta| {
-                                    mmv_mrow_variant(
-                                        &vk(meta),
-                                        dt,
-                                        rows,
-                                        in_f,
-                                        res,
-                                        o4_of(integrated),
-                                    )
-                                    .map(|(n, _, outs)| (n, outs))
+                                    let o4 = MmvO4 {
+                                        q4k_packed_meta: meta,
+                                        ..o4_of(integrated)
+                                    };
+                                    mmv_mrow_variant(&vk, dt, rows, in_f, res, o4)
+                                        .map(|(n, _, outs)| (n, outs))
                                 };
                                 let (scalar, on) = (pick(false), pick(true));
                                 let row_m4 = m4 && rows <= 4;
@@ -14332,13 +14329,13 @@ mod tests {
                                     assert_eq!(
                                         on.map(|(n, outs)| (n.to_string(), outs)),
                                         Some((want, 4)),
-                                        "{at}: the knob did not select the packed twin"
+                                        "{at}: the parameter did not select the packed twin"
                                     );
                                     packed.insert((row_m4, res));
                                 } else {
                                     assert_eq!(
                                         on, scalar,
-                                        "{at}: the knob changed a build with no twin"
+                                        "{at}: the parameter changed a build with no twin"
                                     );
                                     if dt == DType::Q4K {
                                         fell_back += 1;
@@ -14347,7 +14344,7 @@ mod tests {
                                 if let Some((n, _)) = scalar {
                                     assert!(
                                         !n.ends_with("_packed_meta"),
-                                        "{at}: knob off selected {n}"
+                                        "{at}: the parameter off selected {n}"
                                     );
                                 }
                             }
@@ -14362,6 +14359,59 @@ mod tests {
             "the packed twin was not selected for every (m4, res) build it has"
         );
         assert!(fell_back > 0, "no Q4_K lookup without a twin was checked");
+    }
+
+    /// Who gets the packed-metadata build: by default the integrated fixture and not the discrete
+    /// one, and either way round when the parameter or its `INFR_MMV_Q4K_META` alias says so.
+    #[test]
+    fn mmv_q4k_packed_meta_default_and_overrides() {
+        use crate::tuning::tests::fixture_tuning_env;
+        const IGPU: &str = "raphael-igpu-amdwin";
+        const DGPU: &str = "rx7900xtx-amdwin";
+        // A Q4_K decode GEMV that takes the four-output build on both device classes.
+        let name = |t: &crate::tuning::Tuning| {
+            let vk = infr_core::config::VulkanCfg::default();
+            crate::recorder::mmv_mrow_variant(
+                &vk,
+                DType::Q4K,
+                1,
+                1024,
+                false,
+                crate::recorder::MmvO4::of(t),
+            )
+            .map(|(n, _, _)| n)
+        };
+        // (fixture, environment layer, the parameter it should resolve to)
+        type Case = (&'static str, &'static [(&'static str, &'static str)], bool);
+        let cases: [Case; 6] = [
+            (IGPU, &[], true),
+            (DGPU, &[], false),
+            (
+                IGPU,
+                &[("INFR_TUNE", "mmv_mrow.q4k_packed_meta=false")],
+                false,
+            ),
+            (
+                DGPU,
+                &[("INFR_TUNE", "mmv_mrow.q4k_packed_meta=true")],
+                true,
+            ),
+            (IGPU, &[("INFR_MMV_Q4K_META", "0")], false),
+            (DGPU, &[("INFR_MMV_Q4K_META", "1")], true),
+        ];
+        for (id, env, want) in cases {
+            let t = fixture_tuning_env(id, env);
+            assert_eq!(
+                t.mmv_q4k_packed_meta, want,
+                "{id} {env:?}: resolved parameter"
+            );
+            let want_name = if want {
+                "native_mmv_mrow_q4k_o4_m4_packed_meta"
+            } else {
+                "native_mmv_mrow_q4k_o4_m4"
+            };
+            assert_eq!(name(&t), Some(want_name), "{id} {env:?}: selected build");
+        }
     }
 
     /// Compile and execute `g` once over zero-filled buffers, one per bound (non-Internal) tensor,

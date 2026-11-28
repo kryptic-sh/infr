@@ -26,6 +26,38 @@ Provenance tags point at the finding that opened the item:
 
 ## Open
 
+### B-CI-PR-SCOPE — scope pull request CI runs to the jobs a change needs (asked by the owner, 2026-11-28)
+
+**Kind:** planned change, not started. A pull request runs every CI job,
+whatever files it touches. Run only the jobs whose inputs changed, judged from
+the pull request's changed files.
+
+- **What exists:** two workflows. `.github/workflows/ci.yml` runs on pushes to
+  `main`, `v*` tags, every `pull_request` and `workflow_dispatch`, with no path
+  filter on any trigger or job. Its jobs: `fmt`, `clippy` (a matrix over
+  operating systems), `docs`, `audit`, `test` (a matrix), `cpu-goldens`,
+  `build`, `metal-check`, `linux-arm-check`, `test-macos`, `cpu-bench-macos`,
+  `windows-smoke`, then `dist` (skipped on pull requests) and the publish jobs,
+  whose `publish-github-release` `needs` the build and test jobs and runs only
+  on a `v*` tag push. The only `if:` conditions are on tags and on the event
+  type, never on paths. `.github/workflows/cron.yml` runs `deny` and `miri`
+  weekly and on dispatch.
+- **How, without a new dependency:** a first job lists the pull request's
+  changed files against its base (`git diff --name-only`) and maps them to the
+  jobs that need them, and the other jobs read its outputs in their `if:`.
+  Changes to `.github/`, `Cargo.lock`, a `Cargo.toml` or the toolchain pin
+  select everything. In this workspace a changed crate under `crates/` selects
+  its reverse dependencies too (`cargo metadata` gives the graph). A docs-only
+  change (`docs/`, `*.md`) needs only the markdown check, if one is added. A
+  path-filter action such as `dorny/paths-filter` would be a new dependency,
+  which is the owner's call.
+- **Keep:** pushes to `main`, tags and scheduled runs still run everything. A
+  skipped job says why in the run summary rather than passing silently. A job
+  skipped by `if:` reports as skipped, so required checks and the publish jobs'
+  `needs` must tolerate it; one summary job to require is the usual answer. The
+  publish jobs only run on tag pushes, which still run every job, so they are
+  not affected as long as the selection applies to `pull_request` events only.
+
 ### B-Q4K-PACKED-META — what the packed Q4_K header load left (2026-11-28)
 
 **Kind:** coverage gaps and scoped-out work from plan 12's S6 (PR 121).

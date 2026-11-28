@@ -14285,6 +14285,85 @@ mod tests {
         );
     }
 
+    /// `mmv_q4k_meta` swaps in the packed-metadata twin exactly where one is built: a Q4_K
+    /// four-output build without the fused residual at the plain row cap, or at `m4` with or
+    /// without it. Everywhere else — the knob off, another dtype, the two-output layout, rows past
+    /// 8, an OUTS4 residual without `m4` — the selection is the one the knob-off lookup makes.
+    #[test]
+    fn mmv_q4k_meta_selects_the_packed_twin() {
+        use crate::recorder::mmv_mrow_variant;
+        let mut packed = std::collections::BTreeSet::new();
+        let mut fell_back = 0;
+        for integrated in [false, true] {
+            for &dt in &POLICY_DTYPES {
+                for m4 in [false, true] {
+                    for res in [false, true] {
+                        for in_f in [1024usize, 4096] {
+                            for rows in 1..=16 {
+                                let vk = |meta| infr_core::config::VulkanCfg {
+                                    mmv_m4: m4,
+                                    mmv_q4k_meta: meta,
+                                    ..Default::default()
+                                };
+                                let pick = |meta| {
+                                    mmv_mrow_variant(
+                                        &vk(meta),
+                                        dt,
+                                        rows,
+                                        in_f,
+                                        res,
+                                        o4_of(integrated),
+                                    )
+                                    .map(|(n, _, outs)| (n, outs))
+                                };
+                                let (scalar, on) = (pick(false), pick(true));
+                                let row_m4 = m4 && rows <= 4;
+                                let has_twin = dt == DType::Q4K
+                                    && rows <= 8
+                                    && matches!(scalar, Some((_, 4)))
+                                    && (row_m4 || !res);
+                                let at = format!(
+                                    "{dt:?} integrated={integrated} m4={m4} res={res} \
+                                     in_f={in_f} rows={rows}"
+                                );
+                                if has_twin {
+                                    let (s, _) = scalar.unwrap();
+                                    let want = format!("{s}_packed_meta");
+                                    assert_eq!(
+                                        on.map(|(n, outs)| (n.to_string(), outs)),
+                                        Some((want, 4)),
+                                        "{at}: the knob did not select the packed twin"
+                                    );
+                                    packed.insert((row_m4, res));
+                                } else {
+                                    assert_eq!(
+                                        on, scalar,
+                                        "{at}: the knob changed a build with no twin"
+                                    );
+                                    if dt == DType::Q4K {
+                                        fell_back += 1;
+                                    }
+                                }
+                                if let Some((n, _)) = scalar {
+                                    assert!(
+                                        !n.ends_with("_packed_meta"),
+                                        "{at}: knob off selected {n}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            packed.into_iter().collect::<Vec<_>>(),
+            [(false, false), (true, false), (true, true)],
+            "the packed twin was not selected for every (m4, res) build it has"
+        );
+        assert!(fell_back > 0, "no Q4_K lookup without a twin was checked");
+    }
+
     /// Compile and execute `g` once over zero-filled buffers, one per bound (non-Internal) tensor,
     /// `usage` naming any that need something other than Weights/Activations (KV caches, the
     /// positions staging buffer). The refusal tests below only need `lower_op` to run.

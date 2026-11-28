@@ -72,13 +72,18 @@ this slice showed on Intel has no known cause (B-GEMMA-DECODE-ROPE-GAIN).
   memory budget. Find out what `VK_EXT_memory_budget` reports before and after
   the filler, then fix the guard or the test, whichever is wrong.
 
-## S4. Core count
+## S4. Core count — answered: it stays unknown
 
-`0xa721` is not in `intel_shader_core_count` (transcribed from llama.cpp), so
-the device reports `cores:?` and every rule scaled by core count falls back. A
-device id does not fix the EU count (the same id ships in 80 and 96 EU parts),
-so read it from the driver if ANV exposes it. Otherwise leave it unknown and
-tune the parameters that depend on it directly in S5.
+Neither the driver nor llama.cpp reports one. ANV on `0xa721` advertises no
+core-count property (`VK_INTEL_device_info` carries only an IP version), and
+llama.cpp's `ggml_vk_intel_shader_core_count` has no entry for it either. It
+uses placeholders instead. A device id does not fix the EU count (the same id
+ships in 80 and 96 EU parts), so none is hardcoded. On this device only two
+rules run on the fallback: the integrated prefill chunk
+(`integrated_ubatch_rows`, 128 rows) and the submit prior
+(`submit.prior_gflops`, 16). S5 tunes both directly. The rest are off here by
+their own switches. A Linux-only i915/xe topology query is the one way left to
+read the count; it is in B-INTEL-IGPU-PERF.
 
 ## S5. Tuning rows for the Intel iGPU
 

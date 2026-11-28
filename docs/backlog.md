@@ -226,8 +226,13 @@ rule in AGENTS.md: output unchanged or no further from the CPU reference.
   timeout. The i915/xe kernel driver has its own preemption and reset timeouts.
   Measure what the Intel part tolerates before raising the chunk height, which
   is where prefill speed on an iGPU comes from.
-- **The core count.** `0xa721` reports `cores:?` (plan 19 S4). Rules scaled by
-  core count (split-K windows, grid sizing) take their fallback here.
+- **The core count.** `0xa721` reports `cores:?`, and no Vulkan property or
+  llama.cpp table gives it (plan 19 S4). The fallback decides two rules here,
+  the 128-row integrated prefill chunk and the 16 GFLOP/s `submit.prior_gflops`,
+  which S5 tunes directly. The one source left is the kernel driver: the i915/xe
+  topology query (a raw ioctl, Linux-only, outside `caps.rs`). That would be a
+  new mechanism, the owner's call. The CPU model is not a source, because the
+  i5-1335U and the i7-1355U share the id at 80 and 96 EU.
 
 ### B-WIN-IGPU-NAN-BUDGET — the budget probe's allocations gave NaN on an AMD iGPU (2026-11-28)
 

@@ -26,6 +26,35 @@ Provenance tags point at the finding that opened the item:
 
 ## Open
 
+### B-Q4K-PACKED-META — what the packed Q4_K header load left (2026-11-28)
+
+**Kind:** coverage gaps and scoped-out work from plan 12's S6 (PR 121).
+
+`mmv_mrow.q4k_packed_meta` selects the packed-metadata twin of the Q4_K
+four-output int8 decode GEMV (`native_mmv_mrow_q4k_o4`, `_o4_m4`, `_o4_m4_res`).
+It is on only through the table rows
+`amd-proprietary-rdna2-integrated-q4k-packed-meta` and
+`radv-rdna2-integrated-q4k-packed-meta`. Figures are in
+`docs/perf/vulkan-q4k-packed-meta.md`.
+
+- **Devices not measured.** Every other integrated GPU: AMD architectures other
+  than RDNA2 (the Ryzen AI parts), and the Intel iGPU (`intel-rplu-igpu-anv`),
+  which keeps the generic default off. A row for one of them needs the decode
+  A/B the perf doc describes (`INFR_TUNE=mmv_mrow.q4k_packed_meta=true|false`),
+  alternated, on that device.
+- **The RADV row rests on the contributor's one measurement**: gemma-4 E4B
+  Q4_K_M at one depth on a Ryzen 7 7800X3D iGPU, +24.8%, not reproduced here (no
+  RADV on the Windows box, and the model was not cached). It is a `contributor`
+  row, so it logs at startup.
+- **Builds without a twin.** The FUSE_QUANT builds (`INFR_MMV_FUSE_QUANT`, off
+  by default), the two-output builds and the rows-past-8 `_m16` build read the
+  header as before. Q5_K shares the six-bit scale layout (`k4()` serves both)
+  and has no twin either. Each would need its own bit-identity check and a
+  measurement on a device it reaches.
+- **Discrete GPUs** gained at most 0.4% on the RX 7900 XTX and nothing on the RX
+  580, so they keep the scalar build. Not a defect; recorded so the default is
+  not re-proposed without a new measurement.
+
 ### B-INTEL-IGPU — the first run on an Intel iGPU: what failed and why (2026-11-27)
 
 **Kind:** findings from a run, the fixes in progress and queued.

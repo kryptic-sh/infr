@@ -105,6 +105,22 @@ jobs:
           RUSTDOCFLAGS:
             "-D rustdoc::broken_intra_doc_links -D rustdoc::private_intra_doc_links"
 
+  # RustSec advisories against `Cargo.lock`, on every change. `cargo audit`
+  # fetches the advisory DB itself and fails only on a vulnerability: an
+  # unmaintained or yanked crate is a warning. `cron.yml`'s cargo-deny run
+  # rechecks a quiet tree weekly.
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      # A prebuilt binary rather than `cargo install`, as for cargo-deny.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - run: cargo audit
+
   test:
     name: cargo test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

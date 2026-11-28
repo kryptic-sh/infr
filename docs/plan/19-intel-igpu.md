@@ -53,14 +53,12 @@ agreed between the two sessions:
 - **An Intel-only cause stays here**, for example a 16-wide subgroup in the
   quantizer.
 
-## S2c. Win RoPE's speed back — done on Intel; the XTX measurement is owed
+## S2c. Win RoPE's speed back — done (`100302da`)
 
 The rotary shaders read the CPU's own `rope_freqs` table from a buffer
-(`VulkanBackend::rope_freq_table`) instead of deriving each frequency in
-double-float, and their output is bit-identical to the build before. What is
-left: tg128 on the RX 7900 XTX, through the Windows session, against the build
-before S2 and the one before this slice, alternated. The gemma-3 decode gain
-this slice showed on Intel has no known cause (B-GEMMA-DECODE-ROPE-GAIN).
+(`VulkanBackend::rope_freq_table`), and their output is bit-identical to the
+build before. It wins back what S2 cost on every device measured. The gemma-3
+decode gain on Intel has no known cause (B-GEMMA-DECODE-ROPE-GAIN).
 
 ## S3. The harness failures — the first two done; the pool guard is B-ANV-UMA-BUDGET-GUARD
 
@@ -85,33 +83,18 @@ rules run on the fallback: the integrated prefill chunk
 their own switches. A Linux-only i915/xe topology query is the one way left to
 read the count; it is in B-INTEL-IGPU-PERF.
 
-## S5. Tuning rows for the Intel iGPU
+## S5. Tuning rows for the Intel iGPU — done
 
-There is no `infr tune sweep` yet (plan 10 section 3.5). Sweep by hand: for each
-candidate parameter (`infr tune list`; first `device.sg_pref`, `gemv.variant`,
-`gemv.kq_fma`, `gemv_rm.rows`, `gemv_sg.rows`, `mmv_mw.warps@*`, the prefill
-tile and split-K parameters, and the chunk height and submit split the watchdog
-rule sets), run
-
-```text
-INFR_DEV=Vulkan0 INFR_TUNE=<param>=<value> infr bench -p 512 -n 0 -r 5 <model>
-INFR_DEV=Vulkan0 INFR_TUNE=<param>=<value> infr bench -p 0 -n 128 -r 5 <model>
-```
-
-on Qwen3-1.7B, Llama-3.2-1B and Gemma-3-1B Q4_K_M, alternating values in one
-quiet window (AGENTS.md "Performance measurements"). Then run `infr tune check`
-at the winning set. A value that wins and stays within tolerance goes into a
-row:
-
-- a class row (`vendor = "intel"`, `arch = "IntelXe1"`,
-  `driver = "INTEL_OPEN_SOURCE_MESA"`, `integrated = true`) for what should hold
-  across Xe-LP iGPUs;
-- a device row (`device_id = 0xa721`) only for what is plainly specific to this
-  part.
-
-Each row cites its source (device, driver, date, command, evidence) the way the
-AMD rows do. The snapshot test for the Intel fixture changes with it, and no
-other fixture's snapshot may.
+One value beat the defaults on Qwen3-1.7B, Llama-3.2-1B and gemma-3-1b:
+`gemv_rm.rows = 4`, in the class row `intel-xe-lp-anv-integrated-gemv-rm`. It
+was measured with `device.i8_dot` off. With the other defaults it reaches only
+the Q6_K GEMVs outside the subgroup band. The row's source block lists what else
+was tried and lost. The prefill chunk is `integrated_ubatch_rows`, not a table
+parameter, and 256 or 512 rows did not speed prefill up while the int8 dot is
+off. The kernels behind `mmv_mw.warps` and split-K do not run on this device
+with the dot off. Sweep again once S2b turns the dot back on: prefill then takes
+the int8 kernels, and the chunk height and those kernels become worth tuning.
+The llama.cpp baseline is in B-INTEL-IGPU-PERF.
 
 ## Not in this plan
 

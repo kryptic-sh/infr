@@ -359,9 +359,17 @@ fn defaults_are_the_pre_table_rules() {
         let g = &d.kernels.vulkan.gemv;
         assert_eq!(t.gemv_variant, g.variant, "{id}");
         assert_eq!(t.gemv_rm_enabled, !g.no_rm);
+        // The one row that moves a default here: `intel-xe-lp-anv-integrated-gemv-rm` sets 4 rows
+        // on an integrated Intel Xe1 GPU (Xe-LP and Xe-LPG) under Mesa ANV.
+        let xe_lp_anv = f.vendor() == "intel"
+            && f.arch == "IntelXe1"
+            && f.driver.as_deref() == Some("INTEL_OPEN_SOURCE_MESA")
+            && f.integrated;
+        let rm = if xe_lp_anv { 4 } else { g.rm };
         assert_eq!(
             (t.gemv_rm_rows, t.gemv_rm_min_out, t.gemv_rm_max_out),
-            (g.rm, g.rm_minout, g.rm_maxout)
+            (rm, g.rm_minout, g.rm_maxout),
+            "{id}"
         );
         assert_eq!(
             (t.gemv_sg_enabled, t.gemv_id_sg_enabled),

@@ -815,6 +815,28 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   A770 under the same driver included, is unchanged. The row goes once the dp4a
   kernels pass here; `INFR_TUNE=device.i8_dot=true` or
   `kernels.vulkan.tuning.rows = false` turns them back on meanwhile.
+- **On an integrated Intel Xe1 GPU under Mesa ANV, the multi-row (RM) decode
+  GEMV writes four output rows per workgroup** (table row
+  `intel-xe-lp-anv-integrated-gemv-rm`, `gemv_rm.rows = 4`; the default is 2).
+  Its output is unchanged: each row's sum does not depend on how many rows share
+  a workgroup. With this device's other defaults it reaches only the Q6_K GEMVs
+  outside the subgroup band (`gemv_sg.min_out` to `gemv_sg.max_out`), such as a
+  Q6_K output head. Q4_K takes the `gemv.variant = reg` kernel first, which is
+  unchanged. The row matches Xe-LP and Xe-LPG alike (Tiger Lake to Raptor Lake,
+  and Meteor Lake and Arrow Lake too), and was measured on the Raptor Lake-U
+  iGPU only (PCI 0xa721, Mesa ANV driverVersion 0x6803001, i915). The command
+  was
+  `INFR_DEV=Vulkan0 INFR_TUNE=gemv_rm.rows=4 infr bench --dev Vulkan0 --json <model>`,
+  with `-p 0 -n 128 -r 3` and `-p 512 -n 0 -r 1`. Each candidate ran once
+  between two default runs, at load average 0.01 to 1.68. All three models are
+  Q4_K_M. tg128 on Qwen3-1.7B went from 10.20/10.20 to 10.42 t/s, on
+  Llama-3.2-1B-Instruct from 14.35/14.34 to 14.46, and on gemma-3-1b-it from
+  9.07/9.08 to 9.07. pp512 did not move: Llama-3.2-1B 22.23/22.29 to 22.28,
+  gemma-3-1b 15.83/15.90 to 15.91, Qwen3-1.7B 13.3/13.3 to 13.3.
+  `gemv.variant = sg` also beat the defaults (tg128 Qwen3 10.37, Llama 14.46),
+  but by less, and the two together scored below the row alone (Qwen3 10.32).
+  `device.sg_pref = 32`, the other `gemv.variant` builds, `gemv_sg.rows = 4` or
+  `8` and `submit.prior_gflops = 32` or `64` lost or did not move.
 - **A context whose RoPE angles would pass 2^24 rad is refused at session
   sizing**, on every backend, where it used to be accepted. The largest angle is
   the last position over the smallest rope frequency divisor
@@ -1648,7 +1670,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   from 17.6 / 17.5 to 17.4 / 17.5; gemma-3-1b-it Q4_K_M pp512 from 353.4 / 352.9
   to 352.7 / 352.6 and tg128 from 15.1 / 15.0 to 17.8 / 17.7. That decode gain
   is larger than anything RoPE cost before, and its cause is not known yet
-  (B-GEMMA-DECODE-ROPE-GAIN).
+  (B-GEMMA-DECODE-ROPE-GAIN). On the RX 7900 XTX (AMD Windows driver 2.0.353,
+  six alternated rounds of `infr bench -r 3`), against the build before this
+  fix, Qwen3-1.7B Q4_K_M tg128 went from 451.76 to 452.67 t/s and pp512 from
+  11542.20 to 11514.98, and gemma-3-1b-it Q4_K_M tg128 from 420.96 to 418.93.
 - **Expert-parallel MoE prefill on Vulkan stays inside the guaranteed workgroup
   limit.** The band remap after each MoE layer's top-k (`moe_ep_band_remap`)
   dispatched one workgroup per (token, slot) assignment where each workgroup

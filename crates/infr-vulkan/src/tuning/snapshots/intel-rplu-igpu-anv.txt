@@ -1,15 +1,16 @@
 device:  Intel(R) Graphics (RPL-U) (IntelXe1, INTEL_OPEN_SOURCE_MESA, integrated)
 match:   vendor=intel arch=IntelXe1 driver=INTEL_OPEN_SOURCE_MESA integrated=true device_id=0xa721 cu=0 subgroup=8-32 driver_version=0x6803001
-hash:    67b199a4
+hash:    d28ad523
 rows:
   intel-xe-lp-anv-integrated-i8-dot [class row, maintainer] sets device.i8_dot
+  intel-xe-lp-anv-integrated-gemv-rm [class row, maintainer] sets gemv_rm.rows
 
 device.sg_pref               16        default
 device.i8_dot                false     row intel-xe-lp-anv-integrated-i8-dot
 gemv.variant                 reg       default
 gemv.kq_fma                  false     default
 gemv_rm.enabled              true      default
-gemv_rm.rows                 2         default
+gemv_rm.rows                 4         row intel-xe-lp-anv-integrated-gemv-rm
 gemv_rm.min_out              2048      default
 gemv_rm.max_out              max       default
 gemv_sg.enabled              true      default

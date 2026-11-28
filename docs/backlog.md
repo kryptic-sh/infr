@@ -391,14 +391,25 @@ the free at once while the free figure came back about 2 s later. Left:
 
 **Kind:** flaky CI test, not fixed.
 
-`crates/infr-metal/tests/gemv_bw.rs` `f16_native_probe` failed once in
-`cargo test (macOS / Metal)` on `91cc4df8` with "dequant-cached f32 weight would
-exceed the GPU working set: 4.64 GiB allocated + 0.28 GiB for this F16 tensor >
-4.67 GiB budget". That commit touched no Metal code, the job passed on
-`3def4aec`, and a re-run of the same job on the same commit passed. The test
-allocates to within a few hundred MB of the runner's working set, so it passes
-or fails on what else the runner holds. Shrink its shapes, or skip it under the
-budget, the way the other bench tests do.
+`crates/infr-metal/tests/gemv_bw.rs` `f16_native_probe` failed in
+`cargo test (macOS / Metal)` on `91cc4df8`, on `14aa555d` (a docs-only commit)
+and on `0006fdb3` (a tuning-table change), the last two on 2026-11-28. Each time
+it failed with "dequant-cached f32 weight would exceed the GPU working set: 4.64
+GiB allocated + 0.28 GiB for this F16 tensor > 4.67 GiB budget". None of those
+commits touched Metal code. A re-run of the job on the same commit passed the
+first two times.
+
+The likely cause (suspected, not shown): the CI step runs
+`cargo test -p infr-metal --locked -- --include-ignored` with no
+`--test-threads`, so libtest runs this file's bandwidth probes in parallel.
+`f16_native_probe`'s cached-f32 arm alone holds eight 65536 × 1152 f32 weights,
+about 2.25 GiB. Two or three probes at once would pass the runner's 4.67 GiB
+working set, which fits the "4.64 GiB allocated" before its last tensor. Fixes,
+cheapest first:
+
+- serialise the probes in `gemv_bw.rs` behind one static `Mutex`;
+- run that test binary with `--test-threads=1`;
+- shrink the probe shapes.
 
 ### B-GEMMA-DECODE-ROPE-GAIN — gemma-3 decode got 19% faster from the RoPE table, and why is unknown (2026-11-28)
 
@@ -421,6 +432,14 @@ What is known:
   dispatch, which is far too little to explain 11 ms a token.
 - A review of the diff found no skipped or shortened work: the workgroup counts,
   fused KV writes and record-once path are unchanged.
+
+It is Intel-only. The Windows session ran the same three builds alternated
+(72e8d84f, 0642de45, 100302da; `infr bench -r 3`, six rounds, AMD Windows driver
+2.0.353). gemma-3-1b tg128 on the RX 7900 XTX went 420.96 / 404.29 / 418.93, and
+on the AMD iGPU 20.40 / 20.40 / 20.44. On neither GPU is the result above the
+pre-RoPE build. It is not the GLSL built-ins being slow on Xe1 either: the
+pre-RoPE build used `pow`, `sin` and `cos` and decoded at the same 15.0 t/s as
+0642de45.
 
 A guess, not shown: the decode path's record-once `qk_norm_rope` variants
 (`USE_PARAMS`, BDA) were slow on ANV in a way the static ones are not. Examples
@@ -729,7 +748,7 @@ which removes most repeated pipeline creation within a process and so changes
 how much this is worth; and before the float lineup's kernel slices (plan 16, S3
 on), which edit shaders in every slice.
 
-### B-SERVER-PANIC-GAUGE-FLAKE — `streaming_panic_is_reported_as_a_failure` failed once (2026-11-27)
+### B-SERVER-PANIC-GAUGE-FLAKE — `streaming_panic_is_reported_as_a_failure` fails now and then (2026-11-27)
 
 **Kind:** flaky test, not diagnosed. In a full
 `INFR_DEV=Vulkan1 cargo nextest run --workspace --locked`, the infr-server test
@@ -738,7 +757,9 @@ that the slot gauge is released by the unwind (gauge 1, expected 0). It passed
 five times alone and in the next full run (1814 of 1814). The guess, untested:
 the assertion reads the gauge before the panicking stream task's unwind has
 dropped its slot, a race with the runtime's worker thread. The change under test
-that day touched only Vulkan kernels.
+that day touched only Vulkan kernels. It failed the same way again on
+2026-11-28, in a full run under load during plan 19 S5's checks (a tuning-table
+change), and passed in three re-runs of its own.
 
 ### B-REFERENCE-CACHE — what slice 1 of the reference cache left (2026-11-26)
 

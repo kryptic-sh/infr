@@ -1579,22 +1579,25 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   and after the weight load, the `kv.overflow` placement and the unified-memory
   spill all read that figure, so the guard admitted any number of unwritten
   allocations and a context sized from the room could come out larger than the
-  device could hold. A backend now makes three unwritten 64 MiB allocations when
-  it opens and measures the free figure of the heap they land in. Where the
-  median drop is under half of one (32 MiB), every later reading is held at the
-  per-heap budget read then, so the room is that budget less what the process
-  holds, or the live figure when that is lower. Where the drop is at least that,
-  where the device refuses the allocation, and on a device without
-  `VK_EXT_memory_budget`, no ceiling is set and the reading is used as before.
-  Where that heap has under 96 MiB free before a round, the probe is skipped and
-  no ceiling is set either; on ANV that means under about 107 MiB of host memory
-  available at open, and that backend is then left unguarded as before for its
-  life, so the defect returns if the host frees memory later.
-  `kernels.vulkan.vram_limit` caps the result as before. On ANV the guard now
-  refuses allocations it used to admit, and an auto-sized context can come out
-  smaller: memory the host frees after the backend opens, including pages a
-  backend closed just before freed, is not seen by it. The probe was run only on
-  the Intel iGPU so far.
+  device could hold. A backend on Mesa ANV with unified memory now makes three
+  unwritten 64 MiB allocations when it opens and measures the free figure of the
+  heap they land in. Where the median drop is under half of one (32 MiB), every
+  later reading is held at the per-heap budget read then, so the room is that
+  budget less what the process holds, or the live figure when that is lower.
+  Where the drop is at least that, where the device refuses the allocation, and
+  on a device without `VK_EXT_memory_budget`, no ceiling is set and the reading
+  is used as before. Where that heap has under 96 MiB free before a round, the
+  probe is skipped and no ceiling is set either; on ANV that means under about
+  107 MiB of host memory available at open, and that backend is then left
+  unguarded as before for its life, so the defect returns if the host frees
+  memory later. `kernels.vulkan.vram_limit` caps the result as before. On ANV
+  the guard now refuses allocations it used to admit, and an auto-sized context
+  can come out smaller: memory the host frees after the backend opens, including
+  pages a backend closed just before freed, is not seen by it. Every other
+  driver skips the probe and keeps its reading as before: on AMD's Windows
+  driver for an RDNA2 iGPU, every run gave NaN logits once the probe was added,
+  although it set no ceiling there, and why is not known yet. The probe was run
+  only on the Intel iGPU so far.
 - **Vulkan RoPE takes the CPU reference's angle, and accurate sine and cosine of
   it, on drivers with loose transcendental built-ins.** Every rotary shader
   (`rope.comp`, `qk_norm_rope.comp`, `qk_norm_rope_interleaved.comp`,

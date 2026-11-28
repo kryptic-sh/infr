@@ -1304,6 +1304,16 @@ fn budget_ceiling<H>(
     Some(read().into_iter().map(|(budget, _)| budget).collect())
 }
 
+/// Whether [`probe_budget_ceiling`] runs on a device: only on Mesa ANV with unified memory, the
+/// one driver whose free figure is known not to drop with an allocation. Elsewhere the probe could
+/// only confirm the reading is honest, and its allocations are not free of effect on every driver
+/// (B-WIN-IGPU-NAN-BUDGET).
+fn budget_probe_applies(probe: &crate::caps::DeviceProbe, unified_memory: bool) -> bool {
+    unified_memory
+        && probe.driver_id_reported
+        && probe.driver_id == vk::DriverId::INTEL_OPEN_SOURCE_MESA
+}
+
 /// [`budget_ceiling`] for this device, probed with unwritten allocations in the first
 /// device-local memory type and measured on that type's heap. `None` without
 /// `VK_EXT_memory_budget`, where the guard counts this backend's own allocations instead
@@ -3668,7 +3678,11 @@ impl VulkanBackend {
         backend.shared.kv_alloc_cost();
         // After it, so the ceilings are read with none of its probes held, and before anything
         // else reads the budget.
-        let ceiling = probe_budget_ceiling(&backend.shared);
+        let ceiling = if budget_probe_applies(&device_probe, backend.shared.caps.unified_memory) {
+            probe_budget_ceiling(&backend.shared)
+        } else {
+            None
+        };
         backend.shared.budget_ceiling.get_or_init(|| ceiling);
 
         // `kernels.vulkan.vram_limit`: say what every budget on this device will be measured
@@ -7693,6 +7707,32 @@ mod tests {
             |()| half.set(0),
         );
         assert_eq!(ceiling, None);
+    }
+
+    /// The budget probe runs on Mesa ANV with unified memory only: not on another driver, not
+    /// without unified memory, and not where the driver id was never reported.
+    #[test]
+    fn the_budget_probe_runs_on_anv_with_unified_memory_only() {
+        let probe = |driver_id, driver_id_reported| crate::caps::DeviceProbe {
+            driver_id,
+            driver_id_reported,
+            ..Default::default()
+        };
+        let anv = probe(vk::DriverId::INTEL_OPEN_SOURCE_MESA, true);
+        assert!(budget_probe_applies(&anv, true));
+        assert!(!budget_probe_applies(&anv, false));
+        assert!(!budget_probe_applies(
+            &probe(vk::DriverId::INTEL_OPEN_SOURCE_MESA, false),
+            true
+        ));
+        for other in [
+            vk::DriverId::AMD_PROPRIETARY,
+            vk::DriverId::MESA_RADV,
+            vk::DriverId::INTEL_PROPRIETARY_WINDOWS,
+            vk::DriverId::NVIDIA_PROPRIETARY,
+        ] {
+            assert!(!budget_probe_applies(&probe(other, true), true));
+        }
     }
 
     /// The cost the probes support, on hand-made drivers, each probe at memory-requirements

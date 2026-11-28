@@ -229,6 +229,38 @@ rule in AGENTS.md: output unchanged or no further from the CPU reference.
 - **The core count.** `0xa721` reports `cores:?` (plan 19 S4). Rules scaled by
   core count (split-K windows, grid sizing) take their fallback here.
 
+### B-WIN-IGPU-NAN-BUDGET — the budget probe's allocations gave NaN on an AMD iGPU (2026-11-28)
+
+On the Windows box's AMD iGPU (Ryzen 9950X3D's RDNA2, AMD Windows driver
+2.0.353, unified memory), every run gave NaN logits from 0467360f on, float
+configs included. That commit added `probe_budget_ceiling` in `infr_vulkan`. The
+session there bisected it with
+`infr tune check unsloth/ERNIE-4.5-0.3B-PT-GGUF:Q4_K_M` on that device: 4d06dc6c
+passes, 0467360f fails (`token_misses 82 <= 0 FAIL`). The RX 7900 XTX on the
+same box passes, and the probe's debug line read `ceiling=None` at every backend
+open on both devices. So no ceiling was held. The only runtime change on that
+device was the probe itself: three 64 MiB allocations in the first device-local
+memory type, never written, each freed straight away. A review compared every
+path that reads the budget with 0467360f^ and found them identical when no
+ceiling is set.
+
+The probe now runs only on Mesa ANV with unified memory
+(`budget_probe_applies`), the one driver it exists for. That removes the
+trigger, not the cause. Allocating and freeing memory that is never written
+cannot make NaN by itself. The likely mechanism (a guess, not shown) is a buffer
+infr reads before writing it: fresh allocations on that driver come back zeroed,
+and after the probe's frees a later allocation reuses memory that is not. If so,
+other allocation churn could bring the NaN back on that iGPU: a model reload, a
+second backend in one process, or eviction. What is left to do:
+
+- Confirm on the Windows box's iGPU that main with the gate passes again.
+- Find the buffer. Run the probe again (or any allocate and free of similar size
+  before the load) and fill new allocations with a NaN pattern to see which one
+  is read before it is written. Then fix that path to initialise it.
+- The gate's call site in `VulkanBackend` construction is not covered by a test.
+  `the_budget_probe_runs_on_anv_with_unified_memory_only` covers only the
+  predicate.
+
 ### B-ANV-UMA-BUDGET-GUARD — what the budget ceiling left on the Intel iGPU (2026-11-27)
 
 **Kind:** findings left by the fix, not fixed.

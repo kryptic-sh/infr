@@ -267,16 +267,15 @@ and these exist to force one off when bisecting a correctness or perf problem.
   (runs the wave64 path that AMD GCN takes on a device that can pin 32),
   GEMM/GEMV tiers (`gemm_warp`, `mmq`, `mmv`, `mmv_q4k_meta` — opt-in packed
   Q4_K header loads, see `docs/perf/vulkan-q4k-packed-meta.md` — `mrow`,
-  `moe_small_m`, the `[kernels.vulkan.gemv]` sub-table), attention (`flash_warp`,
-  `flash_splits`,
-  `flash_min_rows`, `pv_splits`), DeltaNet (`dn_chunk_scan`, `dn_chunk`,
-  `dn_split`), and the plumbing switches (`push_desc`, `pipeline_cache_disk`,
-  `no_replay`, `no_vram_guard`, `gfx_queue` — an alias that turns the
-  `queue.family` tuning parameter to `graphics` — the BDA chunk caps). Note
-  `f16 = false` also disables coopmat regardless of `coopmat`, matching
-  `INFR_NO_F16`'s effect today. The hardware-shaped numbers (split counts,
-  thresholds, rows per workgroup, subgroup pins) are per-device tuning
-  parameters, set under `[kernels.vulkan.tune]`; see the next section.
+  `moe_small_m`, the `[kernels.vulkan.gemv]` sub-table), attention
+  (`flash_warp`, `flash_splits`, `flash_min_rows`, `pv_splits`), DeltaNet
+  (`dn_chunk_scan`, `dn_chunk`, `dn_split`), and the plumbing switches
+  (`push_desc`, `pipeline_cache_disk`, `no_replay`, `no_vram_guard`, `gfx_queue`
+  — an alias that turns the `queue.family` tuning parameter to `graphics` — the
+  BDA chunk caps). Note `f16 = false` also disables coopmat regardless of
+  `coopmat`, matching `INFR_NO_F16`'s effect today. The hardware-shaped numbers
+  (split counts, thresholds, rows per workgroup, subgroup pins) are per-device
+  tuning parameters, set under `[kernels.vulkan.tune]`; see the next section.
 - **`[kernels.metal]`** — the Apple backend's native/CMM/RT kernel families per
   dtype, plus `deltanet`, `moe` and `pipeline_cache` (persist the compiled
   `MTLComputePipelineState`s as an `MTLBinaryArchive` under `~/.cache/infr`, so

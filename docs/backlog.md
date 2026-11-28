@@ -222,12 +222,33 @@ This entry is the work beyond that, the kernels and paths themselves, each a
 candidate until measured. None of it has been measured. Each one is held to the
 rule in AGENTS.md: output unchanged or no further from the CPU reference.
 
-- **A baseline first.** llama.cpp is cloned at `ref/llama.cpp` on the Intel
-  laptop but not built yet, so nothing yet says how far infr is from llama.cpp's
-  Vulkan backend on this device. Build it and run `infr compare` or `infr bench`
-  against `llama-bench` on Qwen3-1.7B, Llama-3.2-1B and Gemma-3-1B Q4_K_M, pp512
-  and tg128, in a quiet window. That baseline decides which items below are
-  worth doing.
+- **The baseline (2026-11-28).** llama.cpp 9fa7a33cb (`ref/llama.cpp`, Vulkan
+  backend, `-ngl 99`) against infr 53d15f19, on the Raptor Lake-U iGPU (Vulkan0,
+  Mesa ANV), all three models Q4_K_M. Both tools ran with `-r 3`, alternated
+  over two rounds in a quiet window at load average 0.08 to 1.19;
+  `llama-bench -p 512 -n 0` and `-p 0 -n 128`, and the same flags to
+  `infr bench --dev Vulkan0 --json`. "infr i8" is one more round of infr with
+  `INFR_TUNE=device.i8_dot=true` (load under 1), the setting the table row turns
+  off because gemma-3 fails its tolerance rows with it.
+
+  | model, test         | llama.cpp     | infr        | infr i8 |
+  | ------------------- | ------------- | ----------- | ------- |
+  | Qwen3-1.7B pp512    | 523.24/519.89 | 13.14/13.15 | 148.33  |
+  | Qwen3-1.7B tg128    | 15.73/15.74   | 10.25/10.27 | 16.65   |
+  | Llama-3.2-1B pp512  | 741.42/746.40 | 22.31/22.37 | 212.12  |
+  | Llama-3.2-1B tg128  | 20.82/21.61   | 14.23/14.34 | 20.96   |
+  | gemma-3-1b-it pp512 | 768.79/776.74 | 15.83/15.85 | 345.20  |
+  | gemma-3-1b-it tg128 | 20.02/20.11   | 9.09/9.08   | 16.82   |
+
+  What it says: the int8 dot (plan 19 S2b) is the largest lever. With it, infr's
+  decode is level with llama.cpp on Qwen3 and Llama and behind on gemma-3, and
+  prefill is still 2.2x to 3.5x behind. Without it, prefill is 33x to 49x behind
+  and decode 1.5x to 2.2x. So after S2b lands, the prefill GEMM tier on a device
+  with dp4a and no cooperative matrix is the next target; llama.cpp's banner
+  reads `int dot: 1 | matrix cores: none` on this device, the same tier. Not
+  checked: how close llama.cpp's output is to the CPU reference here, so this
+  compares speed only.
+
 - **Subgroup widths.** Xe-LP's subgroup range is 8 to 32 and `device.sg_pref`
   resolves to 16 on it. Kernels that pin 32 run SIMD32 on Intel, which can cost
   occupancy and registers there. See which kernels pin which width on this

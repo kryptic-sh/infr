@@ -42,7 +42,7 @@ layout(push_constant) uniform PC {
     uint pos;              // first token position
     uint mask_type;        // 0 = causal, 1 = sliding window, 2 = canvas
     uint window;
-    float theta;
+    float theta;           // unused: the frequencies come from the bound `rf` table
     uint cache_cap_rows;   // ring-buffer row capacity (0 or >= kv_len = full context)
     uint canvas_lo;        // `AttnMask::Canvas { lo }` lower bound; read on mask_type == 2 only
 } pc;
@@ -57,10 +57,14 @@ layout(binding = 1) readonly buffer KB { uint ku[]; };
 layout(binding = 2) readonly buffer WKB { float wk_b[]; };
 // wv_b: [n_head, kv_lora_rank, v_head_dim] — f32
 layout(binding = 3) readonly buffer WVB { float wv_b[]; };
+// rf: the internal q_pe rope's per-pair frequencies (`qk_rope_dim/2` floats), the CPU reference's
+// `rope_freqs` table for theta and qk_rope_dim, built on the host
+// (`VulkanBackend::rope_freq_table`), so the angle `pos * rf[p]` is the CPU's.
+layout(binding = 4) readonly buffer RFB { float rf[]; };
 // dst: [rows, n_head, v_head_dim] — f32 writeonly
 //
 // The two optional read bindings come BEFORE dst, in this order, because the hazard tracker treats
-// the TRAILING binding as the write: the recorder binds [.., ff, kbias, dst], so `dst` must stay
+// the TRAILING binding as the write: the recorder binds [.., rf, ff, kbias, dst], so `dst` must stay
 // last or the read-only buffers would be marked written and `dst` left untracked (no store→read
 // barrier before the wo-projection reads it — nondeterminism).
 //
@@ -70,17 +74,17 @@ layout(binding = 3) readonly buffer WVB { float wv_b[]; };
 //                   deepseek32's lightning-indexer top-k, 0 on the selected keys and -inf
 //                   elsewhere. Indexed by KEY POSITION, not by the ring row.
 #if defined(FREQ_FACTORS) && defined(KEY_BIAS)
-layout(binding = 4) readonly buffer FB { float ff[]; };
+layout(binding = 5) readonly buffer FB { float ff[]; };
+layout(binding = 6) readonly buffer BB { float kbias[]; };
+layout(binding = 7) writeonly buffer DB { float dst[]; };
+#elif defined(FREQ_FACTORS)
+layout(binding = 5) readonly buffer FB { float ff[]; };
+layout(binding = 6) writeonly buffer DB { float dst[]; };
+#elif defined(KEY_BIAS)
 layout(binding = 5) readonly buffer BB { float kbias[]; };
 layout(binding = 6) writeonly buffer DB { float dst[]; };
-#elif defined(FREQ_FACTORS)
-layout(binding = 4) readonly buffer FB { float ff[]; };
-layout(binding = 5) writeonly buffer DB { float dst[]; };
-#elif defined(KEY_BIAS)
-layout(binding = 4) readonly buffer BB { float kbias[]; };
-layout(binding = 5) writeonly buffer DB { float dst[]; };
 #else
-layout(binding = 4) writeonly buffer DB { float dst[]; };
+layout(binding = 5) writeonly buffer DB { float dst[]; };
 #endif
 
 // Add the score mask at key POSITION `j` (NOT the ring row) for this workgroup's query row. The
@@ -189,12 +193,11 @@ void main() {
     }
     // Rope q_pe into sq[kv_lora_rank ..]: pair p owned by lane p, p+128, ... (qk_rope_dim ≤ 64,
     // so at most ceil(64/128) = 1 pair per lane); each lane computes sin/cos for its pair.
-    // ln theta inside the loop: a lane runs it at most once, and the lanes without a pair skip it.
     uint hf = pc.qk_rope_dim >> 1u;
     for (uint p = tid; p < hf; p += 128u) {
         uint i0 = 2u * p;
         uint i1 = i0 + 1u;
-        precise float ang = float(abs_pos) * rope_freq(rope_ln_theta(pc.theta), p, pc.qk_rope_dim);
+        precise float ang = float(abs_pos) * rf[p];
 #ifdef FREQ_FACTORS
         ang = rope_div(ang, ff[p]);
 #endif

@@ -507,7 +507,7 @@ fn main() {
         // head's math. Dispatched by `Recorder::mla`.
         ("mla", "mla", &[]),
         // YaRN freq_factors variant: the internal q_pe rope DIVIDES its angle by ff[pair]
-        // (`-DFREQ_FACTORS` adds the binding-4 ff buffer — see `Recorder::mla`).
+        // (`-DFREQ_FACTORS` adds the binding-5 ff buffer — see `Recorder::mla`).
         ("mla", "mla_ff", &["-DFREQ_FACTORS"]),
         // deepseek32: `-DKEY_BIAS` adds the `[rows, kv_len]` additive score mask the lightning
         // indexer's top-k expands into (`Op::Mla::key_bias`). Independent of FREQ_FACTORS, so all
@@ -694,7 +694,7 @@ fn main() {
         // Test-only: drives rope_angle.glsl for `ops::tests::rope_angle_matches_f64`.
         ("rope_angle_test", "rope_angle_test", &[]),
         // YaRN freq_factors variant: the rotation angle is DIVIDED by ff[pair] (`-DFREQ_FACTORS`
-        // adds the binding-2 ff buffer — see `Recorder::rope`).
+        // adds the ff buffer after the frequency table — see `Recorder::rope`).
         ("rope", "rope_ff", &["-DFREQ_FACTORS"]),
         // NEOX split-half pairing (`Op::Rope::neox`) — deepseek32's lightning indexer, whose rope
         // is NEOX where the MLA rope beside it is NORM. Static f32 in place only, which is the one

@@ -1792,6 +1792,10 @@ struct BdaWeightArena {
 
 // ── VulkanBackend ─────────────────────────────────────────────────────────────
 
+/// RoPE frequency tables on the device, keyed by `(theta.to_bits(), rope_dim)`, the only inputs a
+/// table depends on (a per-pair divisor is applied per angle, not baked in).
+type RopeFreqTables = HashMap<(u32, usize), Arc<dyn Buffer>>;
+
 /// Vulkan device + allocator + pipeline cache.
 pub struct VulkanBackend {
     // NOTE: `moe_pager` is declared before `shared` so the session's buffers are freed first on
@@ -1829,6 +1833,8 @@ pub struct VulkanBackend {
     bda_weight_arena: Mutex<Option<BdaWeightArena>>,
     /// Placeholder for kernel bindings an op leaves unused — see [`Self::unused_binding`].
     unused_binding: OnceLock<Box<dyn Buffer>>,
+    /// RoPE frequency tables on the device — see [`Self::rope_freq_table`].
+    rope_freq_tables: Mutex<RopeFreqTables>,
     /// The engine configuration this backend reads its knobs from — one value, held for the
     /// backend's whole life, borrowed (never cloned) at every read site.
     ///
@@ -1991,6 +1997,27 @@ impl VulkanBackend {
         }
         let b = self.alloc(4, BufferUsage::Activations)?;
         Ok(self.unused_binding.get_or_init(|| b).as_ref())
+    }
+
+    /// [`infr_core::math::rope_freqs`]`(theta, rope_dim)` in a device buffer, the per-pair
+    /// frequencies every rotary kernel binds, so each angle is the CPU reference's
+    /// `pos * freq` bit for bit. Uploaded on the first use of a shape and kept for the backend's
+    /// life: recordings that bind it, replay tapes included, never outlive it.
+    pub fn rope_freq_table(&self, theta: f32, rope_dim: usize) -> Result<Arc<dyn Buffer>> {
+        let mut tables = self.rope_freq_tables.lock().unwrap();
+        if let Some(b) = tables.get(&(theta.to_bits(), rope_dim)) {
+            return Ok(Arc::clone(b));
+        }
+        let freqs = infr_core::math::rope_freqs(theta, rope_dim);
+        let bytes: &[u8] = bytemuck::cast_slice(&freqs);
+        // A zero-sized buffer cannot be bound; a table with no pairs is never read.
+        let b = self.alloc(bytes.len().max(4), BufferUsage::Activations)?;
+        if !bytes.is_empty() {
+            self.upload(b.as_ref(), bytes)?;
+        }
+        let b: Arc<dyn Buffer> = Arc::from(b);
+        tables.insert((theta.to_bits(), rope_dim), Arc::clone(&b));
+        Ok(b)
     }
 
     /// The resolved per-device kernel parameters (see the `tuning` module).
@@ -3599,6 +3626,7 @@ impl VulkanBackend {
             dense_pager: Mutex::new(None),
             bda_weight_arena: Mutex::new(None),
             unused_binding: OnceLock::new(),
+            rope_freq_tables: Mutex::new(HashMap::new()),
             cfg,
             shared: Arc::new(VulkanShared {
                 _entry: entry,

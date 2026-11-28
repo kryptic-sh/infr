@@ -53,23 +53,14 @@ agreed between the two sessions:
 - **An Intel-only cause stays here**, for example a 16-wide subgroup in the
   quantizer.
 
-## S2c. Win RoPE's speed back
+## S2c. Win RoPE's speed back — done on Intel; the XTX measurement is owed
 
-S2 (`8e0a650a`, `3def4aec`) made RoPE accurate on every device at a cost:
-
-- **Intel iGPU:** Qwen3-1.7B pp512 152.1 / 152.2 to 149.2 / 149.2 t/s.
-- **RX 7900 XTX, AMD Windows driver:** tg128 453.43 to 440.48 t/s (-2.9%, six
-  interleaved rounds).
-- **AMD iGPU:** tg128 27.15 to 27.11, within its spread.
-
-Decode runs one row, so the per-pair work is what shows: each thread derives its
-frequency in double-float (`rope_freq`) and reduces its own angle. The
-frequencies depend only on the op's shape, so compute them once per op on the
-host with `infr_core::math::rope_freqs` (the CPU's own values, so bit-identical
-by construction) and bind them the way `freq_factors` is bound. That leaves only
-the sincos per pair. Hold the angle bit-identity and `rope_angle_matches_f64` as
-they are, and measure tg128 on the XTX (through the Windows session) and
-pp512/tg128 on the Intel iGPU, alternating builds.
+The rotary shaders read the CPU's own `rope_freqs` table from a buffer
+(`VulkanBackend::rope_freq_table`) instead of deriving each frequency in
+double-float, and their output is bit-identical to the build before. What is
+left: tg128 on the RX 7900 XTX, through the Windows session, against the build
+before S2 and the one before this slice, alternated. The gemma-3 decode gain
+this slice showed on Intel has no known cause (B-GEMMA-DECODE-ROPE-GAIN).
 
 ## S3. The harness failures — the first two done; the pool guard is B-ANV-UMA-BUDGET-GUARD
 

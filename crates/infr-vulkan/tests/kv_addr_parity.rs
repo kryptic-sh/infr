@@ -1186,6 +1186,7 @@ fn qk_norm_rope_bda_matches_bound() {
     let nwb = synth_f32(hd, 55);
     let nw = be.alloc(nwb.len(), BufferUsage::Activations).unwrap();
     be.upload(nw.as_ref(), &nwb).unwrap();
+    let freqs = be.rope_freq_table(10000.0, rope_dim).unwrap();
     let (b, a0, ao) = store_legs(&be, n * 2, |rec, dst, addr| match addr {
         Some(a) => rec.qk_norm_rope_at(
             x.as_ref(),
@@ -1197,6 +1198,7 @@ fn qk_norm_rope_bda_matches_bound() {
             hd,
             rope_dim,
             10000.0,
+            freqs.as_ref(),
             0,
             0,
             1e-6,
@@ -1211,6 +1213,7 @@ fn qk_norm_rope_bda_matches_bound() {
             hd,
             rope_dim,
             10000.0,
+            freqs.as_ref(),
             0,
             0,
             1e-6,

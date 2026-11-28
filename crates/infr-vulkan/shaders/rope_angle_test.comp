@@ -1,9 +1,9 @@
 #version 460
 // Test harness for rope_angle.glsl (the GPU test `rope_angle_matches_f64`): one invocation per
 // element, `pc.mode` picks the function. 0: (sin, cos) of x[i] into y[2i], y[2i+1].
-// 1: rope_div(x[2i], x[2i+1]) into y[i]. 2: rope_freq for theta, p = i and rope_dim into y[i].
+// 1: rope_div(x[2i], x[2i+1]) into y[i].
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
-layout(push_constant) uniform PC { uint n; uint mode; float theta; uint rope_dim; } pc;
+layout(push_constant) uniform PC { uint n; uint mode; } pc;
 layout(binding = 0) readonly buffer XB { float x[]; };
 layout(binding = 1) buffer YB { float y[]; };
 #include "rope_angle.glsl"
@@ -15,9 +15,7 @@ void main() {
         vec2 sc = rope_sincos(x[i]);
         y[2u * i] = sc.x;
         y[2u * i + 1u] = sc.y;
-    } else if (pc.mode == 1u) {
-        y[i] = rope_div(x[2u * i], x[2u * i + 1u]);
     } else {
-        y[i] = rope_freq(rope_ln_theta(pc.theta), i, pc.rope_dim);
+        y[i] = rope_div(x[2u * i], x[2u * i + 1u]);
     }
 }

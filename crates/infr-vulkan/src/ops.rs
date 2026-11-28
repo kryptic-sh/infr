@@ -661,7 +661,7 @@ impl VulkanBackend {
         // recorder's `kernel("rope", …, 28)` — the kernel cache is shared by name, so a smaller
         // range here would create a pipeline layout that doesn't contain the shader's block
         // (VUID-VkComputePipelineCreateInfo-layout-10069).
-        let k = self.kernel("rope", crate::gemm::rope_spv(), 2, 28);
+        let k = self.kernel("rope", crate::gemm::rope_spv(), 3, 28);
         let mut push = [0u8; 28];
         push[0..4].copy_from_slice(&(t as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(n_heads as u32).to_ne_bytes());
@@ -671,7 +671,8 @@ impl VulkanBackend {
         push[20..24].copy_from_slice(&0u32.to_ne_bytes()); // pos_offset
         push[24..28].copy_from_slice(&0u32.to_ne_bytes()); // out_base (eager: write at row 0)
         let groups = (t * n_heads).div_ceil(crate::recorder::ROPE_WG) as u32;
-        self.run_kernel(k, &[x], t * n_heads * hd, &push, groups)
+        let freqs = infr_core::math::rope_freqs(theta, rope_dim);
+        self.run_kernel(k, &[x, &freqs], t * n_heads * hd, &push, groups)
     }
 
     /// SwiGLU activation: `y[i] = silu(gate[i]) * up[i]`.
@@ -723,6 +724,8 @@ impl VulkanBackend {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use infr_core::backend::Buffer;
+    use std::sync::Arc;
 
     /// Host RoPE over `x` `[t, nh, hd]` as `rope.comp` computes it: token `p` at position
     /// `pos0 + p`, the first `rd` lanes rotated (interleaved NORM pairs, or NEOX split halves), the
@@ -1053,7 +1056,8 @@ pub(crate) mod tests {
     /// rope_angle.glsl, which every RoPE shader takes its angle from, against the host: `sin`
     /// and `cos` against f64 over the RoPE domain (to its 2^24 limit, densely around the odd
     /// multiples of pi/4, plus tiny and negative angles, and NaN past the limit), and the divide
-    /// and the frequencies bit for bit against the CPU's binary32 `a / b` and `rope_freqs`. The
+    /// bit for bit against the CPU's binary32 `a / b` (the frequencies are the CPU's own table,
+    /// see `rope_freq_table_is_the_cpu_table_built_once`). The
     /// trig bound follows from the reduction: `r` is within about 2^-24 ABSOLUTE of
     /// `x - k*pi/2` over the domain, however small `r` is, and the polynomials and the final
     /// rounding add about another 2^-24, so 2^-22 absolute has room; below pi/4 there is no
@@ -1067,36 +1071,15 @@ pub(crate) mod tests {
             env!("OUT_DIR"),
             "/rope_angle_test.spv"
         )));
-        let run = |mode: u32, n: usize, theta: f32, rope_dim: u32, x: &[f32]| -> Vec<f32> {
-            let k = be.kernel("rope_angle_test", &spv, 2, 16);
-            let mut push = [0u8; 16];
+        let run = |mode: u32, n: usize, x: &[f32]| -> Vec<f32> {
+            let k = be.kernel("rope_angle_test", &spv, 2, 8);
+            let mut push = [0u8; 8];
             push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
             push[4..8].copy_from_slice(&mode.to_ne_bytes());
-            push[8..12].copy_from_slice(&theta.to_ne_bytes());
-            push[12..16].copy_from_slice(&rope_dim.to_ne_bytes());
             let out_len = if mode == 0 { 2 * n } else { n };
             be.run_kernel(k, &[x], out_len, &push, (n as u32).div_ceil(64))
                 .unwrap()
         };
-        let thetas = [1e4f32, 1e5, 1.5e5, 5e5, 1e6, 5e6, 1e7, 12345.678];
-        let dims = [16u32, 32, 64, 80, 96, 128, 192, 256, 512];
-        // The frequencies, exactly as the CPU reference rounds them.
-        let mut freq_mismatch = Vec::new();
-        for &theta in &thetas {
-            for &d in &dims {
-                let got = run(2, d as usize / 2, theta, d, &[0.0]);
-                let want = infr_core::math::rope_freqs(theta, d as usize);
-                for (p, (g, w)) in got.iter().zip(&want).enumerate() {
-                    if g.to_bits() != w.to_bits() {
-                        freq_mismatch.push((theta, d, p, *g, *w));
-                    }
-                }
-            }
-        }
-        assert!(
-            freq_mismatch.is_empty(),
-            "rope_freq differs from rope_freqs: {freq_mismatch:?}"
-        );
 
         // The divide, against binary32 `/`: RoPE's own angle-by-divisor quotients and a spread
         // of operand magnitudes.
@@ -1119,7 +1102,7 @@ pub(crate) mod tests {
             };
             pairs.extend([next(), next()]);
         }
-        let got = run(1, pairs.len() / 2, 0.0, 0, &pairs);
+        let got = run(1, pairs.len() / 2, &pairs);
         let bad: Vec<_> = pairs
             .chunks(2)
             .zip(&got)
@@ -1178,7 +1161,7 @@ pub(crate) mod tests {
         }
         let neg: Vec<f32> = xs.iter().map(|x| -x).collect();
         xs.extend(neg);
-        let got = run(0, xs.len(), 0.0, 0, &xs);
+        let got = run(0, xs.len(), &xs);
         let ulp = |v: f64| {
             let v = v.abs().max(f32::MIN_POSITIVE as f64);
             2f64.powi(v.log2().floor() as i32 - 23)
@@ -1208,11 +1191,37 @@ pub(crate) mod tests {
         );
         assert!(bad.is_empty(), "rope_sincos misses its bound: {bad:?}");
         let past = [f32::from_bits(limit.to_bits() + 1), 3e7, 1e10, -1e10];
-        let got = run(0, past.len(), 0.0, 0, &past);
+        let got = run(0, past.len(), &past);
         assert!(
             got.iter().all(|v| v.is_nan()),
             "rope_sincos past 2^24 must be NaN: {past:?} -> {got:?}"
         );
+    }
+
+    /// The frequency table every rotary kernel binds holds [`infr_core::math::rope_freqs`] bit for
+    /// bit, and a second request for the same shape returns the same buffer rather than uploading
+    /// another (red if `rope_freq_table` builds per call or keys on less than theta and rope_dim).
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn rope_freq_table_is_the_cpu_table_built_once() {
+        let be = VulkanBackend::new().unwrap();
+        let read = |b: &dyn Buffer| {
+            let mut bytes = vec![0u8; b.len_bytes()];
+            be.download(b, &mut bytes).unwrap();
+            bytemuck::cast_slice::<u8, u32>(&bytes).to_vec()
+        };
+        for (theta, d) in [(1e4f32, 128usize), (1e6, 128), (5e5, 64), (12345.678, 512)] {
+            let t = be.rope_freq_table(theta, d).unwrap();
+            let want: Vec<u32> = infr_core::math::rope_freqs(theta, d)
+                .iter()
+                .map(|f| f.to_bits())
+                .collect();
+            assert_eq!(read(t.as_ref()), want, "theta {theta} rope_dim {d}");
+            assert!(Arc::ptr_eq(&t, &be.rope_freq_table(theta, d).unwrap()));
+        }
+        let a = be.rope_freq_table(1e4, 128).unwrap();
+        assert!(!Arc::ptr_eq(&a, &be.rope_freq_table(1e6, 128).unwrap()));
+        assert!(!Arc::ptr_eq(&a, &be.rope_freq_table(1e4, 64).unwrap()));
     }
 
     #[test]
@@ -1231,8 +1240,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// More rotation pairs than `rope.comp` has lanes, so its shared frequency table is filled
-    /// in several chunks, the last one ragged: every pair past the first chunk must still rotate.
+    /// More rotation pairs than `rope.comp` has lanes in a workgroup: every pair must rotate.
     #[test]
     #[ignore = "requires a Vulkan GPU"]
     fn rope_wider_than_a_workgroup_matches_host() {

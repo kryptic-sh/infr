@@ -19,11 +19,9 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #endif
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
-// The frequencies, which depend only on the op: the workgroup's lanes compute one workgroup's
-// width of them at a time, one each, and every lane's (token, head) reads them back.
-shared float freqs[gl_WorkGroupSize.x];
 
 layout(push_constant) uniform PC {
+    // `theta` is unused here: the frequencies come from the bound `rf` table.
     uint t; uint nheads; uint hd; uint rope_dim; float theta; uint pos_offset; uint out_base;
 #ifdef KV_BDA
     // -DKV_BDA (#74 slice 3, OUT_F16 only): write the f16 K cache by device address (kv_addr.glsl
@@ -33,41 +31,46 @@ layout(push_constant) uniform PC {
 #endif
 } pc;
 layout(binding = 0) readonly buffer XB { float x[]; };
-// Per-pair frequency divisors (`rope_dim/2` floats): the rotation angle is DIVIDED by ff[pair]
-// (deepseek2's YaRN k_pe ramp, the llama3 `rope_freqs.weight`). They bind right after the inputs
-// (x, then params under USE_PARAMS) and shift y one slot later — the hazard tracker treats the
-// TRAILING binding as the write, and the recorder binds [x, (params,) ff, y], so the output must
-// come last for the store→read barrier. Under KV_BDA y is never declared, but the recorder still
-// binds the cache inert in that last slot.
+// The per-pair frequencies (`rope_dim/2` floats): the CPU reference's `rope_freqs` table for this
+// op's theta and rope_dim, built on the host (`VulkanBackend::rope_freq_table`), so the angle
+// `pos * rf[pair]` is the CPU's. Then the optional per-pair frequency divisors (`rope_dim/2`
+// floats): the rotation angle is DIVIDED by ff[pair] (deepseek2's YaRN k_pe ramp, the llama3
+// `rope_freqs.weight`). Both bind right after the inputs (x, then params under USE_PARAMS) and
+// shift y later — the hazard tracker treats the TRAILING binding as the write, and the recorder
+// binds [x, (params,) rf, (ff,) y], so the output must come last for the store→read barrier.
+// Under KV_BDA y is never declared, but the recorder still binds the cache inert in that last
+// slot.
 #ifdef USE_PARAMS
 layout(binding = 1) readonly buffer PB { uint p_pos; uint p_kvlen; };
+layout(binding = 2) readonly buffer RF { float rf[]; };
 #ifdef FREQ_FACTORS
-layout(binding = 2) readonly buffer FB { float ff[]; };
+layout(binding = 3) readonly buffer FB { float ff[]; };
+#ifndef KV_BDA
+layout(binding = 4) buffer YB { float16_t y[]; };
+#endif
+#else
 #ifndef KV_BDA
 layout(binding = 3) buffer YB { float16_t y[]; };
 #endif
-#else
-#ifndef KV_BDA
-layout(binding = 2) buffer YB { float16_t y[]; };
-#endif
 #endif
 #else
+layout(binding = 1) readonly buffer RF { float rf[]; };
 #ifdef FREQ_FACTORS
-layout(binding = 1) readonly buffer FB { float ff[]; };
+layout(binding = 2) readonly buffer FB { float ff[]; };
 #endif
 #ifdef OUT_F16
 #ifndef KV_BDA
 #ifdef FREQ_FACTORS
-layout(binding = 2) buffer YB { float16_t y[]; };
+layout(binding = 3) buffer YB { float16_t y[]; };
 #else
-layout(binding = 1) buffer YB { float16_t y[]; };
+layout(binding = 2) buffer YB { float16_t y[]; };
 #endif
 #endif
 #else
 #ifdef FREQ_FACTORS
-layout(binding = 2) buffer YB { float y[]; };
+layout(binding = 3) buffer YB { float y[]; };
 #else
-layout(binding = 1) buffer YB { float y[]; };
+layout(binding = 2) buffer YB { float y[]; };
 #endif
 #endif
 #endif
@@ -87,9 +90,7 @@ void main() {
     // `maxComputeWorkGroupCount[0]`; equal to `gl_GlobalInvocationID.x` when unsplit.
     uint idx = (gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x) * gl_WorkGroupSize.x
         + gl_LocalInvocationID.x;
-    // A lane past the last (token, head) still takes part in the frequency table and its
-    // barriers; it only skips the loads and stores.
-    bool live = idx < pc.t * pc.nheads;
+    if (idx >= pc.t * pc.nheads) { return; }
 #ifdef USE_PARAMS
     uint pos = p_pos + idx / pc.nheads;
     uint out_base = pc.out_base * p_pos; // pc.out_base is the 0/1 multiplier in dyn mode
@@ -102,47 +103,37 @@ void main() {
     // Passthrough only the un-rotated tail [rope_dim, hd); the rotated loop below overwrites
     // [0, rope_dim), so copying it here too just doubled the store traffic (into the KV cache
     // under KV_BDA). Final bytes are identical (as in qk_norm_rope.comp's partial-RoPE tail).
-    if (live) {
 #ifdef OUT_F16
-        for (uint i = pc.rope_dim; i < pc.hd; i++) { KVWH(obase + i, x[base + i]); }
+    for (uint i = pc.rope_dim; i < pc.hd; i++) { KVWH(obase + i, x[base + i]); }
 #else
-        for (uint i = pc.rope_dim; i < pc.hd; i++) { y[obase + i] = x[base + i]; }
+    for (uint i = pc.rope_dim; i < pc.hd; i++) { y[obase + i] = x[base + i]; }
 #endif
-    }
     uint hf = pc.rope_dim / 2u;
-    uint lane = gl_LocalInvocationID.x;
-    vec2 ln_theta = rope_ln_theta(pc.theta);
-    for (uint c0 = 0u; c0 < hf; c0 += gl_WorkGroupSize.x) {
-        if (c0 + lane < hf) { freqs[lane] = rope_freq(ln_theta, c0 + lane, pc.rope_dim); }
-        barrier();
-        uint c1 = min(c0 + gl_WorkGroupSize.x, hf);
-        for (uint i = c0; live && i < c1; i++) {
-            precise float ang = float(pos) * freqs[i - c0];
+    for (uint i = 0u; i < hf; i++) {
+        precise float ang = float(pos) * rf[i];
 #ifdef FREQ_FACTORS
-            ang = rope_div(ang, ff[i]);
+        ang = rope_div(ang, ff[i]);
 #endif
-            vec2 sc = rope_sincos(ang);
+        vec2 sc = rope_sincos(ang);
 #ifdef BACKWARD
-            float s = -sc.x;
+        float s = -sc.x;
 #else
-            float s = sc.x;
+        float s = sc.x;
 #endif
-            float co = sc.y;
+        float co = sc.y;
 #ifdef NEOX
-            uint i0 = i, i1 = i + hf;
+        uint i0 = i, i1 = i + hf;
 #else
-            uint i0 = 2u * i, i1 = i0 + 1u;
+        uint i0 = 2u * i, i1 = i0 + 1u;
 #endif
-            float a = x[base + i0];
-            float b = x[base + i1];
+        float a = x[base + i0];
+        float b = x[base + i1];
 #ifdef OUT_F16
-            KVWH(obase + i0, a * co - b * s);
-            KVWH(obase + i1, a * s + b * co);
+        KVWH(obase + i0, a * co - b * s);
+        KVWH(obase + i1, a * s + b * co);
 #else
-            y[obase + i0] = a * co - b * s;
-            y[obase + i1] = a * s + b * co;
+        y[obase + i0] = a * co - b * s;
+        y[obase + i1] = a * s + b * co;
 #endif
-        }
-        barrier();
     }
 }

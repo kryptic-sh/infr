@@ -5207,6 +5207,9 @@ impl<'a> Recorder<'a> {
         mask_type: u32,
         window: u32,
         theta: f32,
+        // The internal q_pe rope's per-pair frequencies (`qk_rope_dim/2` floats):
+        // `VulkanBackend::rope_freq_table` for `theta` and `qk_rope_dim`.
+        freqs: &dyn Buffer,
         cache_cap_rows: u32,
         // `AttnMask::Canvas { lo }`'s lower bound. Read by the shader on `mask_type == 2` only;
         // pass 0 for the causal and sliding-window masks, which derive their own `lo`.
@@ -5245,6 +5248,7 @@ impl<'a> Recorder<'a> {
             Self::vkb(k_cache),
             Self::vkb(wk_b),
             Self::vkb(wv_b),
+            Self::vkb(freqs),
         ];
         bufs.extend(freq_factors.map(Self::vkb));
         bufs.extend(key_bias.map(Self::vkb));
@@ -5757,9 +5761,13 @@ impl<'a> Recorder<'a> {
         hd: usize,
         rope_dim: usize,
         theta: f32,
+        // The per-pair frequencies (`rope_dim/2` floats): `VulkanBackend::rope_freq_table`
+        // for `theta` and `rope_dim`, the CPU reference's own table.
+        freqs: &dyn Buffer,
         pos_offset: usize,
-        // YaRN per-pair frequency divisors (`rope_dim/2` floats) — binds at 2 and selects the
-        // `rope_ff` kernel build (compile-time presence; the plain `rope` build has no ff binding).
+        // YaRN per-pair frequency divisors (`rope_dim/2` floats) — binds at 2, after `freqs`, and
+        // selects the `rope_ff` kernel build (compile-time presence; the plain `rope` build has no
+        // ff binding).
         freq_factors: Option<&dyn Buffer>,
         // NEOX split-half pairing instead of the interleaved NORM one (`Op::Rope::neox`) — a
         // second compile-time build rather than a push-constant branch, so the existing NORM
@@ -5782,19 +5790,19 @@ impl<'a> Recorder<'a> {
             Some(ff) => {
                 let k = if neox {
                     self.be
-                        .kernel("rope_ff_neox", crate::gemm::rope_ff_neox_spv(), 3, 28)
+                        .kernel("rope_ff_neox", crate::gemm::rope_ff_neox_spv(), 4, 28)
                 } else if backward {
                     self.be
-                        .kernel("rope_ff_back", crate::gemm::rope_ff_back_spv(), 3, 28)
+                        .kernel("rope_ff_back", crate::gemm::rope_ff_back_spv(), 4, 28)
                 } else {
-                    self.be.kernel("rope_ff", crate::gemm::rope_ff_spv(), 3, 28)
+                    self.be.kernel("rope_ff", crate::gemm::rope_ff_spv(), 4, 28)
                 };
                 self.dispatch_wide(
                     k,
                     // ff BEFORE y: the trailing `n_out` bindings are the hazard-tracked writes,
-                    // and `y` (index 2) must be that write — binding ff last would mark the
+                    // and `y` (index 3) must be that write — binding ff last would mark the
                     // read-only divisors as written and leave `y` untracked (same race as mla_ff).
-                    &[Self::vkb(x), Self::vkb(ff), Self::vkb(y)],
+                    &[Self::vkb(x), Self::vkb(freqs), Self::vkb(ff), Self::vkb(y)],
                     1,
                     &push,
                     (t * n_heads).div_ceil(ROPE_WG) as u32,
@@ -5803,16 +5811,16 @@ impl<'a> Recorder<'a> {
             None => {
                 let k = if neox {
                     self.be
-                        .kernel("rope_neox", crate::gemm::rope_neox_spv(), 2, 28)
+                        .kernel("rope_neox", crate::gemm::rope_neox_spv(), 3, 28)
                 } else if backward {
                     self.be
-                        .kernel("rope_back", crate::gemm::rope_back_spv(), 2, 28)
+                        .kernel("rope_back", crate::gemm::rope_back_spv(), 3, 28)
                 } else {
-                    self.be.kernel("rope", crate::gemm::rope_spv(), 2, 28)
+                    self.be.kernel("rope", crate::gemm::rope_spv(), 3, 28)
                 };
                 self.dispatch_wide(
                     k,
-                    &[Self::vkb(x), Self::vkb(y)],
+                    &[Self::vkb(x), Self::vkb(freqs), Self::vkb(y)],
                     1,
                     &push,
                     (t * n_heads).div_ceil(ROPE_WG) as u32,
@@ -5836,6 +5844,9 @@ impl<'a> Recorder<'a> {
         hd: usize,
         rope_dim: usize,
         theta: f32,
+        // The per-pair frequencies (`rope_dim/2` floats): `VulkanBackend::rope_freq_table`
+        // for `theta` and `rope_dim`, the CPU reference's own table.
+        freqs: &dyn Buffer,
         pos_offset: usize,
         out_base: usize,
         freq_factors: Option<&dyn Buffer>,
@@ -5852,10 +5863,10 @@ impl<'a> Recorder<'a> {
             Some(ff) => {
                 let k = self
                     .be
-                    .kernel("rope_f16_ff", crate::gemm::rope_f16_ff_spv(), 3, 28);
+                    .kernel("rope_f16_ff", crate::gemm::rope_f16_ff_spv(), 4, 28);
                 self.dispatch_wide(
                     k,
-                    &[Self::vkb(x), Self::vkb(ff), Self::vkb(y)],
+                    &[Self::vkb(x), Self::vkb(freqs), Self::vkb(ff), Self::vkb(y)],
                     1,
                     &push,
                     (t * n_heads).div_ceil(ROPE_WG) as u32,
@@ -5864,10 +5875,10 @@ impl<'a> Recorder<'a> {
             None => {
                 let k = self
                     .be
-                    .kernel("rope_f16", crate::gemm::rope_f16_spv(), 2, 28);
+                    .kernel("rope_f16", crate::gemm::rope_f16_spv(), 3, 28);
                 self.dispatch_wide(
                     k,
-                    &[Self::vkb(x), Self::vkb(y)],
+                    &[Self::vkb(x), Self::vkb(freqs), Self::vkb(y)],
                     1,
                     &push,
                     (t * n_heads).div_ceil(ROPE_WG) as u32,
@@ -5890,6 +5901,9 @@ impl<'a> Recorder<'a> {
         hd: usize,
         rope_dim: usize,
         theta: f32,
+        // The per-pair frequencies (`rope_dim/2` floats): `VulkanBackend::rope_freq_table`
+        // for `theta` and `rope_dim`, the CPU reference's own table.
+        freqs: &dyn Buffer,
         out_base_mul: usize,
         freq_factors: Option<&dyn Buffer>,
     ) {
@@ -5905,10 +5919,16 @@ impl<'a> Recorder<'a> {
             Some(ff) => {
                 let k =
                     self.be
-                        .kernel("rope_f16_dyn_ff", crate::gemm::rope_f16_dyn_ff_spv(), 4, 28);
+                        .kernel("rope_f16_dyn_ff", crate::gemm::rope_f16_dyn_ff_spv(), 5, 28);
                 self.dispatch_wide(
                     k,
-                    &[Self::vkb(x), Self::vkb(params), Self::vkb(ff), Self::vkb(y)],
+                    &[
+                        Self::vkb(x),
+                        Self::vkb(params),
+                        Self::vkb(freqs),
+                        Self::vkb(ff),
+                        Self::vkb(y),
+                    ],
                     1,
                     &push,
                     (t * n_heads).div_ceil(ROPE_WG) as u32,
@@ -5917,10 +5937,15 @@ impl<'a> Recorder<'a> {
             None => {
                 let k = self
                     .be
-                    .kernel("rope_f16_dyn", crate::gemm::rope_f16_dyn_spv(), 3, 28);
+                    .kernel("rope_f16_dyn", crate::gemm::rope_f16_dyn_spv(), 4, 28);
                 self.dispatch_wide(
                     k,
-                    &[Self::vkb(x), Self::vkb(params), Self::vkb(y)],
+                    &[
+                        Self::vkb(x),
+                        Self::vkb(params),
+                        Self::vkb(freqs),
+                        Self::vkb(y),
+                    ],
                     1,
                     &push,
                     (t * n_heads).div_ceil(ROPE_WG) as u32,
@@ -6927,6 +6952,7 @@ impl<'a> Recorder<'a> {
         hd: usize,
         rope_dim: usize,
         theta: f32,
+        freqs: &dyn Buffer,
         pos_offset: usize,
         out_base: usize,
         freq_factors: Option<&dyn Buffer>,
@@ -6945,10 +6971,10 @@ impl<'a> Recorder<'a> {
             Some(ff) => {
                 let k =
                     self.be
-                        .kernel("rope_f16_ff_bda", crate::gemm::rope_f16_ff_bda_spv(), 3, 36);
+                        .kernel("rope_f16_ff_bda", crate::gemm::rope_f16_ff_bda_spv(), 4, 36);
                 self.dispatch_wide(
                     k,
-                    &[Self::vkb(x), Self::vkb(ff), Self::vkb(y)],
+                    &[Self::vkb(x), Self::vkb(freqs), Self::vkb(ff), Self::vkb(y)],
                     1,
                     &push,
                     (t * n_heads).div_ceil(ROPE_WG) as u32,
@@ -6957,10 +6983,10 @@ impl<'a> Recorder<'a> {
             None => {
                 let k = self
                     .be
-                    .kernel("rope_f16_bda", crate::gemm::rope_f16_bda_spv(), 2, 36);
+                    .kernel("rope_f16_bda", crate::gemm::rope_f16_bda_spv(), 3, 36);
                 self.dispatch_wide(
                     k,
-                    &[Self::vkb(x), Self::vkb(y)],
+                    &[Self::vkb(x), Self::vkb(freqs), Self::vkb(y)],
                     1,
                     &push,
                     (t * n_heads).div_ceil(ROPE_WG) as u32,
@@ -6983,6 +7009,7 @@ impl<'a> Recorder<'a> {
         hd: usize,
         rope_dim: usize,
         theta: f32,
+        freqs: &dyn Buffer,
         out_base_mul: usize,
         freq_factors: Option<&dyn Buffer>,
     ) {
@@ -7001,12 +7028,18 @@ impl<'a> Recorder<'a> {
                 let k = self.be.kernel(
                     "rope_f16_dyn_ff_bda",
                     crate::gemm::rope_f16_dyn_ff_bda_spv(),
-                    4,
+                    5,
                     36,
                 );
                 self.dispatch_wide(
                     k,
-                    &[Self::vkb(x), Self::vkb(params), Self::vkb(ff), Self::vkb(y)],
+                    &[
+                        Self::vkb(x),
+                        Self::vkb(params),
+                        Self::vkb(freqs),
+                        Self::vkb(ff),
+                        Self::vkb(y),
+                    ],
                     1,
                     &push,
                     (t * n_heads).div_ceil(ROPE_WG) as u32,
@@ -7016,12 +7049,17 @@ impl<'a> Recorder<'a> {
                 let k = self.be.kernel(
                     "rope_f16_dyn_bda",
                     crate::gemm::rope_f16_dyn_bda_spv(),
-                    3,
+                    4,
                     36,
                 );
                 self.dispatch_wide(
                     k,
-                    &[Self::vkb(x), Self::vkb(params), Self::vkb(y)],
+                    &[
+                        Self::vkb(x),
+                        Self::vkb(params),
+                        Self::vkb(freqs),
+                        Self::vkb(y),
+                    ],
                     1,
                     &push,
                     (t * n_heads).div_ceil(ROPE_WG) as u32,
@@ -7044,6 +7082,7 @@ impl<'a> Recorder<'a> {
         hd: usize,
         rope_dim: usize,
         theta: f32,
+        freqs: &dyn Buffer,
         rope_pos: usize,
         out_base: usize,
         eps: f32,
@@ -7066,12 +7105,18 @@ impl<'a> Recorder<'a> {
                 let k = self.be.kernel(
                     "qk_norm_rope_ff_bda",
                     crate::gemm::qk_norm_rope_ff_bda_spv(),
-                    4,
+                    5,
                     44,
                 );
                 self.dispatch_wide(
                     k,
-                    &[Self::vkb(x), Self::vkb(nw), Self::vkb(ff), Self::vkb(y)],
+                    &[
+                        Self::vkb(x),
+                        Self::vkb(nw),
+                        Self::vkb(freqs),
+                        Self::vkb(ff),
+                        Self::vkb(y),
+                    ],
                     1,
                     &push,
                     (rows * nheads) as u32,
@@ -7081,12 +7126,12 @@ impl<'a> Recorder<'a> {
                 let k = self.be.kernel(
                     "qk_norm_rope_bda",
                     crate::gemm::qk_norm_rope_bda_spv(),
-                    3,
+                    4,
                     44,
                 );
                 self.dispatch_wide(
                     k,
-                    &[Self::vkb(x), Self::vkb(nw), Self::vkb(y)],
+                    &[Self::vkb(x), Self::vkb(nw), Self::vkb(freqs), Self::vkb(y)],
                     1,
                     &push,
                     (rows * nheads) as u32,
@@ -7109,6 +7154,7 @@ impl<'a> Recorder<'a> {
         hd: usize,
         rope_dim: usize,
         theta: f32,
+        freqs: &dyn Buffer,
         rope_pos: usize,
         out_base: usize,
         eps: f32,
@@ -7117,7 +7163,7 @@ impl<'a> Recorder<'a> {
         let k = self.be.kernel(
             "qk_norm_rope_interleaved_bda",
             crate::gemm::qk_norm_rope_interleaved_bda_spv(),
-            3,
+            4,
             44,
         );
         let mut push = [0u8; 44];
@@ -7134,7 +7180,7 @@ impl<'a> Recorder<'a> {
         push[40..44].copy_from_slice(&((y_addr >> 32) as u32).to_ne_bytes());
         self.dispatch_wide(
             k,
-            &[Self::vkb(qg), Self::vkb(nw), Self::vkb(y)],
+            &[Self::vkb(qg), Self::vkb(nw), Self::vkb(freqs), Self::vkb(y)],
             1,
             &push,
             (rows * nheads) as u32,
@@ -7157,6 +7203,7 @@ impl<'a> Recorder<'a> {
         hd: usize,
         rope_dim: usize,
         theta: f32,
+        freqs: &dyn Buffer,
         out_base_mul: usize,
         eps: f32,
         kcap: usize,
@@ -7165,13 +7212,13 @@ impl<'a> Recorder<'a> {
             Some(_) => self.be.kernel(
                 "qk_norm_rope_dyn_ff_bda",
                 crate::gemm::qk_norm_rope_dyn_ff_bda_spv(),
-                5,
+                6,
                 44,
             ),
             None => self.be.kernel(
                 "qk_norm_rope_dyn_bda",
                 crate::gemm::qk_norm_rope_dyn_bda_spv(),
-                4,
+                5,
                 44,
             ),
         };
@@ -7194,6 +7241,7 @@ impl<'a> Recorder<'a> {
                     Self::vkb(x),
                     Self::vkb(nw),
                     Self::vkb(params),
+                    Self::vkb(freqs),
                     Self::vkb(f),
                     Self::vkb(y),
                 ],
@@ -7203,7 +7251,13 @@ impl<'a> Recorder<'a> {
             ),
             None => self.dispatch_wide(
                 k,
-                &[Self::vkb(x), Self::vkb(nw), Self::vkb(params), Self::vkb(y)],
+                &[
+                    Self::vkb(x),
+                    Self::vkb(nw),
+                    Self::vkb(params),
+                    Self::vkb(freqs),
+                    Self::vkb(y),
+                ],
                 1,
                 &push,
                 (rows * nheads) as u32,
@@ -7226,6 +7280,7 @@ impl<'a> Recorder<'a> {
         hd: usize,
         rope_dim: usize,
         theta: f32,
+        freqs: &dyn Buffer,
         out_base_mul: usize,
         eps: f32,
         src_stride: usize,
@@ -7233,7 +7288,7 @@ impl<'a> Recorder<'a> {
         let k = self.be.kernel(
             "qk_norm_rope_interleaved_dyn_bda",
             crate::gemm::qk_norm_rope_interleaved_dyn_bda_spv(),
-            4,
+            5,
             44,
         );
         let mut push = [0u8; 44];
@@ -7254,6 +7309,7 @@ impl<'a> Recorder<'a> {
                 Self::vkb(qg),
                 Self::vkb(nw),
                 Self::vkb(params),
+                Self::vkb(freqs),
                 Self::vkb(y),
             ],
             1,
@@ -7524,6 +7580,9 @@ impl<'a> Recorder<'a> {
         hd: usize,
         rope_dim: usize,
         theta: f32,
+        // The per-pair frequencies (`rope_dim/2` floats): `VulkanBackend::rope_freq_table`
+        // for `theta` and `rope_dim`, the CPU reference's own table.
+        freqs: &dyn Buffer,
         rope_pos: usize,
         out_base: usize,
         eps: f32,
@@ -7546,10 +7605,16 @@ impl<'a> Recorder<'a> {
             Some(ff) => {
                 let k =
                     self.be
-                        .kernel("qk_norm_rope_ff", crate::gemm::qk_norm_rope_ff_spv(), 4, 36);
+                        .kernel("qk_norm_rope_ff", crate::gemm::qk_norm_rope_ff_spv(), 5, 36);
                 self.dispatch_wide(
                     k,
-                    &[Self::vkb(x), Self::vkb(nw), Self::vkb(ff), Self::vkb(y)],
+                    &[
+                        Self::vkb(x),
+                        Self::vkb(nw),
+                        Self::vkb(freqs),
+                        Self::vkb(ff),
+                        Self::vkb(y),
+                    ],
                     1,
                     &push,
                     (rows * nheads) as u32,
@@ -7558,10 +7623,10 @@ impl<'a> Recorder<'a> {
             None => {
                 let k = self
                     .be
-                    .kernel("qk_norm_rope", crate::gemm::qk_norm_rope_spv(), 3, 36);
+                    .kernel("qk_norm_rope", crate::gemm::qk_norm_rope_spv(), 4, 36);
                 self.dispatch_wide(
                     k,
-                    &[Self::vkb(x), Self::vkb(nw), Self::vkb(y)],
+                    &[Self::vkb(x), Self::vkb(nw), Self::vkb(freqs), Self::vkb(y)],
                     1,
                     &push,
                     (rows * nheads) as u32,
@@ -7583,6 +7648,9 @@ impl<'a> Recorder<'a> {
         hd: usize,
         rope_dim: usize,
         theta: f32,
+        // The per-pair frequencies (`rope_dim/2` floats): `VulkanBackend::rope_freq_table`
+        // for `theta` and `rope_dim`, the CPU reference's own table.
+        freqs: &dyn Buffer,
         rope_pos: usize,
         out_base: usize,
         eps: f32,
@@ -7591,7 +7659,7 @@ impl<'a> Recorder<'a> {
         let k = self.be.kernel(
             "qk_norm_rope_interleaved",
             crate::gemm::qk_norm_rope_interleaved_spv(),
-            3,
+            4,
             36,
         );
         let mut push = [0u8; 36];
@@ -7606,7 +7674,7 @@ impl<'a> Recorder<'a> {
         push[32..36].copy_from_slice(&(src_stride as u32).to_ne_bytes());
         self.dispatch_wide(
             k,
-            &[Self::vkb(qg), Self::vkb(nw), Self::vkb(y)],
+            &[Self::vkb(qg), Self::vkb(nw), Self::vkb(freqs), Self::vkb(y)],
             1,
             &push,
             (rows * nheads) as u32,
@@ -7627,6 +7695,7 @@ impl<'a> Recorder<'a> {
         hd: usize,
         rope_dim: usize,
         theta: f32,
+        freqs: &dyn Buffer,
         out_base_mul: usize,
         eps: f32,
         src_stride: usize,
@@ -7634,7 +7703,7 @@ impl<'a> Recorder<'a> {
         let k = self.be.kernel(
             "qk_norm_rope_interleaved_dyn",
             crate::gemm::qk_norm_rope_interleaved_dyn_spv(),
-            4,
+            5,
             36,
         );
         let mut push = [0u8; 36];
@@ -7653,6 +7722,7 @@ impl<'a> Recorder<'a> {
                 Self::vkb(qg),
                 Self::vkb(nw),
                 Self::vkb(params),
+                Self::vkb(freqs),
                 Self::vkb(y),
             ],
             1,
@@ -8256,25 +8326,28 @@ impl<'a> Recorder<'a> {
         hd: usize,
         rope_dim: usize,
         theta: f32,
+        // The per-pair frequencies (`rope_dim/2` floats): `VulkanBackend::rope_freq_table`
+        // for `theta` and `rope_dim`, the CPU reference's own table.
+        freqs: &dyn Buffer,
         out_base_mul: usize,
         eps: f32,
         // Fused-K cache write only: the cache's ROW capacity — an SWA ring cache writes row
         // `pos % kcap` (identity on a full-context cache). 0 (no modulo) for the Q write.
         kcap: usize,
     ) {
-        // With freq_factors (gemma4 full-attention layers) `ff` binds at 3 and the output shifts
-        // to 4 — same PC layout either way.
+        // With freq_factors (gemma4 full-attention layers) `ff` binds at 4, after `freqs`, and the
+        // output shifts to 5 — same PC layout either way.
         let k = match ff {
             Some(_) => self.be.kernel(
                 "qk_norm_rope_dyn_ff",
                 crate::gemm::qk_norm_rope_dyn_ff_spv(),
-                5,
+                6,
                 36,
             ),
             None => self.be.kernel(
                 "qk_norm_rope_dyn",
                 crate::gemm::qk_norm_rope_dyn_spv(),
-                4,
+                5,
                 36,
             ),
         };
@@ -8295,6 +8368,7 @@ impl<'a> Recorder<'a> {
                     Self::vkb(x),
                     Self::vkb(nw),
                     Self::vkb(params),
+                    Self::vkb(freqs),
                     Self::vkb(f),
                     Self::vkb(y),
                 ],
@@ -8304,7 +8378,13 @@ impl<'a> Recorder<'a> {
             ),
             None => self.dispatch_wide(
                 k,
-                &[Self::vkb(x), Self::vkb(nw), Self::vkb(params), Self::vkb(y)],
+                &[
+                    Self::vkb(x),
+                    Self::vkb(nw),
+                    Self::vkb(params),
+                    Self::vkb(freqs),
+                    Self::vkb(y),
+                ],
                 1,
                 &push,
                 (rows * nheads) as u32,
@@ -13189,28 +13269,97 @@ mod tests {
             (
                 "rope",
                 vec![f(N * 16), f(N * 16)],
-                Box::new(|r, b| r.rope(b[0], b[1], ROWS, W, 16, 16, 1e4, 0, None, false, false)),
+                Box::new(|r, b| {
+                    r.rope(
+                        b[0],
+                        b[1],
+                        ROWS,
+                        W,
+                        16,
+                        16,
+                        1e4,
+                        &*r.be.rope_freq_table(1e4, 16).unwrap(),
+                        0,
+                        None,
+                        false,
+                        false,
+                    )
+                }),
             ),
             (
                 "rope_f16",
                 vec![f(N * 16), f(N * 8)],
-                Box::new(|r, b| r.rope_f16(b[0], b[1], ROWS, W, 16, 16, 1e4, 0, 0, None)),
+                Box::new(|r, b| {
+                    r.rope_f16(
+                        b[0],
+                        b[1],
+                        ROWS,
+                        W,
+                        16,
+                        16,
+                        1e4,
+                        &*r.be.rope_freq_table(1e4, 16).unwrap(),
+                        0,
+                        0,
+                        None,
+                    )
+                }),
             ),
             (
                 "rope_f16_ff",
                 vec![f(N * 16), f(8), f(N * 8)],
-                Box::new(|r, b| r.rope_f16(b[0], b[2], ROWS, W, 16, 16, 1e4, 0, 0, Some(b[1]))),
+                Box::new(|r, b| {
+                    r.rope_f16(
+                        b[0],
+                        b[2],
+                        ROWS,
+                        W,
+                        16,
+                        16,
+                        1e4,
+                        &*r.be.rope_freq_table(1e4, 16).unwrap(),
+                        0,
+                        0,
+                        Some(b[1]),
+                    )
+                }),
             ),
             (
                 "rope_f16_dyn",
                 vec![f(N * 16), (8, Fill::Zero, Act), f(N * 8)],
-                Box::new(|r, b| r.rope_f16_dyn(b[0], b[1], b[2], ROWS, W, 16, 16, 1e4, 0, None)),
+                Box::new(|r, b| {
+                    r.rope_f16_dyn(
+                        b[0],
+                        b[1],
+                        b[2],
+                        ROWS,
+                        W,
+                        16,
+                        16,
+                        1e4,
+                        &*r.be.rope_freq_table(1e4, 16).unwrap(),
+                        0,
+                        None,
+                    )
+                }),
             ),
             (
                 "rope_f16_dyn_ff",
                 vec![f(N * 16), (8, Fill::Zero, Act), f(8), f(N * 8)],
                 Box::new(|r, b| {
-                    r.rope_f16_dyn(b[0], b[1], b[3], ROWS, W, 16, 16, 1e4, 0, Some(b[2]))
+                    r.rope_f16_dyn(
+                        b[0],
+                        b[1],
+                        b[3],
+                        ROWS,
+                        W,
+                        16,
+                        16,
+                        1e4,
+                        &*r.be.rope_freq_table(1e4, 16).unwrap(),
+                        0,
+                        Some(b[2]),
+                    )
                 }),
             ),
             (
@@ -13218,7 +13367,20 @@ mod tests {
                 vec![f(N * 16), (N * 32, Fill::Data, Kv)],
                 Box::new(|r, b| {
                     let a = b[1].device_addr().unwrap();
-                    r.rope_f16_at(b[0], b[1], a, ROWS, W, 16, 16, 1e4, 0, 0, None)
+                    r.rope_f16_at(
+                        b[0],
+                        b[1],
+                        a,
+                        ROWS,
+                        W,
+                        16,
+                        16,
+                        1e4,
+                        &*r.be.rope_freq_table(1e4, 16).unwrap(),
+                        0,
+                        0,
+                        None,
+                    )
                 }),
             ),
             (
@@ -13226,7 +13388,20 @@ mod tests {
                 vec![f(N * 16), f(8), (N * 32, Fill::Data, Kv)],
                 Box::new(|r, b| {
                     let a = b[2].device_addr().unwrap();
-                    r.rope_f16_at(b[0], b[2], a, ROWS, W, 16, 16, 1e4, 0, 0, Some(b[1]))
+                    r.rope_f16_at(
+                        b[0],
+                        b[2],
+                        a,
+                        ROWS,
+                        W,
+                        16,
+                        16,
+                        1e4,
+                        &*r.be.rope_freq_table(1e4, 16).unwrap(),
+                        0,
+                        0,
+                        Some(b[1]),
+                    )
                 }),
             ),
             (
@@ -13234,7 +13409,20 @@ mod tests {
                 vec![f(N * 16), (8, Fill::Zero, Act), (N * 32, Fill::Data, Kv)],
                 Box::new(|r, b| {
                     let a = b[2].device_addr().unwrap();
-                    r.rope_f16_dyn_at(b[0], b[1], b[2], a, ROWS, W, 16, 16, 1e4, 0, None)
+                    r.rope_f16_dyn_at(
+                        b[0],
+                        b[1],
+                        b[2],
+                        a,
+                        ROWS,
+                        W,
+                        16,
+                        16,
+                        1e4,
+                        &*r.be.rope_freq_table(1e4, 16).unwrap(),
+                        0,
+                        None,
+                    )
                 }),
             ),
             (
@@ -13247,7 +13435,20 @@ mod tests {
                 ],
                 Box::new(|r, b| {
                     let a = b[3].device_addr().unwrap();
-                    r.rope_f16_dyn_at(b[0], b[1], b[3], a, ROWS, W, 16, 16, 1e4, 0, Some(b[2]))
+                    r.rope_f16_dyn_at(
+                        b[0],
+                        b[1],
+                        b[3],
+                        a,
+                        ROWS,
+                        W,
+                        16,
+                        16,
+                        1e4,
+                        &*r.be.rope_freq_table(1e4, 16).unwrap(),
+                        0,
+                        Some(b[2]),
+                    )
                 }),
             ),
             (
@@ -13259,7 +13460,21 @@ mod tests {
                 "qk_norm_rope",
                 vec![f(UNITS * HD), f(HD), (UNITS * HD * 2, Fill::Data, Act)],
                 Box::new(|r, b| {
-                    r.qk_norm_rope(b[0], b[1], b[2], UNITS, 1, HD, HD, 1e4, 0, 0, 1e-6, None)
+                    r.qk_norm_rope(
+                        b[0],
+                        b[1],
+                        b[2],
+                        UNITS,
+                        1,
+                        HD,
+                        HD,
+                        1e4,
+                        &*r.be.rope_freq_table(1e4, HD).unwrap(),
+                        0,
+                        0,
+                        1e-6,
+                        None,
+                    )
                 }),
             ),
             (
@@ -13275,6 +13490,7 @@ mod tests {
                         HD,
                         HD,
                         1e4,
+                        &*r.be.rope_freq_table(1e4, HD).unwrap(),
                         0,
                         0,
                         1e-6,
@@ -13292,7 +13508,20 @@ mod tests {
                 ],
                 Box::new(|r, b| {
                     r.qk_norm_rope_dyn(
-                        b[0], b[1], b[2], None, b[3], UNITS, 1, HD, HD, 1e4, 0, 1e-6, 0,
+                        b[0],
+                        b[1],
+                        b[2],
+                        None,
+                        b[3],
+                        UNITS,
+                        1,
+                        HD,
+                        HD,
+                        1e4,
+                        &*r.be.rope_freq_table(1e4, HD).unwrap(),
+                        0,
+                        1e-6,
+                        0,
                     )
                 }),
             ),
@@ -13301,7 +13530,22 @@ mod tests {
                 vec![f(UNITS * HD), f(HD), (UNITS * HD * 2, Fill::Data, Kv)],
                 Box::new(|r, b| {
                     let a = b[2].device_addr().unwrap();
-                    r.qk_norm_rope_at(b[0], b[1], b[2], a, UNITS, 1, HD, HD, 1e4, 0, 0, 1e-6, None)
+                    r.qk_norm_rope_at(
+                        b[0],
+                        b[1],
+                        b[2],
+                        a,
+                        UNITS,
+                        1,
+                        HD,
+                        HD,
+                        1e4,
+                        &*r.be.rope_freq_table(1e4, HD).unwrap(),
+                        0,
+                        0,
+                        1e-6,
+                        None,
+                    )
                 }),
             ),
             (
@@ -13583,6 +13827,8 @@ mod tests {
         be.upload(params.as_ref(), bytemuck::cast_slice(&[P_POS, 0]))
             .unwrap();
         let (ffb, params) = (ffb.as_ref(), params.as_ref());
+        let rf = be.rope_freq_table(THETA, RD).unwrap();
+        let rf = rf.as_ref();
         // (tokens, heads, split point): 143 pairs in three workgroups, the last ragged; then 645
         // pairs in 11 workgroups, split at three into a 3 x 4 grid with one padding workgroup.
         for (t, nh, split) in [(13usize, 11usize, None), (5, 129, Some(3u32))] {
@@ -13595,7 +13841,7 @@ mod tests {
             let rope = |neox, back, ff: bool| -> RopeOp {
                 Box::new(move |r, y, t, nh| {
                     let ff = ff.then_some(ffb);
-                    r.rope(xb, y, t, nh, HD, RD, THETA, POS, ff, neox, back)
+                    r.rope(xb, y, t, nh, HD, RD, THETA, rf, POS, ff, neox, back)
                 })
             };
             let cases: Vec<(&str, Out, u32, bool, bool, bool, RopeOp)> = vec![
@@ -13660,7 +13906,9 @@ mod tests {
                     false,
                     false,
                     false,
-                    Box::new(|r, y, t, nh| r.rope_f16(xb, y, t, nh, HD, RD, THETA, POS, 0, None)),
+                    Box::new(|r, y, t, nh| {
+                        r.rope_f16(xb, y, t, nh, HD, RD, THETA, rf, POS, 0, None)
+                    }),
                 ),
                 (
                     "rope_f16_ff",
@@ -13670,7 +13918,7 @@ mod tests {
                     false,
                     false,
                     Box::new(|r, y, t, nh| {
-                        r.rope_f16(xb, y, t, nh, HD, RD, THETA, POS, 0, Some(ffb))
+                        r.rope_f16(xb, y, t, nh, HD, RD, THETA, rf, POS, 0, Some(ffb))
                     }),
                 ),
                 (
@@ -13681,7 +13929,7 @@ mod tests {
                     false,
                     false,
                     Box::new(|r, y, t, nh| {
-                        r.rope_f16_dyn(xb, params, y, t, nh, HD, RD, THETA, 0, None)
+                        r.rope_f16_dyn(xb, params, y, t, nh, HD, RD, THETA, rf, 0, None)
                     }),
                 ),
                 (
@@ -13692,7 +13940,7 @@ mod tests {
                     false,
                     false,
                     Box::new(|r, y, t, nh| {
-                        r.rope_f16_dyn(xb, params, y, t, nh, HD, RD, THETA, 0, Some(ffb))
+                        r.rope_f16_dyn(xb, params, y, t, nh, HD, RD, THETA, rf, 0, Some(ffb))
                     }),
                 ),
                 (
@@ -13704,7 +13952,7 @@ mod tests {
                     false,
                     Box::new(|r, y, t, nh| {
                         let a = y.device_addr().unwrap();
-                        r.rope_f16_at(xb, y, a, t, nh, HD, RD, THETA, POS, 0, None)
+                        r.rope_f16_at(xb, y, a, t, nh, HD, RD, THETA, rf, POS, 0, None)
                     }),
                 ),
                 (
@@ -13716,7 +13964,7 @@ mod tests {
                     false,
                     Box::new(|r, y, t, nh| {
                         let a = y.device_addr().unwrap();
-                        r.rope_f16_at(xb, y, a, t, nh, HD, RD, THETA, POS, 0, Some(ffb))
+                        r.rope_f16_at(xb, y, a, t, nh, HD, RD, THETA, rf, POS, 0, Some(ffb))
                     }),
                 ),
                 (
@@ -13728,7 +13976,7 @@ mod tests {
                     false,
                     Box::new(|r, y, t, nh| {
                         let a = y.device_addr().unwrap();
-                        r.rope_f16_dyn_at(xb, params, y, a, t, nh, HD, RD, THETA, 0, None)
+                        r.rope_f16_dyn_at(xb, params, y, a, t, nh, HD, RD, THETA, rf, 0, None)
                     }),
                 ),
                 (
@@ -13740,7 +13988,7 @@ mod tests {
                     false,
                     Box::new(|r, y, t, nh| {
                         let a = y.device_addr().unwrap();
-                        r.rope_f16_dyn_at(xb, params, y, a, t, nh, HD, RD, THETA, 0, Some(ffb))
+                        r.rope_f16_dyn_at(xb, params, y, a, t, nh, HD, RD, THETA, rf, 0, Some(ffb))
                     }),
                 ),
             ];
@@ -14804,6 +15052,7 @@ mod tests {
             hd,
             rope_dim,
             theta,
+            &*be.rope_freq_table(theta, rope_dim).unwrap(),
             rope_pos,
             out_base,
             1e-6,
@@ -17035,6 +17284,7 @@ mod tests {
             0, // mask_type: causal
             0, // window
             theta,
+            &*be.rope_freq_table(theta, qk_rope).unwrap(),
             cap_rows as u32, // cache_cap_rows — ring capacity > kv_len
             0,               // canvas_lo — unused by the causal mask
             None,            // freq_factors — no YaRN divisors in the reference test
@@ -17342,6 +17592,7 @@ mod tests {
                 c.mask_type,
                 c.window,
                 theta,
+                &*be.rope_freq_table(theta, qk_rope).unwrap(),
                 c.cap as u32,
                 c.canvas_lo,
                 None,

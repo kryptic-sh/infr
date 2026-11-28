@@ -1,14 +1,14 @@
 // RoPE angle arithmetic shared by every rotary shader (rope, qk_norm_rope,
 // qk_norm_rope_interleaved, mla), so the GPU angle is the CPU reference's
 // (infr_core::math::rope: `pos * rope_freqs[p]`, then `/ divisor`, each rounded to binary32) and
-// its sine and cosine are accurate. The GLSL built-ins are not: Vulkan lets `/` be off by 2.5
-// ulp, `pow` by more, and `sin`/`cos` by an absolute 2^-11, and drivers use that slack (Mesa ANV
-// on Intel does).
+// its sine and cosine are accurate. The frequencies themselves are the CPU's `rope_freqs` table,
+// built on the host and bound to each shader, so only the product, the divide and the sincos
+// happen here. The GLSL built-ins are not good enough for those: Vulkan lets `/` be off by 2.5
+// ulp and `sin`/`cos` by an absolute 2^-11, and drivers use that slack (Mesa ANV on Intel does).
 //
 // Exactness rests only on binary32 add, subtract and multiply, which Vulkan requires to be
 // correctly rounded, with `precise` so no compiler reassociates or contracts them, and on integer
-// operations. The one built-in `/` left (rope_ln_theta's low-order correction) needs only
-// Vulkan's 2.5 ulp. Not `fma`: Vulkan lets it round like a multiply then an add, and Mesa folds
+// operations. Not `fma`: Vulkan lets it round like a multiply then an add, and Mesa folds
 // `fma(a, b, -(a * b))` to 0 even under `precise`. Exact products therefore come from Dekker's
 // splitting, not from an fma. The GPU test `rope_angle_matches_f64` holds every function here to
 // the CPU or to f64.
@@ -122,86 +122,4 @@ vec2 rope_sincos(float x) {
     uint q = uint(int(k)) & 3u;
     vec2 sc = (q & 1u) == 0u ? vec2(s, c) : vec2(c, -s);
     return (q & 2u) == 0u ? sc : -sc;
-}
-
-// Double-float arithmetic (unevaluated sum hi + lo) for rope_freq: Knuth's two-sum and
-// Dekker's products.
-vec2 rope_dd_fast_two_sum(float a, float b) {
-    precise float s = a + b;
-    precise float e = b - (s - a);
-    return vec2(s, e);
-}
-vec2 rope_dd_add(vec2 x, vec2 y) {
-    precise float s = x.x + y.x;
-    precise float bb = s - x.x;
-    precise float e = ((x.x - (s - bb)) + (y.x - bb)) + (x.y + y.y);
-    return rope_dd_fast_two_sum(s, e);
-}
-vec2 rope_dd_mul(vec2 x, vec2 y) {
-    vec2 p = rope_two_prod(x.x, y.x);
-    precise float e = p.y + (x.x * y.y + x.y * y.x);
-    return rope_dd_fast_two_sum(p.x, e);
-}
-vec2 rope_dd_mul_f(vec2 x, float b) {
-    vec2 p = rope_two_prod(x.x, b);
-    precise float e = p.y + x.y * b;
-    return rope_dd_fast_two_sum(p.x, e);
-}
-#define ROPE_DD(h, l) vec2(uintBitsToFloat(h), uintBitsToFloat(l))
-
-// ln theta in double-float for rope_freq; it depends only on the op, so callers take it once
-// rather than per pair. theta = m 2^E with m in [sqrt(1/2), sqrt(2)), and
-// ln m = 2 atanh(u), u = (m-1)/(m+1), |u| < 0.172: the odd series to u^15, its first three terms
-// in double-float.
-vec2 rope_ln_theta(float theta) {
-    const vec2 LN2 = ROPE_DD(0x3f317218u, 0xb102e308u);
-    int ex;
-    float m = frexp(theta, ex);
-    if (m < uintBitsToFloat(0x3f3504f3u)) {
-        m *= 2.0;
-        ex -= 1;
-    }
-    // u = (m - 1) / (m + 1) in double-float; m - 1 is exact (Sterbenz).
-    precise float num = m - 1.0;
-    vec2 den = rope_dd_add(vec2(m, 0.0), vec2(1.0, 0.0));
-    float uh = rope_div(num, den.x);
-    vec2 uq = rope_two_prod(uh, den.x);
-    precise float ul = (((num - uq.x) - uq.y) - uh * den.y) / den.x;
-    vec2 u = rope_dd_fast_two_sum(uh, ul);
-    vec2 w = rope_dd_mul(u, u);
-    precise float wf = w.x;
-    precise float tail = ((((1.0 / 15.0 * wf + 1.0 / 13.0) * wf + 1.0 / 11.0) * wf + 1.0 / 9.0) * wf
-        + 1.0 / 7.0) * wf;
-    vec2 q = rope_dd_add(ROPE_DD(0x3e4ccccdu, 0xb14ccccdu), vec2(tail, 0.0));
-    q = rope_dd_add(ROPE_DD(0x3eaaaaabu, 0xb22aaaabu), rope_dd_mul(w, q));
-    // ln m = 2u (1 + w q)
-    vec2 lnm = rope_dd_mul_f(rope_dd_add(u, rope_dd_mul(rope_dd_mul(u, w), q)), 2.0);
-    return rope_dd_add(rope_dd_mul_f(LN2, float(ex)), lnm);
-}
-
-// theta^e for pair p, e = -2p/rope_dim rounded to binary32 as the CPU's `rope_freqs` writes it,
-// from `ln_theta = rope_ln_theta(theta)`: e^(e ln theta) carried in double-float and rounded
-// once. No error bound is proven here; the GPU test `rope_angle_matches_f64` checks that it equals
-// the correctly rounded infr_core::math::powf value bit for bit on every base and width it
-// covers.
-// e^r, |r| <= ln2/2 after taking out n ln 2: Taylor to r^12, the terms through r^6 in
-// double-float.
-float rope_freq(vec2 ln_theta, uint p, uint rope_dim) {
-    const vec2 LN2 = ROPE_DD(0x3f317218u, 0xb102e308u);
-    float e = rope_div(-2.0 * float(p), float(rope_dim));
-    vec2 y = rope_dd_mul_f(ln_theta, e);
-    precise float n = roundEven(y.x * uintBitsToFloat(0x3fb8aa3bu));
-    vec2 r = rope_dd_add(y, rope_dd_mul_f(LN2, -n));
-    precise float rf = r.x;
-    precise float pt = (((((2.087675588e-9 * rf + 2.505210794e-8) * rf + 2.755731998e-7) * rf
-        + 2.755731884e-6) * rf + 2.480158764e-5) * rf + 1.984127011e-4) * rf;
-    vec2 er = rope_dd_add(ROPE_DD(0x3ab60b61u, 0xae13e93fu), vec2(pt, 0.0));
-    er = rope_dd_add(ROPE_DD(0x3c088889u, 0xafeeeeefu), rope_dd_mul(r, er));
-    er = rope_dd_add(ROPE_DD(0x3d2aaaabu, 0xb0aaaaabu), rope_dd_mul(r, er));
-    er = rope_dd_add(ROPE_DD(0x3e2aaaabu, 0xb1aaaaabu), rope_dd_mul(r, er));
-    er = rope_dd_add(vec2(0.5, 0.0), rope_dd_mul(r, er));
-    er = rope_dd_add(vec2(1.0, 0.0), rope_dd_mul(r, er));
-    er = rope_dd_add(vec2(1.0, 0.0), rope_dd_mul(r, er));
-    precise float res = er.x + er.y;
-    return ldexp(res, int(n));
 }

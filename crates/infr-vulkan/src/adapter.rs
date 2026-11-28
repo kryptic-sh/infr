@@ -2179,6 +2179,8 @@ fn lower_op(
             // on the bound build. `out_buf` stays bound at its write slot in the `_at` method for the
             // store→read barrier. Bit-identical to the bound dispatch.
             let y_addr = out_buf.device_addr();
+            // The per-pair frequencies, the CPU reference's table (bit-identical angles).
+            let rf = be_.rope_freq_table(*theta, *rope_dim as usize)?;
             match mode {
                 RopeMode::Static(rope_pos) => {
                     let ff = match freq_factors {
@@ -2198,6 +2200,7 @@ fn lower_op(
                                 *head_dim as usize,
                                 *rope_dim as usize,
                                 *theta,
+                                &*rf,
                                 rope_pos[&positions.0],
                                 fused.unwrap_or(0),
                                 *eps,
@@ -2212,6 +2215,7 @@ fn lower_op(
                                 *head_dim as usize,
                                 *rope_dim as usize,
                                 *theta,
+                                &*rf,
                                 rope_pos[&positions.0],
                                 fused.unwrap_or(0),
                                 *eps,
@@ -2230,6 +2234,7 @@ fn lower_op(
                                 *head_dim as usize,
                                 *rope_dim as usize,
                                 *theta,
+                                &*rf,
                                 rope_pos[&positions.0],
                                 fused.unwrap_or(0),
                                 *eps,
@@ -2244,6 +2249,7 @@ fn lower_op(
                                 *head_dim as usize,
                                 *rope_dim as usize,
                                 *theta,
+                                &*rf,
                                 rope_pos[&positions.0],
                                 fused.unwrap_or(0),
                                 *eps,
@@ -2287,6 +2293,7 @@ fn lower_op(
                                 *head_dim as usize,
                                 *rope_dim as usize,
                                 *theta,
+                                &*rf,
                                 out_base_mul,
                                 *eps,
                                 *x_stride as usize,
@@ -2301,6 +2308,7 @@ fn lower_op(
                                 *head_dim as usize,
                                 *rope_dim as usize,
                                 *theta,
+                                &*rf,
                                 out_base_mul,
                                 *eps,
                                 *x_stride as usize,
@@ -2321,6 +2329,7 @@ fn lower_op(
                                 *head_dim as usize,
                                 *rope_dim as usize,
                                 *theta,
+                                &*rf,
                                 out_base_mul,
                                 *eps,
                                 kc,
@@ -2336,6 +2345,7 @@ fn lower_op(
                                 *head_dim as usize,
                                 *rope_dim as usize,
                                 *theta,
+                                &*rf,
                                 out_base_mul,
                                 *eps,
                                 kc,
@@ -2393,6 +2403,8 @@ fn lower_op(
             // present); the un-fused Q-scratch write stays bound. `out_buf` stays bound at its write
             // slot in the `_at` method for the store→read barrier.
             let y_addr = out_buf.device_addr();
+            // The per-pair frequencies, the CPU reference's table (bit-identical angles).
+            let rf = be_.rope_freq_table(*theta, *rope_dim as usize)?;
             match mode {
                 RopeMode::Static(rope_pos) => {
                     if f16_out {
@@ -2406,6 +2418,7 @@ fn lower_op(
                                 *head_dim as usize,
                                 *rope_dim as usize,
                                 *theta,
+                                &*rf,
                                 rope_pos[&positions.0],
                                 fused.unwrap_or(0),
                                 ff,
@@ -2418,6 +2431,7 @@ fn lower_op(
                                 *head_dim as usize,
                                 *rope_dim as usize,
                                 *theta,
+                                &*rf,
                                 rope_pos[&positions.0],
                                 fused.unwrap_or(0),
                                 ff,
@@ -2432,6 +2446,7 @@ fn lower_op(
                             *head_dim as usize,
                             *rope_dim as usize,
                             *theta,
+                            &*rf,
                             rope_pos[&positions.0],
                             ff,
                             *neox,
@@ -2465,6 +2480,7 @@ fn lower_op(
                             *head_dim as usize,
                             *rope_dim as usize,
                             *theta,
+                            &*rf,
                             usize::from(fused.is_some()),
                             ff,
                         ),
@@ -2477,6 +2493,7 @@ fn lower_op(
                             *head_dim as usize,
                             *rope_dim as usize,
                             *theta,
+                            &*rf,
                             usize::from(fused.is_some()),
                             ff,
                         ),
@@ -4852,6 +4869,7 @@ fn lower_op(
             };
             let ff = freq_factors.map(r).transpose()?;
             let kbias = key_bias.map(r).transpose()?;
+            let rf = be_.rope_freq_table(*theta, *qk_rope_dim as usize)?;
             rec.mla(
                 r(*q)?,
                 r(*k_cache)?,
@@ -4871,6 +4889,7 @@ fn lower_op(
                 mask_type,
                 window,
                 *theta,
+                &*rf,
                 cache_cap_rows,
                 canvas_lo,
                 ff,

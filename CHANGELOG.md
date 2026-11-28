@@ -27,6 +27,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   request draws from the same distribution, but on a backend that samples on the
   GPU or runs MTP it may not reproduce the tokens the same seed gives without
   `logprobs`.
+- **The rotary `infr_vulkan::Recorder` methods take a `freqs` buffer** after
+  `theta`: `rope`, `rope_f16`, `rope_f16_dyn`, `rope_f16_at`, `rope_f16_dyn_at`,
+  every `qk_norm_rope` form and `mla`. Pass
+  `VulkanBackend::rope_freq_table(theta, rope_dim)` (`qk_rope_dim` for `mla`),
+  the per-pair frequencies the kernels now read instead of deriving them.
 - **`infr_core::graph::Op` gains `AttnTemp`**, the position-dependent attention
   temperature, so an exhaustive match on `Op` must handle it.
 - **`infr_cpu::op_tap::TappedOp` gains `Mla`, `MulVec` and `AttnTemp`**, so an
@@ -118,6 +123,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`VulkanBackend::rope_freq_table(theta, rope_dim)`** returns the device
+  buffer of the CPU reference's per-pair RoPE frequencies (`rope_freqs`), built
+  once per (theta, rope width) and kept for the backend's life: the table the
+  rotary `Recorder` methods now take.
 - **`infr_core::math::ROPE_ANGLE_MAX`**, the largest RoPE rotation angle any
   backend computes faithfully; the Vulkan shaders and the context refusal read
   it.
@@ -1608,14 +1617,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   past it, so a llama3-style rope at position 131070 missed the reference by 2.7
   times its tolerance. They now share `rope_angle.glsl`, which takes no
   transcendental built-in. The angle is bit for bit the CPU's `pos * freq`, then
-  `/ divisor`: the divide equals binary32 `/`, and the frequency equals
-  `rope_freqs` on every base and width the GPU test `rope_angle_matches_f64`
-  covers. Sine and cosine are not bit-identical: they are within 2^-22 absolute
-  of the exact values for angles up to 2^24 rad (1.8 × 2^-24 measured on Intel),
-  which is the domain the test covers; a session that could reach a larger angle
-  is refused (see Changed). The extra arithmetic costs prefill speed: Qwen3-1.7B
-  Q4_K_M pp512 on the Intel iGPU went from 152.1 / 152.2 to 149.2 / 149.2 t/s
-  (two alternated runs each, `infr bench -p 512 -n 0 -r 3`).
+  `/ divisor`: the divide equals binary32 `/`, and the frequencies are the CPU's
+  own `rope_freqs` table, built once per (theta, rope width) on the host and
+  bound to the shaders (`VulkanBackend::rope_freq_table`). Sine and cosine are
+  not bit-identical: they are within 2^-22 absolute of the exact values for
+  angles up to 2^24 rad (1.8 × 2^-24 measured on Intel), which is the domain the
+  GPU test `rope_angle_matches_f64` covers; a session that could reach a larger
+  angle is refused (see Changed). The extra arithmetic costs some prefill speed.
+  On the Intel iGPU (Mesa ANV, packed int8 dot on for every build, two
+  alternated rounds of `infr bench -r 3`), against the build before this fix,
+  Qwen3-1.7B Q4_K_M pp512 went from 152.4 / 152.5 to 150.4 / 150.0 t/s and tg128
+  from 17.6 / 17.5 to 17.4 / 17.5; gemma-3-1b-it Q4_K_M pp512 from 353.4 / 352.9
+  to 352.7 / 352.6 and tg128 from 15.1 / 15.0 to 17.8 / 17.7. That decode gain
+  is larger than anything RoPE cost before, and its cause is not known yet
+  (B-GEMMA-DECODE-ROPE-GAIN).
 - **Expert-parallel MoE prefill on Vulkan stays inside the guaranteed workgroup
   limit.** The band remap after each MoE layer's top-k (`moe_ep_band_remap`)
   dispatched one workgroup per (token, slot) assignment where each workgroup

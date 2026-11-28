@@ -366,6 +366,34 @@ allocates to within a few hundred MB of the runner's working set, so it passes
 or fails on what else the runner holds. Shrink its shapes, or skip it under the
 budget, the way the other bench tests do.
 
+### B-GEMMA-DECODE-ROPE-GAIN — gemma-3 decode got 19% faster from the RoPE table, and why is unknown (2026-11-28)
+
+Plan 19 S2c made the rotary shaders read the CPU's frequency table from a
+buffer. On the Intel iGPU (Mesa ANV,
+`--set kernels.vulkan.tune.device.i8_dot=true`, quiet machine, builds
+alternated), gemma-3-1b-it Q4_K_M tg128 went from 15.2 to 18.2 t/s
+(`infr bench -p 0 -n 128 -r 3`, two rounds each). The build before the RoPE work
+ran at 15.0, so this is more than RoPE ever cost. Qwen3-1.7B decode barely
+moved, and prefill is unchanged on both. The output did not change: the kernel
+dumps are bit-identical to the build before, the tolerance rows are identical,
+and greedy `infr run` text is identical.
+
+What is known:
+
+- The decode dispatch structure is the same. `prof.stages` shows the same
+  barrier counts per submit, and exec time per token went from 65.4 to 54.3 ms.
+- The decode submits are not in the `prof.ops` report, which covers only the
+  prefill chunks. In prefill, `qk_norm_rope` went from about 20 µs to 8 µs a
+  dispatch, which is far too little to explain 11 ms a token.
+- A review of the diff found no skipped or shortened work: the workgroup counts,
+  fused KV writes and record-once path are unchanged.
+
+A guess, not shown: the decode path's record-once `qk_norm_rope` variants
+(`USE_PARAMS`, BDA) were slow on ANV in a way the static ones are not. Examples
+are register spills, or a heavy per-workgroup lane-0 prologue that serialised a
+latency-bound dispatch. To find out, get per-op device times for the decode
+submits on both builds.
+
 ### B-ROPE-REFUSAL-TIMING — the RoPE context refusal fires at the first generate (2026-11-27)
 
 **Kind:** gap found in review, not fixed (low severity: it needs a context past

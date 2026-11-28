@@ -6,6 +6,7 @@
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform PC {
+    // `theta` is unused here: the frequencies come from the bound `rf` table.
     uint rows; uint nheads; uint hd; uint rope_dim; float theta; uint rope_pos; uint out_base; float eps;
     // Fused-K cache write, dyn mode only: the cache's ROW capacity (an SWA ring cache recycles
     // rows the window mask already excludes — the write row is pos % kcap, identity on a
@@ -23,14 +24,30 @@ layout(push_constant) uniform PC {
 } pc;
 layout(binding = 0) readonly buffer XB { float x[]; };
 layout(binding = 1) readonly buffer NB { float nw[]; };
+// The per-pair frequencies (`rope_dim/2` floats, `rf`): the CPU reference's `rope_freqs` table for
+// this op's theta and rope_dim, built on the host (`VulkanBackend::rope_freq_table`), so the angle
+// `pos * rf[p]` is the CPU's. It binds after the inputs and before the optional `ff` and the output
+// `y`, which stays last for the recorder's reads|writes split.
 #ifdef USE_PARAMS
 // Record-once decode: pos comes from a host-updated params SSBO instead of a push constant, so the
 // command buffer can be replayed across tokens. `pc.rope_pos` is unused; `pc.out_base` is the 0/1
-// out_base multiplier (Q→0, K→pos). Output `y` moves to binding 3 (params takes binding 2) so the
-// recorder's reads|writes split stays output-last. With FREQ_FACTORS (gemma4 full-attention layers
-// replayed), `ff` takes binding 3 and `y` shifts to binding 4 — still output-last.
+// out_base multiplier (Q→0, K→pos). Params take binding 2, `rf` binding 3, then (gemma4
+// full-attention layers replayed, FREQ_FACTORS) `ff` binding 4, and `y` last.
 layout(binding = 2) readonly buffer PB { uint p_pos; uint p_kvlen; };
+layout(binding = 3) readonly buffer RF { float rf[]; };
 #ifdef FREQ_FACTORS
+layout(binding = 4) readonly buffer FF { float ff[]; };
+#ifndef KV_BDA
+layout(binding = 5) buffer YB { float16_t y[]; };
+#endif
+#elif !defined(KV_BDA)
+layout(binding = 4) buffer YB { float16_t y[]; };
+#endif
+#else
+layout(binding = 2) readonly buffer RF { float rf[]; };
+#ifdef FREQ_FACTORS
+// gemma4 full-attention layers use proportional RoPE: per-pair frequency divisors (most are huge →
+// those dims are left unrotated). `ff` takes binding 3 (read), `y` shifts to binding 4 (write).
 layout(binding = 3) readonly buffer FF { float ff[]; };
 #ifndef KV_BDA
 layout(binding = 4) buffer YB { float16_t y[]; };
@@ -38,15 +55,6 @@ layout(binding = 4) buffer YB { float16_t y[]; };
 #elif !defined(KV_BDA)
 layout(binding = 3) buffer YB { float16_t y[]; };
 #endif
-#elif defined(FREQ_FACTORS)
-// gemma4 full-attention layers use proportional RoPE: per-pair frequency divisors (most are huge →
-// those dims are left unrotated). `ff` takes binding 2 (read), `y` shifts to binding 3 (write).
-layout(binding = 2) readonly buffer FF { float ff[]; };
-#ifndef KV_BDA
-layout(binding = 3) buffer YB { float16_t y[]; };
-#endif
-#elif !defined(KV_BDA)
-layout(binding = 2) buffer YB { float16_t y[]; };
 #endif
 #ifdef KV_BDA
 #include "kv_addr.glsl"
@@ -62,9 +70,6 @@ layout(binding = 2) buffer YB { float16_t y[]; };
 #define QK_NORM_ROPE_MAX_HD 512
 shared float xs[QK_NORM_ROPE_MAX_HD];
 shared float red[64];
-// ln theta, which depends only on the op: lane 0 takes it while the others load the row, and the
-// norm's reduction barriers publish it.
-shared vec2 ln_theta_s;
 
 void main() {
 #ifdef KV_BDA
@@ -80,7 +85,6 @@ void main() {
     uint r = unit / pc.nheads;
     uint in_base = (r * pc.nheads + h) * pc.hd;
 
-    if (t == 0u) { ln_theta_s = rope_ln_theta(pc.theta); }
     float pss = 0.0;
     for (uint i = t; i < pc.hd; i += 64u) { float v = x[in_base + i]; xs[i] = v; pss += v * v; }
     red[t] = pss;
@@ -103,13 +107,12 @@ void main() {
     uint absp = rope_pos + r;
     uint out_base_idx = ((out_base + r) * pc.nheads + h) * pc.hd;
     uint hf = pc.rope_dim / 2u;
-    vec2 ln_theta = ln_theta_s;
     for (uint p = t; p < hf; p += 64u) {
         uint i0 = p;
         uint i1 = p + hf;
         float a = xs[i0] * scale * nw[i0];
         float b = xs[i1] * scale * nw[i1];
-        precise float ang = float(absp) * rope_freq(ln_theta, p, pc.rope_dim);
+        precise float ang = float(absp) * rf[p];
 #ifdef FREQ_FACTORS
         // proportional rope: ff[p] huge → ang≈0 → this dim left unrotated
         ang = rope_div(ang, ff[p]);

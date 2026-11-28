@@ -1105,6 +1105,30 @@ unverified against a reference. The direction, posted on the PR:
   should not stop at the first image; and limits should not count images the
   client resends from earlier turns.
 
+- **Corrected against `ref/llama.cpp` at `5676dfbe0` (2026-11-28)**, which
+  supersedes the older readings below where they disagree, and was posted on PR
+  #110 the same day:
+  - The image token limits are 70 and 1120 (`set_limit_image_tokens(70, 1120)`
+    in `tools/mtmd/mtmd-model.cpp`, changed from 40/280 upstream in #28335), so
+    the default ceiling is 1120, not 280.
+  - There is no letterbox: Gemma 4 images are resized straight to the target
+    size (upstream #30922). The "fit and pad" bullet below is out of date.
+  - Causal or not depends on the model: `mtmd_decode_use_non_causal` is true for
+    gemma4v only when `n_embd` is neither 1536 nor 2560, so E2B and E4B decode
+    image spans causally. The larger Gemma 4 models attend bidirectionally on
+    sliding-window layers only (`LLAMA_NON_CAUSAL_TYPE_SWA_ONLY` in
+    `src/models/gemma4.cpp`), and a non-causal span has to fit in one ubatch.
+    The "image spans need non-causal attention" point above holds for those
+    larger models only.
+  - Still true: the per-layer output scale `v.blk.N.out_scale.weight`
+    (`ls_out_w`, applied after the second residual in `build_vit`), and the need
+    for an embeddings-then-logits comparison with llama.cpp.
+  - Suggested scope, as posted: E2B and E4B first (causal), then the larger
+    models with the sliding-window rule.
+- **PR #110's deadline:** the contributor was asked on 2026-11-28 whether they
+  will take the seam rework. With no answer by about 2026-12-05, close the PR
+  with thanks and plan the work here, crediting the contributor and Noxyntious
+  for the parts that carry over.
 - **Gemma 4 preprocessing, as the crcbl session read it from llama.cpp at
   `57291f2`** (their reading and their runs, not checked here; the first three
   are infr's steps, not the crate's):
@@ -1367,6 +1391,47 @@ with the parameter on (both models ran, no skip).
 Not known: whether two runs of one configuration agree bit for bit on that card
 and driver (the test compares two configurations and does not run either twice),
 which is the first thing to check, and how far apart the two runs' logits are.
+
+### B-WIN-VRAM-LIMIT — `vram_limit_tests` fail on both GPUs under the AMD Windows driver (2026-11-28)
+
+**Kind:** failing ignored GPU tests at the shipped defaults, on `main`; not
+diagnosed. Seen on `72e8d84f` and identical on the change tested on top of it,
+so not caused by that change; not re-run since.
+
+- **RX 7900 XTX (Vulkan0):** six tests in `seam::model::vram_limit_tests::tests`
+  fail because the room left under the test's VRAM limit comes out as zero:
+  `clamped_default_ctx_allocates_its_estimate`,
+  `clamped_kv_opens_no_pooled_block`,
+  `explicit_ctx_f16_cannot_hold_is_served_in_q8`,
+  `explicit_ctx_short_of_the_room_after_the_weights_is_refused`,
+  `overflow_spills_a_second_slot_past_the_reserve` and
+  `overflow_spills_the_minimum_when_nothing_fits`.
+- **Integrated GPU (Vulkan1):**
+  `overflow_refuses_what_cannot_stream_before_the_load` fails: "not the refusal
+  with the sizes: context 4096 does not fit this device: after its KV cache
+  (0.47 GB in F16/F16) and the activation reserve, 0.00 GB is left for streaming
+  the 0.39 GB of dense weights", so the refusal fires, but with a message the
+  test does not expect.
+- **First thing to check:** what the driver reports as the heap budget under the
+  test's limit on each device (the budget extension's numbers against the limit
+  the test sets), since both failures point at the room after the limit being
+  read as zero. The Intel iGPU's budget work (B-ANV-UMA-BUDGET-GUARD) is
+  ANV-only and does not touch this path.
+
+### B-GQA-DECODE-PARKED — a GQA-batched decode attention pass, parked (2026-11-28)
+
+**Kind:** considered and declined for now. PR #120's contributor wrote a decode
+attention pass that batches the query heads of one KV group, and measured it
+1.8% slower on their RX 580; our notes record grouped decode attention as 1.87x
+slower on RDNA3. Asked on the PR (2026-11-28) to keep it on their branch. If it
+comes back, it should be a per-device tuning parameter in
+`crates/infr-vulkan/src/tuning/` rather than a global `kernels.vulkan.*` key,
+and needs: a test running every (head dim, group) build it adds, with a
+per-shape check that the batched kernel ran; timings out of code comments;
+`attn_decode_parity.rs`'s module doc updated; a Breaking entry for any new
+`VulkanCfg` field; and the MTP verify path gated the same way as decode. The
+same PR's `nc_fa` P·V unroll cap was asked for as its own PR, to be measured
+here on the iGPU and on the RX 7900 XTX with `INFR_NO_COOPMAT=1`.
 
 ### B-KQ-FMA-BW-IGPU — `kq_fma_mrow_bw` trips the integrated GPU's watchdog (2026-11-26)
 
